@@ -131,7 +131,7 @@ def backtest_symbol(symbol):
         index=equity_dates
     )
     mdd = max_drawdown(equity_series) if not equity_series.empty else 0
-    monthly_returns = equity_series.resample("M").last().pct_change()
+    monthly_returns = equity_series.resample("ME").last().pct_change()
 
     positive_months = (monthly_returns > 0).sum()
     negative_months = (monthly_returns <= 0).sum()
@@ -187,6 +187,11 @@ if results:
     avg_return = sum(r["total_return"] for r in results) / len(results)
     avg_win_rate = sum(r["win_rate"] for r in results) / len(results)
     avg_mdd = sum(r["max_drawdown"] for r in results) / len(results)
+
+    # CSV 파일로 저장
+    df_results = pd.DataFrame(results)
+    df_results.to_csv("backtest_results.csv", index=False)
+    print("\nCSV 저장 완료: backtest_results.csv")
 
     print("=== 전체 요약 ===")
     print(f"테스트 종목 수: {len(results)}")
