@@ -18,4 +18,4 @@ STOP_LOSS_RATE = -0.08             # 손절 -8%
 
 # 안전 모드
 ENABLE_REAL_TRADING = False        # 실거래 금지
-ENABLE_PAPER_TRADING = False       # 아직 모의투자도 비활성
+ENABLE_PAPER_TRADING = True       # 아직 모의투자도 비활성
