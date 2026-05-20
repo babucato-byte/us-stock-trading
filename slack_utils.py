@@ -5,15 +5,16 @@ from dotenv import load_dotenv
 load_dotenv()
 
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
+SLACK_ALERT_WEBHOOK_URL = os.getenv("SLACK_ALERT_WEBHOOK_URL")
 
 
-def send_slack_message(message):
-    if not SLACK_WEBHOOK_URL:
+def _send(webhook_url, message):
+    if not webhook_url:
         print("Slack Webhook URL이 없습니다.")
         return False
 
     response = requests.post(
-        SLACK_WEBHOOK_URL,
+        webhook_url,
         json={"text": message},
         timeout=10
     )
@@ -26,3 +27,11 @@ def send_slack_message(message):
     print(response.status_code)
     print(response.text)
     return False
+
+
+def send_slack_message(message):
+    return _send(SLACK_WEBHOOK_URL, message)
+
+
+def send_slack_alert(message):
+    return _send(SLACK_ALERT_WEBHOOK_URL, message)

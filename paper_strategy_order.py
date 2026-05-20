@@ -7,7 +7,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from order_safety import run_order_safety_check
 from market_hours import get_us_market_session
-from slack_utils import send_slack_message
+from slack_utils import send_slack_alert
 
 load_dotenv()
 
@@ -175,7 +175,14 @@ def main():
 
     for symbol in tickers:
         if symbol in held_symbols:
+            msg = f"""
+        *Paper Trading 보유 종목 재매수 차단*
+
+        종목: {symbol}
+        상태: 이미 보유 중인 종목이라 추가 주문을 차단했습니다.
+        """
             print(f"{symbol} 이미 보유 중 → 주문 건너뜀")
+            send_slack_alert(msg)
             continue
 
         already_ordered = (
@@ -183,8 +190,16 @@ def main():
             & (order_history["order_date"] == today)
         ).any()
 
+
         if already_ordered:
+            msg = f"""
+        *Paper Trading 중복 주문 차단*
+
+        종목: {symbol}
+        상태: 오늘 이미 주문된 종목이라 추가 주문을 차단했습니다.
+        """
             print(f"{symbol} 오늘 이미 주문됨 → 건너뜀")
+            send_slack_alert(msg)
             continue
 
         result = analyze_stock(symbol)
@@ -211,7 +226,7 @@ def main():
             상태: 현재 시간대는 주문하지 않음
             """
                 print(f"{symbol} 탐지 완료 → 현재 시간대는 주문하지 않음")
-                send_slack_message(msg)
+                send_slack_alert(msg)
                 continue
 
 
@@ -248,10 +263,10 @@ def main():
                 ```{response.text[:1000]}```
                 """
 
-                send_slack_message(msg)
+                send_slack_alert(msg)
 
 
-                send_slack_message(msg)
+                send_slack_alert(msg)
                 new_row = pd.DataFrame([
                     {
                         "symbol": symbol,
