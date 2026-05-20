@@ -45,6 +45,7 @@ def backtest_symbol(symbol):
     buy_price = 0
     trades = []
     equity_values = []
+    equity_dates = []
 
     for i in range(200, len(df)):
         price = df["Close"].iloc[i]
@@ -57,6 +58,7 @@ def backtest_symbol(symbol):
 
         current_value = cash + position * price
         equity_values.append(current_value)
+        equity_dates.append(df.index[i])
 
         # 매수 조건
         if position == 0:
@@ -124,8 +126,15 @@ def backtest_symbol(symbol):
         if sell_trades else 0
     )
 
-    equity_series = pd.Series(equity_values)
+    equity_series = pd.Series(
+        equity_values,
+        index=equity_dates
+    )
     mdd = max_drawdown(equity_series) if not equity_series.empty else 0
+    monthly_returns = equity_series.resample("M").last().pct_change()
+
+    positive_months = (monthly_returns > 0).sum()
+    negative_months = (monthly_returns <= 0).sum()
 
     return {
         "symbol": symbol,
@@ -139,6 +148,8 @@ def backtest_symbol(symbol):
         "max_drawdown": mdd,
         "max_consecutive_losses": max_consecutive_losses,
         "cagr": cagr,
+        "positive_months": int(positive_months),
+        "negative_months": int(negative_months),
     }
 
 
@@ -167,6 +178,8 @@ for r in results:
 최대손실 MDD: {r['max_drawdown']:.2f}%
 최대 연속 손실: {r['max_consecutive_losses']}회
 연평균 수익률 CAGR: {r['cagr']:.2f}%
+수익 월: {r['positive_months']}개월
+손실 월: {r['negative_months']}개월
 ----------------------------
 """)
 
