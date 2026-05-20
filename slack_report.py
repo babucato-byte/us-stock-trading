@@ -97,6 +97,8 @@ def analyze_stock(symbol):
 
 results = []
 
+high_score_count = 0
+
 for symbol in tickers:
 
     try:
