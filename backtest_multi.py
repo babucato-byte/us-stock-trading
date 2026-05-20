@@ -11,8 +11,8 @@ INITIAL_CASH = 10000
 #TAKE_PROFIT = 0.15
 #STOP_LOSS = -0.08
 
-MAX_ALLOWED_MDD = -25
-MAX_ALLOWED_CONSECUTIVE_LOSSES = 5
+MAX_ALLOWED_MDD = -40
+MAX_ALLOWED_CONSECUTIVE_LOSSES = 10
 
 def calculate_rsi(df, period=14):
     delta = df["Close"].diff()
@@ -79,7 +79,7 @@ def backtest_symbol(symbol):
         else:
             profit_rate = (price - buy_price) / buy_price
 
-             if profit_rate >= TAKE_PROFIT_RATE or profit_rate <= STOP_LOSS_RATE or price < ma200:
+            if profit_rate >= TAKE_PROFIT_RATE or profit_rate <= STOP_LOSS_RATE or price < ma200:
                 cash = position * price
                 position = 0
 
@@ -176,6 +176,9 @@ for r in results:
 
     if r["max_consecutive_losses"] > MAX_ALLOWED_CONSECUTIVE_LOSSES:
         risk_status = "위험 제외 후보"
+
+    r["risk_status"] = risk_status
+
     print(f"""
 [{r['symbol']}]
 위험 판정: {risk_status}
