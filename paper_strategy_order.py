@@ -2,6 +2,7 @@ import os
 import requests
 import yfinance as yf
 import pandas as pd
+from datetime import datetime
 from dotenv import load_dotenv
 from order_safety import run_order_safety_check
 
@@ -53,6 +54,8 @@ def submit_order(symbol, qty=1):
     print(f"{symbol} 주문 결과:", response.status_code)
     print(response.text)
 
+    return response
+
 
 def analyze_stock(symbol):
     ticker = yf.Ticker(symbol)
@@ -93,52 +96,116 @@ def analyze_stock(symbol):
 
     return {
         "symbol": symbol,
-        "price": price,
-        "ma200": ma200,
-        "rsi": rsi,
-        "volume_ratio": volume_ratio,
+        "price": float(price),
+        "ma200": float(ma200),
+        "rsi": float(rsi),
+        "volume_ratio": float(volume_ratio),
         "score": score
     }
 
 
-try:
-    watchlist_df = pd.read_csv("watchlist.csv")
-    tickers = watchlist_df["symbol"].dropna().unique().tolist()
-except Exception as e:
-    print(f"watchlist.csv 읽기 실패: {e}")
-    tickers = []
+def load_watchlist():
+    try:
+        watchlist_df = pd.read_csv("watchlist.csv")
+
+        if watchlist_df.empty:
+            print("watchlist.csv가 비어 있습니다.")
+            return []
+
+        return watchlist_df["symbol"].dropna().unique().tolist()
+
+    except Exception as e:
+        print(f"watchlist.csv 읽기 실패: {e}")
+        return []
 
 
-account = get_account()
-positions = get_positions()
+def load_order_history():
+    try:
+        return pd.read_csv("order_history.csv")
+    except Exception:
+        return pd.DataFrame(columns=["symbol", "order_date"])
 
-open_position_count = len(positions)
-today_trade_count = 0
 
-print("Paper 계좌 연결 성공")
-print("현재 보유 종목 수:", open_position_count)
+def save_order_history(order_history):
+    order_history.to_csv("order_history.csv", index=False)
 
-for symbol in tickers:
-    result = analyze_stock(symbol)
 
-    if not result:
-        continue
+def main():
+    tickers = load_watchlist()
 
-    print(result)
+    if not tickers:
+        print("주문 대상 종목이 없습니다.")
+        return
 
-    if result["score"] >= 70:
-        print(f"{symbol} 전략 조건 충족")
+    account = get_account()
+    positions = get_positions()
 
-        run_order_safety_check(
-            position_rate=0.01,
-            today_trade_count=today_trade_count,
-            open_position_count=open_position_count
-        )
+    open_position_count = len(positions)
+    today_trade_count = 0
+    today = datetime.now().strftime("%Y-%m-%d")
 
-        submit_order(symbol, qty=1)
+    held_symbols = [p["symbol"] for p in positions]
 
-        today_trade_count += 1
-        open_position_count += 1
+    order_history = load_order_history()
 
-    else:
-        print(f"{symbol} 조건 미충족")
+    print("Paper 계좌 연결 성공")
+    print("현재 보유 종목 수:", open_position_count)
+    print("현재 보유 종목:", held_symbols)
+
+    for symbol in tickers:
+        if symbol in held_symbols:
+            print(f"{symbol} 이미 보유 중 → 주문 건너뜀")
+            continue
+
+        already_ordered = (
+            (order_history["symbol"] == symbol)
+            & (order_history["order_date"] == today)
+        ).any()
+
+        if already_ordered:
+            print(f"{symbol} 오늘 이미 주문됨 → 건너뜀")
+            continue
+
+        result = analyze_stock(symbol)
+
+        if not result:
+            print(f"{symbol} 분석 실패")
+            continue
+
+        print(result)
+
+        if result["score"] >= 70:
+            print(f"{symbol} 전략 조건 충족")
+
+            run_order_safety_check(
+                position_rate=0.01,
+                today_trade_count=today_trade_count,
+                open_position_count=open_position_count
+            )
+
+            response = submit_order(symbol, qty=1)
+
+            if response.status_code in [200, 201]:
+                new_row = pd.DataFrame([
+                    {
+                        "symbol": symbol,
+                        "order_date": today
+                    }
+                ])
+
+                order_history = pd.concat(
+                    [order_history, new_row],
+                    ignore_index=True
+                )
+
+                save_order_history(order_history)
+
+                today_trade_count += 1
+                open_position_count += 1
+
+        else:
+            print(f"{symbol} 조건 미충족")
+
+
+if __name__ == "__main__":
+    main()
