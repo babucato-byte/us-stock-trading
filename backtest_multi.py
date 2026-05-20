@@ -10,6 +10,8 @@ INITIAL_CASH = 10000
 TAKE_PROFIT = 0.15
 STOP_LOSS = -0.08
 
+MAX_ALLOWED_MDD = -25
+MAX_ALLOWED_CONSECUTIVE_LOSSES = 5
 
 def calculate_rsi(df, period=14):
     delta = df["Close"].diff()
@@ -166,8 +168,16 @@ results = sorted(results, key=lambda x: x["total_return"], reverse=True)
 print("\n=== 여러 종목 백테스트 결과 ===\n")
 
 for r in results:
+    risk_status = "통과"
+
+    if r["max_drawdown"] < MAX_ALLOWED_MDD:
+        risk_status = "위험 제외 후보"
+
+    if r["max_consecutive_losses"] > MAX_ALLOWED_CONSECUTIVE_LOSSES:
+        risk_status = "위험 제외 후보"
     print(f"""
 [{r['symbol']}]
+위험 판정: {risk_status}
 최종 자금: ${r['final_value']:.2f}
 총 수익률: {r['total_return']:.2f}%
 거래 횟수: {r['trade_count']}
