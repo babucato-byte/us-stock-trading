@@ -1,0 +1,13 @@
+[Unit]
+Description=Alpaca Paper Order Monitor
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/trading
+ExecStart=/home/ubuntu/trading/venv/bin/python /home/ubuntu/trading/order_monitor.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
