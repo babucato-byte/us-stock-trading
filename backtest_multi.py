@@ -1,5 +1,6 @@
 import yfinance as yf
 import pandas as pd
+from risk_config import TAKE_PROFIT_RATE, STOP_LOSS_RATE
 
 tickers = [
     "AAPL", "MSFT", "STLA", "C", "PLTR",
@@ -7,8 +8,8 @@ tickers = [
 ]
 
 INITIAL_CASH = 10000
-TAKE_PROFIT = 0.15
-STOP_LOSS = -0.08
+#TAKE_PROFIT = 0.15
+#STOP_LOSS = -0.08
 
 MAX_ALLOWED_MDD = -25
 MAX_ALLOWED_CONSECUTIVE_LOSSES = 5
@@ -78,7 +79,7 @@ def backtest_symbol(symbol):
         else:
             profit_rate = (price - buy_price) / buy_price
 
-            if profit_rate >= TAKE_PROFIT or profit_rate <= STOP_LOSS or price < ma200:
+             if profit_rate >= TAKE_PROFIT_RATE or profit_rate <= STOP_LOSS_RATE or price < ma200:
                 cash = position * price
                 position = 0
 
