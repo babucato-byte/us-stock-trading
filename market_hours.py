@@ -2,21 +2,38 @@ from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
 
-def is_us_market_open():
+def get_us_market_session():
     ny_time = datetime.now(ZoneInfo("America/New_York"))
 
-    # 월~금만 허용
     if ny_time.weekday() >= 5:
-        return False
+        return "closed"
 
-    market_open = time(9, 30)
-    market_close = time(16, 0)
+    premarket_start = time(4, 0)
+    regular_start = time(9, 30)
+    regular_end = time(16, 0)
+    after_end = time(20, 0)
 
-    return market_open <= ny_time.time() <= market_close
+    current_time = ny_time.time()
+
+    if premarket_start <= current_time < regular_start:
+        return "premarket"
+
+    if regular_start <= current_time <= regular_end:
+        return "regular"
+
+    if regular_end < current_time <= after_end:
+        return "aftermarket"
+
+    return "closed"
+
+
+def is_us_regular_market_open():
+    return get_us_market_session() == "regular"
+
+
+def is_us_premarket():
+    return get_us_market_session() == "premarket"
 
 
 if __name__ == "__main__":
-    if is_us_market_open():
-        print("미국장 열림")
-    else:
-        print("미국장 닫힘")
+    print(get_us_market_session())

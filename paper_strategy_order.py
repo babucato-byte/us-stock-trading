@@ -5,7 +5,7 @@ import pandas as pd
 from datetime import datetime
 from dotenv import load_dotenv
 from order_safety import run_order_safety_check
-from market_hours import is_us_market_open
+from market_hours import get_us_market_session
 
 load_dotenv()
 
@@ -132,9 +132,21 @@ def save_order_history(order_history):
 
 
 def main():
-    if not is_us_market_open():
-        print("미국장이 닫혀 있어 주문을 중단합니다.")
+    market_session = get_us_market_session()
+
+    if market_session == "closed":
+        print("미국장이 완전히 닫혀 있어 실행을 중단합니다.")
         return
+
+    if market_session == "premarket":
+        print("프리마켓 시간입니다. 탐지만 수행하고 주문은 하지 않습니다.")
+        allow_order = False
+    elif market_session == "regular":
+        print("정규장 시간입니다. 조건 충족 시 Paper 주문을 허용합니다.")
+        allow_order = True
+    else:
+        print("애프터마켓 시간입니다. 탐지만 수행하고 주문은 하지 않습니다.")
+        allow_order = False
 
     tickers = load_watchlist()
 
@@ -181,6 +193,10 @@ def main():
 
         if result["score"] >= 70:
             print(f"{symbol} 전략 조건 충족")
+
+            if not allow_order:
+                print(f"{symbol} 탐지 완료 → 현재 시간대는 주문하지 않음")
+                continue
 
             run_order_safety_check(
                 position_rate=0.01,
