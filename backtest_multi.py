@@ -37,6 +37,7 @@ def backtest_symbol(symbol):
 
     df["MA200"] = df["Close"].rolling(window=200).mean()
     df["RSI"] = calculate_rsi(df)
+    df["AVG_VOLUME_20"] = df["Volume"].rolling(window=20).mean()
 
     cash = INITIAL_CASH
     position = 0
@@ -49,12 +50,16 @@ def backtest_symbol(symbol):
         ma200 = df["MA200"].iloc[i]
         rsi = df["RSI"].iloc[i]
 
+        volume = df["Volume"].iloc[i]
+        avg_volume_20 = df["AVG_VOLUME_20"].iloc[i]
+        volume_ratio = volume / avg_volume_20
+
         current_value = cash + position * price
         equity_values.append(current_value)
 
         # 매수 조건
         if position == 0:
-            if price > ma200 and 40 <= rsi <= 65:
+            if price > ma200 and 40 <= rsi <= 65 and volume_ratio >= 1.2:
                 position = cash / price
                 buy_price = price
                 cash = 0
