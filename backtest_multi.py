@@ -31,6 +31,7 @@ def max_drawdown(equity_curve):
 
 def backtest_symbol(symbol):
     df = yf.Ticker(symbol).history(period="5y")
+    spy_df = yf.Ticker("SPY").history(period="5y")
 
     if df.empty or len(df) < 220:
         return None
@@ -91,10 +92,30 @@ def backtest_symbol(symbol):
     final_value = cash
     total_return = (final_value - INITIAL_CASH) / INITIAL_CASH * 100
 
+    years = 5
+
+    cagr = ((final_value / INITIAL_CASH) ** (1 / years) - 1) * 100
+
     sell_trades = [t for t in trades if t["type"] == "SELL"]
 
     wins = [t for t in sell_trades if t["profit_rate"] > 0]
     losses = [t for t in sell_trades if t["profit_rate"] <= 0]
+
+    # 최대 연속 손실 계산
+
+    max_consecutive_losses = 0
+    current_losses = 0
+
+    for t in sell_trades:
+
+        if t["profit_rate"] <= 0:
+            current_losses += 1
+
+            if current_losses > max_consecutive_losses:
+                max_consecutive_losses = current_losses
+
+        else:
+            current_losses = 0
 
     win_rate = (len(wins) / len(sell_trades) * 100) if sell_trades else 0
 
@@ -116,6 +137,8 @@ def backtest_symbol(symbol):
         "win_rate": win_rate,
         "avg_profit": avg_profit,
         "max_drawdown": mdd,
+        "max_consecutive_losses": max_consecutive_losses,
+        "cagr": cagr,
     }
 
 
@@ -142,6 +165,8 @@ for r in results:
 승률: {r['win_rate']:.2f}%
 평균 거래 수익률: {r['avg_profit']:.2f}%
 최대손실 MDD: {r['max_drawdown']:.2f}%
+최대 연속 손실: {r['max_consecutive_losses']}회
+연평균 수익률 CAGR: {r['cagr']:.2f}%
 ----------------------------
 """)
 
