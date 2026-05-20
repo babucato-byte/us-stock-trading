@@ -2,10 +2,12 @@ import os
 import requests
 import yfinance as yf
 import pandas as pd
+from account_risk import check_daily_loss_limit
 from datetime import datetime
 from dotenv import load_dotenv
 from order_safety import run_order_safety_check
 from market_hours import get_us_market_session
+from slack_utils import send_slack_message
 
 load_dotenv()
 
@@ -157,6 +159,8 @@ def main():
     account = get_account()
     positions = get_positions()
 
+    check_daily_loss_limit()
+
     open_position_count = len(positions)
     today_trade_count = 0
     today = datetime.now().strftime("%Y-%m-%d")
@@ -195,8 +199,23 @@ def main():
             print(f"{symbol} 전략 조건 충족")
 
             if not allow_order:
+                msg = f"""
+            *Paper Trading 탐지 알림*
+
+            종목: {symbol}
+            점수: {result['score']}
+            현재가: {result['price']:.2f}
+            RSI: {result['rsi']:.2f}
+            거래량 배수: {result['volume_ratio']:.2f}배
+
+            상태: 현재 시간대는 주문하지 않음
+            """
                 print(f"{symbol} 탐지 완료 → 현재 시간대는 주문하지 않음")
+                send_slack_message(msg)
                 continue
+
+
+
 
             run_order_safety_check(
                 position_rate=0.01,
@@ -207,6 +226,32 @@ def main():
             response = submit_order(symbol, qty=1)
 
             if response.status_code in [200, 201]:
+                msg = f"""
+                *Paper Trading 주문 접수*
+
+                종목: {symbol}
+                수량: 1주
+                점수: {result['score']}
+                현재가: {result['price']:.2f}
+                RSI: {result['rsi']:.2f}
+                거래량 배수: {result['volume_ratio']:.2f}배
+
+                상태: 주문 접수 성공
+                """
+            else:
+                msg = f"""
+                *Paper Trading 주문 실패*
+
+                종목: {symbol}
+                응답코드: {response.status_code}
+                응답내용:
+                ```{response.text[:1000]}```
+                """
+
+                send_slack_message(msg)
+
+
+                send_slack_message(msg)
                 new_row = pd.DataFrame([
                     {
                         "symbol": symbol,
