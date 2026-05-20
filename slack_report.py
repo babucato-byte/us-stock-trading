@@ -1,24 +1,19 @@
 import os
 import requests
 import yfinance as yf
+import pandas as pd
 from dotenv import load_dotenv
 
 load_dotenv()
 
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 
-tickers = [
-    "AAPL",
-    "MSFT",
-    "STLA",
-    "C",
-    "PLTR",
-    "GM",
-    "F",
-    "CVX",
-    "PRU"
-]
-
+try:
+    watchlist_df = pd.read_csv("watchlist.csv")
+    tickers = watchlist_df["symbol"].dropna().unique().tolist()
+except Exception as e:
+    print(f"watchlist.csv 읽기 실패: {e}")
+    tickers = []
 
 def send_slack(message):
 
@@ -121,9 +116,13 @@ results = sorted(results, key=lambda x: x["score"], reverse=True)
 
 # Slack 메시지 생성
 
-message = "*미국주식 프리마켓 기술 스캐너*\n\n"
+message = "*미국주식 Watchlist 기반 프리마켓 기술 스캐너*\n\n"
 
-high_score_count = 0
+if not tickers:
+    message += "watchlist.csv에 분석할 종목이 없습니다."
+    print(message)
+    send_slack(message)
+    exit()
 
 for item in results:
 
