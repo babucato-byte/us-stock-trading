@@ -5,6 +5,7 @@ import pandas as pd
 from datetime import datetime
 from dotenv import load_dotenv
 from order_safety import run_order_safety_check
+from market_hours import is_us_market_open
 
 load_dotenv()
 
@@ -131,6 +132,10 @@ def save_order_history(order_history):
 
 
 def main():
+    if not is_us_market_open():
+        print("미국장이 닫혀 있어 주문을 중단합니다.")
+        return
+
     tickers = load_watchlist()
 
     if not tickers:
