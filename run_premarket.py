@@ -27,7 +27,7 @@ if now_kst.hour == target_hour:
     subprocess.run(
         [
             "/home/ubuntu/trading/venv/bin/python",
-            "/home/ubuntu/trading/slack_report.py"
+            "/home/ubuntu/trading/daily_pipeline.py"
         ],
         cwd="/home/ubuntu/trading"
     )
