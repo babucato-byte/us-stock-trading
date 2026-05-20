@@ -202,6 +202,16 @@ if results:
     df_results = pd.DataFrame(results)
     df_results.to_csv("backtest_results.csv", index=False)
     print("\nCSV 저장 완료: backtest_results.csv")
+    # 통과 종목만 watchlist로 저장
+    passed_results = [
+        r for r in results
+        if r.get("risk_status") == "통과"
+    ]
+
+    df_watchlist = pd.DataFrame(passed_results)
+    df_watchlist.to_csv("watchlist.csv", index=False)
+
+    print("Watchlist 저장 완료: watchlist.csv")
 
     print("=== 전체 요약 ===")
     print(f"테스트 종목 수: {len(results)}")
