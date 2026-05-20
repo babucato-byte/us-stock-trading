@@ -1,0 +1,152 @@
+import yfinance as yf
+import pandas as pd
+
+tickers = [
+    "AAPL", "MSFT", "STLA", "C", "PLTR",
+    "GM", "F", "CVX", "PRU"
+]
+
+INITIAL_CASH = 10000
+TAKE_PROFIT = 0.15
+STOP_LOSS = -0.08
+
+
+def calculate_rsi(df, period=14):
+    delta = df["Close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.rolling(window=period).mean()
+    avg_loss = loss.rolling(window=period).mean()
+
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def max_drawdown(equity_curve):
+    peak = equity_curve.cummax()
+    drawdown = (equity_curve - peak) / peak
+    return drawdown.min() * 100
+
+
+def backtest_symbol(symbol):
+    df = yf.Ticker(symbol).history(period="5y")
+
+    if df.empty or len(df) < 220:
+        return None
+
+    df["MA200"] = df["Close"].rolling(window=200).mean()
+    df["RSI"] = calculate_rsi(df)
+
+    cash = INITIAL_CASH
+    position = 0
+    buy_price = 0
+    trades = []
+    equity_values = []
+
+    for i in range(200, len(df)):
+        price = df["Close"].iloc[i]
+        ma200 = df["MA200"].iloc[i]
+        rsi = df["RSI"].iloc[i]
+
+        current_value = cash + position * price
+        equity_values.append(current_value)
+
+        # 매수 조건
+        if position == 0:
+            if price > ma200 and 40 <= rsi <= 65:
+                position = cash / price
+                buy_price = price
+                cash = 0
+                trades.append({
+                    "type": "BUY",
+                    "date": df.index[i],
+                    "price": price
+                })
+
+        # 매도 조건
+        else:
+            profit_rate = (price - buy_price) / buy_price
+
+            if profit_rate >= TAKE_PROFIT or profit_rate <= STOP_LOSS or price < ma200:
+                cash = position * price
+                position = 0
+
+                trades.append({
+                    "type": "SELL",
+                    "date": df.index[i],
+                    "price": price,
+                    "profit_rate": profit_rate
+                })
+
+    if position > 0:
+        final_price = df["Close"].iloc[-1]
+        cash = position * final_price
+
+    final_value = cash
+    total_return = (final_value - INITIAL_CASH) / INITIAL_CASH * 100
+
+    sell_trades = [t for t in trades if t["type"] == "SELL"]
+
+    wins = [t for t in sell_trades if t["profit_rate"] > 0]
+    losses = [t for t in sell_trades if t["profit_rate"] <= 0]
+
+    win_rate = (len(wins) / len(sell_trades) * 100) if sell_trades else 0
+
+    avg_profit = (
+        sum(t["profit_rate"] for t in sell_trades) / len(sell_trades) * 100
+        if sell_trades else 0
+    )
+
+    equity_series = pd.Series(equity_values)
+    mdd = max_drawdown(equity_series) if not equity_series.empty else 0
+
+    return {
+        "symbol": symbol,
+        "final_value": final_value,
+        "total_return": total_return,
+        "trade_count": len(sell_trades),
+        "win_count": len(wins),
+        "loss_count": len(losses),
+        "win_rate": win_rate,
+        "avg_profit": avg_profit,
+        "max_drawdown": mdd,
+    }
+
+
+results = []
+
+for symbol in tickers:
+    print(f"{symbol} 백테스트 중...")
+    result = backtest_symbol(symbol)
+    if result:
+        results.append(result)
+
+results = sorted(results, key=lambda x: x["total_return"], reverse=True)
+
+print("\n=== 여러 종목 백테스트 결과 ===\n")
+
+for r in results:
+    print(f"""
+[{r['symbol']}]
+최종 자금: ${r['final_value']:.2f}
+총 수익률: {r['total_return']:.2f}%
+거래 횟수: {r['trade_count']}
+승리: {r['win_count']}
+손실: {r['loss_count']}
+승률: {r['win_rate']:.2f}%
+평균 거래 수익률: {r['avg_profit']:.2f}%
+최대손실 MDD: {r['max_drawdown']:.2f}%
+----------------------------
+""")
+
+if results:
+    avg_return = sum(r["total_return"] for r in results) / len(results)
+    avg_win_rate = sum(r["win_rate"] for r in results) / len(results)
+    avg_mdd = sum(r["max_drawdown"] for r in results) / len(results)
+
+    print("=== 전체 요약 ===")
+    print(f"테스트 종목 수: {len(results)}")
+    print(f"평균 수익률: {avg_return:.2f}%")
+    print(f"평균 승률: {avg_win_rate:.2f}%")
+    print(f"평균 최대손실 MDD: {avg_mdd:.2f}%")
