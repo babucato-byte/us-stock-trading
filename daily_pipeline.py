@@ -1,8 +1,20 @@
+import os
+import requests
 import subprocess
 from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv()
+
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 
 PYTHON = "/home/ubuntu/trading/venv/bin/python"
 BASE_DIR = "/home/ubuntu/trading"
+LOG_DIR = f"{BASE_DIR}/logs"
+
+os.makedirs(LOG_DIR, exist_ok=True)
+
+log_file = f"{LOG_DIR}/daily_pipeline.log"
 
 steps = [
     {
@@ -15,11 +27,40 @@ steps = [
     }
 ]
 
-print("=== Daily Pipeline 시작 ===")
-print(datetime.now())
+
+def write_log(message):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{now}] {message}"
+    print(line)
+
+    with open(log_file, "a") as f:
+        f.write(line + "\n")
+
+
+def send_slack_error(message):
+    if not SLACK_WEBHOOK_URL:
+        write_log("SLACK_WEBHOOK_URL 없음")
+        return
+
+    payload = {
+        "text": f"""
+*자동매매 파이프라인 오류 발생*
+
+```{message}```
+"""
+    }
+
+    requests.post(
+        SLACK_WEBHOOK_URL,
+        json=payload,
+        timeout=10
+    )
+
+
+write_log("=== Daily Pipeline 시작 ===")
 
 for step in steps:
-    print(f"\n[실행] {step['name']}")
+    write_log(f"[실행] {step['name']}")
 
     result = subprocess.run(
         step["command"],
@@ -29,15 +70,16 @@ for step in steps:
     )
 
     if result.stdout:
-        print(result.stdout)
+        write_log(result.stdout[-3000:])
 
     if result.stderr:
-        print("[ERROR]")
-        print(result.stderr)
+        write_log("[STDERR]")
+        write_log(result.stderr[-3000:])
 
     if result.returncode != 0:
-        print(f"[중단] {step['name']} 실패")
+        error_message = f"{step['name']} 실패\n\n{result.stderr[-3000:]}"
+        write_log(error_message)
+        send_slack_error(error_message)
         exit(1)
 
-print("\n=== Daily Pipeline 완료 ===")
-print(datetime.now())
+write_log("=== Daily Pipeline 완료 ===")
