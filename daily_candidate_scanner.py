@@ -1,6 +1,7 @@
 import pandas as pd
 import yfinance as yf
 from datetime import datetime
+from slack_utils import send_slack_alert
 
 MIN_PRICE = 5
 MIN_AVG_DOLLAR_VOLUME = 20_000_000
@@ -120,9 +121,17 @@ for idx, symbol in enumerate(symbols[:SCAN_LIMIT], start=1):
 df = pd.DataFrame(results)
 
 if df.empty:
+
     print("조건 만족 후보 없음")
+
     df.to_csv("candidates.csv", index=False)
+
+    send_slack_alert(
+        "실시간 후보 탐지 결과: 조건 만족 후보 없음"
+    )
+
 else:
+
     df = df.sort_values(
         by=["score", "smart_money_score", "volume_ratio"],
         ascending=False
@@ -131,5 +140,63 @@ else:
     df.to_csv("candidates.csv", index=False)
 
     print("\n=== 조건 만족 후보 ===")
-    print(df[["symbol", "type", "price", "rsi", "volume_ratio", "score", "smart_money_score"]])
+
+    print(
+        df[
+            [
+                "symbol",
+                "type",
+                "price",
+                "rsi",
+                "volume_ratio",
+                "score",
+                "smart_money_score"
+            ]
+        ]
+    )
+
     print(f"\n후보 저장 완료: {len(df)}개 → candidates.csv")
+
+    top_candidates = df.head(5)
+
+    message_lines = []
+
+    message_lines.append(
+        "*실시간 후보 탐지 결과*"
+    )
+
+    message_lines.append("")
+
+    for _, row in top_candidates.iterrows():
+
+        line = (
+            f"{row['symbol']} | "
+            f"{row['type']} | "
+            f"RSI={row['rsi']} | "
+            f"VOL={row['volume_ratio']}x | "
+            f"SCORE={row['score']} | "
+            f"SMART={row['smart_money_score']}"
+        )
+
+        message_lines.append(line)
+
+    message_lines.append("")
+
+    message_lines.append(
+        f"전체 후보 수: {len(df)}개"
+    )
+
+    message = "\n".join(message_lines)
+
+    print("\nSlack 전송 시도")
+
+    try:
+
+        send_slack_alert(message)
+
+        print("Slack 전송 완료")
+
+    except Exception as e:
+
+        print("Slack 오류 발생")
+        print(e)
