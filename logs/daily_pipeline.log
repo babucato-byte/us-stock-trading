@@ -182,3 +182,563 @@ watchlist.csv에 분석할 종목이 없습니다.
 Slack 전송 완료
 
 [2026-05-20 07:18:00] === Daily Pipeline 완료 ===
+[2026-05-20 13:00:02] === Daily Pipeline 시작 ===
+[2026-05-20 13:00:02] [실행] 백테스트 실행 및 watchlist 생성
+[2026-05-20 13:00:10] AAPL 백테스트 중...
+MSFT 백테스트 중...
+STLA 백테스트 중...
+C 백테스트 중...
+PLTR 백테스트 중...
+GM 백테스트 중...
+F 백테스트 중...
+CVX 백테스트 중...
+PRU 백테스트 중...
+
+=== 여러 종목 백테스트 결과 ===
+
+
+[PLTR]
+위험 판정: 통과
+최종 자금: $36894.75
+총 수익률: 268.95%
+거래 횟수: 26
+승리: 15
+손실: 11
+승률: 57.69%
+평균 거래 수익률: 6.16%
+최대손실 MDD: -28.91%
+최대 연속 손실: 3회
+연평균 수익률 CAGR: 29.84%
+수익 월: 20개월
+손실 월: 30개월
+----------------------------
+
+
+[C]
+위험 판정: 통과
+최종 자금: $14481.14
+총 수익률: 44.81%
+거래 횟수: 12
+승리: 6
+손실: 6
+승률: 50.00%
+평균 거래 수익률: 4.23%
+최대손실 MDD: -19.58%
+최대 연속 손실: 3회
+연평균 수익률 CAGR: 7.69%
+수익 월: 17개월
+손실 월: 33개월
+----------------------------
+
+
+[AAPL]
+위험 판정: 통과
+최종 자금: $13150.19
+총 수익률: 31.50%
+거래 횟수: 14
+승리: 6
+손실: 8
+승률: 42.86%
+평균 거래 수익률: 2.47%
+최대손실 MDD: -26.98%
+최대 연속 손실: 4회
+연평균 수익률 CAGR: 5.63%
+수익 월: 19개월
+손실 월: 31개월
+----------------------------
+
+
+[STLA]
+위험 판정: 통과
+최종 자금: $13138.92
+총 수익률: 31.39%
+거래 횟수: 11
+승리: 5
+손실: 6
+승률: 45.45%
+평균 거래 수익률: 3.21%
+최대손실 MDD: -32.43%
+최대 연속 손실: 5회
+연평균 수익률 CAGR: 5.61%
+수익 월: 9개월
+손실 월: 41개월
+----------------------------
+
+
+[MSFT]
+위험 판정: 통과
+최종 자금: $11308.01
+총 수익률: 13.08%
+거래 횟수: 16
+승리: 4
+손실: 12
+승률: 25.00%
+평균 거래 수익률: 1.15%
+최대손실 MDD: -39.69%
+최대 연속 손실: 10회
+연평균 수익률 CAGR: 2.49%
+수익 월: 15개월
+손실 월: 35개월
+----------------------------
+
+
+[PRU]
+위험 판정: 통과
+최종 자금: $10581.08
+총 수익률: 5.81%
+거래 횟수: 12
+승리: 3
+손실: 9
+승률: 25.00%
+평균 거래 수익률: 0.83%
+최대손실 MDD: -24.60%
+최대 연속 손실: 5회
+연평균 수익률 CAGR: 1.14%
+수익 월: 13개월
+손실 월: 37개월
+----------------------------
+
+
+[F]
+위험 판정: 통과
+최종 자금: $10580.95
+총 수익률: 5.81%
+거래 횟수: 12
+승리: 4
+손실: 8
+승률: 33.33%
+평균 거래 수익률: 1.33%
+최대손실 MDD: -24.23%
+최대 연속 손실: 5회
+연평균 수익률 CAGR: 1.14%
+수익 월: 12개월
+손실 월: 38개월
+----------------------------
+
+
+[GM]
+위험 판정: 위험 제외 후보
+최종 자금: $9550.08
+총 수익률: -4.50%
+거래 횟수: 21
+승리: 6
+손실: 15
+승률: 28.57%
+평균 거래 수익률: 0.26%
+최대손실 MDD: -40.05%
+최대 연속 손실: 7회
+연평균 수익률 CAGR: -0.92%
+수익 월: 14개월
+손실 월: 36개월
+----------------------------
+
+
+[CVX]
+위험 판정: 위험 제외 후보
+최종 자금: $6470.10
+총 수익률: -35.30%
+거래 횟수: 12
+승리: 1
+손실: 11
+승률: 8.33%
+평균 거래 수익률: -3.44%
+최대손실 MDD: -50.48%
+최대 연속 손실: 11회
+연평균 수익률 CAGR: -8.34%
+수익 월: 12개월
+손실 월: 38개월
+----------------------------
+
+
+CSV 저장 완료: backtest_results.csv
+Watchlist 저장 완료: watchlist.csv
+=== 전체 요약 ===
+테스트 종목 수: 9
+평균 수익률: 40.17%
+평균 승률: 35.14%
+평균 최대손실 MDD: -31.88%
+
+[2026-05-20 13:00:10] [실행] Slack 정기 리포트 발송
+[2026-05-20 13:00:15] *미국주식 Watchlist 기반 프리마켓 기술 스캐너*
+
+
+*[F]*
+유형: 급등 가능 후보
+
+현재가: 13.06
+200일선: 12.33
+
+RSI: 58.29
+
+거래량 배수: 0.64배
+
+기술점수: 70/100
+
+------------------------
+
+Slack 전송 완료
+
+[2026-05-20 13:00:15] === Daily Pipeline 완료 ===
+[2026-05-21 00:18:45] === Daily Pipeline 시작 ===
+[2026-05-21 00:18:45] [실행] 거래 가능 종목 universe 생성
+[2026-05-21 00:18:51] 거래 가능 종목 저장 완료: 12890개
+파일: universe.csv
+
+[2026-05-21 00:18:51] [실행] 실제 조건 기반 후보 스캔
+[2026-05-21 00:21:52] [702/800] PBI.PRB 분석 중
+[703/800] MMED 분석 중
+[704/800] MMKT 분석 중
+[705/800] MMSI 분석 중
+[706/800] MMT 분석 중
+[707/800] MNDY 분석 중
+[708/800] MPB 분석 중
+[709/800] MPLT 분석 중
+[710/800] MPWR 분석 중
+[711/800] MQ 분석 중
+[712/800] IPOS 분석 중
+[713/800] MRNA 분석 중
+[714/800] MRP 분석 중
+[715/800] MRTN 분석 중
+[716/800] MRVI 분석 중
+[717/800] MRX 분석 중
+[718/800] BFRZ 분석 중
+[719/800] PFX 분석 중
+[720/800] PHIO 분석 중
+[721/800] PHOE 분석 중
+[722/800] NCEL 분석 중
+[723/800] PLMK 분석 중
+[724/800] MSBI 분석 중
+[725/800] MSEX 분석 중
+[726/800] MSFT 분석 중
+[727/800] MSGE 분석 중
+[728/800] MSGS 분석 중
+[729/800] MSOS 분석 중
+[730/800] MTCH 분석 중
+[731/800] MTLS 분석 중
+[732/800] MVST 분석 중
+[733/800] MXI 분석 중
+[734/800] MYGN 분석 중
+[735/800] MYN 분석 중
+[736/800] MYRG 분석 중
+[737/800] MZTI 분석 중
+[738/800] NAGE 분석 중
+[739/800] NAIL 분석 중
+[740/800] NAUT 분석 중
+[741/800] PLRZ 분석 중
+[742/800] PLSM 분석 중
+[743/800] BFOC 분석 중
+[744/800] BFLB 분석 중
+[745/800] PMT.PRA 분석 중
+[746/800] PMT.PRB 분석 중
+[747/800] PMT.PRC 분석 중
+[748/800] PMTRW 분석 중
+[749/800] NAVN 분석 중
+[750/800] NB 분석 중
+[751/800] NBBK 분석 중
+[752/800] NBIS 분석 중
+[753/800] NBIX 분석 중
+[754/800] NBOS 분석 중
+[755/800] NBR 분석 중
+[756/800] NBTB 분석 중
+[757/800] NCLH 분석 중
+[758/800] NDSN 분석 중
+[759/800] NE 분석 중
+[760/800] NEAR 분석 중
+[761/800] NEO 분석 중
+[762/800] RAAQ 분석 중
+[763/800] RAAQU 분석 중
+[764/800] RADX 분석 중
+[765/800] RANGU 분석 중
+[766/800] RAY 분석 중
+[767/800] RAYA 분석 중
+[768/800] RC.PRE 분석 중
+[769/800] NEOG 분석 중
+[770/800] NFLX 분석 중
+[771/800] NFRA 분석 중
+[772/800] NG 분석 중
+[773/800] NGEN 분석 중
+[774/800] NGNE 분석 중
+[775/800] NGVC 분석 중
+[776/800] NHC 분석 중
+[777/800] NIC 분석 중
+[778/800] NICE 분석 중
+[779/800] NJR 분석 중
+[780/800] NMAI 분석 중
+[781/800] NMIH 분석 중
+[782/800] NMRA 분석 중
+[783/800] NMRK 분석 중
+[784/800] NN 분석 중
+[785/800] RCKTW 분석 중
+[786/800] REGCO 분석 중
+[787/800] REGCP 분석 중
+[788/800] REVB 분석 중
+[789/800] NNDM 분석 중
+[790/800] NOAH 분석 중
+[791/800] RGNT 분석 중
+[792/800] RGTIW 분석 중
+[793/800] FCBD 분석 중
+[794/800] RILYN 분석 중
+[795/800] NRDS 분석 중
+[796/800] NRGV 분석 중
+[797/800] NRIX 분석 중
+[798/800] NBN 분석 중
+[799/800] NSA 분석 중
+[800/800] NTLA 분석 중
+
+=== 조건 만족 후보 ===
+    symbol         type   price    rsi  volume_ratio  score  smart_money_score
+40     RXO  수급/세력 가능 후보   23.85  59.89          2.14    100                 70
+7      HUN     기술 조건 후보   14.06  46.74          1.75    100                 40
+66     ROG     기술 조건 후보  133.00  46.14          1.68    100                 40
+44     LYV     기술 조건 후보  164.44  60.13          1.50    100                 40
+113   NEOG     기술 조건 후보    8.83  41.07          1.41    100                 40
+..     ...          ...     ...    ...           ...    ...                ...
+79    HLIO     기술 조건 후보   79.16  69.39          1.24     70                 20
+26     PEP     기술 조건 후보  149.29  28.10          1.23     70                 20
+86     IWY     기술 조건 후보  292.97  74.60          1.22     70                 20
+82     IGM     기술 조건 후보  154.63  71.22          1.21     70                 20
+97    MEOH     기술 조건 후보   60.54  35.75          1.21     70                 20
+
+[116 rows x 7 columns]
+
+후보 저장 완료: 116개 → candidates.csv
+
+[2026-05-21 00:21:52] [STDERR]
+[2026-05-21 00:21:52]  possibly delisted; no price data found  (period=1y) (Yahoo error = "No data found, symbol may be delisted")
+$GAB.PRK: possibly delisted; no price data found  (period=1y) (Yahoo error = "No data found, symbol may be delisted")
+$GCTS.WS: possibly delisted; no price data found  (period=1y) (Yahoo error = "No data found, symbol may be delisted")
+$GL.PRD: possibly delisted; no price data found  (period=1y) (Yahoo error = "No data found, symbol may be delisted")
+$GLED.RT: possibly delisted; no price data found  (period=1y) (Yahoo error = "No data found, symbol may be delisted")
+$GNL.PRA: possibly delisted; no price data found  (period=1y) (Yahoo error = "No data found, symbol may be delisted")
+$GUT.PRC: possibly delisted; no price data found  (period=1y) (Yahoo error = "No data found, symbol may be delisted")
+$HIG.PRG: possibly delisted; no price data found  (period=1y) (Yahoo error = "No data found, symbol may be delisted")
+$HEI.A: possibly delisted; no price data found  (period=1y) (Yahoo error = "No data found, symbol may be delisted")
+$JPM.PRK: possibly delisted; no price data found  (period=1y) (Yahoo error = "No data found, symbol may be delisted")
+$KEY.PRK: possibly delisted; no price data found  (period=1y) (Yahoo error = "No data found, symbol may be delisted")
+$KIM.PRM: possibly delisted; no price data found  (period=1y) (Yahoo error = "No data found, symbol may be delisted")
+$MET.PRA: possibly delisted; no price data found  (period=1y) (Yahoo error = "No data found, symbol may be delisted")
+$MET.PRE: possibly delisted; no price data found  (period=1y) (Yahoo error = "No data found, symbol may be delisted")
+$MFA.PRB: possibly delisted; no price data found  (period=1y) (Yahoo error = "No data found, symbol may be delisted")
+/home/ubuntu/trading/daily_candidate_scanner.py:43: RuntimeWarning: invalid value encountered in scalar divide
+  volume_ratio = volume / avg_volume_20
+$MKC.V: possibly delisted; no price data found  (period=1y) (Yahoo error = "No data found, symbol may be delisted")
+$MZYX.U: possibly delisted; no price data found  (period=1y) (Yahoo error = "No data found, symbol may be delisted")
+$MZYX.WS: possibly delisted; no price data found  (period=1y) (Yahoo error = "No data found, symbol may be delisted")
+$PBI.PRB: possibly delisted; no price data found  (period=1y) (Yahoo error = "No data found, symbol may be delisted")
+$PMT.PRA: possibly delisted; no price data found  (period=1y) (Yahoo error = "No data found, symbol may be delisted")
+$PMT.PRB: possibly delisted; no price data found  (period=1y) (Yahoo error = "No data found, symbol may be delisted")
+$PMT.PRC: possibly delisted; no price data found  (period=1y) (Yahoo error = "No data found, symbol may be delisted")
+/home/ubuntu/trading/daily_candidate_scanner.py:43: RuntimeWarning: invalid value encountered in scalar divide
+  volume_ratio = volume / avg_volume_20
+$RC.PRE: possibly delisted; no price data found  (period=1y) (Yahoo error = "No data found, symbol may be delisted")
+
+[2026-05-21 00:21:52] [실행] 백테스트 실행 및 watchlist 생성
+[2026-05-21 00:22:00] AAPL 백테스트 중...
+MSFT 백테스트 중...
+STLA 백테스트 중...
+C 백테스트 중...
+PLTR 백테스트 중...
+GM 백테스트 중...
+F 백테스트 중...
+CVX 백테스트 중...
+PRU 백테스트 중...
+
+=== 여러 종목 백테스트 결과 ===
+
+
+[PLTR]
+위험 판정: 통과
+최종 자금: $36894.75
+총 수익률: 268.95%
+거래 횟수: 26
+승리: 15
+손실: 11
+승률: 57.69%
+평균 거래 수익률: 6.16%
+최대손실 MDD: -28.91%
+최대 연속 손실: 3회
+연평균 수익률 CAGR: 29.84%
+수익 월: 20개월
+손실 월: 30개월
+----------------------------
+
+
+[C]
+위험 판정: 통과
+최종 자금: $15066.56
+총 수익률: 50.67%
+거래 횟수: 12
+승리: 6
+손실: 6
+승률: 50.00%
+평균 거래 수익률: 4.23%
+최대손실 MDD: -19.58%
+최대 연속 손실: 3회
+연평균 수익률 CAGR: 8.54%
+수익 월: 17개월
+손실 월: 33개월
+----------------------------
+
+
+[AAPL]
+위험 판정: 통과
+최종 자금: $13150.19
+총 수익률: 31.50%
+거래 횟수: 14
+승리: 6
+손실: 8
+승률: 42.86%
+평균 거래 수익률: 2.47%
+최대손실 MDD: -26.98%
+최대 연속 손실: 4회
+연평균 수익률 CAGR: 5.63%
+수익 월: 19개월
+손실 월: 31개월
+----------------------------
+
+
+[STLA]
+위험 판정: 통과
+최종 자금: $13138.91
+총 수익률: 31.39%
+거래 횟수: 11
+승리: 5
+손실: 6
+승률: 45.45%
+평균 거래 수익률: 3.21%
+최대손실 MDD: -32.43%
+최대 연속 손실: 5회
+연평균 수익률 CAGR: 5.61%
+수익 월: 9개월
+손실 월: 41개월
+----------------------------
+
+
+[MSFT]
+위험 판정: 통과
+최종 자금: $11308.02
+총 수익률: 13.08%
+거래 횟수: 16
+승리: 4
+손실: 12
+승률: 25.00%
+평균 거래 수익률: 1.15%
+최대손실 MDD: -39.69%
+최대 연속 손실: 10회
+연평균 수익률 CAGR: 2.49%
+수익 월: 15개월
+손실 월: 35개월
+----------------------------
+
+
+[F]
+위험 판정: 통과
+최종 자금: $10710.58
+총 수익률: 7.11%
+거래 횟수: 12
+승리: 4
+손실: 8
+승률: 33.33%
+평균 거래 수익률: 1.33%
+최대손실 MDD: -24.23%
+최대 연속 손실: 5회
+연평균 수익률 CAGR: 1.38%
+수익 월: 12개월
+손실 월: 38개월
+----------------------------
+
+
+[PRU]
+위험 판정: 통과
+최종 자금: $10581.08
+총 수익률: 5.81%
+거래 횟수: 12
+승리: 3
+손실: 9
+승률: 25.00%
+평균 거래 수익률: 0.83%
+최대손실 MDD: -24.60%
+최대 연속 손실: 5회
+연평균 수익률 CAGR: 1.14%
+수익 월: 13개월
+손실 월: 37개월
+----------------------------
+
+
+[GM]
+위험 판정: 위험 제외 후보
+최종 자금: $9550.08
+총 수익률: -4.50%
+거래 횟수: 21
+승리: 6
+손실: 15
+승률: 28.57%
+평균 거래 수익률: 0.26%
+최대손실 MDD: -40.05%
+최대 연속 손실: 7회
+연평균 수익률 CAGR: -0.92%
+수익 월: 14개월
+손실 월: 36개월
+----------------------------
+
+
+[CVX]
+위험 판정: 위험 제외 후보
+최종 자금: $6275.92
+총 수익률: -37.24%
+거래 횟수: 12
+승리: 1
+손실: 11
+승률: 8.33%
+평균 거래 수익률: -3.44%
+최대손실 MDD: -50.48%
+최대 연속 손실: 11회
+연평균 수익률 CAGR: -8.90%
+수익 월: 11개월
+손실 월: 39개월
+----------------------------
+
+
+CSV 저장 완료: backtest_results.csv
+Watchlist 저장 완료: watchlist.csv
+=== 전체 요약 ===
+테스트 종목 수: 9
+평균 수익률: 40.75%
+평균 승률: 35.14%
+평균 최대손실 MDD: -31.88%
+
+[2026-05-21 00:22:00] [실행] Slack 정기 리포트 발송
+[2026-05-21 00:22:04] *미국주식 Watchlist 기반 프리마켓 기술 스캐너*
+
+
+*[C]*
+유형: 급등 가능 후보
+
+현재가: 124.82
+200일선: 108.44
+
+RSI: 44.49
+
+거래량 배수: 0.80배
+
+기술점수: 70/100
+
+------------------------
+
+*[F]*
+유형: 급등 가능 후보
+
+현재가: 13.22
+200일선: 12.35
+
+RSI: 60.99
+
+거래량 배수: 0.52배
+
+기술점수: 70/100
+
+------------------------
+
+Slack 전송 완료
+
+[2026-05-21 00:22:04] === Daily Pipeline 완료 ===

@@ -109,18 +109,17 @@ def analyze_stock(symbol):
 
 def load_watchlist():
     try:
-        watchlist_df = pd.read_csv("watchlist.csv")
+        candidates_df = pd.read_csv("candidates.csv")
 
-        if watchlist_df.empty:
-            print("watchlist.csv가 비어 있습니다.")
+        if candidates_df.empty:
+            print("candidates.csv가 비어 있습니다.")
             return []
 
-        return watchlist_df["symbol"].dropna().unique().tolist()
+        return candidates_df["symbol"].dropna().unique().tolist()
 
     except Exception as e:
-        print(f"watchlist.csv 읽기 실패: {e}")
+        print(f"candidates.csv 읽기 실패: {e}")
         return []
-
 
 def load_order_history():
     try:
