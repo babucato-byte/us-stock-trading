@@ -18,14 +18,6 @@ log_file = f"{LOG_DIR}/daily_pipeline.log"
 
 steps = [
     {
-        "name": "거래 가능 종목 universe 생성",
-        "command": [PYTHON, f"{BASE_DIR}/universe_builder.py"]
-    },
-    {
-        "name": "실제 조건 기반 후보 스캔",
-        "command": [PYTHON, f"{BASE_DIR}/daily_candidate_scanner.py"]
-    },
-    {
         "name": "백테스트 실행 및 watchlist 생성",
         "command": [PYTHON, f"{BASE_DIR}/backtest_multi.py"]
     },
