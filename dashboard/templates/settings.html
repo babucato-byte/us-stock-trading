@@ -32,21 +32,90 @@
   <form method="post" class="settings-grid">
     <input type="hidden" name="section" value="rules">
     {% for key, value in rules.items() %}
-      {% if key != 'active_preset' %}
+      {% if key not in ['active_preset', 'filters'] %}
       <label class="form-label">{{ key }}
-        {% if value is boolean %}
-        <select class="form-select" name="{{ key }}">
-          <option value="true" {% if value %}selected{% endif %}>true</option>
-          <option value="false" {% if not value %}selected{% endif %}>false</option>
-        </select>
-        {% else %}
         <input class="form-control" name="{{ key }}" value="{{ value }}">
-        {% endif %}
       </label>
       {% endif %}
     {% endfor %}
     <button class="btn btn-primary">Save Rules</button>
   </form>
+</section>
+
+<section class="mb-4">
+  <h2>Scanner Filters</h2>
+  <div class="table-responsive">
+    <table class="table table-dark table-sm align-middle filter-table">
+      <thead>
+        <tr>
+          <th>Field</th>
+          <th>Operator</th>
+          <th>Value</th>
+          <th>Min</th>
+          <th>Max</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for filter in rules.filters %}
+        <tr>
+          <form method="post">
+            <input type="hidden" name="section" value="filter_update">
+            <input type="hidden" name="filter_index" value="{{ loop.index0 }}">
+            <td>
+              <select class="form-select form-select-sm" name="field">
+                {% for field in filter_fields %}
+                <option value="{{ field }}" {% if filter.field == field %}selected{% endif %}>{{ field }}</option>
+                {% endfor %}
+              </select>
+            </td>
+            <td>
+              <select class="form-select form-select-sm" name="operator">
+                {% for operator in filter_operators %}
+                <option value="{{ operator }}" {% if filter.operator == operator %}selected{% endif %}>{{ operator }}</option>
+                {% endfor %}
+              </select>
+            </td>
+            <td><input class="form-control form-control-sm" name="value" value="{{ filter.value|join(', ') if filter.value is iterable and filter.value is not string else filter.value|default('', true) }}"></td>
+            <td><input class="form-control form-control-sm" name="min" value="{{ filter.min|default('', true) }}"></td>
+            <td><input class="form-control form-control-sm" name="max" value="{{ filter.max|default('', true) }}"></td>
+            <td class="text-end">
+              <button class="btn btn-sm btn-primary">Update</button>
+          </form>
+              <form method="post" class="d-inline">
+                <input type="hidden" name="section" value="filter_delete">
+                <input type="hidden" name="filter_index" value="{{ loop.index0 }}">
+                <button class="btn btn-sm btn-outline-danger">Delete</button>
+              </form>
+            </td>
+        </tr>
+        {% endfor %}
+        <tr>
+          <form method="post">
+            <input type="hidden" name="section" value="filter_add">
+            <td>
+              <select class="form-select form-select-sm" name="field">
+                {% for field in filter_fields %}
+                <option value="{{ field }}">{{ field }}</option>
+                {% endfor %}
+              </select>
+            </td>
+            <td>
+              <select class="form-select form-select-sm" name="operator">
+                {% for operator in filter_operators %}
+                <option value="{{ operator }}">{{ operator }}</option>
+                {% endfor %}
+              </select>
+            </td>
+            <td><input class="form-control form-control-sm" name="value"></td>
+            <td><input class="form-control form-control-sm" name="min"></td>
+            <td><input class="form-control form-control-sm" name="max"></td>
+            <td class="text-end"><button class="btn btn-sm btn-success">Add</button></td>
+          </form>
+        </tr>
+      </tbody>
+    </table>
+  </div>
 </section>
 
 <section>

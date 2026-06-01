@@ -53,6 +53,15 @@ body {
   align-items: end;
 }
 
+.filter-table {
+  min-width: 860px;
+}
+
+.filter-table th,
+.filter-table td {
+  white-space: nowrap;
+}
+
 h1 {
   font-size: 1.6rem;
   margin-bottom: 18px;

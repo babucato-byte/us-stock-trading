@@ -1,4 +1,6 @@
 import json
+import math
+import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -20,21 +22,47 @@ STRONG_CANDIDATES_FILE = BASE_DIR / "strong_candidates.csv"
 ORDER_CANDIDATES_FILE = BASE_DIR / "order_candidates.csv"
 PREVIOUS_CANDIDATES_FILE = BASE_DIR / "previous_candidates.csv"
 
+DEFAULT_FILTERS = [
+    {"field": "price", "operator": ">=", "value": 5},
+    {"field": "avg_dollar_volume", "operator": ">=", "value": 20_000_000},
+    {"field": "rsi", "operator": "between", "min": 40, "max": 65},
+    {"field": "volume_ratio", "operator": ">=", "value": 1.2},
+    {"field": "score", "operator": ">=", "value": 70},
+    {"field": "smart_money_score", "operator": ">=", "value": 50},
+]
 
 DEFAULT_RULES = {
     "active_preset": "paper_safe",
     "scan_limit": 800,
-    "min_price": 5,
-    "min_avg_dollar_volume": 20_000_000,
-    "rsi_min": 40,
-    "rsi_max": 65,
-    "volume_ratio_min": 1.2,
-    "min_score": 70,
-    "smart_money_min": 50,
     "top_alert_count": 5,
-    "ma200_required": True,
     "avg_volume_window": 20,
     "rsi_period": 14,
+    "filters": DEFAULT_FILTERS,
+}
+
+SUPPORTED_OPERATORS = {">=", "<=", ">", "<", "==", "!=", "between", "in", "not_in"}
+SUPPORTED_FIELDS = {
+    "symbol",
+    "price",
+    "ma200",
+    "above_ma200",
+    "rsi",
+    "volume",
+    "avg_volume",
+    "volume_ratio",
+    "avg_dollar_volume",
+    "dollar_volume",
+    "score",
+    "smart_money_score",
+    "type",
+    "atr",
+    "gap_percent",
+    "market_cap",
+    "relative_strength",
+    "vwap_position",
+    "float_shares",
+    "sector",
+    "exchange",
 }
 
 
@@ -51,20 +79,67 @@ def load_json(path, fallback):
         data = json.load(f)
     merged = fallback.copy()
     merged.update(data)
-    return merged
+    return normalize_rules(merged)
 
 
 def load_scanner_rules(preset_name=None):
     ensure_config_files()
     rules = load_json(RULES_FILE, DEFAULT_RULES)
-    presets = load_json(PRESETS_FILE, {})
-    selected = preset_name or rules.get("active_preset")
+    presets = read_presets()
+    selected = preset_name
     if selected and selected in presets:
         preset_rules = presets[selected].copy()
         preset_rules.pop("description", None)
-        rules.update(preset_rules)
+        rules.update(normalize_rules(preset_rules))
         rules["active_preset"] = selected
-    return rules
+    return normalize_rules(rules)
+
+
+def read_presets():
+    if not PRESETS_FILE.exists():
+        return {}
+    with PRESETS_FILE.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    return {name: normalize_rules(preset) for name, preset in data.items()}
+
+
+def normalize_rules(rules):
+    normalized = rules.copy()
+    if "filters" not in normalized:
+        normalized["filters"] = legacy_rules_to_filters(normalized)
+    normalized.setdefault("scan_limit", DEFAULT_RULES["scan_limit"])
+    normalized.setdefault("top_alert_count", DEFAULT_RULES["top_alert_count"])
+    normalized.setdefault("avg_volume_window", DEFAULT_RULES["avg_volume_window"])
+    normalized.setdefault("rsi_period", DEFAULT_RULES["rsi_period"])
+    normalized["filters"] = list(normalized.get("filters") or [])
+    return normalized
+
+
+def legacy_rules_to_filters(rules):
+    filters = [
+        {"field": "price", "operator": ">=", "value": rules.get("min_price", 5)},
+        {
+            "field": "avg_dollar_volume",
+            "operator": ">=",
+            "value": rules.get("min_avg_dollar_volume", 20_000_000),
+        },
+        {
+            "field": "rsi",
+            "operator": "between",
+            "min": rules.get("rsi_min", 40),
+            "max": rules.get("rsi_max", 65),
+        },
+        {"field": "volume_ratio", "operator": ">=", "value": rules.get("volume_ratio_min", 1.2)},
+        {"field": "score", "operator": ">=", "value": rules.get("min_score", 70)},
+        {
+            "field": "smart_money_score",
+            "operator": ">=",
+            "value": rules.get("smart_money_min", 50),
+        },
+    ]
+    if rules.get("ma200_required", True):
+        filters.append({"field": "above_ma200", "operator": "==", "value": True})
+    return filters
 
 
 def calculate_rsi(df, period):
@@ -77,6 +152,19 @@ def calculate_rsi(df, period):
     return 100 - (100 / (1 + rs))
 
 
+def calculate_atr(df, period=14):
+    previous_close = df["Close"].shift(1)
+    ranges = pd.concat(
+        [
+            df["High"] - df["Low"],
+            (df["High"] - previous_close).abs(),
+            (df["Low"] - previous_close).abs(),
+        ],
+        axis=1,
+    )
+    return ranges.max(axis=1).rolling(window=period).mean()
+
+
 @dataclass
 class CandidateBuckets:
     candidates: pd.DataFrame
@@ -87,72 +175,209 @@ class CandidateBuckets:
 def analyze(symbol, rules):
     try:
         df = yf.Ticker(symbol).history(period="1y")
-        avg_window = int(rules["avg_volume_window"])
-        rsi_period = int(rules["rsi_period"])
-        min_history = max(220, avg_window + rsi_period + 5)
-
-        if df.empty or len(df) < min_history:
+        metrics = build_symbol_metrics(symbol, df, rules)
+        if not metrics:
             return None
-
-        df["MA200"] = df["Close"].rolling(window=200).mean()
-        df["RSI"] = calculate_rsi(df, rsi_period)
-        df["AVG_VOLUME"] = df["Volume"].rolling(window=avg_window).mean()
-
-        price = float(df["Close"].iloc[-1])
-        ma200 = float(df["MA200"].iloc[-1])
-        rsi = float(df["RSI"].iloc[-1])
-        volume = float(df["Volume"].iloc[-1])
-        avg_volume = float(df["AVG_VOLUME"].iloc[-1])
-        if avg_volume <= 0:
+        if not apply_filters(metrics, rules.get("filters", [])):
             return None
-
-        volume_ratio = volume / avg_volume
-        avg_dollar_volume = price * avg_volume
-
-        if price < float(rules["min_price"]):
-            return None
-        if avg_dollar_volume < float(rules["min_avg_dollar_volume"]):
-            return None
-        if rules.get("ma200_required", True) and price <= ma200:
-            return None
-
-        score = 0
-        if price > ma200:
-            score += 40
-        if float(rules["rsi_min"]) <= rsi <= float(rules["rsi_max"]):
-            score += 30
-        if volume_ratio >= float(rules["volume_ratio_min"]):
-            score += 30
-
-        smart_money_score = 0
-        if volume_ratio >= 2:
-            smart_money_score += 30
-        if volume_ratio >= 3:
-            smart_money_score += 20
-        if price > ma200:
-            smart_money_score += 20
-        if float(rules["rsi_min"]) <= rsi <= float(rules["rsi_max"]):
-            smart_money_score += 20
-
-        if score < int(rules["min_score"]):
-            return None
-
-        stock_type = "smart_money" if smart_money_score >= int(rules["smart_money_min"]) else "technical"
-        return {
-            "symbol": symbol,
-            "price": round(price, 2),
-            "ma200": round(ma200, 2),
-            "rsi": round(rsi, 2),
-            "volume_ratio": round(volume_ratio, 2),
-            "avg_dollar_volume": round(avg_dollar_volume, 0),
-            "score": int(score),
-            "smart_money_score": int(smart_money_score),
-            "type": stock_type,
-            "scan_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
+        return candidate_from_metrics(metrics, rules)
     except Exception as exc:
         print(f"{symbol} scan failed: {exc}")
         return None
+
+
+def build_symbol_metrics(symbol, df, rules):
+    avg_window = int(rules.get("avg_volume_window", DEFAULT_RULES["avg_volume_window"]))
+    rsi_period = int(rules.get("rsi_period", DEFAULT_RULES["rsi_period"]))
+    min_history = max(220, avg_window + rsi_period + 5)
+
+    if df.empty or len(df) < min_history:
+        return None
+
+    df = df.copy()
+    df["MA200"] = df["Close"].rolling(window=200).mean()
+    df["RSI"] = calculate_rsi(df, rsi_period)
+    df["AVG_VOLUME"] = df["Volume"].rolling(window=avg_window).mean()
+    df["ATR"] = calculate_atr(df)
+
+    price = safe_float(df["Close"].iloc[-1])
+    previous_close = safe_float(df["Close"].iloc[-2])
+    ma200 = safe_float(df["MA200"].iloc[-1])
+    rsi = safe_float(df["RSI"].iloc[-1])
+    volume = safe_float(df["Volume"].iloc[-1])
+    avg_volume = safe_float(df["AVG_VOLUME"].iloc[-1])
+    atr = safe_float(df["ATR"].iloc[-1])
+    if not avg_volume or avg_volume <= 0:
+        return None
+
+    volume_ratio = volume / avg_volume
+    avg_dollar_volume = price * avg_volume
+    dollar_volume = price * volume
+    above_ma200 = price > ma200 if ma200 is not None else False
+    rsi_in_default_range = 40 <= rsi <= 65 if rsi is not None else False
+    gap_percent = ((price - previous_close) / previous_close) * 100 if previous_close else None
+
+    score = 0
+    if above_ma200:
+        score += 40
+    if rsi_in_default_range:
+        score += 30
+    if volume_ratio >= 1.2:
+        score += 30
+
+    smart_money_score = 0
+    if volume_ratio >= 2:
+        smart_money_score += 30
+    if volume_ratio >= 3:
+        smart_money_score += 20
+    if above_ma200:
+        smart_money_score += 20
+    if rsi_in_default_range:
+        smart_money_score += 20
+
+    return {
+        "symbol": symbol,
+        "price": price,
+        "ma200": ma200,
+        "above_ma200": above_ma200,
+        "rsi": rsi,
+        "volume": volume,
+        "avg_volume": avg_volume,
+        "volume_ratio": volume_ratio,
+        "avg_dollar_volume": avg_dollar_volume,
+        "dollar_volume": dollar_volume,
+        "score": int(score),
+        "smart_money_score": int(smart_money_score),
+        "atr": atr,
+        "gap_percent": gap_percent,
+        "market_cap": None,
+        "relative_strength": None,
+        "vwap_position": None,
+        "float_shares": None,
+        "sector": None,
+        "exchange": None,
+    }
+
+
+def safe_float(value):
+    try:
+        number = float(value)
+    except Exception:
+        return None
+    return None if math.isnan(number) else number
+
+
+def candidate_from_metrics(metrics, rules):
+    smart_money_score = int(metrics["smart_money_score"])
+    smart_money_min = int(get_filter_threshold(rules, "smart_money_score", 50))
+    stock_type = "smart_money" if smart_money_score >= smart_money_min else "technical"
+    return {
+        "symbol": metrics["symbol"],
+        "price": round(metrics["price"], 2),
+        "ma200": round(metrics["ma200"], 2),
+        "rsi": round(metrics["rsi"], 2),
+        "volume_ratio": round(metrics["volume_ratio"], 2),
+        "avg_dollar_volume": round(metrics["avg_dollar_volume"], 0),
+        "dollar_volume": round(metrics["dollar_volume"], 0),
+        "score": int(metrics["score"]),
+        "smart_money_score": smart_money_score,
+        "type": stock_type,
+        "scan_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def apply_filters(metrics, filters):
+    for rule_filter in filters:
+        if not evaluate_filter(metrics, rule_filter):
+            return False
+    return True
+
+
+def evaluate_filter(metrics, rule_filter):
+    field = rule_filter.get("field")
+    operator = rule_filter.get("operator")
+    if field not in SUPPORTED_FIELDS:
+        warn_skip(f"Unsupported scanner field '{field}' skipped.")
+        return True
+    if operator not in SUPPORTED_OPERATORS:
+        warn_skip(f"Unsupported scanner operator '{operator}' skipped.")
+        return True
+    actual = metrics.get(field)
+    if actual is None:
+        warn_skip(f"Scanner field '{field}' is not available for {metrics.get('symbol', 'symbol')}; skipped.")
+        return True
+
+    try:
+        if operator == "between":
+            return compare_between(actual, rule_filter.get("min"), rule_filter.get("max"))
+        if operator in {"in", "not_in"}:
+            expected = normalize_collection(rule_filter.get("value", []))
+            contains = actual in expected
+            return contains if operator == "in" else not contains
+
+        expected = normalize_expected(actual, rule_filter.get("value"))
+        if operator == ">=":
+            return actual >= expected
+        if operator == "<=":
+            return actual <= expected
+        if operator == ">":
+            return actual > expected
+        if operator == "<":
+            return actual < expected
+        if operator == "==":
+            return actual == expected
+        if operator == "!=":
+            return actual != expected
+    except (TypeError, ValueError) as exc:
+        warn_skip(f"Scanner filter for field '{field}' is invalid: {exc}; skipped.")
+        return True
+    return True
+
+
+def compare_between(actual, min_value, max_value):
+    min_value = normalize_expected(actual, min_value)
+    max_value = normalize_expected(actual, max_value)
+    if min_value not in (None, "") and actual < min_value:
+        return False
+    if max_value not in (None, "") and actual > max_value:
+        return False
+    return True
+
+
+def normalize_expected(actual, expected):
+    if isinstance(actual, (int, float)) and isinstance(expected, str):
+        try:
+            number = float(expected)
+            return int(number) if number.is_integer() else number
+        except ValueError:
+            return expected
+    return expected
+
+
+def normalize_collection(value):
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return [value]
+
+
+def warn_skip(message):
+    warnings.warn(message, RuntimeWarning, stacklevel=2)
+    print(f"WARNING: {message}")
+
+
+def get_filter_threshold(rules, field, fallback):
+    for rule_filter in rules.get("filters", []):
+        if rule_filter.get("field") == field and rule_filter.get("operator") in {">=", ">"}:
+            return rule_filter.get("value", fallback)
+        if rule_filter.get("field") == field and rule_filter.get("operator") == "between":
+            return rule_filter.get("min", fallback)
+    return fallback
+
+
+def get_default_threshold(field, fallback):
+    return get_filter_threshold(DEFAULT_RULES, field, fallback)
 
 
 def empty_candidates_frame():
@@ -164,6 +389,7 @@ def empty_candidates_frame():
             "rsi",
             "volume_ratio",
             "avg_dollar_volume",
+            "dollar_volume",
             "score",
             "smart_money_score",
             "type",
@@ -173,6 +399,7 @@ def empty_candidates_frame():
 
 
 def build_candidate_buckets(df, rules):
+    rules = normalize_rules(rules)
     if df.empty:
         empty = empty_candidates_frame()
         return CandidateBuckets(empty, empty.copy(), empty.copy())
@@ -181,11 +408,14 @@ def build_candidate_buckets(df, rules):
         by=["score", "smart_money_score", "volume_ratio"],
         ascending=False,
     ).reset_index(drop=True)
-    strong = df[df["smart_money_score"] >= int(rules["smart_money_min"])].copy()
+    smart_money_min = int(get_filter_threshold(rules, "smart_money_score", 50))
+    score_min = int(get_filter_threshold(rules, "score", 70))
+    volume_ratio_min = float(get_filter_threshold(rules, "volume_ratio", 1.2))
+    strong = df[df["smart_money_score"] >= smart_money_min].copy()
     order_candidates = df[
-        (df["score"] >= int(rules["min_score"]))
-        & (df["smart_money_score"] >= int(rules["smart_money_min"]))
-        & (df["volume_ratio"] >= float(rules["volume_ratio_min"]))
+        (df["score"] >= score_min)
+        & (df["smart_money_score"] >= smart_money_min)
+        & (df["volume_ratio"] >= volume_ratio_min)
     ].copy()
     return CandidateBuckets(df, strong.reset_index(drop=True), order_candidates.reset_index(drop=True))
 
@@ -209,14 +439,15 @@ def save_candidate_files(buckets):
 
 def classify_candidate(row, smart_money_min):
     if int(row.get("smart_money_score", 0)) >= int(smart_money_min):
-        return "수급/세력 가능 후보"
+        return "수급/모멘텀 강한 후보"
     return "기술 조건 후보"
 
 
 def build_realtime_slack_message(df, rules, market_session, previous_symbols=None):
+    rules = normalize_rules(rules)
     previous_symbols = previous_symbols or set()
     top_count = int(rules.get("top_alert_count", 5) or 5)
-    smart_money_min = int(rules.get("smart_money_min", DEFAULT_RULES["smart_money_min"]))
+    smart_money_min = int(get_filter_threshold(rules, "smart_money_score", 50))
     total_count = len(df)
     strong_count = int((df["smart_money_score"] >= smart_money_min).sum()) if not df.empty else 0
     volume_2x_count = int((df["volume_ratio"] >= 2).sum()) if not df.empty else 0
@@ -235,7 +466,7 @@ def build_realtime_slack_message(df, rules, market_session, previous_symbols=Non
         f"수급 강한 후보: {strong_count}개",
         f"거래량 2배 이상: {volume_2x_count}개",
         "",
-        f"TOP {top_count} 후보",
+        f"TOP {top_count}",
         "",
     ]
 
@@ -243,9 +474,7 @@ def build_realtime_slack_message(df, rules, market_session, previous_symbols=Non
         lines.append("조건을 만족한 후보가 없습니다.")
     else:
         for idx, (_, row) in enumerate(top.iterrows(), start=1):
-            lines.append(
-                f"{idx}. {row['symbol']} — {classify_candidate(row, smart_money_min)}"
-            )
+            lines.append(f"{idx}. {row['symbol']} - {classify_candidate(row, smart_money_min)}")
             lines.append(
                 f"   가격: {float(row['price']):.2f} | RSI: {float(row['rsi']):.2f} | "
                 f"거래량: {float(row['volume_ratio']):.2f}배"
@@ -268,21 +497,16 @@ def build_realtime_slack_message(df, rules, market_session, previous_symbols=Non
             "수급 리더:",
             "",
             f"* {', '.join(smart_money_leaders) if smart_money_leaders else '없음'}",
-        ]
-    )
-
-    lines.extend(
-        [
             "",
             "해석:",
             "",
-            "* 반복 등장 종목은 수급 유지 가능성",
+            "* 반복 등장 종목은 수급 지속 가능성 우선 관찰",
             f"* 수급점수 {smart_money_min} 이상은 우선 관찰",
-            "* 프리마켓 탐지 단계이므로 주문은 정규장 기준",
+            "* 프리마켓/애프터마켓에서는 주문하지 않고 후보만 기록",
         ]
     )
     if market_session == "regular":
-        lines[-1] = "* 현재 정규장이므로 주문 검토는 Paper Trading 안전조건 기준"
+        lines[-1] = "* 정규장에서는 Paper Trading 안전조건 기준으로만 주문 검토"
     return "\n".join(lines)
 
 

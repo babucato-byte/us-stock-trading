@@ -114,6 +114,33 @@ python dashboard/app.py
 - `TRADING_MODE=live`
 - `LIVE_DRY_RUN=False`
 
+## Scanner Rule Engine
+
+Scanner conditions are managed in `config/scanner_rules.json` and can also be edited from Dashboard Settings. New scanner filters should be added to the `filters` array so `daily_candidate_scanner.py` does not need code changes for ordinary threshold updates.
+
+Example:
+
+```json
+{
+  "scan_limit": 1500,
+  "top_alert_count": 5,
+  "filters": [
+    {"field": "price", "operator": ">=", "value": 5},
+    {"field": "avg_dollar_volume", "operator": ">=", "value": 20000000},
+    {"field": "rsi", "operator": "between", "min": 40, "max": 65},
+    {"field": "volume_ratio", "operator": ">=", "value": 1.2},
+    {"field": "score", "operator": ">=", "value": 70},
+    {"field": "smart_money_score", "operator": ">=", "value": 50}
+  ]
+}
+```
+
+Supported operators: `>=`, `<=`, `>`, `<`, `==`, `!=`, `between`, `in`, `not_in`.
+
+Supported fields include the current scanner metrics `price`, `avg_dollar_volume`, `rsi`, `volume_ratio`, `score`, `smart_money_score`, `above_ma200`, plus extension fields prepared for later use: `atr`, `gap_percent`, `market_cap`, `relative_strength`, `vwap_position`, `dollar_volume`, `float_shares`, `sector`, and `exchange`.
+
+Unknown fields do not stop the scanner. They are logged as warnings and skipped. Presets in `config/scanner_presets.json` use the same rule-engine structure: `conservative_trend`, `smart_money`, `momentum`, `paper_safe`, and `live_dry_run`.
+
 ## Cron
 
 예시:

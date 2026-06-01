@@ -12,6 +12,7 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from broker import BrokerConfig
+from daily_candidate_scanner import SUPPORTED_FIELDS, SUPPORTED_OPERATORS, normalize_rules
 from market_hours import get_us_market_session
 
 
@@ -26,6 +27,9 @@ CSV_FILES = {
     "orders": "order_history.csv",
     "gpt": "gpt_candidate_analysis.csv",
 }
+
+FILTER_FIELDS = sorted(SUPPORTED_FIELDS)
+FILTER_OPERATORS = [">=", "<=", ">", "<", "==", "!=", "between", "in", "not_in"]
 
 EDITABLE_RISK_KEYS = {
     "MAX_DAILY_LOSS_RATE",
@@ -89,15 +93,46 @@ def create_app():
             elif section == "preset":
                 preset = request.form.get("active_preset")
                 if preset in presets:
+                    selected = presets[preset].copy()
+                    selected.pop("description", None)
+                    rules.update(selected)
                     rules["active_preset"] = preset
                     write_json(rules_path, rules)
                     flash(f"Preset selected: {preset}")
+            elif section == "filter_add":
+                rules = normalize_rules(rules)
+                rules["filters"].append(parse_filter_form(request.form))
+                write_json(rules_path, rules)
+                flash("Scanner filter added.")
+            elif section == "filter_update":
+                rules = normalize_rules(rules)
+                index = int(request.form.get("filter_index", -1))
+                if 0 <= index < len(rules["filters"]):
+                    rules["filters"][index] = parse_filter_form(request.form)
+                    write_json(rules_path, rules)
+                    flash("Scanner filter updated.")
+            elif section == "filter_delete":
+                rules = normalize_rules(rules)
+                index = int(request.form.get("filter_index", -1))
+                if 0 <= index < len(rules["filters"]):
+                    rules["filters"].pop(index)
+                    write_json(rules_path, rules)
+                    flash("Scanner filter deleted.")
             elif section == "risk":
                 update_risk_config(request.form)
                 flash("Risk settings saved. Live guardrails were not modified.")
             return redirect(url_for("settings"))
 
-        return render_template("settings.html", rules=rules, presets=presets, risk_values=risk_values, broker=BrokerConfig())
+        rules = normalize_rules(rules)
+        return render_template(
+            "settings.html",
+            rules=rules,
+            presets=presets,
+            risk_values=risk_values,
+            broker=BrokerConfig(),
+            filter_fields=FILTER_FIELDS,
+            filter_operators=FILTER_OPERATORS,
+        )
 
     return app
 
@@ -125,17 +160,45 @@ def write_json(path, data):
 
 
 def coerce_rules(form, current):
-    updated = current.copy()
+    updated = normalize_rules(current).copy()
     for key, value in form.items():
         if key == "section":
             continue
-        if key == "ma200_required":
-            updated[key] = value == "true"
-        elif key in current:
+        if key in {"active_preset", "filters"}:
+            continue
+        if key in updated:
             updated[key] = coerce_number(value)
-    if "ma200_required" not in form:
-        updated["ma200_required"] = False
     return updated
+
+
+def parse_filter_form(form):
+    operator = form.get("operator")
+    rule_filter = {
+        "field": form.get("field", "").strip(),
+        "operator": operator,
+    }
+    if operator == "between":
+        min_value = coerce_optional_number(form.get("min", ""))
+        max_value = coerce_optional_number(form.get("max", ""))
+        if min_value is not None:
+            rule_filter["min"] = min_value
+        if max_value is not None:
+            rule_filter["max"] = max_value
+    else:
+        value = form.get("value", "")
+        if operator in {"in", "not_in"}:
+            rule_filter["value"] = [item.strip() for item in value.split(",") if item.strip()]
+        elif value.lower() in {"true", "false"}:
+            rule_filter["value"] = value.lower() == "true"
+        else:
+            rule_filter["value"] = coerce_number(value)
+    return rule_filter
+
+
+def coerce_optional_number(value):
+    if value is None or str(value).strip() == "":
+        return None
+    return coerce_number(value)
 
 
 def coerce_number(value):
