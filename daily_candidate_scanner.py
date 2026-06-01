@@ -213,13 +213,22 @@ def classify_candidate(row, smart_money_min):
     return "기술 조건 후보"
 
 
-def build_realtime_slack_message(df, rules, market_session):
+def build_realtime_slack_message(df, rules, market_session, previous_symbols=None):
+    previous_symbols = previous_symbols or set()
     top_count = int(rules.get("top_alert_count", 5) or 5)
     smart_money_min = int(rules.get("smart_money_min", DEFAULT_RULES["smart_money_min"]))
     total_count = len(df)
     strong_count = int((df["smart_money_score"] >= smart_money_min).sum()) if not df.empty else 0
     volume_2x_count = int((df["volume_ratio"] >= 2).sum()) if not df.empty else 0
     top = df.head(top_count) if not df.empty else df
+    current_symbols = set(df["symbol"].dropna().astype(str)) if not df.empty else set()
+    new_symbols = sorted(current_symbols - previous_symbols)
+    repeated_symbols = sorted(current_symbols & previous_symbols)
+    smart_money_leaders = (
+        df.sort_values("smart_money_score", ascending=False).head(5)["symbol"].dropna().astype(str).tolist()
+        if not df.empty
+        else []
+    )
 
     lines = [
         f"전체 후보: {total_count}개",
@@ -245,6 +254,22 @@ def build_realtime_slack_message(df, rules, market_session):
                 f"   기술점수: {int(row['score'])} | 수급점수: {int(row['smart_money_score'])}"
             )
             lines.append("")
+
+    lines.extend(
+        [
+            "신규 등장:",
+            "",
+            f"* {', '.join(new_symbols) if new_symbols else '없음'}",
+            "",
+            "반복 등장:",
+            "",
+            f"* {', '.join(repeated_symbols) if repeated_symbols else '없음'}",
+            "",
+            "수급 리더:",
+            "",
+            f"* {', '.join(smart_money_leaders) if smart_money_leaders else '없음'}",
+        ]
+    )
 
     lines.extend(
         [
@@ -275,6 +300,7 @@ def scan(preset_name=None, send_slack=True):
         if result:
             results.append(result)
 
+    previous_symbols = load_previous_symbols()
     buckets = build_candidate_buckets(pd.DataFrame(results), rules)
     save_candidate_files(buckets)
 
@@ -282,6 +308,7 @@ def scan(preset_name=None, send_slack=True):
         buckets.candidates,
         rules,
         get_us_market_session(),
+        previous_symbols,
     )
     print(message)
     if send_slack:
