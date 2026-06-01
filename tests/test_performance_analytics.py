@@ -127,4 +127,4 @@ def test_dashboard_performance_route_importable(monkeypatch):
     response = client.get("/performance")
 
     assert response.status_code == 200
-    assert b"Performance Analytics" in response.data
+    assert "성과 분석".encode("utf-8") in response.data

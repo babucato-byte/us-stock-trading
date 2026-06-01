@@ -1,34 +1,37 @@
 {% extends "base.html" %}
 {% block content %}
-<h1>Performance Analytics</h1>
+<h1>성과 분석</h1>
+<div class="alert alert-info">Paper Trading 성과 검증용 화면입니다.</div>
 
 {% if api_error %}
-<div class="alert alert-warning">Alpaca Paper API fallback active. {{ api_error }}</div>
+<div class="alert alert-warning">Alpaca Paper API 연결에 실패해 CSV 기준으로 표시합니다. {{ api_error }}</div>
 {% endif %}
 
 {% if not has_data %}
-<div class="alert alert-info">No performance data yet.</div>
+<div class="alert alert-info">아직 성과 데이터가 없습니다.</div>
 {% else %}
 <div class="row g-3 mb-3">
-  <div class="col-6 col-lg-3"><div class="metric"><span>Total Orders</span><strong>{{ summary.total_orders }}</strong></div></div>
-  <div class="col-6 col-lg-3"><div class="metric"><span>Filled Orders</span><strong>{{ summary.filled_orders }}</strong></div></div>
-  <div class="col-6 col-lg-3"><div class="metric"><span>Win Rate</span><strong>{{ summary.win_rate }}%</strong></div></div>
-  <div class="col-6 col-lg-3"><div class="metric"><span>Profit Factor</span><strong>{{ summary.profit_factor }}</strong></div></div>
-  <div class="col-6 col-lg-3"><div class="metric"><span>Open P/L</span><strong>${{ summary.total_unrealized_pl }}</strong></div></div>
-  <div class="col-6 col-lg-3"><div class="metric"><span>Daily Return</span><strong>{{ summary.daily_return_pct }}%</strong></div></div>
-  <div class="col-6 col-lg-3"><div class="metric"><span>Open Positions</span><strong>{{ summary.open_positions }}</strong></div></div>
-  <div class="col-6 col-lg-3"><div class="metric"><span>Broker</span><strong>{{ broker.status_label }}</strong></div></div>
+  <div class="col-6 col-lg-3"><div class="metric"><span>총 주문 수</span><strong>{{ summary.total_orders }}</strong><small>로컬 기록 포함</small></div></div>
+  <div class="col-6 col-lg-3"><div class="metric"><span>체결 주문</span><strong>{{ summary.filled_orders }}</strong><small>filled 기준</small></div></div>
+  <div class="col-6 col-lg-3"><div class="metric"><span>취소 주문</span><strong>{{ summary.canceled_orders }}</strong><small>취소 처리 건수</small></div></div>
+  <div class="col-6 col-lg-3"><div class="metric"><span>거절 주문</span><strong>{{ summary.rejected_orders }}</strong><small>거절 처리 건수</small></div></div>
+  <div class="col-6 col-lg-3"><div class="metric"><span>승률</span><strong>{{ summary.win_rate }}%</strong><small>수익 체결 비율</small></div></div>
+  <div class="col-6 col-lg-3"><div class="metric"><span>손익비</span><strong>{{ summary.profit_factor }}</strong><small>Profit Factor</small></div></div>
+  <div class="col-6 col-lg-3"><div class="metric"><span>미실현 손익</span><strong>${{ summary.total_unrealized_pl }}</strong><small>보유 포지션 기준</small></div></div>
+  <div class="col-6 col-lg-3"><div class="metric"><span>일일 수익률</span><strong>{{ summary.daily_return_pct }}%</strong><small>계좌 평가 기준</small></div></div>
+  <div class="col-6 col-lg-3"><div class="metric"><span>보유 종목</span><strong>{{ summary.open_positions }}</strong><small>현재 포지션 수</small></div></div>
+  <div class="col-6 col-lg-3"><div class="metric"><span>거래 모드</span><strong>{{ value_label(broker.status_label) }}</strong><small>실거래 보호 유지</small></div></div>
 </div>
 
 <div class="row g-3 mb-4">
-  <div class="col-12 col-md-6"><div class="metric"><span>Best Symbol</span><strong>{{ summary.best_symbol or 'None' }}</strong></div></div>
-  <div class="col-12 col-md-6"><div class="metric"><span>Worst Symbol</span><strong>{{ summary.worst_symbol or 'None' }}</strong></div></div>
+  <div class="col-12 col-md-6"><div class="metric"><span>최대 수익 종목</span><strong>{{ summary.best_symbol or '없음' }}</strong><small>미실현 손익 기준</small></div></div>
+  <div class="col-12 col-md-6"><div class="metric"><span>최대 손실 종목</span><strong>{{ summary.worst_symbol or '없음' }}</strong><small>미실현 손익 기준</small></div></div>
 </div>
 
 <section>
-  <h2>Recent Filled Trades</h2>
+  <h2>최근 체결 내역</h2>
   {% if not trades %}
-  <div class="alert alert-info">No performance trades yet.</div>
+  <div class="alert alert-info">아직 체결 성과 내역이 없습니다.</div>
   {% else %}
   <div class="table-responsive">
     <table class="table table-sm table-striped align-middle">

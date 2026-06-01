@@ -1,6 +1,9 @@
 {% extends "base.html" %}
 {% block content %}
-<h1>{{ name.replace('_', ' ') }}</h1>
+<h1>{{ title }}</h1>
+{% if hint %}
+<div class="alert alert-info">{{ hint }}</div>
+{% endif %}
 <div class="table-responsive">
   <table class="table table-sm table-striped align-middle">
     <thead>

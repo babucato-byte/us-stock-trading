@@ -114,6 +114,28 @@ python dashboard/app.py
 - `TRADING_MODE=live`
 - `LIVE_DRY_RUN=False`
 
+## Dashboard Korean UI
+
+Flask Dashboard is presented as a Korean operations console named `자동매매 운영 관제`.
+
+Main labels:
+
+- `Performance`: `성과 분석`
+- `Settings`: `설정`
+- `Logs`: `로그`
+- `Candidates`: `후보 종목`
+- `Strong Candidates`: `수급 강한 후보`
+- `Order Candidates`: `주문 검토 후보`
+- `Orders`: `주문 내역`
+- `GPT`: `AI 분석`
+- `Broker`: `거래 모드`
+- `Market`: `시장 상태`
+- `Live Guard`: `실거래 보호`
+
+The dashboard keeps Bootstrap dark mode and mobile responsive cards. Candidate tables show short Korean context messages such as `현재 조건을 통과한 종목 목록입니다.` and `실제 주문 전 최종 검토 대상입니다.` Performance Analytics shows `Paper Trading 성과 검증용 화면입니다.`
+
+Live trading safety remains read-only in the Dashboard. `ENABLE_REAL_TRADING=False` and `LIVE_DRY_RUN=True` must stay unchanged unless a separate live-enablement review is performed.
+
 ## Scanner Rule Engine
 
 Scanner conditions are managed in `config/scanner_rules.json` and can also be edited from Dashboard Settings. New scanner filters should be added to the `filters` array so `daily_candidate_scanner.py` does not need code changes for ordinary threshold updates.

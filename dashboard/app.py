@@ -31,6 +31,54 @@ CSV_FILES = {
     "performance_trades": "performance_trades.csv",
 }
 
+UI_LABELS = {
+    "candidates": "후보 종목",
+    "strong_candidates": "수급 강한 후보",
+    "order_candidates": "주문 검토 후보",
+    "orders": "주문 내역",
+    "gpt": "AI 분석",
+    "performance_summary": "성과 요약",
+    "performance_trades": "성과 거래 내역",
+    "Broker": "거래 모드",
+    "Market": "시장 상태",
+    "systemd": "서비스 상태",
+    "Live Guard": "실거래 보호",
+    "Win Rate": "승률",
+    "Profit Factor": "손익비",
+    "Daily Return": "일일 수익률",
+    "Open P/L": "미실현 손익",
+    "Open Positions": "보유 종목",
+    "Total Orders": "총 주문 수",
+    "Filled Orders": "체결 주문",
+    "Canceled Orders": "취소 주문",
+    "Rejected Orders": "거절 주문",
+}
+
+VALUE_LABELS = {
+    "PAPER": "모의투자",
+    "LIVE_DRY_RUN": "실거래 예행연습",
+    "LIVE_DISABLED": "실거래 비활성",
+    "LIVE_ENABLED": "실거래 활성",
+    "premarket": "프리마켓",
+    "regular": "정규장",
+    "afterhours": "애프터마켓",
+    "closed": "장 마감",
+    "active": "정상 실행",
+    "inactive": "중지",
+    "failed": "오류",
+    "Locked": "실거래 차단",
+}
+
+TABLE_HINTS = {
+    "candidates": "현재 조건을 통과한 종목 목록입니다.",
+    "strong_candidates": "수급 조건이 강하게 포착된 후보 종목입니다.",
+    "order_candidates": "실제 주문 전 최종 검토 대상입니다.",
+    "orders": "Paper Trading 주문 기록입니다.",
+    "gpt": "AI 분석 결과입니다.",
+    "performance_summary": "Paper Trading 성과 요약입니다.",
+    "performance_trades": "성과 분석에 사용된 거래 목록입니다.",
+}
+
 FILTER_FIELDS = sorted(SUPPORTED_FIELDS)
 FILTER_OPERATORS = [">=", "<=", ">", "<", "==", "!=", "between", "in", "not_in"]
 
@@ -47,6 +95,13 @@ EDITABLE_RISK_KEYS = {
 def create_app():
     app = Flask(__name__)
     app.secret_key = "local-dashboard-only"
+
+    @app.context_processor
+    def inject_ui_helpers():
+        return {
+            "ui_label": ui_label,
+            "value_label": value_label,
+        }
 
     @app.route("/")
     def index():
@@ -68,7 +123,14 @@ def create_app():
         if name not in CSV_FILES:
             return redirect(url_for("index"))
         df = read_csv(CSV_FILES[name])
-        return render_template("table.html", name=name, rows=df.to_dict("records"), columns=df.columns.tolist())
+        return render_template(
+            "table.html",
+            name=name,
+            title=ui_label(name),
+            hint=TABLE_HINTS.get(name, ""),
+            rows=df.to_dict("records"),
+            columns=df.columns.tolist(),
+        )
 
     @app.route("/logs")
     def logs():
@@ -119,7 +181,7 @@ def create_app():
             if section == "rules":
                 updated = coerce_rules(request.form, rules)
                 write_json(rules_path, updated)
-                flash("Scanner rules saved.")
+                flash("스캐너 규칙이 저장되었습니다.")
             elif section == "preset":
                 preset = request.form.get("active_preset")
                 if preset in presets:
@@ -128,29 +190,29 @@ def create_app():
                     rules.update(selected)
                     rules["active_preset"] = preset
                     write_json(rules_path, rules)
-                    flash(f"Preset selected: {preset}")
+                    flash(f"프리셋이 선택되었습니다: {preset}")
             elif section == "filter_add":
                 rules = normalize_rules(rules)
                 rules["filters"].append(parse_filter_form(request.form))
                 write_json(rules_path, rules)
-                flash("Scanner filter added.")
+                flash("스캐너 필터가 추가되었습니다.")
             elif section == "filter_update":
                 rules = normalize_rules(rules)
                 index = int(request.form.get("filter_index", -1))
                 if 0 <= index < len(rules["filters"]):
                     rules["filters"][index] = parse_filter_form(request.form)
                     write_json(rules_path, rules)
-                    flash("Scanner filter updated.")
+                    flash("스캐너 필터가 수정되었습니다.")
             elif section == "filter_delete":
                 rules = normalize_rules(rules)
                 index = int(request.form.get("filter_index", -1))
                 if 0 <= index < len(rules["filters"]):
                     rules["filters"].pop(index)
                     write_json(rules_path, rules)
-                    flash("Scanner filter deleted.")
+                    flash("스캐너 필터가 삭제되었습니다.")
             elif section == "risk":
                 update_risk_config(request.form)
-                flash("Risk settings saved. Live guardrails were not modified.")
+                flash("리스크 설정이 저장되었습니다. 실거래 보호 설정은 변경되지 않았습니다.")
             return redirect(url_for("settings"))
 
         rules = normalize_rules(rules)
@@ -165,6 +227,14 @@ def create_app():
         )
 
     return app
+
+
+def ui_label(value):
+    return UI_LABELS.get(value, str(value).replace("_", " "))
+
+
+def value_label(value):
+    return VALUE_LABELS.get(str(value), str(value))
 
 
 def read_csv(filename):
@@ -277,9 +347,9 @@ def run_command(command):
     try:
         result = subprocess.run(command, cwd=BASE_DIR, capture_output=True, text=True, timeout=5)
         output = (result.stdout or result.stderr).strip()
-        return output[-1000:] if output else "No output"
+        return output[-1000:] if output else "출력 없음"
     except Exception as exc:
-        return f"Unavailable: {exc}"
+        return f"사용 불가: {exc}"
 
 
 def get_systemd_status():

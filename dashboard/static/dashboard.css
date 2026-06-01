@@ -32,6 +32,13 @@ body {
   word-break: break-word;
 }
 
+.metric small {
+  display: block;
+  margin-top: 8px;
+  color: #8192a3;
+  line-height: 1.35;
+}
+
 .link-metric:hover {
   border-color: #5ca8ff;
 }
