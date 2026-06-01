@@ -207,47 +207,57 @@ def save_candidate_files(buckets):
     buckets.candidates[["symbol"]].to_csv(PREVIOUS_CANDIDATES_FILE, index=False)
 
 
-def format_scanner_alert(buckets, rules, previous_symbols):
-    df = buckets.candidates
-    current_symbols = set(df["symbol"].astype(str)) if not df.empty else set()
-    new_symbols = sorted(current_symbols - previous_symbols)
-    repeat_symbols = sorted(current_symbols & previous_symbols)
-    rising = []
+def classify_candidate(row, smart_money_min):
+    if int(row.get("smart_money_score", 0)) >= int(smart_money_min):
+        return "수급/세력 가능 후보"
+    return "기술 조건 후보"
 
-    if not df.empty:
-        rising = df.sort_values("smart_money_score", ascending=False).head(5)["symbol"].tolist()
 
-    top = df.head(int(rules["top_alert_count"])) if not df.empty else df
-    market_session = get_us_market_session()
-    order_available = market_session == "regular" and not buckets.order_candidates.empty
+def build_realtime_slack_message(df, rules, market_session):
+    top_count = int(rules.get("top_alert_count", 5) or 5)
+    smart_money_min = int(rules.get("smart_money_min", DEFAULT_RULES["smart_money_min"]))
+    total_count = len(df)
+    strong_count = int((df["smart_money_score"] >= smart_money_min).sum()) if not df.empty else 0
+    volume_2x_count = int((df["volume_ratio"] >= 2).sum()) if not df.empty else 0
+    top = df.head(top_count) if not df.empty else df
 
     lines = [
-        "*Realtime Candidate Scan*",
-        f"- Total candidates: {len(buckets.candidates)}",
-        f"- Strong smart-money candidates: {len(buckets.strong_candidates)}",
-        f"- Volume >= 2x candidates: {int((df['volume_ratio'] >= 2).sum()) if not df.empty else 0}",
-        f"- Regular-session order review: {'YES' if order_available else 'NO'} ({market_session})",
+        f"전체 후보: {total_count}개",
+        f"수급 강한 후보: {strong_count}개",
+        f"거래량 2배 이상: {volume_2x_count}개",
         "",
-        "*Top candidates*",
+        f"TOP {top_count} 후보",
+        "",
     ]
 
     if top.empty:
-        lines.append("- None")
+        lines.append("조건을 만족한 후보가 없습니다.")
     else:
-        for _, row in top.iterrows():
+        for idx, (_, row) in enumerate(top.iterrows(), start=1):
             lines.append(
-                f"- {row['symbol']} | score {row['score']} | smart {row['smart_money_score']} | "
-                f"RSI {row['rsi']} | vol {row['volume_ratio']}x"
+                f"{idx}. {row['symbol']} — {classify_candidate(row, smart_money_min)}"
             )
+            lines.append(
+                f"   가격: {float(row['price']):.2f} | RSI: {float(row['rsi']):.2f} | "
+                f"거래량: {float(row['volume_ratio']):.2f}배"
+            )
+            lines.append(
+                f"   기술점수: {int(row['score'])} | 수급점수: {int(row['smart_money_score'])}"
+            )
+            lines.append("")
 
     lines.extend(
         [
             "",
-            f"*New*: {', '.join(new_symbols[:10]) if new_symbols else 'None'}",
-            f"*Repeated*: {', '.join(repeat_symbols[:10]) if repeat_symbols else 'None'}",
-            f"*Smart-money leaders*: {', '.join(rising) if rising else 'None'}",
+            "해석:",
+            "",
+            "* 반복 등장 종목은 수급 유지 가능성",
+            f"* 수급점수 {smart_money_min} 이상은 우선 관찰",
+            "* 프리마켓 탐지 단계이므로 주문은 정규장 기준",
         ]
     )
+    if market_session == "regular":
+        lines[-1] = "* 현재 정규장이므로 주문 검토는 Paper Trading 안전조건 기준"
     return "\n".join(lines)
 
 
@@ -265,11 +275,14 @@ def scan(preset_name=None, send_slack=True):
         if result:
             results.append(result)
 
-    previous_symbols = load_previous_symbols()
     buckets = build_candidate_buckets(pd.DataFrame(results), rules)
     save_candidate_files(buckets)
 
-    message = format_scanner_alert(buckets, rules, previous_symbols)
+    message = build_realtime_slack_message(
+        buckets.candidates,
+        rules,
+        get_us_market_session(),
+    )
     print(message)
     if send_slack:
         send_slack_alert(message)
