@@ -1,0 +1,2 @@
+total_orders,filled_orders,canceled_orders,rejected_orders,open_positions,win_rate,avg_profit_pct,avg_loss_pct,profit_factor,total_unrealized_pl,daily_return_pct,best_symbol,worst_symbol,generated_at
+1,0,0,0,0,0.0,0.0,0.0,0.0,0.0,0.0,,,2026-06-01 21:22:46

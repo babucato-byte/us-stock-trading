@@ -141,6 +141,42 @@ Supported fields include the current scanner metrics `price`, `avg_dollar_volume
 
 Unknown fields do not stop the scanner. They are logged as warnings and skipped. Presets in `config/scanner_presets.json` use the same rule-engine structure: `conservative_trend`, `smart_money`, `momentum`, `paper_safe`, and `live_dry_run`.
 
+## Performance Analytics
+
+Performance Analytics measures Paper Trading results before any real-trading decision. It reads Alpaca Paper account/orders/positions, combines them with `order_history.csv`, and writes:
+
+- `performance_summary.csv`: account-level metrics such as win rate, profit factor, daily return, open P/L, and open positions
+- `performance_trades.csv`: filled-order trade rows with current position P/L where available
+
+Run manually:
+
+```bash
+python performance_analytics.py
+```
+
+Dashboard:
+
+```bash
+python dashboard/app.py
+```
+
+Open `http://SERVER_IP:5000/performance` or use the Performance menu. The dashboard falls back to existing CSV data if Alpaca Paper API calls fail, and shows "No performance data yet" when no summary exists.
+
+Suggested Paper Trading validation period before live review:
+
+- Run Paper Trading for at least 2 to 4 weeks.
+- Confirm orders are filled only under expected market-session and risk rules.
+- Review `performance_summary.csv`, `performance_trades.csv`, order history, Slack alerts, and dashboard metrics.
+
+Minimum live-review checklist:
+
+- Win rate is stable across multiple weeks, not just one day.
+- Profit Factor is above 1.0 and preferably above 1.3 after fees/slippage assumptions.
+- Average loss is controlled and smaller than the planned risk budget.
+- No repeated rejected/canceled order pattern remains unresolved.
+- Open P/L and daily return stay inside account-level drawdown limits.
+- `ENABLE_REAL_TRADING=False` and `LIVE_DRY_RUN=True` remain unchanged until a separate live-enablement review.
+
 ## Cron
 
 예시:

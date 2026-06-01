@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Performance Analytics</h1>
+
+{% if api_error %}
+<div class="alert alert-warning">Alpaca Paper API fallback active. {{ api_error }}</div>
+{% endif %}
+
+{% if not has_data %}
+<div class="alert alert-info">No performance data yet.</div>
+{% else %}
+<div class="row g-3 mb-3">
+  <div class="col-6 col-lg-3"><div class="metric"><span>Total Orders</span><strong>{{ summary.total_orders }}</strong></div></div>
+  <div class="col-6 col-lg-3"><div class="metric"><span>Filled Orders</span><strong>{{ summary.filled_orders }}</strong></div></div>
+  <div class="col-6 col-lg-3"><div class="metric"><span>Win Rate</span><strong>{{ summary.win_rate }}%</strong></div></div>
+  <div class="col-6 col-lg-3"><div class="metric"><span>Profit Factor</span><strong>{{ summary.profit_factor }}</strong></div></div>
+  <div class="col-6 col-lg-3"><div class="metric"><span>Open P/L</span><strong>${{ summary.total_unrealized_pl }}</strong></div></div>
+  <div class="col-6 col-lg-3"><div class="metric"><span>Daily Return</span><strong>{{ summary.daily_return_pct }}%</strong></div></div>
+  <div class="col-6 col-lg-3"><div class="metric"><span>Open Positions</span><strong>{{ summary.open_positions }}</strong></div></div>
+  <div class="col-6 col-lg-3"><div class="metric"><span>Broker</span><strong>{{ broker.status_label }}</strong></div></div>
+</div>
+
+<div class="row g-3 mb-4">
+  <div class="col-12 col-md-6"><div class="metric"><span>Best Symbol</span><strong>{{ summary.best_symbol or 'None' }}</strong></div></div>
+  <div class="col-12 col-md-6"><div class="metric"><span>Worst Symbol</span><strong>{{ summary.worst_symbol or 'None' }}</strong></div></div>
+</div>
+
+<section>
+  <h2>Recent Filled Trades</h2>
+  {% if not trades %}
+  <div class="alert alert-info">No performance trades yet.</div>
+  {% else %}
+  <div class="table-responsive">
+    <table class="table table-sm table-striped align-middle">
+      <thead>
+        <tr>{% for col in columns %}<th>{{ col }}</th>{% endfor %}</tr>
+      </thead>
+      <tbody>
+        {% for row in trades %}
+        <tr>{% for col in columns %}<td>{{ row[col] }}</td>{% endfor %}</tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</section>
+{% endif %}
+{% endblock %}

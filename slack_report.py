@@ -4,6 +4,7 @@ import pandas as pd
 
 from broker import BrokerConfig
 from market_hours import get_us_market_session
+from performance_analytics import generate_performance_report
 from slack_utils import send_slack_message
 
 
@@ -33,6 +34,7 @@ def build_daily_summary():
     gpt = _read_csv("gpt_candidate_analysis.csv")
     backtest = _read_csv("backtest_results.csv")
     broker_config = BrokerConfig()
+    performance_summary, _ = generate_performance_report()
 
     market_state = get_us_market_session()
     backtest_summary = "No backtest file"
@@ -63,12 +65,34 @@ def build_daily_summary():
             "*GPT summary*",
             f"- {gpt_summary}",
             "",
+            "*Performance Summary*",
+            f"- Win Rate: {format_pct(performance_summary.get('win_rate'))}",
+            f"- Profit Factor: {performance_summary.get('profit_factor', 0)}",
+            f"- Daily Return: {format_signed_pct(performance_summary.get('daily_return_pct'))}",
+            f"- Open P/L: {format_money(performance_summary.get('total_unrealized_pl'))}",
+            f"- Open Positions: {performance_summary.get('open_positions', 0)}",
+            "",
             "*Risk status*",
             "- ENABLE_REAL_TRADING default is False",
             "- LIVE_DRY_RUN default is True",
             "- Dashboard cannot enable live trading",
         ]
     )
+
+
+def format_pct(value):
+    return f"{float(value or 0):.2f}%"
+
+
+def format_signed_pct(value):
+    number = float(value or 0)
+    return f"{number:+.2f}%"
+
+
+def format_money(value):
+    number = float(value or 0)
+    sign = "+" if number >= 0 else "-"
+    return f"{sign}${abs(number):.2f}"
 
 
 def main():

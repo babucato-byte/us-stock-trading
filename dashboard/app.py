@@ -14,6 +14,7 @@ if str(BASE_DIR) not in sys.path:
 from broker import BrokerConfig
 from daily_candidate_scanner import SUPPORTED_FIELDS, SUPPORTED_OPERATORS, normalize_rules
 from market_hours import get_us_market_session
+from performance_analytics import generate_performance_report
 
 
 CONFIG_DIR = BASE_DIR / "config"
@@ -26,6 +27,8 @@ CSV_FILES = {
     "order_candidates": "order_candidates.csv",
     "orders": "order_history.csv",
     "gpt": "gpt_candidate_analysis.csv",
+    "performance_summary": "performance_summary.csv",
+    "performance_trades": "performance_trades.csv",
 }
 
 FILTER_FIELDS = sorted(SUPPORTED_FIELDS)
@@ -49,6 +52,7 @@ def create_app():
     def index():
         broker = BrokerConfig()
         counts = {key: len(read_csv(filename)) for key, filename in CSV_FILES.items()}
+        performance_summary = read_latest_performance_summary()
         return render_template(
             "index.html",
             counts=counts,
@@ -56,6 +60,7 @@ def create_app():
             market_session=get_us_market_session(),
             systemd_status=get_systemd_status(),
             cron_status=get_cron_status(),
+            performance_summary=performance_summary,
         )
 
     @app.route("/table/<name>")
@@ -75,6 +80,31 @@ def create_app():
             if LOG_DIR.resolve() in path.parents and path.exists():
                 content = "\n".join(path.read_text(encoding="utf-8", errors="replace").splitlines()[-300:])
         return render_template("logs.html", files=[f.name for f in files], selected=selected, content=content)
+
+    @app.route("/performance")
+    def performance():
+        api_error = ""
+        try:
+            summary, trades = generate_performance_report()
+            api_error = summary.get("api_error", "")
+        except Exception as exc:
+            api_error = str(exc)
+            summary = read_latest_performance_summary()
+            trades = read_csv("performance_trades.csv")
+        has_data = bool(summary)
+        if not trades.empty and "status" in trades.columns:
+            trades = trades[trades["status"].astype(str).str.lower() == "filled"]
+        recent_trades = trades.head(25).to_dict("records") if not trades.empty else []
+        columns = trades.columns.tolist() if not trades.empty else []
+        return render_template(
+            "performance.html",
+            summary=summary,
+            trades=recent_trades,
+            columns=columns,
+            has_data=has_data,
+            api_error=api_error,
+            broker=BrokerConfig(),
+        )
 
     @app.route("/settings", methods=["GET", "POST"])
     def settings():
@@ -157,6 +187,13 @@ def read_json(path, fallback):
 def write_json(path, data):
     path.parent.mkdir(exist_ok=True)
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def read_latest_performance_summary():
+    df = read_csv("performance_summary.csv")
+    if df.empty:
+        return {}
+    return df.tail(1).to_dict("records")[0]
 
 
 def coerce_rules(form, current):
