@@ -1,290 +1,204 @@
-import os
-import requests
-import yfinance as yf
-import pandas as pd
-from account_risk import check_daily_loss_limit
 from datetime import datetime
-from dotenv import load_dotenv
-from order_safety import run_order_safety_check
+from pathlib import Path
+
+import pandas as pd
+import yfinance as yf
+
+from account_risk import check_daily_loss_limit
+from broker import AlpacaBroker
 from market_hours import get_us_market_session
+from order_safety import run_order_safety_check
 from slack_utils import send_slack_alert
 
-load_dotenv()
 
-API_KEY = os.getenv("ALPACA_API_KEY")
-SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
-BASE_URL = os.getenv("ALPACA_BASE_URL")
-
-headers = {
-    "APCA-API-KEY-ID": API_KEY,
-    "APCA-API-SECRET-KEY": SECRET_KEY,
-    "Content-Type": "application/json"
-}
+BASE_DIR = Path(__file__).resolve().parent
+ORDER_CANDIDATES_FILE = BASE_DIR / "order_candidates.csv"
+CANDIDATES_FILE = BASE_DIR / "candidates.csv"
+ORDER_HISTORY_FILE = BASE_DIR / "order_history.csv"
 
 
-def get_account():
-    url = f"{BASE_URL}/v2/account"
-    response = requests.get(url, headers=headers, timeout=10)
-    response.raise_for_status()
-    return response.json()
+def calculate_rsi(df, period=14):
+    delta = df["Close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(window=period).mean()
+    avg_loss = loss.rolling(window=period).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
 
-def get_positions():
-    url = f"{BASE_URL}/v2/positions"
-    response = requests.get(url, headers=headers, timeout=10)
-    response.raise_for_status()
-    return response.json()
-
-
-def submit_order(symbol, qty=1):
-    order = {
-        "symbol": symbol,
-        "qty": str(qty),
-        "side": "buy",
-        "type": "market",
-        "time_in_force": "day"
-    }
-
-    url = f"{BASE_URL}/v2/orders"
-
-    response = requests.post(
-        url,
-        headers=headers,
-        json=order,
-        timeout=10
-    )
-
-    print(f"{symbol} 주문 결과:", response.status_code)
-    print(response.text)
-
+def submit_order(symbol, qty=1, broker=None):
+    broker = broker or AlpacaBroker()
+    response = broker.submit_order(symbol, qty=qty)
+    print(f"{symbol} order result: {response.status_code} {response.text[:500]}")
     return response
 
 
 def analyze_stock(symbol):
-    ticker = yf.Ticker(symbol)
-    df = ticker.history(period="1y")
-
-    if df.empty:
+    df = yf.Ticker(symbol).history(period="1y")
+    if df.empty or len(df) < 220:
         return None
 
     df["MA200"] = df["Close"].rolling(window=200).mean()
-
-    delta = df["Close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    avg_gain = gain.rolling(window=14).mean()
-    avg_loss = loss.rolling(window=14).mean()
-
-    rs = avg_gain / avg_loss
-    df["RSI"] = 100 - (100 / (1 + rs))
-
+    df["RSI"] = calculate_rsi(df)
     df["AVG_VOLUME_20"] = df["Volume"].rolling(window=20).mean()
 
-    price = df["Close"].iloc[-1]
-    ma200 = df["MA200"].iloc[-1]
-    rsi = df["RSI"].iloc[-1]
-    volume_ratio = df["Volume"].iloc[-1] / df["AVG_VOLUME_20"].iloc[-1]
+    price = float(df["Close"].iloc[-1])
+    ma200 = float(df["MA200"].iloc[-1])
+    rsi = float(df["RSI"].iloc[-1])
+    avg_volume = float(df["AVG_VOLUME_20"].iloc[-1])
+    if avg_volume <= 0:
+        return None
+    volume_ratio = float(df["Volume"].iloc[-1]) / avg_volume
 
     score = 0
-
     if price > ma200:
         score += 40
-
     if 40 <= rsi <= 65:
         score += 30
-
     if volume_ratio >= 1.2:
         score += 30
 
     return {
         "symbol": symbol,
-        "price": float(price),
-        "ma200": float(ma200),
-        "rsi": float(rsi),
-        "volume_ratio": float(volume_ratio),
-        "score": score
+        "price": price,
+        "ma200": ma200,
+        "rsi": rsi,
+        "volume_ratio": volume_ratio,
+        "score": score,
     }
 
 
-def load_watchlist():
+def _load_symbols_from_csv(path):
     try:
-        candidates_df = pd.read_csv("candidates.csv")
-
-        if candidates_df.empty:
-            print("candidates.csv가 비어 있습니다.")
+        df = pd.read_csv(path)
+        if df.empty or "symbol" not in df.columns:
             return []
-
-        return candidates_df["symbol"].dropna().unique().tolist()
-
-    except Exception as e:
-        print(f"candidates.csv 읽기 실패: {e}")
+        return df["symbol"].dropna().astype(str).unique().tolist()
+    except Exception as exc:
+        print(f"Failed to read {path.name}: {exc}")
         return []
+
+
+def load_watchlist():
+    order_symbols = _load_symbols_from_csv(ORDER_CANDIDATES_FILE)
+    if order_symbols:
+        print(f"Loaded {len(order_symbols)} symbols from order_candidates.csv")
+        return order_symbols
+    fallback = _load_symbols_from_csv(CANDIDATES_FILE)
+    print(f"Loaded {len(fallback)} symbols from candidates.csv fallback")
+    return fallback
+
 
 def load_order_history():
     try:
-        return pd.read_csv("order_history.csv")
+        return pd.read_csv(ORDER_HISTORY_FILE)
     except Exception:
-        return pd.DataFrame(columns=["symbol", "order_date"])
+        return pd.DataFrame(columns=["symbol", "order_date", "mode", "dry_run"])
 
 
 def save_order_history(order_history):
-    order_history.to_csv("order_history.csv", index=False)
+    order_history.to_csv(ORDER_HISTORY_FILE, index=False)
+
+
+def is_duplicate_order(order_history, symbol, order_date):
+    if order_history.empty or "symbol" not in order_history.columns or "order_date" not in order_history.columns:
+        return False
+    return (
+        (order_history["symbol"].astype(str) == symbol)
+        & (order_history["order_date"].astype(str) == order_date)
+    ).any()
+
+
+def _notify_order_blocked(symbol, reason):
+    send_slack_alert(f"*Order blocked*\n- Symbol: {symbol}\n- Reason: {reason}")
 
 
 def main():
+    broker = AlpacaBroker()
     market_session = get_us_market_session()
+    allow_order = market_session == "regular"
 
-    if market_session == "closed":
-        print("미국장이 완전히 닫혀 있어 실행을 중단합니다.")
-        return
-
-    if market_session == "premarket":
-        print("프리마켓 시간입니다. 탐지만 수행하고 주문은 하지 않습니다.")
-        allow_order = False
-    elif market_session == "regular":
-        print("정규장 시간입니다. 조건 충족 시 Paper 주문을 허용합니다.")
-        allow_order = True
-    else:
-        print("애프터마켓 시간입니다. 탐지만 수행하고 주문은 하지 않습니다.")
-        allow_order = False
+    print(f"Broker mode: {broker.config.status_label}")
+    print(f"Market session: {market_session}")
+    if not allow_order:
+        print("Orders are only reviewed during regular market hours.")
 
     tickers = load_watchlist()
-
     if not tickers:
-        print("주문 대상 종목이 없습니다.")
+        print("No order review candidates.")
         return
 
-    account = get_account()
-    positions = get_positions()
-
-    check_daily_loss_limit()
+    account = broker.get_account()
+    positions = broker.get_positions()
+    check_daily_loss_limit(account)
 
     open_position_count = len(positions)
     today_trade_count = 0
     today = datetime.now().strftime("%Y-%m-%d")
-
     held_symbols = [p["symbol"] for p in positions]
-
     order_history = load_order_history()
 
-    print("Paper 계좌 연결 성공")
-    print("현재 보유 종목 수:", open_position_count)
-    print("현재 보유 종목:", held_symbols)
+    print(f"Open positions: {open_position_count}")
+    print(f"Held symbols: {held_symbols}")
 
     for symbol in tickers:
         if symbol in held_symbols:
-            msg = f"""
-        *Paper Trading 보유 종목 재매수 차단*
-
-        종목: {symbol}
-        상태: 이미 보유 중인 종목이라 추가 주문을 차단했습니다.
-        """
-            print(f"{symbol} 이미 보유 중 → 주문 건너뜀")
-            send_slack_alert(msg)
+            _notify_order_blocked(symbol, "Already held")
             continue
 
-        already_ordered = (
-            (order_history["symbol"] == symbol)
-            & (order_history["order_date"] == today)
-        ).any()
-
-
-        if already_ordered:
-            msg = f"""
-        *Paper Trading 중복 주문 차단*
-
-        종목: {symbol}
-        상태: 오늘 이미 주문된 종목이라 추가 주문을 차단했습니다.
-        """
-            print(f"{symbol} 오늘 이미 주문됨 → 건너뜀")
-            send_slack_alert(msg)
+        if is_duplicate_order(order_history, symbol, today):
+            _notify_order_blocked(symbol, "Duplicate order prevented for today")
             continue
 
         result = analyze_stock(symbol)
-
         if not result:
-            print(f"{symbol} 분석 실패")
+            print(f"{symbol} analysis failed")
             continue
 
-        print(result)
+        if result["score"] < 70:
+            print(f"{symbol} did not meet order score threshold: {result['score']}")
+            continue
 
-        if result["score"] >= 70:
-            print(f"{symbol} 전략 조건 충족")
-
-            if not allow_order:
-                msg = f"""
-            *Paper Trading 탐지 알림*
-
-            종목: {symbol}
-            점수: {result['score']}
-            현재가: {result['price']:.2f}
-            RSI: {result['rsi']:.2f}
-            거래량 배수: {result['volume_ratio']:.2f}배
-
-            상태: 현재 시간대는 주문하지 않음
-            """
-                print(f"{symbol} 탐지 완료 → 현재 시간대는 주문하지 않음")
-                send_slack_alert(msg)
-                continue
-
-
-
-
-            run_order_safety_check(
-                position_rate=0.01,
-                today_trade_count=today_trade_count,
-                open_position_count=open_position_count
+        if not allow_order:
+            send_slack_alert(
+                f"*Order review only*\n- Symbol: {symbol}\n- Score: {result['score']}\n"
+                f"- Market session: {market_session}\n- Status: no order submitted"
             )
+            continue
 
-            response = submit_order(symbol, qty=1)
+        run_order_safety_check(
+            position_rate=0.01,
+            today_trade_count=today_trade_count,
+            open_position_count=open_position_count,
+        )
 
-            if response.status_code in [200, 201]:
-                msg = f"""
-                *Paper Trading 주문 접수*
+        response = submit_order(symbol, qty=1, broker=broker)
+        success = response.status_code in [200, 201]
+        status = "DRY RUN" if response.dry_run else ("SUBMITTED" if success else "FAILED")
+        send_slack_alert(
+            f"*Paper Strategy Order*\n- Symbol: {symbol}\n- Qty: 1\n"
+            f"- Score: {result['score']}\n- Price: {result['price']:.2f}\n"
+            f"- RSI: {result['rsi']:.2f}\n- Volume ratio: {result['volume_ratio']:.2f}x\n"
+            f"- Broker mode: {broker.config.status_label}\n- Status: {status}"
+        )
 
-                종목: {symbol}
-                수량: 1주
-                점수: {result['score']}
-                현재가: {result['price']:.2f}
-                RSI: {result['rsi']:.2f}
-                거래량 배수: {result['volume_ratio']:.2f}배
-
-                상태: 주문 접수 성공
-                """
-            else:
-                msg = f"""
-                *Paper Trading 주문 실패*
-
-                종목: {symbol}
-                응답코드: {response.status_code}
-                응답내용:
-                ```{response.text[:1000]}```
-                """
-
-                send_slack_alert(msg)
-
-
-                send_slack_alert(msg)
-                new_row = pd.DataFrame([
+        if success:
+            new_row = pd.DataFrame(
+                [
                     {
                         "symbol": symbol,
-                        "order_date": today
+                        "order_date": today,
+                        "mode": broker.config.status_label,
+                        "dry_run": response.dry_run,
                     }
-                ])
-
-                order_history = pd.concat(
-                    [order_history, new_row],
-                    ignore_index=True
-                )
-
-                save_order_history(order_history)
-
-                today_trade_count += 1
+                ]
+            )
+            order_history = pd.concat([order_history, new_row], ignore_index=True)
+            save_order_history(order_history)
+            today_trade_count += 1
+            if not response.dry_run:
                 open_position_count += 1
-
-        else:
-            print(f"{symbol} 조건 미충족")
 
 
 if __name__ == "__main__":

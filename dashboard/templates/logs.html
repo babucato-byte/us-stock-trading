@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Logs</h1>
+<div class="row g-3">
+  <div class="col-12 col-md-3">
+    <div class="list-group">
+      {% for file in files %}
+      <a class="list-group-item list-group-item-action {% if file == selected %}active{% endif %}" href="{{ url_for('logs', file=file) }}">{{ file }}</a>
+      {% endfor %}
+    </div>
+  </div>
+  <div class="col-12 col-md-9">
+    <pre class="ops-output">{{ content }}</pre>
+  </div>
+</div>
+{% endblock %}

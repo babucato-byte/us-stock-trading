@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Settings</h1>
+<div class="alert alert-warning">Live trading switches are read-only here. Paper and Live Dry-run guardrails stay protected.</div>
+
+<section class="mb-4">
+  <h2>Broker Guardrails</h2>
+  <div class="row g-3">
+    <div class="col-md-4"><div class="metric"><span>Mode</span><strong>{{ broker.status_label }}</strong></div></div>
+    <div class="col-md-4"><div class="metric"><span>ENABLE_REAL_TRADING</span><strong>{{ broker.enable_real_trading }}</strong></div></div>
+    <div class="col-md-4"><div class="metric"><span>LIVE_DRY_RUN</span><strong>{{ broker.live_dry_run }}</strong></div></div>
+  </div>
+</section>
+
+<section class="mb-4">
+  <h2>Scanner Preset</h2>
+  <form method="post" class="row g-2">
+    <input type="hidden" name="section" value="preset">
+    <div class="col-12 col-md-6">
+      <select class="form-select" name="active_preset">
+        {% for name, preset in presets.items() %}
+        <option value="{{ name }}" {% if rules.active_preset == name %}selected{% endif %}>{{ name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="col-auto"><button class="btn btn-primary">Apply</button></div>
+  </form>
+</section>
+
+<section class="mb-4">
+  <h2>Scanner Rules</h2>
+  <form method="post" class="settings-grid">
+    <input type="hidden" name="section" value="rules">
+    {% for key, value in rules.items() %}
+      {% if key != 'active_preset' %}
+      <label class="form-label">{{ key }}
+        {% if value is boolean %}
+        <select class="form-select" name="{{ key }}">
+          <option value="true" {% if value %}selected{% endif %}>true</option>
+          <option value="false" {% if not value %}selected{% endif %}>false</option>
+        </select>
+        {% else %}
+        <input class="form-control" name="{{ key }}" value="{{ value }}">
+        {% endif %}
+      </label>
+      {% endif %}
+    {% endfor %}
+    <button class="btn btn-primary">Save Rules</button>
+  </form>
+</section>
+
+<section>
+  <h2>Risk Settings</h2>
+  <form method="post" class="settings-grid">
+    <input type="hidden" name="section" value="risk">
+    {% for key, value in risk_values.items() %}
+    <label class="form-label">{{ key }}<input class="form-control" name="{{ key }}" value="{{ value }}"></label>
+    {% endfor %}
+    <button class="btn btn-primary">Save Risk</button>
+  </form>
+</section>
+{% endblock %}

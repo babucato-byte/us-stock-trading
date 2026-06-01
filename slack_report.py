@@ -1,159 +1,81 @@
-import os
-import requests
-import yfinance as yf
+from pathlib import Path
+
 import pandas as pd
-from dotenv import load_dotenv
 
-load_dotenv()
+from broker import BrokerConfig
+from market_hours import get_us_market_session
+from slack_utils import send_slack_message
 
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 
-try:
-    watchlist_df = pd.read_csv("watchlist.csv")
-    tickers = watchlist_df["symbol"].dropna().unique().tolist()
-except Exception as e:
-    print(f"watchlist.csv 읽기 실패: {e}")
-    tickers = []
+BASE_DIR = Path(__file__).resolve().parent
 
-def send_slack(message):
 
-    response = requests.post(
-        SLACK_WEBHOOK_URL,
-        json={"text": message},
-        timeout=10
+def _read_csv(name):
+    path = BASE_DIR / name
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _top_symbols(df, limit=5):
+    if df.empty or "symbol" not in df.columns:
+        return "None"
+    return ", ".join(df["symbol"].dropna().astype(str).head(limit).tolist()) or "None"
+
+
+def build_daily_summary():
+    candidates = _read_csv("candidates.csv")
+    strong = _read_csv("strong_candidates.csv")
+    orders = _read_csv("order_candidates.csv")
+    gpt = _read_csv("gpt_candidate_analysis.csv")
+    backtest = _read_csv("backtest_results.csv")
+    broker_config = BrokerConfig()
+
+    market_state = get_us_market_session()
+    backtest_summary = "No backtest file"
+    if not backtest.empty:
+        backtest_summary = f"{len(backtest)} rows available"
+        if "symbol" in backtest.columns:
+            backtest_summary += f"; top: {_top_symbols(backtest)}"
+
+    gpt_summary = "No GPT analysis"
+    if not gpt.empty:
+        gpt_summary = f"{len(gpt)} analyzed; top: {_top_symbols(gpt)}"
+
+    return "\n".join(
+        [
+            "*Daily Value Report*",
+            f"- Market state: {market_state}",
+            f"- Broker guardrail: {broker_config.status_label}",
+            "",
+            "*Candidate summary*",
+            f"- Total candidates: {len(candidates)}",
+            f"- Strong candidates: {len(strong)}",
+            f"- Order review candidates: {len(orders)}",
+            f"- Top candidates: {_top_symbols(candidates)}",
+            "",
+            "*Backtest summary*",
+            f"- {backtest_summary}",
+            "",
+            "*GPT summary*",
+            f"- {gpt_summary}",
+            "",
+            "*Risk status*",
+            "- ENABLE_REAL_TRADING default is False",
+            "- LIVE_DRY_RUN default is True",
+            "- Dashboard cannot enable live trading",
+        ]
     )
 
-    print("Slack 전송 완료")
 
-
-def analyze_stock(symbol):
-
-    ticker = yf.Ticker(symbol)
-
-    df = ticker.history(period="1y")
-
-    if df.empty:
-        return None
-
-    # 200일선
-    df["MA200"] = df["Close"].rolling(window=200).mean()
-
-    # RSI
-    delta = df["Close"].diff()
-
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    avg_gain = gain.rolling(window=14).mean()
-    avg_loss = loss.rolling(window=14).mean()
-
-    rs = avg_gain / avg_loss
-
-    df["RSI"] = 100 - (100 / (1 + rs))
-
-    # 거래량 평균
-    df["AVG_VOLUME_20"] = df["Volume"].rolling(window=20).mean()
-
-    current_price = df["Close"].iloc[-1]
-    ma200 = df["MA200"].iloc[-1]
-
-    rsi = df["RSI"].iloc[-1]
-
-    today_volume = df["Volume"].iloc[-1]
-    avg_volume = df["AVG_VOLUME_20"].iloc[-1]
-
-    volume_ratio = today_volume / avg_volume
-
-    score = 0
-
-    # 점수 계산
-
-    if current_price > ma200:
-        score += 40
-
-    if 40 <= rsi <= 65:
-        score += 30
-
-    if volume_ratio >= 1.5:
-        score += 30
-
-    # 타입 분류
-
-    stock_type = "관찰"
-
-    if score >= 70:
-        stock_type = "급등 가능 후보"
-
-    return {
-        "symbol": symbol,
-        "price": current_price,
-        "ma200": ma200,
-        "rsi": rsi,
-        "volume_ratio": volume_ratio,
-        "score": score,
-        "type": stock_type
-    }
-
-
-results = []
-
-high_score_count = 0
-
-for symbol in tickers:
-
-    try:
-
-        result = analyze_stock(symbol)
-
-        if result:
-            results.append(result)
-
-    except Exception as e:
-
-        print(symbol, e)
-
-
-# 점수순 정렬
-results = sorted(results, key=lambda x: x["score"], reverse=True)
-
-# Slack 메시지 생성
-
-message = "*미국주식 Watchlist 기반 프리마켓 기술 스캐너*\n\n"
-
-if not tickers:
-    message += "watchlist.csv에 분석할 종목이 없습니다."
+def main():
+    message = build_daily_summary()
     print(message)
-    send_slack(message)
-    exit()
+    send_slack_message(message)
 
-for item in results:
 
-    # 점수 70 이상만 출력
-    if item["score"] < 70:
-        continue
-
-    high_score_count += 1
-
-    message += f"""
-*[{item['symbol']}]*
-유형: {item['type']}
-
-현재가: {item['price']:.2f}
-200일선: {item['ma200']:.2f}
-
-RSI: {item['rsi']:.2f}
-
-거래량 배수: {item['volume_ratio']:.2f}배
-
-기술점수: {item['score']}/100
-
-------------------------
-"""
-
-if high_score_count == 0:
-
-    message += "오늘은 조건 만족 종목이 없습니다."
-
-print(message)
-
-send_slack(message)
+if __name__ == "__main__":
+    main()

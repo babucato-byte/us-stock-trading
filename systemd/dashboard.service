@@ -1,0 +1,16 @@
+[Unit]
+Description=Trading Flask Dashboard
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/trading
+Environment=TRADING_MODE=paper
+Environment=ENABLE_REAL_TRADING=False
+Environment=LIVE_DRY_RUN=True
+ExecStart=/home/ubuntu/trading/venv/bin/python /home/ubuntu/trading/dashboard/app.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

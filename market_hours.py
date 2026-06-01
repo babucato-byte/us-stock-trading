@@ -2,8 +2,8 @@ from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
 
-def get_us_market_session():
-    ny_time = datetime.now(ZoneInfo("America/New_York"))
+def get_us_market_session(now=None):
+    ny_time = now.astimezone(ZoneInfo("America/New_York")) if now else datetime.now(ZoneInfo("America/New_York"))
 
     if ny_time.weekday() >= 5:
         return "closed"
@@ -27,12 +27,12 @@ def get_us_market_session():
     return "closed"
 
 
-def is_us_regular_market_open():
-    return get_us_market_session() == "regular"
+def is_us_regular_market_open(now=None):
+    return get_us_market_session(now) == "regular"
 
 
-def is_us_premarket():
-    return get_us_market_session() == "premarket"
+def is_us_premarket(now=None):
+    return get_us_market_session(now) == "premarket"
 
 
 if __name__ == "__main__":

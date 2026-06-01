@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="row g-3 mb-3">
+  <div class="col-12 col-md-3"><div class="metric"><span>Broker</span><strong>{{ broker.status_label }}</strong></div></div>
+  <div class="col-12 col-md-3"><div class="metric"><span>Market</span><strong>{{ market_session }}</strong></div></div>
+  <div class="col-12 col-md-3"><div class="metric"><span>systemd</span><strong>{{ systemd_status }}</strong></div></div>
+  <div class="col-12 col-md-3"><div class="metric"><span>Live Guard</span><strong>Locked</strong></div></div>
+</div>
+
+<div class="row g-3">
+  {% for key, value in counts.items() %}
+  <div class="col-6 col-lg-2">
+    <a class="metric link-metric" href="{{ url_for('table', name=key) }}">
+      <span>{{ key.replace('_', ' ') }}</span>
+      <strong>{{ value }}</strong>
+    </a>
+  </div>
+  {% endfor %}
+</div>
+
+<section class="mt-4">
+  <h2>Cron</h2>
+  <pre class="ops-output">{{ cron_status }}</pre>
+</section>
+{% endblock %}
