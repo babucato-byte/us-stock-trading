@@ -4,3 +4,9 @@ __pycache__/
 .env
 backtest_results.csv
 watchlist.csv
+candidates.csv
+strong_candidates.csv
+order_candidates.csv
+previous_candidates.csv
+gpt_candidate_analysis.csv
+logs/
