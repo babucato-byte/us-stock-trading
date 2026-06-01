@@ -1,1 +1,4 @@
 symbol,side,qty,filled_avg_price,current_price,unrealized_pl,unrealized_plpc,status,submitted_at,filled_at
+F,buy,1,13.09,17.36,8.53,32.57,filled,2026-05-20T09:20:17.000365Z,2026-05-20T13:31:55.714362Z
+F,buy,1,13.1,17.36,8.53,32.57,filled,2026-05-20T08:21:27.853486Z,2026-05-20T13:31:09.852078Z
+AAPL,buy,1,300.02,310.43,10.41,3.47,filled,2026-05-20T08:00:24.997918Z,2026-05-20T13:32:16.59488Z
