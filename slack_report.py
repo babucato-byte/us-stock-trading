@@ -49,6 +49,18 @@ def _broker_mode_label(value):
     return labels.get(str(value), str(value))
 
 
+def _ai_provider_label(gpt_df):
+    if gpt_df.empty or "provider" not in gpt_df.columns:
+        return "규칙 기반 fallback"
+    provider = str(gpt_df["provider"].dropna().astype(str).iloc[0]).lower()
+    labels = {
+        "openai": "ChatGPT API",
+        "gemini": "Gemini API",
+        "fallback": "규칙 기반 fallback",
+    }
+    return labels.get(provider, provider or "규칙 기반 fallback")
+
+
 def format_count(value):
     return f"{int(value):,}개"
 
@@ -71,6 +83,7 @@ def build_daily_summary():
             backtest_top = f"상위 종목: {_top_symbols(backtest)}"
 
     gpt_done = "분석 완료: 0건"
+    gpt_provider = f"분석 방식: {_ai_provider_label(gpt)}"
     gpt_top = "주요 종목: 없음"
     if not gpt.empty:
         gpt_done = f"분석 완료: {len(gpt):,}건"
@@ -98,6 +111,7 @@ def build_daily_summary():
             "",
             "🤖 AI 분석 현황",
             f"- {gpt_done}",
+            f"- {gpt_provider}",
             f"- {gpt_top}",
             "",
             "📈 성과 요약",

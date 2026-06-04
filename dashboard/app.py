@@ -123,6 +123,8 @@ def create_app():
         if name not in CSV_FILES:
             return redirect(url_for("index"))
         df = read_csv(CSV_FILES[name])
+        if name == "gpt":
+            df = ensure_ai_provider_columns(df)
         return render_template(
             "table.html",
             name=name,
@@ -245,6 +247,21 @@ def read_csv(filename):
         return pd.read_csv(path)
     except Exception:
         return pd.DataFrame()
+
+
+def ensure_ai_provider_columns(df):
+    if df.empty:
+        for column in ["provider", "model"]:
+            if column not in df.columns:
+                df[column] = []
+        return df
+    if "provider" not in df.columns:
+        df["provider"] = "fallback"
+    df["provider"] = df["provider"].fillna("fallback").replace("", "fallback")
+    if "model" not in df.columns:
+        df["model"] = "fallback"
+    df["model"] = df["model"].fillna("fallback").replace("", "fallback")
+    return df
 
 
 def read_json(path, fallback):

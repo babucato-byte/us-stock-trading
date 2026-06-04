@@ -61,6 +61,44 @@ python order_monitor.py
 
 `paper_strategy_order.py`는 정규장(`regular`)에서만 주문을 검토합니다. 프리마켓과 애프터마켓에서는 알림만 보내고 주문하지 않습니다.
 
+## AI Analysis
+
+`gpt_analysis.py`는 후보 종목을 분석해 `gpt_candidate_analysis.csv`에 저장하는 보조 분석 레이어입니다. AI 분석 결과는 Slack, Dashboard, CSV에만 반영되며 주문 실행 조건의 최종 결정권을 갖지 않습니다. Paper Trading 검증 관점의 참고 정보로만 사용하세요.
+
+분석 우선순위:
+
+- `AI_ANALYSIS_PROVIDER=auto`: `OPENAI_API_KEY`가 있으면 ChatGPT API, 없으면 `GEMINI_API_KEY`로 Gemini API, 둘 다 없으면 규칙 기반 fallback
+- `AI_ANALYSIS_PROVIDER=openai`: OpenAI 키가 있을 때 ChatGPT API 사용, 없으면 fallback
+- `AI_ANALYSIS_PROVIDER=gemini`: Gemini 키가 있을 때 Gemini API 사용, 없으면 fallback
+- `AI_ANALYSIS_PROVIDER=fallback`: API 비용 없이 규칙 기반 분석만 사용
+
+OpenAI 사용:
+
+```env
+AI_ANALYSIS_PROVIDER=openai
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-4o-mini
+AI_ANALYSIS_LIMIT=10
+```
+
+Gemini 사용:
+
+```env
+AI_ANALYSIS_PROVIDER=gemini
+GEMINI_API_KEY=
+GEMINI_MODEL=gemini-1.5-flash
+AI_ANALYSIS_LIMIT=10
+```
+
+무료 운영 또는 API Key 미설정 시:
+
+```env
+AI_ANALYSIS_PROVIDER=fallback
+AI_ANALYSIS_LIMIT=10
+```
+
+기본 분석 대상은 `strong_candidates.csv` 상위 10개이며 `AI_ANALYSIS_LIMIT`로 조정할 수 있습니다. API 사용 시 후보 수와 실행 빈도에 따라 비용이 발생할 수 있으므로 cron 주기와 limit 값을 보수적으로 관리하세요.
+
 ## Slack Channels
 
 - `SLACK_ALERT_WEBHOOK_URL`: `#realtime-alerts`
