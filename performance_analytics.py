@@ -41,6 +41,23 @@ TRADE_COLUMNS = [
     "filled_at",
 ]
 
+SUMMARY_LABELS = {
+    "total_orders": "전체 주문 수",
+    "filled_orders": "체결 주문 수",
+    "canceled_orders": "취소 주문 수",
+    "rejected_orders": "거절 주문 수",
+    "open_positions": "보유 종목 수",
+    "win_rate": "승률",
+    "avg_profit_pct": "평균 수익률",
+    "avg_loss_pct": "평균 손실률",
+    "profit_factor": "손익비",
+    "total_unrealized_pl": "미실현 손익",
+    "daily_return_pct": "일일 수익률",
+    "best_symbol": "최고 성과 종목",
+    "worst_symbol": "최저 성과 종목",
+    "generated_at": "생성 시각",
+}
+
 
 def read_csv(path, columns=None):
     if not path.exists():
@@ -266,12 +283,12 @@ def generate_performance_report(broker=None, write_files=True):
 
 def main():
     summary, trades_df = generate_performance_report()
-    print("Performance Summary")
+    print("성과 요약")
     for key in SUMMARY_COLUMNS:
-        print(f"- {key}: {summary.get(key, '')}")
-    print(f"Trades: {len(trades_df)}")
+        print(f"- {SUMMARY_LABELS.get(key, key)}: {summary.get(key, '')}")
+    print(f"거래 내역 수: {len(trades_df):,}건")
     if summary.get("api_error"):
-        print(f"API fallback: {summary['api_error']}")
+        print(f"API 대체 처리: {summary['api_error']}")
 
 
 if __name__ == "__main__":

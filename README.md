@@ -72,11 +72,17 @@ python order_monitor.py
   - smart-money 상위 후보
   - 정규장 주문 가능 여부
 - `SLACK_WEBHOOK_URL`: `#value-report`
+  - 한국어 기준 `일일 운영 리포트`를 전송합니다.
   - 시장 상태
-  - 후보 요약
+  - 거래 모드
+  - 후보 종목 현황
   - 백테스트 요약
-  - GPT 요약
+  - AI 분석 현황
+  - 성과 요약
   - 리스크 상태
+  - 실거래 기본값: 비활성화
+  - Dry Run 기본값: 활성화
+  - Dashboard에서 실거래 활성화 불가
 
 ## Scanner Presets
 

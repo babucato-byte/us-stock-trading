@@ -1,4 +1,5 @@
 import os
+
 import requests
 from dotenv import load_dotenv
 
@@ -10,13 +11,13 @@ SLACK_ALERT_WEBHOOK_URL = os.getenv("SLACK_ALERT_WEBHOOK_URL")
 
 def _send(webhook_url, message):
     if not webhook_url:
-        print("Slack Webhook URL이 없습니다.")
+        print("Slack Webhook URL이 설정되지 않았습니다.")
         return False
 
     response = requests.post(
         webhook_url,
         json={"text": message},
-        timeout=10
+        timeout=10,
     )
 
     if response.status_code == 200:
