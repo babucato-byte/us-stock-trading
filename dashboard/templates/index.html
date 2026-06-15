@@ -3,7 +3,7 @@
 <h1>대시보드</h1>
 <div class="row g-3 mb-3">
   <div class="col-12 col-md-3"><div class="metric"><span>거래 모드</span><strong>{{ value_label(broker.status_label) }}</strong><small>현재 주문 실행 환경</small></div></div>
-  <div class="col-12 col-md-3"><div class="metric"><span>시장 상태</span><strong>{{ value_label(market_session) }}</strong><small>미국장 세션 기준</small></div></div>
+  <div class="col-12 col-md-3"><div class="metric"><span>시장 상태</span><strong>{{ market_session.label }}</strong><small>{{ market_session.detail or '미국장 세션 기준' }}</small></div></div>
   <div class="col-12 col-md-3"><div class="metric"><span>서비스 상태</span><strong>{{ value_label(systemd_status) }}</strong><small>주문 모니터 서비스</small></div></div>
   <div class="col-12 col-md-3"><div class="metric"><span>실거래 보호</span><strong>실거래 차단</strong><small>Dashboard에서 해제 불가</small></div></div>
 </div>

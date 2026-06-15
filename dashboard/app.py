@@ -13,7 +13,7 @@ if str(BASE_DIR) not in sys.path:
 
 from broker import BrokerConfig
 from daily_candidate_scanner import SUPPORTED_FIELDS, SUPPORTED_OPERATORS, normalize_rules
-from market_hours import get_us_market_session
+from market_hours import get_market_state_info
 from performance_analytics import generate_performance_report
 
 
@@ -119,7 +119,7 @@ def create_app():
             "index.html",
             counts=counts,
             broker=broker,
-            market_session=get_us_market_session(),
+            market_session=get_market_state_info(),
             systemd_status=get_systemd_status(),
             cron_status=get_cron_status(),
             performance_summary=performance_summary,
@@ -250,13 +250,25 @@ def value_label(value):
 
 
 def read_csv(filename):
-    path = BASE_DIR / filename
+    path = resolve_latest_csv(filename)
     if not path.exists():
         return pd.DataFrame()
     try:
         return pd.read_csv(path)
     except Exception:
         return pd.DataFrame()
+
+
+def resolve_latest_csv(filename):
+    candidates = [BASE_DIR / filename]
+    candidates.extend(
+        path for path in BASE_DIR.rglob(filename)
+        if ".git" not in path.parts and "__pycache__" not in path.parts
+    )
+    existing = [path for path in candidates if path.exists()]
+    if not existing:
+        return BASE_DIR / filename
+    return max(existing, key=lambda path: path.stat().st_mtime)
 
 
 def ensure_ai_provider_columns(df):

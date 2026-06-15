@@ -4,7 +4,7 @@ import sys
 import pandas as pd
 
 from broker import BrokerConfig
-from market_hours import get_us_market_session
+from market_hours import get_market_state_info
 from performance_analytics import generate_performance_report
 from slack_utils import send_slack_message
 
@@ -12,8 +12,20 @@ from slack_utils import send_slack_message
 BASE_DIR = Path(__file__).resolve().parent
 
 
+def resolve_latest_csv(name):
+    candidates = [BASE_DIR / name]
+    candidates.extend(
+        path for path in BASE_DIR.rglob(name)
+        if ".git" not in path.parts and "__pycache__" not in path.parts
+    )
+    existing = [path for path in candidates if path.exists()]
+    if not existing:
+        return BASE_DIR / name
+    return max(existing, key=lambda path: path.stat().st_mtime)
+
+
 def _read_csv(name):
-    path = BASE_DIR / name
+    path = resolve_latest_csv(name)
     if not path.exists():
         return pd.DataFrame()
     try:
@@ -37,6 +49,13 @@ def _market_state_label(value):
         "closed": "장 마감",
     }
     return labels.get(str(value), str(value))
+
+
+def _market_state_lines(market_state):
+    lines = [f"- {market_state.label}"]
+    if market_state.detail:
+        lines.append(f"- {market_state.detail}")
+    return lines
 
 
 def _broker_mode_label(value):
@@ -74,7 +93,7 @@ def build_daily_summary():
     broker_config = BrokerConfig()
     performance_summary, _ = generate_performance_report()
 
-    market_state = get_us_market_session()
+    market_state = get_market_state_info()
     backtest_saved = "저장 결과: 0건"
     backtest_top = "상위 종목: 없음"
     if not backtest.empty:
@@ -94,7 +113,7 @@ def build_daily_summary():
             "📊 일일 운영 리포트",
             "",
             "시장 상태",
-            f"- {_market_state_label(market_state)}",
+            *_market_state_lines(market_state),
             "",
             "거래 모드",
             f"- {_broker_mode_label(broker_config.status_label)}",
