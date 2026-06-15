@@ -77,6 +77,24 @@
       {"field": "smart_money_score", "operator": ">=", "value": 0}
     ]
   },
+  "premarket_momentum_score": {
+    "description": "Standalone score scanner preset. Records premarket momentum candidates only.",
+    "scan_limit": 30,
+    "output_file": "logs/score_scanner_candidates.csv",
+    "paper_trade_log": "logs/paper_trades_score_scanner.csv",
+    "min_score": 70,
+    "required": {
+      "price_above_vwap": true,
+      "ema9_above_ema21": true,
+      "volume_multiple_min": 3.0,
+      "premarket_gain_pct_min": 10.0
+    },
+    "bonus": {
+      "break_prev_high": 20,
+      "adx_gt_25": 10,
+      "near_or_break_52w_high": 10
+    }
+  },
   "live_dry_run": {
     "description": "Strict pre-live dry-run profile. Does not enable live orders.",
     "scan_limit": 1000,

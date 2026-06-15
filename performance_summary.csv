@@ -1,2 +1,2 @@
 total_orders,filled_orders,canceled_orders,rejected_orders,open_positions,win_rate,avg_profit_pct,avg_loss_pct,profit_factor,total_unrealized_pl,daily_return_pct,best_symbol,worst_symbol,generated_at
-4,3,0,0,2,100.0,22.87,0.0,27.47,18.94,-0.0,AAPL,,2026-06-01 12:46:41
+1,0,0,0,0,0.0,0.0,0.0,0.0,0.0,0.0,,,2026-06-15 20:58:14

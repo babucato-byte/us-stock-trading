@@ -157,6 +157,29 @@ TECH_FILTER_WEIGHT_MACD_HISTOGRAM_RISING=2
 TECH_FILTER_WEIGHT_SQZMOM_GREEN=2
 ```
 
+Premarket momentum score scanner:
+
+```bash
+python score_scanner/premarket_momentum_score.py --dry-run --limit 30
+python score_scanner/premarket_momentum_score.py --dry-run --sample
+```
+
+Outputs:
+
+```text
+logs/score_scanner_candidates.csv
+logs/paper_trades_score_scanner.csv
+```
+
+Scoring:
+
+```text
+Required all pass: price > VWAP, EMA9 > EMA21, volume_multiple > 3, premarket_gain_pct >= 10
+Base score: 50
+Bonus: previous high breakout +20, ADX > 25 +10, price >= 98% of 52-week high +10
+Candidate threshold: score >= 70
+```
+
 ## Dashboard
 
 ```bash
