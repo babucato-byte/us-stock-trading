@@ -22,7 +22,13 @@ def candidate_payload(row):
         "rsi": row.get("rsi"),
         "volume_ratio": row.get("volume_ratio"),
         "score": row.get("score"),
+        "technical_score": row.get("technical_score", row.get("score")),
         "smart_money_score": row.get("smart_money_score"),
+        "trend": row.get("trend"),
+        "trend_score": row.get("trend_score"),
+        "momentum_score": row.get("momentum_score"),
+        "breakout_score": row.get("breakout_score"),
+        "final_score": row.get("final_score"),
         "avg_dollar_volume": row.get("avg_dollar_volume"),
         "scan_time": row.get("scan_time"),
     }

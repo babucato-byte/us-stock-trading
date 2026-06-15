@@ -78,3 +78,27 @@ h2 {
   font-size: 1.1rem;
   margin-bottom: 12px;
 }
+
+.trend-cell {
+  font-weight: 700;
+}
+
+.trend-strong-uptrend {
+  color: #2fd36b;
+}
+
+.trend-uptrend {
+  color: #8bdc65;
+}
+
+.trend-sideways {
+  color: #f5d547;
+}
+
+.trend-downtrend {
+  color: #f59f45;
+}
+
+.trend-strong-downtrend {
+  color: #ff5b5b;
+}

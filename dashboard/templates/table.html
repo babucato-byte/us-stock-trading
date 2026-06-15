@@ -7,11 +7,15 @@
 <div class="table-responsive">
   <table class="table table-sm table-striped align-middle">
     <thead>
-      <tr>{% for col in columns %}<th>{{ col }}</th>{% endfor %}</tr>
+      <tr>{% for col in columns %}<th>{{ ui_label(col) }}</th>{% endfor %}</tr>
     </thead>
     <tbody>
       {% for row in rows %}
-      <tr>{% for col in columns %}<td>{{ row[col] }}</td>{% endfor %}</tr>
+      <tr>
+        {% for col in columns %}
+        <td class="{% if col == 'trend' %}trend-cell trend-{{ row[col]|string|lower|replace(' ', '-') }}{% endif %}">{{ row[col] }}</td>
+        {% endfor %}
+      </tr>
       {% endfor %}
     </tbody>
   </table>

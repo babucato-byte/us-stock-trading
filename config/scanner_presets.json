@@ -62,6 +62,21 @@
       {"field": "above_ma200", "operator": "==", "value": true}
     ]
   },
+  "smoke_test": {
+    "description": "Small loose scan for quickly verifying scanner and technical-filter plumbing.",
+    "scan_limit": 30,
+    "top_alert_count": 5,
+    "avg_volume_window": 20,
+    "rsi_period": 14,
+    "filters": [
+      {"field": "price", "operator": ">=", "value": 0},
+      {"field": "avg_dollar_volume", "operator": ">=", "value": 0},
+      {"field": "rsi", "operator": "between", "min": 0, "max": 100},
+      {"field": "volume_ratio", "operator": ">=", "value": 0},
+      {"field": "score", "operator": ">=", "value": 0},
+      {"field": "smart_money_score", "operator": ">=", "value": 0}
+    ]
+  },
   "live_dry_run": {
     "description": "Strict pre-live dry-run profile. Does not enable live orders.",
     "scan_limit": 1000,

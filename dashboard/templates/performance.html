@@ -28,6 +28,21 @@
   <div class="col-12 col-md-6"><div class="metric"><span>최대 손실 종목</span><strong>{{ summary.worst_symbol or '없음' }}</strong><small>미실현 손익 기준</small></div></div>
 </div>
 
+<div class="row g-3 mb-4">
+  <div class="col-12 col-lg-4">
+    <h2>Trend별 승률</h2>
+    {{ segment_table(trend_stats, 'trend') }}
+  </div>
+  <div class="col-12 col-lg-4">
+    <h2>Momentum별 승률</h2>
+    {{ segment_table(momentum_stats, 'momentum_bucket') }}
+  </div>
+  <div class="col-12 col-lg-4">
+    <h2>Breakout별 승률</h2>
+    {{ segment_table(breakout_stats, 'breakout_bucket') }}
+  </div>
+</div>
+
 <section>
   <h2>최근 체결 내역</h2>
   {% if not trades %}
@@ -49,3 +64,27 @@
 </section>
 {% endif %}
 {% endblock %}
+
+{% macro segment_table(rows, label_column) -%}
+{% if not rows %}
+<div class="alert alert-info">데이터 없음</div>
+{% else %}
+<div class="table-responsive">
+  <table class="table table-sm table-striped align-middle">
+    <thead>
+      <tr><th>Segment</th><th>Trades</th><th>Win Rate</th><th>PF</th></tr>
+    </thead>
+    <tbody>
+      {% for row in rows %}
+      <tr>
+        <td>{{ row[label_column] }}</td>
+        <td>{{ row.trade_count }}</td>
+        <td>{{ row.win_rate }}%</td>
+        <td>{{ row.profit_factor }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+{%- endmacro %}

@@ -132,6 +132,31 @@ AI_ANALYSIS_LIMIT=10
 - `paper_safe`: 기본 Paper 운영값
 - `live_dry_run`: 실거래 전 리허설용 엄격 조건, Live 주문 활성화 아님
 
+Smoke test:
+
+```bash
+SCAN_LIMIT=30 USE_TECHNICAL_ENTRY_FILTER=true python scanner.py --preset smoke_test
+python scanner.py --limit 30 --preset smoke_test
+```
+
+Technical filter log report:
+
+```bash
+python update_technical_filter_performance.py
+python analyze_technical_filter_log.py
+```
+
+Technical filter score weights:
+
+```env
+TECHNICAL_FILTER_MIN_SCORE=5
+TECH_FILTER_WEIGHT_PRICE_ABOVE_HMA200=1
+TECH_FILTER_WEIGHT_HMA200_RISING=2
+TECH_FILTER_WEIGHT_HMA_MACD_BULLISH=1
+TECH_FILTER_WEIGHT_MACD_HISTOGRAM_RISING=2
+TECH_FILTER_WEIGHT_SQZMOM_GREEN=2
+```
+
 ## Dashboard
 
 ```bash

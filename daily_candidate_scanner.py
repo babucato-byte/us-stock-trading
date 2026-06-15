@@ -1,5 +1,6 @@
 import json
 import math
+import os
 import warnings
 from dataclasses import dataclass
 from datetime import datetime
@@ -7,10 +8,17 @@ from pathlib import Path
 
 import pandas as pd
 import yfinance as yf
+from dotenv import load_dotenv
 
+from breakout_engine import calculate_breakout
+from indicators import TECHNICAL_CHECK_COLUMNS, technical_entry_filter
 from market_hours import get_us_market_session
+from momentum_engine import calculate_momentum_score
 from slack_utils import send_slack_alert
+from trend_engine import calculate_trend
 
+
+load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_DIR = BASE_DIR / "config"
@@ -21,6 +29,7 @@ CANDIDATES_FILE = BASE_DIR / "candidates.csv"
 STRONG_CANDIDATES_FILE = BASE_DIR / "strong_candidates.csv"
 ORDER_CANDIDATES_FILE = BASE_DIR / "order_candidates.csv"
 PREVIOUS_CANDIDATES_FILE = BASE_DIR / "previous_candidates.csv"
+TECHNICAL_FILTER_LOG_FILE = BASE_DIR / "technical_filter_log.csv"
 
 DEFAULT_FILTERS = [
     {"field": "price", "operator": ">=", "value": 5},
@@ -40,6 +49,30 @@ DEFAULT_RULES = {
     "filters": DEFAULT_FILTERS,
 }
 
+TECHNICAL_FILTER_COLUMNS = [
+    "technical_filter_pass",
+    "technical_filter_score",
+    *TECHNICAL_CHECK_COLUMNS,
+]
+
+TECHNICAL_FILTER_LOG_COLUMNS = [
+    "scan_id",
+    "timestamp",
+    "symbol",
+    "current_price",
+    "technical_filter_pass",
+    "technical_filter_score",
+    "price_above_hma200",
+    "hma200_rising",
+    "hma_macd_bullish",
+    "macd_histogram_rising",
+    "sqzmom_green",
+    "volume_multiple",
+    "rsi",
+    "smart_money_score",
+    "preset",
+]
+
 SUPPORTED_OPERATORS = {">=", "<=", ">", "<", "==", "!=", "between", "in", "not_in"}
 SUPPORTED_FIELDS = {
     "symbol",
@@ -53,7 +86,14 @@ SUPPORTED_FIELDS = {
     "avg_dollar_volume",
     "dollar_volume",
     "score",
+    "technical_score",
     "smart_money_score",
+    "trend",
+    "trend_score",
+    "momentum_score",
+    "breakout_flag",
+    "breakout_score",
+    "final_score",
     "type",
     "atr",
     "gap_percent",
@@ -115,6 +155,100 @@ def normalize_rules(rules):
     return normalized
 
 
+def env_bool(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def env_int(name, default=None):
+    value = os.getenv(name)
+    if value is None or str(value).strip() == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        warn_skip(f"Environment variable '{name}' must be an integer; ignored.")
+        return default
+
+
+def use_technical_entry_filter():
+    return env_bool("USE_TECHNICAL_ENTRY_FILTER", True)
+
+
+def resolve_scan_limit(rules, override_limit=None):
+    base_limit = int(rules["scan_limit"])
+    requested = override_limit if override_limit is not None else env_int("SCAN_LIMIT")
+    if requested is None:
+        return base_limit, False
+    try:
+        limit = int(requested)
+    except (TypeError, ValueError):
+        warn_skip(f"Scan limit '{requested}' must be an integer; using configured scan_limit.")
+        return base_limit, False
+    if limit <= 0:
+        warn_skip(f"Scan limit '{requested}' must be positive; using configured scan_limit.")
+        return base_limit, False
+    return min(base_limit, limit), True
+
+
+def technical_filter_result_fields(result):
+    checks = result.get("checks", {}) if result else {}
+    fields = {
+        "technical_filter_pass": bool(result.get("pass", False)) if result else False,
+        "technical_filter_score": int(result.get("score", 0)) if result else 0,
+    }
+    for column in TECHNICAL_CHECK_COLUMNS:
+        fields[column] = bool(checks.get(column, False))
+    return fields
+
+
+def create_scan_id(now=None):
+    now = now or datetime.now()
+    return now.strftime("%Y%m%d_%H%M%S")
+
+
+def technical_filter_log_row(metrics, result, scan_id, rules):
+    fields = technical_filter_result_fields(result)
+    return {
+        "scan_id": scan_id,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "symbol": metrics.get("symbol"),
+        "current_price": round(metrics["price"], 4) if metrics.get("price") is not None else None,
+        "technical_filter_pass": fields["technical_filter_pass"],
+        "technical_filter_score": fields["technical_filter_score"],
+        "price_above_hma200": fields["price_above_hma200"],
+        "hma200_rising": fields["hma200_rising"],
+        "hma_macd_bullish": fields["hma_macd_bullish"],
+        "macd_histogram_rising": fields["macd_histogram_rising"],
+        "sqzmom_green": fields["sqzmom_green"],
+        "volume_multiple": round(metrics["volume_ratio"], 4) if metrics.get("volume_ratio") is not None else None,
+        "rsi": round(metrics["rsi"], 4) if metrics.get("rsi") is not None else None,
+        "smart_money_score": int(metrics.get("smart_money_score", 0)),
+        "preset": rules.get("active_preset"),
+    }
+
+
+def save_technical_filter_log(rows):
+    if not rows:
+        if not TECHNICAL_FILTER_LOG_FILE.exists():
+            pd.DataFrame(columns=TECHNICAL_FILTER_LOG_COLUMNS).to_csv(TECHNICAL_FILTER_LOG_FILE, index=False)
+        return
+
+    new_rows = pd.DataFrame(rows, columns=TECHNICAL_FILTER_LOG_COLUMNS)
+    if TECHNICAL_FILTER_LOG_FILE.exists():
+        existing = pd.read_csv(TECHNICAL_FILTER_LOG_FILE)
+        missing_columns = [column for column in TECHNICAL_FILTER_LOG_COLUMNS if column not in existing.columns]
+        for column in missing_columns:
+            existing[column] = None
+        combined = pd.concat([existing[TECHNICAL_FILTER_LOG_COLUMNS], new_rows], ignore_index=True)
+    else:
+        combined = new_rows
+    combined = combined.drop_duplicates(subset=["scan_id", "symbol"], keep="last")
+    combined.to_csv(TECHNICAL_FILTER_LOG_FILE, index=False)
+
+
 def legacy_rules_to_filters(rules):
     filters = [
         {"field": "price", "operator": ">=", "value": rules.get("min_price", 5)},
@@ -172,7 +306,7 @@ class CandidateBuckets:
     order_candidates: pd.DataFrame
 
 
-def analyze(symbol, rules):
+def analyze(symbol, rules, scan_id=None, technical_log_rows=None):
     try:
         df = yf.Ticker(symbol).history(period="1y")
         metrics = build_symbol_metrics(symbol, df, rules)
@@ -180,6 +314,22 @@ def analyze(symbol, rules):
             return None
         if not apply_filters(metrics, rules.get("filters", [])):
             return None
+        if use_technical_entry_filter():
+            result = technical_entry_filter(df)
+            print(f"[TECH FILTER] {symbol} pass={result['pass']} score={result['score']} checks={result['checks']}")
+            if technical_log_rows is not None:
+                technical_log_rows.append(technical_filter_log_row(metrics, result, scan_id, rules))
+            if not result["pass"]:
+                return None
+            metrics.update(technical_filter_result_fields(result))
+        else:
+            metrics.update(
+                {
+                    "technical_filter_pass": None,
+                    "technical_filter_score": None,
+                    **{column: None for column in TECHNICAL_CHECK_COLUMNS},
+                }
+            )
         return candidate_from_metrics(metrics, rules)
     except Exception as exc:
         print(f"{symbol} scan failed: {exc}")
@@ -195,6 +345,8 @@ def build_symbol_metrics(symbol, df, rules):
         return None
 
     df = df.copy()
+    trend_metrics = calculate_trend(df)
+    breakout_metrics = calculate_breakout(df)
     df["MA200"] = df["Close"].rolling(window=200).mean()
     df["RSI"] = calculate_rsi(df, rsi_period)
     df["AVG_VOLUME"] = df["Volume"].rolling(window=avg_window).mean()
@@ -213,6 +365,7 @@ def build_symbol_metrics(symbol, df, rules):
     volume_ratio = volume / avg_volume
     avg_dollar_volume = price * avg_volume
     dollar_volume = price * volume
+    momentum_score = calculate_momentum_score(rsi, volume_ratio, dollar_volume, volume_ratio)
     above_ma200 = price > ma200 if ma200 is not None else False
     rsi_in_default_range = 40 <= rsi <= 65 if rsi is not None else False
     gap_percent = ((price - previous_close) / previous_close) * 100 if previous_close else None
@@ -235,9 +388,20 @@ def build_symbol_metrics(symbol, df, rules):
     if rsi_in_default_range:
         smart_money_score += 20
 
+    technical_score = int(score)
+    final_score = calculate_final_score(
+        technical_score,
+        smart_money_score,
+        trend_metrics["trend_score"],
+        momentum_score,
+        breakout_metrics["breakout_score"],
+    )
+
     return {
         "symbol": symbol,
         "price": price,
+        "ma20": trend_metrics["ma20"],
+        "ma50": trend_metrics["ma50"],
         "ma200": ma200,
         "above_ma200": above_ma200,
         "rsi": rsi,
@@ -247,7 +411,14 @@ def build_symbol_metrics(symbol, df, rules):
         "avg_dollar_volume": avg_dollar_volume,
         "dollar_volume": dollar_volume,
         "score": int(score),
+        "technical_score": technical_score,
         "smart_money_score": int(smart_money_score),
+        "trend": trend_metrics["trend"],
+        "trend_score": trend_metrics["trend_score"],
+        "momentum_score": momentum_score,
+        "breakout_flag": breakout_metrics["breakout_flag"],
+        "breakout_score": breakout_metrics["breakout_score"],
+        "final_score": final_score,
         "atr": atr,
         "gap_percent": gap_percent,
         "market_cap": None,
@@ -257,6 +428,24 @@ def build_symbol_metrics(symbol, df, rules):
         "sector": None,
         "exchange": None,
     }
+
+
+def calculate_final_score(technical_score, smart_money_score, trend_score, momentum_score, breakout_score):
+    weighted = (
+        safe_score(technical_score) * 0.20
+        + safe_score(smart_money_score) * 0.20
+        + safe_score(trend_score) * 0.25
+        + safe_score(momentum_score) * 0.25
+        + safe_score(breakout_score) * 0.10
+    )
+    return int(max(0, min(100, round(weighted))))
+
+
+def safe_score(value):
+    try:
+        return max(0, min(100, float(value)))
+    except Exception:
+        return 0
 
 
 def safe_float(value):
@@ -271,19 +460,31 @@ def candidate_from_metrics(metrics, rules):
     smart_money_score = int(metrics["smart_money_score"])
     smart_money_min = int(get_filter_threshold(rules, "smart_money_score", 50))
     stock_type = "smart_money" if smart_money_score >= smart_money_min else "technical"
-    return {
+    candidate = {
         "symbol": metrics["symbol"],
         "price": round(metrics["price"], 2),
+        "ma20": round(metrics["ma20"], 2) if metrics.get("ma20") is not None else None,
+        "ma50": round(metrics["ma50"], 2) if metrics.get("ma50") is not None else None,
         "ma200": round(metrics["ma200"], 2),
         "rsi": round(metrics["rsi"], 2),
         "volume_ratio": round(metrics["volume_ratio"], 2),
         "avg_dollar_volume": round(metrics["avg_dollar_volume"], 0),
         "dollar_volume": round(metrics["dollar_volume"], 0),
         "score": int(metrics["score"]),
+        "technical_score": int(metrics["technical_score"]),
         "smart_money_score": smart_money_score,
+        "trend": metrics["trend"],
+        "trend_score": int(metrics["trend_score"]),
+        "momentum_score": int(metrics["momentum_score"]),
+        "breakout_flag": bool(metrics["breakout_flag"]),
+        "breakout_score": int(metrics["breakout_score"]),
+        "final_score": int(metrics["final_score"]),
         "type": stock_type,
         "scan_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
+    for column in TECHNICAL_FILTER_COLUMNS:
+        candidate[column] = metrics.get(column)
+    return candidate
 
 
 def apply_filters(metrics, filters):
@@ -385,15 +586,25 @@ def empty_candidates_frame():
         columns=[
             "symbol",
             "price",
+            "ma20",
+            "ma50",
             "ma200",
             "rsi",
             "volume_ratio",
             "avg_dollar_volume",
             "dollar_volume",
             "score",
+            "technical_score",
             "smart_money_score",
+            "trend",
+            "trend_score",
+            "momentum_score",
+            "breakout_flag",
+            "breakout_score",
+            "final_score",
             "type",
             "scan_time",
+            *TECHNICAL_FILTER_COLUMNS,
         ]
     )
 
@@ -404,10 +615,8 @@ def build_candidate_buckets(df, rules):
         empty = empty_candidates_frame()
         return CandidateBuckets(empty, empty.copy(), empty.copy())
 
-    df = df.sort_values(
-        by=["score", "smart_money_score", "volume_ratio"],
-        ascending=False,
-    ).reset_index(drop=True)
+    sort_columns = [col for col in ["final_score", "score", "smart_money_score", "volume_ratio"] if col in df.columns]
+    df = df.sort_values(by=sort_columns, ascending=False).reset_index(drop=True)
     smart_money_min = int(get_filter_threshold(rules, "smart_money_score", 50))
     score_min = int(get_filter_threshold(rules, "score", 70))
     volume_ratio_min = float(get_filter_threshold(rules, "volume_ratio", 1.2))
@@ -417,6 +626,8 @@ def build_candidate_buckets(df, rules):
         & (df["smart_money_score"] >= smart_money_min)
         & (df["volume_ratio"] >= volume_ratio_min)
     ].copy()
+    if use_technical_entry_filter() and "technical_filter_pass" in order_candidates.columns:
+        order_candidates = order_candidates[order_candidates["technical_filter_pass"] == True].copy()
     return CandidateBuckets(df, strong.reset_index(drop=True), order_candidates.reset_index(drop=True))
 
 
@@ -483,6 +694,13 @@ def build_realtime_slack_message(df, rules, market_session, previous_symbols=Non
                 f"   기술점수: {int(row['score'])} | 수급점수: {int(row['smart_money_score'])}"
             )
             lines.append("")
+            lines.append(f"   Trend: {row.get('trend', 'Unknown')}")
+            lines.append(f"   Trend Score: {format_int(row.get('trend_score'))}")
+            lines.append(f"   Momentum: {format_int(row.get('momentum_score'))}")
+            lines.append(f"   Breakout: {format_yes_no(row.get('breakout_flag'))}")
+            lines.append(f"   Breakout Score: {format_int(row.get('breakout_score'))}")
+            lines.append(f"   Final Score: {format_int(row.get('final_score', row.get('score')))}")
+            lines.append("")
 
     lines.extend(
         [
@@ -510,23 +728,41 @@ def build_realtime_slack_message(df, rules, market_session, previous_symbols=Non
     return "\n".join(lines)
 
 
-def scan(preset_name=None, send_slack=True):
+def format_int(value):
+    try:
+        return int(float(value))
+    except Exception:
+        return 0
+
+
+def format_yes_no(value):
+    return "YES" if value is True or str(value).lower() in {"true", "1", "yes"} else "NO"
+
+
+def scan(preset_name=None, send_slack=True, scan_limit=None):
     rules = load_scanner_rules(preset_name)
+    scan_id = create_scan_id()
     universe = pd.read_csv(BASE_DIR / "universe.csv")
     symbols = universe["symbol"].dropna().astype(str).unique().tolist()
-    scan_limit = min(len(symbols), int(rules["scan_limit"]))
+    configured_limit, scan_limit_enabled = resolve_scan_limit(rules, scan_limit)
+    scan_limit = min(len(symbols), configured_limit)
 
+    if scan_limit_enabled:
+        print(f"[SCAN LIMIT] enabled limit={scan_limit}")
     print(f"Scanning {scan_limit} of {len(symbols)} symbols with preset {rules.get('active_preset')}")
+    print(f"[SCAN ID] {scan_id}")
     results = []
+    technical_log_rows = []
     for idx, symbol in enumerate(symbols[:scan_limit], start=1):
         print(f"[{idx}/{scan_limit}] {symbol}")
-        result = analyze(symbol, rules)
+        result = analyze(symbol, rules, scan_id=scan_id, technical_log_rows=technical_log_rows)
         if result:
             results.append(result)
 
     previous_symbols = load_previous_symbols()
     buckets = build_candidate_buckets(pd.DataFrame(results), rules)
     save_candidate_files(buckets)
+    save_technical_filter_log(technical_log_rows)
 
     message = build_realtime_slack_message(
         buckets.candidates,

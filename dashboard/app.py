@@ -29,6 +29,7 @@ CSV_FILES = {
     "gpt": "gpt_candidate_analysis.csv",
     "performance_summary": "performance_summary.csv",
     "performance_trades": "performance_trades.csv",
+    "strategy_performance": "strategy_performance.csv",
 }
 
 UI_LABELS = {
@@ -39,6 +40,7 @@ UI_LABELS = {
     "gpt": "AI 분석",
     "performance_summary": "성과 요약",
     "performance_trades": "성과 거래 내역",
+    "strategy_performance": "전략 성과",
     "Broker": "거래 모드",
     "Market": "시장 상태",
     "systemd": "서비스 상태",
@@ -52,6 +54,11 @@ UI_LABELS = {
     "Filled Orders": "체결 주문",
     "Canceled Orders": "취소 주문",
     "Rejected Orders": "거절 주문",
+    "trend": "Trend",
+    "trend_score": "Trend Score",
+    "momentum_score": "Momentum Score",
+    "breakout_score": "Breakout Score",
+    "final_score": "Final Score",
 }
 
 VALUE_LABELS = {
@@ -165,6 +172,9 @@ def create_app():
             summary=summary,
             trades=recent_trades,
             columns=columns,
+            trend_stats=summary.get("trend_stats", []),
+            momentum_stats=summary.get("momentum_stats", []),
+            breakout_stats=summary.get("breakout_stats", []),
             has_data=has_data,
             api_error=api_error,
             broker=BrokerConfig(),

@@ -10,6 +10,8 @@ BASE_DIR = Path(__file__).resolve().parent
 ORDER_HISTORY_FILE = BASE_DIR / "order_history.csv"
 PERFORMANCE_SUMMARY_FILE = BASE_DIR / "performance_summary.csv"
 PERFORMANCE_TRADES_FILE = BASE_DIR / "performance_trades.csv"
+STRATEGY_PERFORMANCE_FILE = BASE_DIR / "strategy_performance.csv"
+CANDIDATES_FILE = BASE_DIR / "candidates.csv"
 
 SUMMARY_COLUMNS = [
     "total_orders",
@@ -39,6 +41,21 @@ TRADE_COLUMNS = [
     "status",
     "submitted_at",
     "filled_at",
+    "trend",
+    "trend_score",
+    "momentum_score",
+    "breakout_flag",
+    "breakout_score",
+    "final_score",
+]
+
+STRATEGY_COLUMNS = [
+    "trend",
+    "trade_count",
+    "win_rate",
+    "profit_factor",
+    "avg_profit_pct",
+    "avg_loss_pct",
 ]
 
 SUMMARY_LABELS = {
@@ -195,6 +212,96 @@ def calculate_profit_factor(trades_df):
     return round(float(gross_profit / gross_loss), 2)
 
 
+def enrich_trades_with_candidate_metrics(trades_df, candidates_df):
+    for column in TRADE_COLUMNS:
+        if column not in trades_df.columns:
+            trades_df[column] = None
+    if trades_df.empty or candidates_df.empty or "symbol" not in candidates_df.columns:
+        return trades_df.reindex(columns=TRADE_COLUMNS)
+
+    metric_columns = [
+        "symbol",
+        "trend",
+        "trend_score",
+        "momentum_score",
+        "breakout_flag",
+        "breakout_score",
+        "final_score",
+    ]
+    available = [column for column in metric_columns if column in candidates_df.columns]
+    metrics = candidates_df[available].drop_duplicates(subset=["symbol"], keep="first")
+    enriched = trades_df.drop(
+        columns=[column for column in available if column != "symbol" and column in trades_df.columns],
+        errors="ignore",
+    ).merge(metrics, on="symbol", how="left")
+    return enriched.reindex(columns=TRADE_COLUMNS)
+
+
+def calculate_group_stats(trades_df, group_column, default_label="Unknown"):
+    if trades_df.empty or group_column not in trades_df.columns:
+        return pd.DataFrame()
+    measured = trades_df.copy()
+    measured["unrealized_pl"] = pd.to_numeric(measured.get("unrealized_pl"), errors="coerce").fillna(0.0)
+    measured["unrealized_plpc"] = pd.to_numeric(measured.get("unrealized_plpc"), errors="coerce").fillna(0.0)
+    measured[group_column] = measured[group_column].fillna(default_label).replace("", default_label)
+    rows = []
+    for value, group in measured.groupby(group_column, dropna=False):
+        wins = int((group["unrealized_pl"] > 0).sum())
+        trade_count = int(len(group))
+        gains = group.loc[group["unrealized_pl"] > 0, "unrealized_plpc"]
+        losses = group.loc[group["unrealized_pl"] < 0, "unrealized_plpc"]
+        rows.append(
+            {
+                group_column: value,
+                "trade_count": trade_count,
+                "win_rate": round((wins / trade_count) * 100, 2) if trade_count else 0.0,
+                "profit_factor": calculate_profit_factor(group),
+                "avg_profit_pct": round(float(gains.mean()), 2) if not gains.empty else 0.0,
+                "avg_loss_pct": round(float(losses.mean()), 2) if not losses.empty else 0.0,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def momentum_bucket(value):
+    number = safe_float(value)
+    if number >= 80:
+        return "80-100"
+    if number >= 60:
+        return "60-79"
+    if number >= 40:
+        return "40-59"
+    if number > 0:
+        return "1-39"
+    return "Unknown"
+
+
+def build_strategy_performance(trades_df):
+    trend_stats = calculate_group_stats(trades_df, "trend")
+    if trend_stats.empty:
+        return pd.DataFrame(columns=STRATEGY_COLUMNS)
+    return trend_stats.reindex(columns=STRATEGY_COLUMNS)
+
+
+def build_segment_summaries(trades_df):
+    if trades_df.empty:
+        return {
+            "trend_stats": pd.DataFrame(),
+            "momentum_stats": pd.DataFrame(),
+            "breakout_stats": pd.DataFrame(),
+        }
+    segmented = trades_df.copy()
+    segmented["momentum_bucket"] = segmented.get("momentum_score", pd.Series(dtype=float)).apply(momentum_bucket)
+    segmented["breakout_bucket"] = segmented.get("breakout_flag", pd.Series(dtype=object)).apply(
+        lambda value: "Breakout" if value is True or str(value).lower() in {"true", "1", "yes"} else "No Breakout"
+    )
+    return {
+        "trend_stats": calculate_group_stats(segmented, "trend"),
+        "momentum_stats": calculate_group_stats(segmented, "momentum_bucket"),
+        "breakout_stats": calculate_group_stats(segmented, "breakout_bucket"),
+    }
+
+
 def calculate_daily_return_pct(account):
     equity = safe_float(account.get("equity"))
     last_equity = safe_float(account.get("last_equity"))
@@ -258,10 +365,12 @@ def build_performance_summary(orders_df, positions_df, account, local_history=No
     return summary, trades_df
 
 
-def write_performance_files(summary, trades_df):
+def write_performance_files(summary, trades_df, strategy_df=None):
     summary_row = {column: summary.get(column, "") for column in SUMMARY_COLUMNS}
     pd.DataFrame([summary_row], columns=SUMMARY_COLUMNS).to_csv(PERFORMANCE_SUMMARY_FILE, index=False)
     trades_df.reindex(columns=TRADE_COLUMNS).to_csv(PERFORMANCE_TRADES_FILE, index=False)
+    strategy_df = strategy_df if strategy_df is not None else build_strategy_performance(trades_df)
+    strategy_df.reindex(columns=STRATEGY_COLUMNS).to_csv(STRATEGY_PERFORMANCE_FILE, index=False)
 
 
 def generate_performance_report(broker=None, write_files=True):
@@ -269,15 +378,22 @@ def generate_performance_report(broker=None, write_files=True):
     orders_df = normalize_orders(snapshot["orders"])
     positions_df = normalize_positions(snapshot["positions"])
     local_history = read_csv(ORDER_HISTORY_FILE, columns=["symbol", "order_date"])
+    candidates_df = read_csv(CANDIDATES_FILE)
     summary, trades_df = build_performance_summary(
         orders_df,
         positions_df,
         snapshot["account"],
         local_history=local_history,
     )
+    trades_df = enrich_trades_with_candidate_metrics(trades_df, candidates_df)
+    segment_summaries = build_segment_summaries(trades_df)
+    strategy_df = build_strategy_performance(trades_df)
     summary["api_error"] = snapshot.get("error", "")
+    summary["trend_stats"] = segment_summaries["trend_stats"].to_dict("records")
+    summary["momentum_stats"] = segment_summaries["momentum_stats"].to_dict("records")
+    summary["breakout_stats"] = segment_summaries["breakout_stats"].to_dict("records")
     if write_files:
-        write_performance_files(summary, trades_df)
+        write_performance_files(summary, trades_df, strategy_df)
     return summary, trades_df
 
 
