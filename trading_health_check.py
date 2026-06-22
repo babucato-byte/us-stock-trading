@@ -42,7 +42,7 @@ def summarize_performance():
     if df.empty:
         return "📈 페이퍼 트레이딩 성과\n- 거래 기록 없음"
 
-    pnl_cols = [c for c in df.columns if c.lower() in {"pnl", "profit", "profit_loss", "realized_pnl"}]
+    pnl_cols = [c for c in df.columns if c.lower() in {"pnl", "profit", "profit_loss", "realized_pnl", "unrealized_pl"}]
     pnl_col = pnl_cols[0] if pnl_cols else None
 
     total = len(df)
