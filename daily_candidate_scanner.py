@@ -16,7 +16,7 @@ from market_hours import get_us_market_session
 from momentum_engine import calculate_momentum_score
 from slack_utils import send_slack_alert
 from trend_engine import calculate_trend
-
+from market_guard import is_us_trading_day
 
 load_dotenv()
 
@@ -653,7 +653,6 @@ def classify_candidate(row, smart_money_min):
         return "수급/모멘텀 강한 후보"
     return "기술 조건 후보"
 
-
 def build_realtime_slack_message(df, rules, market_session, previous_symbols=None):
     rules = normalize_rules(rules)
     previous_symbols = previous_symbols or set()
@@ -777,4 +776,9 @@ def scan(preset_name=None, send_slack=True, scan_limit=None):
 
 
 if __name__ == "__main__":
+
+    if not is_us_trading_day():
+        print("NYSE closed. Scanner skipped.")
+        raise SystemExit(0)
+
     scan()
