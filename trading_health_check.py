@@ -19,15 +19,55 @@ def run_cmd(cmd):
         return f"ERROR: {exc}"
 
 
-def count_rows(path):
-    file_path = BASE_DIR / path
-    if not file_path.exists():
+def count_rows(filename):
+    path = BASE_DIR / filename
+    if not path.exists():
         return 0
     try:
-        df = pd.read_csv(file_path)
-        return len(df)
+        return len(pd.read_csv(path))
     except Exception:
         return 0
+
+
+def summarize_performance():
+    path = BASE_DIR / "performance_trades.csv"
+    if not path.exists():
+        return "📈 페이퍼 트레이딩 성과\n- 거래 기록 없음"
+
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return "📈 페이퍼 트레이딩 성과\n- 성과 파일 읽기 실패"
+
+    if df.empty:
+        return "📈 페이퍼 트레이딩 성과\n- 거래 기록 없음"
+
+    pnl_cols = [c for c in df.columns if c.lower() in {"pnl", "profit", "profit_loss", "realized_pnl"}]
+    pnl_col = pnl_cols[0] if pnl_cols else None
+
+    total = len(df)
+
+    if pnl_col:
+        pnl = pd.to_numeric(df[pnl_col], errors="coerce").fillna(0)
+        wins = int((pnl > 0).sum())
+        losses = int((pnl < 0).sum())
+        win_rate = (wins / total * 100) if total else 0
+        total_pnl = pnl.sum()
+
+        return f"""📈 페이퍼 트레이딩 성과
+
+- 총 거래: {total}건
+- 승리: {wins}건
+- 패배: {losses}건
+- 승률: {win_rate:.1f}%
+- 누적 손익: {total_pnl:.2f}
+"""
+
+    return f"""📈 페이퍼 트레이딩 성과
+
+- 총 거래: {total}건
+- 손익 컬럼 없음
+"""
 
 
 def main():
@@ -44,33 +84,39 @@ def main():
     order_candidates = count_rows("order_candidates.csv")
     technical_logs = count_rows("technical_filter_log.csv")
 
-    status = "HEALTHY"
     issues = []
 
     if git_status:
-        status = "CHECK"
-        issues.append("Git working tree has changes")
+        issues.append("Git 변경 파일이 남아 있습니다.")
 
-    message = f"""=== Trading Health Check ===
+    status = "정상 운영 중" if not issues else "확인 필요"
 
-Time: {now}
-Status: {status}
+    message = f"""📊 미국주식 자동매매 상태 점검
 
-Market Day: {'YES' if market_day else 'NO'}
+점검시각
+- {now}
 
-Git:
-- Branch: {git_branch}
-- Commit: {git_commit}
-- Dirty: {'YES' if git_status else 'NO'}
+시장상태
+- 미국 증시 개장일: {'예' if market_day else '아니오'}
 
-Scanner Files:
-- Candidates: {candidates}
-- Strong Candidates: {strong_candidates}
-- Order Candidates: {order_candidates}
-- Technical Log Rows: {technical_logs}
+Git 상태
+- 브랜치: {git_branch}
+- 최신 커밋: {git_commit}
+- 변경 파일 존재: {'예' if git_status else '아니오'}
 
-Issues:
-{chr(10).join('- ' + issue for issue in issues) if issues else '- None'}
+스캐너 현황
+- 후보 종목 수: {candidates}
+- 강한 후보 수: {strong_candidates}
+- 주문 후보 수: {order_candidates}
+- 기술필터 로그 수: {technical_logs}
+
+시스템 상태
+- {status}
+
+점검 결과
+{chr(10).join('- ' + issue for issue in issues) if issues else '- 이상 없음'}
+
+{summarize_performance()}
 """
 
     print(message)
