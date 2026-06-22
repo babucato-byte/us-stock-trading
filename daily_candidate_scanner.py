@@ -3,7 +3,7 @@ import math
 import os
 import warnings
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -342,6 +342,18 @@ def build_symbol_metrics(symbol, df, rules):
     min_history = max(220, avg_window + rsi_period + 5)
 
     if df.empty or len(df) < min_history:
+        return None
+
+    last_bar_time = df.index[-1]
+    if hasattr(last_bar_time, "to_pydatetime"):
+        last_bar_time = last_bar_time.to_pydatetime()
+
+    if last_bar_time.tzinfo is None:
+        last_bar_time = last_bar_time.replace(tzinfo=timezone.utc)
+
+    data_age_days = (datetime.now(timezone.utc) - last_bar_time.astimezone(timezone.utc)).days
+    if data_age_days > 3:
+        print(f"{symbol} skipped: stale data age={data_age_days} days")
         return None
 
     df = df.copy()
@@ -742,6 +754,10 @@ def scan(preset_name=None, send_slack=True, scan_limit=None):
     rules = load_scanner_rules(preset_name)
     scan_id = create_scan_id()
     universe = pd.read_csv(BASE_DIR / "universe.csv")
+
+    if "exchange" in universe.columns:
+        universe = universe[universe["exchange"].astype(str).str.upper() != "OTC"]
+
     symbols = universe["symbol"].dropna().astype(str).unique().tolist()
     configured_limit, scan_limit_enabled = resolve_scan_limit(rules, scan_limit)
     scan_limit = min(len(symbols), configured_limit)
