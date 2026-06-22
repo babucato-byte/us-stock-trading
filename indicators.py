@@ -151,7 +151,7 @@ def check_sqzmom_green(df, length=None):
 
 
 def technical_entry_filter(df, min_score=None):
-    min_score = int(min_score or env_int("TECHNICAL_FILTER_MIN_SCORE", 5))
+    min_score = int(min_score or env_int("TECHNICAL_FILTER_MIN_SCORE", 7))
     hma_length = env_int("HMA_LONG_LENGTH", 200)
     sqzmom_length = env_int("SQZMOM_LENGTH", 20)
     minimum_rows = max(hma_length + int(math.sqrt(hma_length)), sqzmom_length + 2)
