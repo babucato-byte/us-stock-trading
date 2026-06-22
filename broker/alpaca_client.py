@@ -33,7 +33,7 @@ class AlpacaBroker:
     def _request(self, method, path, **kwargs):
         self.config.validate_for_request()
         url = f"{self.config.base_url}{path}"
-        response = self.session.request(method, url, headers=self.headers, timeout=10, **kwargs)
+        response = self.session.request(method, url, headers=self.headers, timeout=30, **kwargs)
         response.raise_for_status()
         return response.json()
 
@@ -66,7 +66,7 @@ class AlpacaBroker:
         self.config.validate_order_allowed()
         self.config.validate_for_request()
         url = f"{self.config.base_url}/v2/orders"
-        response = self.session.post(url, headers=self.headers, json=order, timeout=10)
+        response = self.session.post(url, headers=self.headers, json=order, timeout=30)
         return BrokerResponse(
             status_code=response.status_code,
             text=response.text,
