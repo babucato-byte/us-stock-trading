@@ -6,6 +6,11 @@ import sys
 
 import pandas as pd
 import yfinance as yf
+import sys
+from pathlib import Path
+
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+from market_guard import is_us_trading_day
 
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -50,9 +55,9 @@ PAPER_TRADE_COLUMNS = [
 
 @dataclass(frozen=True)
 class ScoreScannerConfig:
-    min_score: int = 70
-    min_premarket_gain_pct: float = 10.0
-    min_volume_multiple: float = 3.0
+    min_score: int = 60
+    min_premarket_gain_pct: float = 7.0
+    min_volume_multiple: float = 2.0
     adx_threshold: float = 25.0
     near_52w_ratio: float = 0.98
     avg_volume_window: int = 20
@@ -311,4 +316,8 @@ def main():
 
 
 if __name__ == "__main__":
+    if not is_us_trading_day():
+        print("[MARKET GUARD] NYSE closed. Score scanner skipped.")
+        raise SystemExit(0)
+
     main()

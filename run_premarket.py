@@ -2,6 +2,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import subprocess
 import os
+from market_guard import is_us_trading_day
 
 KST = ZoneInfo("Asia/Seoul")
 NY = ZoneInfo("America/New_York")
@@ -23,7 +24,7 @@ with open(f"{log_dir}/premarket_runner.log", "a") as f:
         f"{now_kst} | NY={now_ny} | DST={is_dst} | target_hour={target_hour}\n"
     )
 
-if now_kst.hour == target_hour:
+if now_kst.hour == target_hour and is_us_trading_day():
     subprocess.run(
         [
             "/home/ubuntu/trading/venv/bin/python",
