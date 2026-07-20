@@ -217,6 +217,47 @@ def test_position_size_over_limit_is_blocked():
         order_safety.check_position_size(order_safety.MAX_POSITION_RATE + 0.5)
 
 
+def test_abnormal_order_value_relative_to_equity_blocks_order(monkeypatch, tmp_path):
+    # Small account, high-priced candidate: qty(1) * price(200) / equity(1000) = 0.20,
+    # which exceeds the existing risk_config.MAX_POSITION_RATE (0.10). No new
+    # threshold is introduced here; this exercises the real position-value
+    # calculation instead of the previous hardcoded 0.01 placeholder.
+    broker = FakeBroker(account={"equity": "1000", "last_equity": "1000"})
+    monkeypatch.setattr(pso, "load_watchlist", lambda: ["AAPL"])
+    monkeypatch.setattr(
+        pso,
+        "analyze_stock",
+        lambda symbol: {
+            "symbol": symbol,
+            "price": 200.0,
+            "ma200": 150.0,
+            "rsi": 50.0,
+            "volume_ratio": 1.5,
+            "score": 100,
+        },
+    )
+    monkeypatch.setattr(pso, "get_us_market_session", lambda: "regular")
+    monkeypatch.setattr(pso, "ORDER_HISTORY_FILE", tmp_path / "order_history.csv")
+    monkeypatch.setattr(pso, "send_slack_alert", lambda msg: True)
+
+    with pytest.raises(Exception):
+        pso.main(broker=broker)
+
+    assert broker.submit_calls == []
+
+
+def test_normal_order_value_within_limit_is_not_blocked_by_position_size(monkeypatch, tmp_path):
+    # Same account/price ratio as the default happy-path fixtures (0.01),
+    # well under MAX_POSITION_RATE — confirms the real calculation still
+    # allows ordinary small orders through.
+    broker = FakeBroker()
+    _patch_common(monkeypatch, tmp_path, ["AAPL"], broker)
+
+    pso.main(broker=broker)
+
+    assert broker.submit_calls == [("AAPL", 1)]
+
+
 # ---------------------------------------------------------------------------
 # External failure handling (scenarios 12-15)
 # ---------------------------------------------------------------------------

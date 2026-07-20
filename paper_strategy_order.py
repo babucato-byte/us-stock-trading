@@ -146,6 +146,7 @@ def main(broker=None):
     account = broker.get_account()
     positions = broker.get_positions()
     check_daily_loss_limit(account)
+    equity = float(account["equity"])
 
     open_position_count = len(positions)
     today_trade_count = 0
@@ -181,14 +182,18 @@ def main(broker=None):
             )
             continue
 
+        order_qty = 1
+        position_value = order_qty * result["price"]
+        position_rate = (position_value / equity) if equity > 0 else float("inf")
+
         run_order_safety_check(
-            position_rate=0.01,
+            position_rate=position_rate,
             today_trade_count=today_trade_count,
             open_position_count=open_position_count,
         )
 
         try:
-            response = submit_order(symbol, qty=1, broker=broker)
+            response = submit_order(symbol, qty=order_qty, broker=broker)
         except requests.exceptions.RequestException as exc:
             print(f"{symbol} order submission failed: {exc}")
             _safe_send_slack_alert(
@@ -217,7 +222,7 @@ def main(broker=None):
                 open_position_count += 1
 
         _safe_send_slack_alert(
-            f"*Paper Strategy Order*\n- Symbol: {symbol}\n- Qty: 1\n"
+            f"*Paper Strategy Order*\n- Symbol: {symbol}\n- Qty: {order_qty}\n"
             f"- Score: {result['score']}\n- Price: {result['price']:.2f}\n"
             f"- RSI: {result['rsi']:.2f}\n- Volume ratio: {result['volume_ratio']:.2f}x\n"
             f"- Broker mode: {broker.config.status_label}\n- Status: {status}"
