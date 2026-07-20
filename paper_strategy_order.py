@@ -2,6 +2,7 @@ import fcntl
 import os
 import tempfile
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -24,6 +25,42 @@ ORDER_HISTORY_LOCK_FILE = BASE_DIR / "order_history.lock"
 ORDER_HISTORY_LOCK_TIMEOUT_SECONDS = 5.0
 REQUIRED_HISTORY_COLUMNS = ["symbol", "order_date", "mode", "dry_run", "status"]
 
+# order_history.csv's schema is frozen (existing consumers, e.g. the
+# dashboard, read it) so broker reconciliation state lives in this separate
+# companion file instead of adding columns. Rows are correlated to
+# order_history.csv by (symbol, order_date), which is already a unique key
+# there (duplicate-order prevention guarantees at most one row per pair).
+ORDER_RECONCILIATION_FILE = BASE_DIR / "order_reconciliation.csv"
+RECONCILIATION_COLUMNS = [
+    "client_order_id",
+    "symbol",
+    "order_date",
+    "requested_qty",
+    "filled_qty",
+    "remaining_qty",
+    "average_fill_price",
+    "broker_status",
+    "local_status",
+    "last_reconciled_at",
+]
+
+# Local status vocabulary for reconciliation rows. PENDING_SUBMISSION/
+# SUBMITTED/PARTIALLY_FILLED are non-terminal (still worth re-checking on a
+# future run); the rest are terminal.
+RECONCILIATION_NON_TERMINAL_STATUSES = {"PENDING_SUBMISSION", "SUBMITTED", "PARTIALLY_FILLED"}
+
+_BROKER_STATUS_TO_LOCAL_STATUS = {
+    "new": "SUBMITTED",
+    "accepted": "SUBMITTED",
+    "pending_new": "SUBMITTED",
+    "partially_filled": "PARTIALLY_FILLED",
+    "filled": "FILLED",
+    "rejected": "REJECTED",
+    "canceled": "CANCELLED",
+    "cancelled": "CANCELLED",
+    "expired": "EXPIRED",
+}
+
 
 class OrderHistoryUnavailable(Exception):
     """Order history could not be safely read; new orders are blocked (fail-closed)."""
@@ -43,9 +80,9 @@ def calculate_rsi(df, period=14):
     return 100 - (100 / (1 + rs))
 
 
-def submit_order(symbol, qty=1, broker=None):
+def submit_order(symbol, qty=1, broker=None, client_order_id=None):
     broker = broker or AlpacaBroker()
-    response = broker.submit_order(symbol, qty=qty)
+    response = broker.submit_order(symbol, qty=qty, client_order_id=client_order_id)
     print(f"{symbol} order result: {response.status_code} {response.text[:500]}")
     return response
 
@@ -157,32 +194,173 @@ def initialize_order_history():
     return df
 
 
-def save_order_history(order_history):
-    """Write order_history.csv atomically: temp file + fsync + os.replace().
+def _atomic_write_csv(path, dataframe):
+    """Write a DataFrame to `path` atomically: temp file + fsync + os.replace().
 
     A crash or exception mid-write leaves the previous file untouched
     (os.replace is atomic on the same filesystem on macOS/Ubuntu), instead
     of a partially-written CSV from an in-place to_csv().
     """
     try:
-        ORDER_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(
-            dir=str(ORDER_HISTORY_FILE.parent), prefix=".order_history_", suffix=".tmp"
-        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.stem}_", suffix=".tmp")
         try:
             with os.fdopen(fd, "w", newline="") as tmp_file:
-                order_history.to_csv(tmp_file, index=False)
+                dataframe.to_csv(tmp_file, index=False)
                 tmp_file.flush()
                 os.fsync(tmp_file.fileno())
-            os.replace(tmp_name, ORDER_HISTORY_FILE)
+            os.replace(tmp_name, path)
         except Exception:
             if os.path.exists(tmp_name):
                 os.remove(tmp_name)
             raise
         return True
     except Exception as exc:
-        print(f"Failed to save order history to {ORDER_HISTORY_FILE}: {exc}")
+        print(f"Failed to save {path}: {exc}")
         return False
+
+
+def save_order_history(order_history):
+    return _atomic_write_csv(ORDER_HISTORY_FILE, order_history)
+
+
+def load_reconciliation():
+    """Read order_reconciliation.csv. Unlike order_history, this is
+    supplementary tracking data, not the duplicate/daily-limit safety gate,
+    so a missing or unreadable file degrades to an empty DataFrame rather
+    than failing closed."""
+    if not ORDER_RECONCILIATION_FILE.exists():
+        df = pd.DataFrame(columns=RECONCILIATION_COLUMNS)
+    else:
+        try:
+            df = pd.read_csv(ORDER_RECONCILIATION_FILE)
+        except Exception as exc:
+            print(f"Failed to read {ORDER_RECONCILIATION_FILE}: {exc}")
+            df = pd.DataFrame(columns=RECONCILIATION_COLUMNS)
+        for col in RECONCILIATION_COLUMNS:
+            if col not in df.columns:
+                df[col] = None
+    # object dtype throughout: columns mix numbers, ISO timestamp strings and
+    # None across their lifetime, so a narrower inferred dtype (e.g. an
+    # all-empty column defaulting to float64) would warn/fail on later
+    # string assignments in _update_reconciliation_from_response / reconcile_pending_orders.
+    return df.astype({col: "object" for col in RECONCILIATION_COLUMNS})
+
+
+def save_reconciliation(reconciliation):
+    return _atomic_write_csv(ORDER_RECONCILIATION_FILE, reconciliation)
+
+
+def _record_pending_reconciliation(client_order_id, symbol, order_date, requested_qty):
+    df = load_reconciliation()
+    new_row = pd.DataFrame(
+        [
+            {
+                "client_order_id": client_order_id,
+                "symbol": symbol,
+                "order_date": order_date,
+                "requested_qty": requested_qty,
+                "filled_qty": 0,
+                "remaining_qty": requested_qty,
+                "average_fill_price": None,
+                "broker_status": None,
+                "local_status": "PENDING_SUBMISSION",
+                "last_reconciled_at": None,
+            }
+        ]
+    )
+    save_reconciliation(pd.concat([df, new_row], ignore_index=True))
+
+
+def _local_status_from_response(response):
+    if response.dry_run:
+        return "SUBMITTED"
+    data = response.data if isinstance(response.data, dict) else {}
+    broker_status = data.get("status")
+    if broker_status in _BROKER_STATUS_TO_LOCAL_STATUS:
+        return _BROKER_STATUS_TO_LOCAL_STATUS[broker_status]
+    return "SUBMITTED" if response.status_code in (200, 201) else "REJECTED"
+
+
+def _update_reconciliation_from_response(client_order_id, response):
+    """Record whatever fill data the immediate submit response carried.
+
+    This is a best-effort snapshot, not the authoritative reconciliation
+    pass — partially_filled is never collapsed into filled here either.
+    """
+    df = load_reconciliation()
+    mask = df["client_order_id"].astype(str) == str(client_order_id)
+    if not mask.any():
+        return
+    data = response.data if isinstance(response.data, dict) else {}
+    broker_status = data.get("status")
+    filled_qty = data.get("filled_qty")
+    requested_qty = df.loc[mask, "requested_qty"].iloc[0]
+
+    filled_qty_val = float(filled_qty) if filled_qty not in (None, "") else 0.0
+    remaining_qty_val = (
+        float(requested_qty) - filled_qty_val if requested_qty not in (None, "") else None
+    )
+
+    df.loc[mask, "broker_status"] = broker_status
+    df.loc[mask, "filled_qty"] = filled_qty_val
+    df.loc[mask, "remaining_qty"] = remaining_qty_val
+    df.loc[mask, "average_fill_price"] = data.get("filled_avg_price")
+    df.loc[mask, "local_status"] = _local_status_from_response(response)
+    df.loc[mask, "last_reconciled_at"] = eastern_now().isoformat()
+    save_reconciliation(df)
+
+
+def reconcile_pending_orders(broker):
+    """Resolve non-terminal reconciliation rows against the broker's truth.
+
+    Never resubmits. A row the broker no longer recognizes (a submission
+    whose local status-update write failed after a real broker request was
+    made, for example) is marked MANUAL_REVIEW instead of being retried
+    automatically. Safe to call repeatedly: always updates rows in place by
+    client_order_id rather than appending, so nothing is recorded twice.
+    """
+    df = load_reconciliation()
+    if df.empty:
+        return
+    pending_mask = df["local_status"].isin(RECONCILIATION_NON_TERMINAL_STATUSES)
+    if not pending_mask.any():
+        return
+
+    for idx in df[pending_mask].index:
+        client_order_id = df.at[idx, "client_order_id"]
+        symbol = df.at[idx, "symbol"]
+        order_date = df.at[idx, "order_date"]
+        try:
+            broker_order = broker.get_order_by_client_order_id(client_order_id)
+        except Exception as exc:
+            print(f"Reconciliation lookup failed for {client_order_id} ({symbol}): {exc}")
+            continue
+
+        if broker_order is None:
+            df.at[idx, "local_status"] = "MANUAL_REVIEW"
+            df.at[idx, "last_reconciled_at"] = eastern_now().isoformat()
+            update_order_status(symbol, order_date, "MANUAL_REVIEW")
+            continue
+
+        broker_status = broker_order.get("status")
+        local_status = _BROKER_STATUS_TO_LOCAL_STATUS.get(broker_status, "UNKNOWN")
+        filled_qty = broker_order.get("filled_qty")
+        requested_qty = df.at[idx, "requested_qty"]
+        filled_qty_val = float(filled_qty) if filled_qty not in (None, "") else 0.0
+        remaining_qty_val = (
+            float(requested_qty) - filled_qty_val if requested_qty not in (None, "") else None
+        )
+
+        df.at[idx, "broker_status"] = broker_status
+        df.at[idx, "filled_qty"] = filled_qty_val
+        df.at[idx, "remaining_qty"] = remaining_qty_val
+        df.at[idx, "average_fill_price"] = broker_order.get("filled_avg_price")
+        df.at[idx, "local_status"] = local_status
+        df.at[idx, "last_reconciled_at"] = eastern_now().isoformat()
+        update_order_status(symbol, order_date, local_status)
+
+    save_reconciliation(df)
 
 
 @contextmanager
@@ -239,7 +417,7 @@ def count_orders_for_date(order_history, order_date):
     return int((order_history["order_date"].astype(str) == order_date).sum())
 
 
-def try_reserve_order(symbol, order_date, mode, dry_run, lock_timeout=ORDER_HISTORY_LOCK_TIMEOUT_SECONDS):
+def try_reserve_order(symbol, order_date, mode, dry_run, qty=1, lock_timeout=ORDER_HISTORY_LOCK_TIMEOUT_SECONDS):
     """Atomically reserve an order slot: lock -> reread -> check -> write -> unlock.
 
     Re-reads order history from disk under an exclusive lock (not the
@@ -248,8 +426,9 @@ def try_reserve_order(symbol, order_date, mode, dry_run, lock_timeout=ORDER_HIST
     Raises DuplicateOrderError (soft block, caller may continue to the next
     symbol) or propagates OrderHistoryUnavailable / the daily-trade-count
     Exception / a reservation-save RuntimeError (hard block, caller should
-    stop). Returns the updated history including the new PENDING_SUBMISSION
-    row on success.
+    stop). Returns (updated_history, client_order_id) on success; the
+    client_order_id is what ties this reservation to the broker's own order
+    record for later reconciliation.
     """
     with _order_history_lock(timeout=lock_timeout):
         order_history = load_order_history()
@@ -271,7 +450,9 @@ def try_reserve_order(symbol, order_date, mode, dry_run, lock_timeout=ORDER_HIST
         reserved_history = pd.concat([order_history, new_row], ignore_index=True)
         if not save_order_history(reserved_history):
             raise RuntimeError("Order history reservation failed; order submission blocked")
-        return reserved_history
+        client_order_id = f"scalp-{symbol}-{order_date}-{uuid.uuid4().hex[:10]}"
+        _record_pending_reconciliation(client_order_id, symbol, order_date, qty)
+        return reserved_history, client_order_id
 
 
 def update_order_status(symbol, order_date, status, lock_timeout=ORDER_HISTORY_LOCK_TIMEOUT_SECONDS):
@@ -321,6 +502,12 @@ def main(broker=None):
     if not tickers:
         print("No order review candidates.")
         return
+
+    # Resolve any PENDING_SUBMISSION/SUBMITTED/PARTIALLY_FILLED rows left
+    # over from a prior run (e.g. the process died between broker submission
+    # and the local status update) against the broker's own record before
+    # evaluating new candidates. Never resubmits.
+    reconcile_pending_orders(broker)
 
     account = broker.get_account()
     positions = broker.get_positions()
@@ -376,11 +563,12 @@ def main(broker=None):
         )
 
         try:
-            order_history = try_reserve_order(
+            order_history, client_order_id = try_reserve_order(
                 symbol,
                 today,
                 broker.config.status_label,
                 False,
+                qty=order_qty,
             )
         except DuplicateOrderError:
             _notify_order_blocked(symbol, "Duplicate order prevented for today")
@@ -394,7 +582,7 @@ def main(broker=None):
         today_trade_count = count_orders_for_date(order_history, today)
 
         try:
-            response = submit_order(symbol, qty=order_qty, broker=broker)
+            response = submit_order(symbol, qty=order_qty, broker=broker, client_order_id=client_order_id)
         except requests.exceptions.RequestException as exc:
             update_order_status(symbol, today, "SUBMISSION_FAILED")
             print(f"{symbol} order submission failed: {exc}")
@@ -405,6 +593,7 @@ def main(broker=None):
 
         success = response.status_code in [200, 201]
         status = "DRY RUN" if response.dry_run else ("SUBMITTED" if success else "FAILED")
+        _update_reconciliation_from_response(client_order_id, response)
 
         if success:
             update_order_status(

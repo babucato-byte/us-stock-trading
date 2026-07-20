@@ -24,10 +24,11 @@ class DummySession:
 
 
 class FakeBrokerResponse:
-    def __init__(self, status_code=200, text="OK", dry_run=False):
+    def __init__(self, status_code=200, text="OK", dry_run=False, data=None):
         self.status_code = status_code
         self.text = text
         self.dry_run = dry_run
+        self.data = data
 
 
 class FakeConfig:
@@ -38,7 +39,7 @@ class FakeBroker:
     """Minimal broker double: no real Alpaca/HTTP calls, fully scripted responses."""
 
     def __init__(self, account=None, positions=None, submit_side_effects=None,
-                 default_response=None):
+                 default_response=None, orders_by_client_id=None):
         self.config = FakeConfig()
         self._account = account or {"equity": "10000", "last_equity": "10000"}
         self._positions = positions or []
@@ -46,7 +47,9 @@ class FakeBroker:
         self._default_response = default_response or FakeBrokerResponse(
             status_code=200, text="OK", dry_run=False
         )
+        self._orders_by_client_id = orders_by_client_id or {}
         self.submit_calls = []
+        self.client_order_ids = []
 
     def get_account(self):
         return self._account
@@ -54,12 +57,16 @@ class FakeBroker:
     def get_positions(self):
         return self._positions
 
-    def submit_order(self, symbol, qty=1):
+    def submit_order(self, symbol, qty=1, client_order_id=None):
         self.submit_calls.append((symbol, qty))
+        self.client_order_ids.append(client_order_id)
         effect = self._submit_side_effects.get(symbol)
         if isinstance(effect, Exception):
             raise effect
         return effect or self._default_response
+
+    def get_order_by_client_order_id(self, client_order_id):
+        return self._orders_by_client_id.get(client_order_id)
 
 
 def _high_score_result(symbol):
@@ -85,6 +92,7 @@ def _patch_common(monkeypatch, tmp_path, tickers, broker, market_session="regula
     monkeypatch.setattr(pso, "get_us_market_session", lambda: market_session)
     monkeypatch.setattr(pso, "ORDER_HISTORY_FILE", tmp_path / "order_history.csv")
     monkeypatch.setattr(pso, "ORDER_HISTORY_LOCK_FILE", tmp_path / "order_history.lock")
+    monkeypatch.setattr(pso, "ORDER_RECONCILIATION_FILE", tmp_path / "order_reconciliation.csv")
     if init_history:
         pso.initialize_order_history()
     slack_calls = []
@@ -355,7 +363,7 @@ def test_order_history_save_failure_is_logged_not_raised(monkeypatch, tmp_path, 
         readonly_dir.chmod(0o700)
 
     assert result is False
-    assert "Failed to save order history" in capsys.readouterr().out
+    assert "Failed to save" in capsys.readouterr().out
 
 
 def test_failed_save_preserves_existing_file(monkeypatch, tmp_path):
@@ -507,6 +515,7 @@ def test_daily_trade_date_uses_eastern_time_not_local(monkeypatch):
 def test_concurrent_reservations_same_symbol_only_one_succeeds(tmp_path, monkeypatch):
     monkeypatch.setattr(pso, "ORDER_HISTORY_FILE", tmp_path / "order_history.csv")
     monkeypatch.setattr(pso, "ORDER_HISTORY_LOCK_FILE", tmp_path / "order_history.lock")
+    monkeypatch.setattr(pso, "ORDER_RECONCILIATION_FILE", tmp_path / "order_reconciliation.csv")
     pso.initialize_order_history()
 
     results = []
@@ -534,6 +543,7 @@ def test_concurrent_reservations_same_symbol_only_one_succeeds(tmp_path, monkeyp
 def test_concurrent_reservations_different_symbols_both_persist(tmp_path, monkeypatch):
     monkeypatch.setattr(pso, "ORDER_HISTORY_FILE", tmp_path / "order_history.csv")
     monkeypatch.setattr(pso, "ORDER_HISTORY_LOCK_FILE", tmp_path / "order_history.lock")
+    monkeypatch.setattr(pso, "ORDER_RECONCILIATION_FILE", tmp_path / "order_reconciliation.csv")
     pso.initialize_order_history()
 
     errors = []
@@ -561,6 +571,7 @@ def test_concurrent_reservations_different_symbols_both_persist(tmp_path, monkey
 def test_concurrent_reservations_respect_daily_trade_limit(tmp_path, monkeypatch):
     monkeypatch.setattr(pso, "ORDER_HISTORY_FILE", tmp_path / "order_history.csv")
     monkeypatch.setattr(pso, "ORDER_HISTORY_LOCK_FILE", tmp_path / "order_history.lock")
+    monkeypatch.setattr(pso, "ORDER_RECONCILIATION_FILE", tmp_path / "order_reconciliation.csv")
     monkeypatch.setattr(order_safety, "MAX_TRADES_PER_DAY", 1)
     pso.initialize_order_history()
 
@@ -589,6 +600,7 @@ def test_concurrent_reservations_respect_daily_trade_limit(tmp_path, monkeypatch
 def test_lock_acquisition_timeout_blocks_order(tmp_path, monkeypatch):
     monkeypatch.setattr(pso, "ORDER_HISTORY_FILE", tmp_path / "order_history.csv")
     monkeypatch.setattr(pso, "ORDER_HISTORY_LOCK_FILE", tmp_path / "order_history.lock")
+    monkeypatch.setattr(pso, "ORDER_RECONCILIATION_FILE", tmp_path / "order_reconciliation.csv")
     pso.initialize_order_history()
 
     import fcntl
@@ -605,3 +617,133 @@ def test_lock_acquisition_timeout_blocks_order(tmp_path, monkeypatch):
     # The file must be untouched — no partial reservation was written.
     history = pd.read_csv(tmp_path / "order_history.csv")
     assert history.empty
+
+
+# ---------------------------------------------------------------------------
+# CODEX-006: reconciliation and partial-fill tracking
+# ---------------------------------------------------------------------------
+
+def _reserve_pending(monkeypatch, tmp_path, symbol="AAPL", qty=1):
+    monkeypatch.setattr(pso, "ORDER_HISTORY_FILE", tmp_path / "order_history.csv")
+    monkeypatch.setattr(pso, "ORDER_HISTORY_LOCK_FILE", tmp_path / "order_history.lock")
+    monkeypatch.setattr(pso, "ORDER_RECONCILIATION_FILE", tmp_path / "order_reconciliation.csv")
+    pso.initialize_order_history()
+    _, client_order_id = pso.try_reserve_order(symbol, TODAY, "PAPER", False, qty=qty)
+    return client_order_id
+
+
+def test_client_order_id_is_generated_and_sent_to_broker(monkeypatch, tmp_path):
+    broker = FakeBroker()
+    _patch_common(monkeypatch, tmp_path, ["AAPL"], broker)
+
+    pso.main(broker=broker)
+
+    assert len(broker.client_order_ids) == 1
+    assert broker.client_order_ids[0].startswith("scalp-AAPL-")
+
+
+def test_reconcile_marks_filled_order_and_updates_history(monkeypatch, tmp_path):
+    client_order_id = _reserve_pending(monkeypatch, tmp_path)
+    broker = FakeBroker(
+        orders_by_client_id={
+            client_order_id: {"status": "filled", "filled_qty": "1", "filled_avg_price": "101.50"}
+        }
+    )
+
+    pso.reconcile_pending_orders(broker)
+
+    reconciliation = pd.read_csv(tmp_path / "order_reconciliation.csv")
+    row = reconciliation[reconciliation["client_order_id"] == client_order_id].iloc[0]
+    assert row["local_status"] == "FILLED"
+    assert float(row["filled_qty"]) == 1.0
+    assert float(row["average_fill_price"]) == 101.50
+    assert pd.notna(row["last_reconciled_at"])
+
+    history = pd.read_csv(tmp_path / "order_history.csv")
+    assert history.loc[history["symbol"] == "AAPL", "status"].iloc[0] == "FILLED"
+
+
+def test_reconcile_partial_fill_is_not_treated_as_filled(monkeypatch, tmp_path):
+    client_order_id = _reserve_pending(monkeypatch, tmp_path)
+    broker = FakeBroker(
+        orders_by_client_id={
+            client_order_id: {"status": "partially_filled", "filled_qty": "0.5", "filled_avg_price": "101.50"}
+        }
+    )
+
+    pso.reconcile_pending_orders(broker)
+
+    reconciliation = pd.read_csv(tmp_path / "order_reconciliation.csv")
+    row = reconciliation[reconciliation["client_order_id"] == client_order_id].iloc[0]
+    assert row["local_status"] == "PARTIALLY_FILLED"
+    assert row["local_status"] != "FILLED"
+
+    history = pd.read_csv(tmp_path / "order_history.csv")
+    assert history.loc[history["symbol"] == "AAPL", "status"].iloc[0] == "PARTIALLY_FILLED"
+
+
+def test_reconcile_unknown_broker_order_marks_manual_review_without_resubmit(monkeypatch, tmp_path):
+    client_order_id = _reserve_pending(monkeypatch, tmp_path)
+    broker = FakeBroker()  # orders_by_client_id empty -> lookup returns None
+
+    pso.reconcile_pending_orders(broker)
+
+    reconciliation = pd.read_csv(tmp_path / "order_reconciliation.csv")
+    row = reconciliation[reconciliation["client_order_id"] == client_order_id].iloc[0]
+    assert row["local_status"] == "MANUAL_REVIEW"
+
+    history = pd.read_csv(tmp_path / "order_history.csv")
+    assert history.loc[history["symbol"] == "AAPL", "status"].iloc[0] == "MANUAL_REVIEW"
+    assert broker.submit_calls == []  # never auto-resubmitted
+
+
+@pytest.mark.parametrize(
+    "broker_status,expected_local_status",
+    [
+        ("rejected", "REJECTED"),
+        ("canceled", "CANCELLED"),
+        ("expired", "EXPIRED"),
+        ("something_alpaca_added_later", "UNKNOWN"),
+    ],
+)
+def test_reconcile_maps_terminal_broker_statuses(monkeypatch, tmp_path, broker_status, expected_local_status):
+    client_order_id = _reserve_pending(monkeypatch, tmp_path)
+    broker = FakeBroker(orders_by_client_id={client_order_id: {"status": broker_status, "filled_qty": "0"}})
+
+    pso.reconcile_pending_orders(broker)
+
+    reconciliation = pd.read_csv(tmp_path / "order_reconciliation.csv")
+    row = reconciliation[reconciliation["client_order_id"] == client_order_id].iloc[0]
+    assert row["local_status"] == expected_local_status
+
+
+def test_reconcile_lookup_failure_leaves_state_unchanged(monkeypatch, tmp_path):
+    client_order_id = _reserve_pending(monkeypatch, tmp_path)
+
+    class FailingLookupBroker(FakeBroker):
+        def get_order_by_client_order_id(self, client_order_id):
+            raise requests.exceptions.ConnectionError("network down")
+
+    broker = FailingLookupBroker()
+
+    pso.reconcile_pending_orders(broker)  # must not raise
+
+    reconciliation = pd.read_csv(tmp_path / "order_reconciliation.csv")
+    row = reconciliation[reconciliation["client_order_id"] == client_order_id].iloc[0]
+    assert row["local_status"] == "PENDING_SUBMISSION"  # unresolved, retryable on a future run
+
+
+def test_reconcile_is_idempotent_no_duplicate_rows(monkeypatch, tmp_path):
+    client_order_id = _reserve_pending(monkeypatch, tmp_path)
+    broker = FakeBroker(
+        orders_by_client_id={
+            client_order_id: {"status": "filled", "filled_qty": "1", "filled_avg_price": "101.50"}
+        }
+    )
+
+    pso.reconcile_pending_orders(broker)
+    pso.reconcile_pending_orders(broker)  # re-run with no new broker state
+
+    reconciliation = pd.read_csv(tmp_path / "order_reconciliation.csv")
+    assert len(reconciliation) == 1
+    assert reconciliation.iloc[0]["local_status"] == "FILLED"

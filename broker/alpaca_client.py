@@ -51,7 +51,30 @@ class AlpacaBroker:
     def get_recent_orders(self, limit=10):
         return self._request("GET", f"/v2/orders?status=all&limit={limit}")
 
-    def submit_order(self, symbol, qty=1, side="buy", order_type="market", time_in_force="day"):
+    def get_order_by_client_order_id(self, client_order_id):
+        """Look up a submitted order by the id we generated at reservation time.
+
+        Returns None on a 404 (order unknown to the broker) instead of
+        raising, so reconciliation can distinguish "not found" from a
+        transport/auth failure, which should be retried rather than treated
+        as a definitive answer.
+        """
+        self.config.validate_order_allowed()
+        self.config.validate_for_request()
+        url = f"{self.config.base_url}/v2/orders:by_client_order_id"
+        response = self.session.request(
+            "GET",
+            url,
+            headers=self.headers,
+            params={"client_order_id": client_order_id},
+            timeout=30,
+        )
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        return response.json()
+
+    def submit_order(self, symbol, qty=1, side="buy", order_type="market", time_in_force="day", client_order_id=None):
         order = {
             "symbol": symbol,
             "qty": str(qty),
@@ -59,6 +82,8 @@ class AlpacaBroker:
             "type": order_type,
             "time_in_force": time_in_force,
         }
+        if client_order_id:
+            order["client_order_id"] = client_order_id
 
         if self.config.is_live_mode and not self.config.can_submit_live_order:
             return BrokerResponse(
