@@ -1,5 +1,22 @@
 # VALIDATION_REPORT
 
+## 2026-07-21 — Phase 1 재수정 사이클 (CODEX-001~006)
+
+`CODEX_REVIEW.md`(대상 커밋 `fe2988c`/`dc9bff9`, verdict FAIL, Phase 2 DO_NOT_PROCEED)의 지시서 우선순위(001→002→003→006→005→004)대로 재수정했다.
+
+- **CODEX-001**: `AlpacaBroker._request()`(GET 경로)가 `submit_order()`와 동일한 안전검사를 거치지 않던 문제 수정. 모든 broker 호출이 매번 `self.config`를 재검증하도록 통일. (`9688a13`)
+- **CODEX-002**: `load_order_history()`를 fail-closed로 전환(`MISSING_HISTORY`/`CORRUPTED_HISTORY` 구분), 거래일 판정을 서버 로컬 시간에서 `market_hours.eastern_now()`(America/New_York) 기준으로 변경. (`b93a08a`)
+- **CODEX-003**: `order_history.csv` 쓰기를 임시파일+fsync+`os.replace()` 원자적 방식으로 전환, `fcntl.flock` 기반 프로세스 잠금 도입. `try_reserve_order()`가 잠금 하에 이력을 다시 읽고 중복/일일한도를 재검사한 뒤에만 기록. `threading` 기반 실제 동시성 재현 테스트로 lost update 없음을 확인. (`b93a08a`)
+- **CODEX-006**: 스키마 동결 원칙을 지키며 별도 파일 `order_reconciliation.csv`로 `client_order_id`/체결 상태 추적을 추가. 매 실행 시작 시 비종결 상태를 broker와 대조(`reconcile_pending_orders`), partially_filled≠filled 유지, 미인식 주문은 `MANUAL_REVIEW`(재주문 없음). (`22a6651`)
+- **CODEX-005**: 저장소 루트 `conftest.py`에 `collect_ignore` 추가 — 상위 디렉터리에서 경로를 명시해 pytest를 실행해도(이 경우 `testpaths`가 무시됨) 루트 스크래치 스크립트가 수집되지 않도록 함. (`962eb69`)
+- **CODEX-004**: 동일 `conftest.py`가 수집 시점에 저장소 루트를 `sys.path`에 직접 삽입 — 실행 위치/ini 해석 여부와 무관하게 import가 안정적으로 동작. (`962eb69`)
+
+검증: 저장소 루트(`pytest -q`, `python -m pytest -q`)와 저장소 상위 디렉터리에서 경로 명시(`pytest us-stock-trading -q`, `python -m pytest us-stock-trading -q`) 4가지 조합 모두 **97 passed, 0 failed**. 동시성 테스트 5회 반복 재실행으로 플레이키니스 없음 확인. `git diff --check` 통과. Live URL이 코드 어디에서도 기본값/폴백으로 쓰이지 않음을 grep으로 재확인. `order_history.csv` 해시가 이번 사이클 전후로 불변(`a61104cf...`) — 실제 운영 파일 미변경.
+
+CRITICAL 0건, HIGH 5건(001/002/003/006/005) 전부 RESOLVED, MEDIUM 1건(004) RESOLVED. Phase 1은 부분 체결의 "포지션 상태 반영"이 Phase 5 범위라 여전히 `IN_PROGRESS`(정책적으로 `VALIDATED`로 올리지 않음 — 상세는 `CURRENT_STATUS.md`/`SCALPING_V1_ROADMAP.md`).
+
+---
+
 ## 2026-07-21 — Codex 독립 검증 수정 사이클
 
 - HIGH 3건과 MEDIUM 1건을 실제 코드/테스트 실행으로 재현하고 모두 수정했다.
