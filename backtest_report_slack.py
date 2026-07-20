@@ -4,17 +4,21 @@ import subprocess
 from datetime import datetime
 from dotenv import load_dotenv
 
+from config.paths import get_project_root
+
 load_dotenv()
 
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 
 now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+BASE_DIR = str(get_project_root())
+
 result = subprocess.run(
-    ["/home/ubuntu/trading/venv/bin/python", "/home/ubuntu/trading/backtest_multi.py"],
+    [f"{BASE_DIR}/venv/bin/python", f"{BASE_DIR}/backtest_multi.py"],
     capture_output=True,
     text=True,
-    cwd="/home/ubuntu/trading"
+    cwd=BASE_DIR
 )
 
 output = result.stdout

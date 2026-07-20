@@ -48,6 +48,10 @@ cp .env.example .env
 
 `.env`에 Alpaca Paper Key와 Slack Webhook을 설정합니다. Live Key를 코드에 하드코딩하지 마세요.
 
+`TRADING_PROJECT_ROOT`는 비워두면 저장소 루트를 자동으로 인식합니다(로컬 개발환경 기본값). 운영 서버처럼 실행 위치와 저장소 경로가 다를 수 있는 환경에서만 `TRADING_PROJECT_ROOT=/home/ubuntu/trading`처럼 명시적으로 설정하세요.
+
+macOS 개발환경 상세 절차는 [docs/DEVELOPMENT_SETUP_MAC.md](docs/DEVELOPMENT_SETUP_MAC.md), 전체 환경변수 목록은 [docs/ENVIRONMENT_VARIABLES.md](docs/ENVIRONMENT_VARIABLES.md)를 참고하세요.
+
 ## Run
 
 ```bash

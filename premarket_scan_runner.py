@@ -3,10 +3,12 @@ from zoneinfo import ZoneInfo
 import subprocess
 import os
 
+from config.paths import get_project_root
+
 KST = ZoneInfo("Asia/Seoul")
 NY = ZoneInfo("America/New_York")
 
-BASE_DIR = "/home/ubuntu/trading"
+BASE_DIR = str(get_project_root())
 PYTHON = f"{BASE_DIR}/venv/bin/python"
 LOG_DIR = f"{BASE_DIR}/logs"
 

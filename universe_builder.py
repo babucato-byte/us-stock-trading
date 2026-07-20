@@ -7,7 +7,14 @@ load_dotenv()
 
 API_KEY = os.getenv("ALPACA_API_KEY")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
-BASE_URL = os.getenv("ALPACA_BASE_URL")
+# Legacy ALPACA_BASE_URL is honored for backward compatibility with existing
+# server .env files; new setups should rely on ALPACA_PAPER_BASE_URL. The
+# fallback default is the paper endpoint, never live, if neither is set.
+BASE_URL = (
+    os.getenv("ALPACA_PAPER_BASE_URL")
+    or os.getenv("ALPACA_BASE_URL")
+    or "https://paper-api.alpaca.markets"
+)
 
 headers = {
     "APCA-API-KEY-ID": API_KEY,
