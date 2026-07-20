@@ -31,6 +31,11 @@ class AlpacaBroker:
         }
 
     def _request(self, method, path, **kwargs):
+        # Safety gate must run before any network access, not just before
+        # order submission: without this, a misconfigured Paper mode whose
+        # ALPACA_PAPER_BASE_URL was overwritten with the Live URL could still
+        # reach account/position endpoints on the Live host via this method.
+        self.config.validate_order_allowed()
         self.config.validate_for_request()
         url = f"{self.config.base_url}{path}"
         response = self.session.request(method, url, headers=self.headers, timeout=30, **kwargs)
