@@ -149,11 +149,40 @@ def test_non_paper_mode_blocked_by_trading_mode_check(monkeypatch):
 def test_paper_mode_passes_trading_mode_check(monkeypatch):
     class FakePaperConfig:
         is_live_mode = False
+        is_paper_mode = True
         can_submit_live_order = False
+
+        def validate_order_allowed(self):
+            return True
 
     monkeypatch.setattr(order_safety, "BrokerConfig", lambda: FakePaperConfig())
 
     assert order_safety.check_trading_mode() is True
+
+
+def test_unknown_trading_mode_is_blocked():
+    config = BrokerConfig(
+        trading_mode="papre",
+        api_key="key",
+        secret_key="secret",
+    )
+    broker = AlpacaBroker(config=config, session=DummySession())
+
+    with pytest.raises(RuntimeError, match="must be exactly 'paper'"):
+        broker.submit_order("AAPL", qty=1)
+
+
+def test_paper_mode_with_live_endpoint_is_blocked():
+    config = BrokerConfig(
+        trading_mode="paper",
+        paper_base_url="https://api.alpaca.markets",
+        api_key="key",
+        secret_key="secret",
+    )
+    broker = AlpacaBroker(config=config, session=DummySession())
+
+    with pytest.raises(RuntimeError, match="not the official Paper endpoint"):
+        broker.submit_order("AAPL", qty=1)
 
 
 def test_duplicate_order_blocks_resubmission(monkeypatch, tmp_path):
@@ -187,6 +216,22 @@ def test_daily_trade_count_limit_blocks_order(monkeypatch, tmp_path):
     _patch_common(monkeypatch, tmp_path, ["AAPL"], broker)
 
     with pytest.raises(Exception):
+        pso.main(broker=broker)
+
+    assert broker.submit_calls == []
+
+
+def test_daily_trade_count_is_restored_from_history(monkeypatch, tmp_path):
+    pd.DataFrame(
+        [
+            {"symbol": f"OLD{i}", "order_date": TODAY, "mode": "PAPER", "dry_run": False}
+            for i in range(order_safety.MAX_TRADES_PER_DAY)
+        ]
+    ).to_csv(tmp_path / "order_history.csv", index=False)
+    broker = FakeBroker()
+    _patch_common(monkeypatch, tmp_path, ["AAPL"], broker)
+
+    with pytest.raises(Exception, match="Daily trade count exceeded"):
         pso.main(broker=broker)
 
     assert broker.submit_calls == []
@@ -272,12 +317,12 @@ def test_broker_timeout_is_handled_safely_and_next_symbol_continues(monkeypatch,
 
     assert broker.submit_calls == [("AAPL", 1), ("MSFT", 1)]
     history = pd.read_csv(tmp_path / "order_history.csv")
-    assert not (history["symbol"] == "AAPL").any()
+    assert history.loc[history["symbol"] == "AAPL", "status"].iloc[0] == "SUBMISSION_FAILED"
     assert (history["symbol"] == "MSFT").any()
     assert any("Order failed" in msg and "AAPL" in msg for msg in slack_calls)
 
 
-def test_rejected_response_is_not_recorded_as_success(monkeypatch, tmp_path):
+def test_rejected_response_is_recorded_as_rejected(monkeypatch, tmp_path):
     broker = FakeBroker(
         submit_side_effects={"AAPL": FakeBrokerResponse(status_code=422, text="rejected", dry_run=False)}
     )
@@ -285,7 +330,8 @@ def test_rejected_response_is_not_recorded_as_success(monkeypatch, tmp_path):
 
     pso.main(broker=broker)
 
-    assert not (tmp_path / "order_history.csv").exists()
+    history = pd.read_csv(tmp_path / "order_history.csv")
+    assert history.loc[history["symbol"] == "AAPL", "status"].iloc[0] == "REJECTED"
     assert any("FAILED" in msg for msg in slack_calls)
 
 
@@ -296,6 +342,35 @@ def test_order_history_save_failure_is_logged_not_raised(monkeypatch, tmp_path, 
 
     assert result is False
     assert "Failed to save order history" in capsys.readouterr().out
+
+
+def test_order_is_not_submitted_when_history_reservation_fails(monkeypatch, tmp_path):
+    broker = FakeBroker()
+    _patch_common(monkeypatch, tmp_path, ["AAPL"], broker)
+    monkeypatch.setattr(pso, "save_order_history", lambda history: False)
+
+    with pytest.raises(RuntimeError, match="reservation failed"):
+        pso.main(broker=broker)
+
+    assert broker.submit_calls == []
+
+
+def test_pending_reservation_blocks_duplicate_after_restart(monkeypatch, tmp_path):
+    pd.DataFrame(
+        [{
+            "symbol": "AAPL",
+            "order_date": TODAY,
+            "mode": "PAPER",
+            "dry_run": False,
+            "status": "PENDING_SUBMISSION",
+        }]
+    ).to_csv(tmp_path / "order_history.csv", index=False)
+    broker = FakeBroker()
+    _patch_common(monkeypatch, tmp_path, ["AAPL"], broker)
+
+    pso.main(broker=broker)
+
+    assert broker.submit_calls == []
 
 
 def test_slack_failure_does_not_prevent_history_save(monkeypatch, tmp_path):

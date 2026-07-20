@@ -116,6 +116,41 @@ def is_duplicate_order(order_history, symbol, order_date):
     ).any()
 
 
+def count_orders_for_date(order_history, order_date):
+    """Count persisted order attempts that can consume the daily order limit."""
+    if order_history.empty or "order_date" not in order_history.columns:
+        return 0
+    return int((order_history["order_date"].astype(str) == order_date).sum())
+
+
+def reserve_order(order_history, symbol, order_date, mode, dry_run):
+    """Persist an order intent before submission so a restart cannot duplicate it."""
+    new_row = pd.DataFrame(
+        [
+            {
+                "symbol": symbol,
+                "order_date": order_date,
+                "mode": mode,
+                "dry_run": dry_run,
+                "status": "PENDING_SUBMISSION",
+            }
+        ]
+    )
+    reserved_history = pd.concat([order_history, new_row], ignore_index=True)
+    if not save_order_history(reserved_history):
+        raise RuntimeError("Order history reservation failed; order submission blocked")
+    return reserved_history
+
+
+def update_order_status(order_history, symbol, order_date, status):
+    mask = (
+        (order_history["symbol"].astype(str) == symbol)
+        & (order_history["order_date"].astype(str) == order_date)
+    )
+    order_history.loc[mask, "status"] = status
+    return save_order_history(order_history)
+
+
 def _notify_order_blocked(symbol, reason):
     send_slack_alert(f"*Order blocked*\n- Symbol: {symbol}\n- Reason: {reason}")
 
@@ -149,10 +184,10 @@ def main(broker=None):
     equity = float(account["equity"])
 
     open_position_count = len(positions)
-    today_trade_count = 0
     today = datetime.now().strftime("%Y-%m-%d")
     held_symbols = [p["symbol"] for p in positions]
     order_history = load_order_history()
+    today_trade_count = count_orders_for_date(order_history, today)
 
     print(f"Open positions: {open_position_count}")
     print(f"Held symbols: {held_symbols}")
@@ -192,9 +227,18 @@ def main(broker=None):
             open_position_count=open_position_count,
         )
 
+        order_history = reserve_order(
+            order_history,
+            symbol,
+            today,
+            broker.config.status_label,
+            False,
+        )
+
         try:
             response = submit_order(symbol, qty=order_qty, broker=broker)
         except requests.exceptions.RequestException as exc:
+            update_order_status(order_history, symbol, today, "SUBMISSION_FAILED")
             print(f"{symbol} order submission failed: {exc}")
             _safe_send_slack_alert(
                 f"*Order failed*\n- Symbol: {symbol}\n- Reason: {exc}"
@@ -205,21 +249,17 @@ def main(broker=None):
         status = "DRY RUN" if response.dry_run else ("SUBMITTED" if success else "FAILED")
 
         if success:
-            new_row = pd.DataFrame(
-                [
-                    {
-                        "symbol": symbol,
-                        "order_date": today,
-                        "mode": broker.config.status_label,
-                        "dry_run": response.dry_run,
-                    }
-                ]
+            update_order_status(
+                order_history,
+                symbol,
+                today,
+                "DRY_RUN" if response.dry_run else "SUBMITTED",
             )
-            order_history = pd.concat([order_history, new_row], ignore_index=True)
-            save_order_history(order_history)
             today_trade_count += 1
             if not response.dry_run:
                 open_position_count += 1
+        else:
+            update_order_status(order_history, symbol, today, "REJECTED")
 
         _safe_send_slack_alert(
             f"*Paper Strategy Order*\n- Symbol: {symbol}\n- Qty: {order_qty}\n"

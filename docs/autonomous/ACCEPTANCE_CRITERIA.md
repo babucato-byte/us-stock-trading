@@ -9,14 +9,14 @@ Phase별 완료 판정 기준. `SCALPING_V1_ROADMAP.md`의 상태를 `VALIDATED`
 - [x] 로드맵 확정 (Phase 0~8 + 유튜브 트랙)
 
 ## Phase 1
-- [ ] 실제 Alpaca/Slack API 호출 0회 (테스트 기준)
+- [x] 실제 Alpaca/Slack API 호출 0회 (테스트 기준, broker/session 및 Slack monkeypatch 사용)
 - [x] 정상 Paper 주문 경로 테스트
 - [x] Live URL/Paper 모드 미확인 차단 테스트
 - [x] 중복 주문 / 보유 종목 재매수 차단 테스트
 - [x] 일일 거래 제한 / 일일 손실 한도 테스트
 - [x] 시장 외 주문 차단 테스트
 - [x] API timeout / rejected 주문 테스트
-- [ ] 비정상 수량/금액 차단 테스트 (position_rate 실계산 반영 후 추가 예정)
+- [x] 비정상 수량/금액 차단 테스트
 - [ ] 부분 체결 처리 테스트 (Phase 5 선행 필요 — 현재는 불가, 잔여 위험으로 이관)
 - [x] 주문 이력 저장 실패 / Slack 실패 격리 테스트
 - 판정: 부분 체결 항목은 Phase 5 완료 후 재평가. 그 전까지 Phase 1은 `IN_PROGRESS`를 유지하며 `VALIDATED`로 올리지 않는다.

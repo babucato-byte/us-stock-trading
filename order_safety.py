@@ -4,8 +4,9 @@ from risk_config import MAX_OPEN_POSITIONS, MAX_POSITION_RATE, MAX_TRADES_PER_DA
 
 def check_trading_mode():
     config = BrokerConfig()
-    if config.is_live_mode and config.can_submit_live_order:
-        raise Exception("Real live trading is blocked by the safety layer.")
+    if not config.is_paper_mode:
+        raise Exception("Only explicit Paper trading mode is allowed by the safety layer.")
+    config.validate_order_allowed()
     return True
 
 

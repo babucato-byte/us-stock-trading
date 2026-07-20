@@ -1,5 +1,15 @@
 # VALIDATION_REPORT
 
+## 2026-07-21 — Codex 독립 검증 수정 사이클
+
+- HIGH 3건과 MEDIUM 1건을 실제 코드/테스트 실행으로 재현하고 모두 수정했다.
+- 주문 모드는 정확히 `paper`이고 endpoint는 공식 Alpaca Paper URL인 경우에만 허용한다.
+- 주문 이력에서 당일 주문 수를 복구하며, 제출 전에 `PENDING_SUBMISSION` 예약을 저장한다.
+- `pytest.ini`의 import 경로를 고정했다.
+- 회귀 테스트 5건을 추가/갱신했고 전체 결과는 70 passed, 0 failed, 2 warnings다.
+- 실제 Alpaca/Slack 호출, 운영 서버 변경, Live 활성화, 데이터 삭제는 수행하지 않았다.
+- Phase 1 부분 체결 승인 기준은 미충족이므로 상태는 `IN_PROGRESS`다.
+
 Claude 자체 검증 결과 기록 (외부 검증자의 `CODEX_REVIEW.md`와는 별개).
 
 ---

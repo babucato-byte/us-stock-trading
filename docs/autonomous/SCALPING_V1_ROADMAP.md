@@ -53,13 +53,14 @@ daily_candidate_scanner.py (전체 시장 스캔, RSI/MA200/거래량/breakout/t
 
 - 목적: candidate → scoring → account risk → duplicate/held check → market/session check → order safety → broker submission → order history → Slack notification 전 경로를 mock 기반으로 검증.
 - 이미 완료(커밋 `946caea`, 16개 테스트): 정상 Paper 주문, Live URL 차단, Paper 모드 미확인 차단, 중복 주문 차단, 보유 종목 재매수 차단, 일일 거래 제한, 일일 손실 한도, 시장 외 주문 차단, API timeout 안전 처리, rejected 주문 처리, 주문 이력 저장 실패 로깅, Slack 실패 격리.
-- **이번 Phase 0/1 사이클에서 추가로 처리**: `position_rate` 하드코딩(0.01) 버그 수정 — 실제 `qty*price/equity` 기준으로 계산하도록 변경하여 "비정상 수량 및 금액 차단"이 기존 `MAX_POSITION_RATE`(risk_config, 변경 없음)로 실질적으로 작동하게 함 + 해당 테스트 추가.
+- **검증 수정 사이클에서 추가 처리**: 명시적 Paper 모드/공식 Paper endpoint 강제, 재시작 후 당일 주문 횟수 복구, 제출 전 `PENDING_SUBMISSION` 예약 영속화, pytest import 경로 고정.
 - **아직 미충족(명시적 잔여 항목)**: "부분 체결 처리" — 현재 `paper_strategy_order.py`는 주문 **제출(HTTP 200/201)** 여부만 확인하고 실제 체결 상태(필드: filled/partially_filled)는 조회하지 않는다. 체결 상태 폴링은 `order_monitor.py`가 별도로 수행하지만 `paper_strategy_order.py`의 이력 저장 로직과 연동되어 있지 않다. 부분 체결을 이력/포지션 상태에 반영하려면 Phase 5(포지션 생명주기 상태 머신)가 선행되어야 하므로, 이번 사이클에서는 강제로 구현하지 않고 **명시적 잔여 위험으로 기록**한다.
 - 완료 조건: 실제 API 호출 0회, 실제 Slack 발송 0회, 전체 테스트 통과, 주문 경로 잔여 위험 문서화 — 앞의 3개는 충족, 마지막(부분 체결)은 Phase 5로 이관 조건부 충족.
 - 관련 파일: `paper_strategy_order.py`, `account_risk.py`, `order_safety.py`, `risk_config.py`, `broker/broker_config.py`, `broker/alpaca_client.py`, `tests/test_paper_order_execution.py`
 - 테스트 결과: (이번 사이클 갱신값은 `CURRENT_STATUS.md` 참고)
 - 커밋 해시: `946caea`(1차), 추가 커밋은 `CURRENT_STATUS.md`에 기록
-- 잔여 위험: 부분 체결 미반영(Phase 5 선행 필요), `run_order_safety_check` 예외 발생 시 해당 실행의 남은 후보가 전부 스킵됨(의도된 보수적 동작으로 유지).
+- 테스트 결과: 70 passed, 0 failed, 2 warnings.
+- 잔여 위험: 부분 체결 미반영(Phase 5 선행 필요), 주문 제출 후 상태 갱신 저장 실패 시 `PENDING_SUBMISSION`으로 남아 수동 확인 전 재주문이 보수적으로 차단됨.
 
 ---
 

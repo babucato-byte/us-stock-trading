@@ -35,7 +35,7 @@ class BrokerConfig:
 
     @property
     def is_paper_mode(self):
-        return not self.is_live_mode
+        return self.trading_mode == "paper"
 
     @property
     def base_url(self):
@@ -60,11 +60,14 @@ class BrokerConfig:
             raise RuntimeError("Alpaca API credentials are missing. Set them in .env or environment variables.")
 
     def validate_order_allowed(self):
-        if self.is_paper_mode:
+        if self.is_paper_mode and self.base_url.rstrip("/") == PAPER_BASE_URL:
             return True
+        if self.is_paper_mode:
+            raise RuntimeError(
+                "Paper order blocked because ALPACA_PAPER_BASE_URL is not the official Paper endpoint."
+            )
         if self.can_submit_live_order:
             raise RuntimeError("Real live trading is disabled in this pre-live PR. Use live dry-run only.")
         raise RuntimeError(
-            "Live order blocked. Live orders require TRADING_MODE=live, "
-            "ENABLE_REAL_TRADING=True, and LIVE_DRY_RUN=False."
+            "Order blocked. TRADING_MODE must be exactly 'paper'; live and unknown modes are disabled."
         )
