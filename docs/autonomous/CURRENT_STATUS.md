@@ -25,6 +25,7 @@ Phase 1 승인 기준의 부분 체결 처리 및 테스트가 남아 있다. CR
 2. 부분 체결 회귀 테스트를 통과시킨 뒤 Phase 1을 재검증한다.
 
 ## 최근 커밋
+- `fe2988c` Remediate paper order safety review findings
 - `cd48b6f` Fix hardcoded position_rate in paper order safety check
 - `946caea` Add paper order execution safety tests
 - `fdf2217` Standardize development environment and project paths

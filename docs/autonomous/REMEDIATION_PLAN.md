@@ -10,6 +10,7 @@
 - 수정 파일: `broker/broker_config.py`, `order_safety.py`
 - 테스트: 오타 모드 차단, Paper 모드의 Live endpoint 차단
 - 처리 상태: RESOLVED
+- 커밋 해시: `fe2988c`
 
 ### CODEX-002
 - 심각도: HIGH
@@ -19,6 +20,7 @@
 - 수정 파일: `paper_strategy_order.py`
 - 테스트: 당일 이력이 한도에 도달한 상태에서 재시작 후 주문 차단
 - 처리 상태: RESOLVED
+- 커밋 해시: `fe2988c`
 
 ### CODEX-003
 - 심각도: HIGH
@@ -28,6 +30,7 @@
 - 수정 파일: `paper_strategy_order.py`
 - 테스트: 예약 저장 실패 시 broker 미호출, 재시작 시 pending 예약의 중복 차단, timeout/rejected 상태 기록
 - 처리 상태: RESOLVED
+- 커밋 해시: `fe2988c`
 
 ### CODEX-004
 - 심각도: MEDIUM
@@ -37,5 +40,6 @@
 - 수정 파일: `pytest.ini`
 - 테스트: 문서화된 `venv/bin/pytest -q` 명령으로 전체 수집 및 실행
 - 처리 상태: RESOLVED
+- 커밋 해시: `fe2988c`
 
 CRITICAL/HIGH 미해결 Finding은 없다. 다만 Phase 1의 별도 승인 기준인 부분 체결 처리가 남아 있어 다음 Phase 자동 진행 조건은 아직 충족하지 않는다.
