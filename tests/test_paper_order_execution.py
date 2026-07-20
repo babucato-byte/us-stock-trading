@@ -1,4 +1,4 @@
-from datetime import datetime
+import threading
 
 import pandas as pd
 import pytest
@@ -9,7 +9,7 @@ import paper_strategy_order as pso
 from broker import AlpacaBroker, BrokerConfig
 
 
-TODAY = datetime.now().strftime("%Y-%m-%d")
+TODAY = pso.eastern_now().strftime("%Y-%m-%d")
 
 
 class DummySession:
@@ -73,11 +73,20 @@ def _high_score_result(symbol):
     }
 
 
-def _patch_common(monkeypatch, tmp_path, tickers, broker, market_session="regular"):
+def _write_history(path, rows=None):
+    """Write a valid order_history.csv with the current required schema."""
+    rows = rows or []
+    pd.DataFrame(rows, columns=pso.REQUIRED_HISTORY_COLUMNS).to_csv(path, index=False)
+
+
+def _patch_common(monkeypatch, tmp_path, tickers, broker, market_session="regular", init_history=True):
     monkeypatch.setattr(pso, "load_watchlist", lambda: tickers)
     monkeypatch.setattr(pso, "analyze_stock", _high_score_result)
     monkeypatch.setattr(pso, "get_us_market_session", lambda: market_session)
     monkeypatch.setattr(pso, "ORDER_HISTORY_FILE", tmp_path / "order_history.csv")
+    monkeypatch.setattr(pso, "ORDER_HISTORY_LOCK_FILE", tmp_path / "order_history.lock")
+    if init_history:
+        pso.initialize_order_history()
     slack_calls = []
     monkeypatch.setattr(pso, "send_slack_alert", lambda msg: slack_calls.append(msg) or True)
     return slack_calls
@@ -105,6 +114,7 @@ def test_successful_order_is_persisted_to_history(monkeypatch, tmp_path):
     history = pd.read_csv(tmp_path / "order_history.csv")
     assert (history["symbol"] == "AAPL").any()
     assert (history["order_date"] == TODAY).any()
+    assert history.loc[history["symbol"] == "AAPL", "status"].iloc[0] == "SUBMITTED"
 
 
 def test_successful_order_triggers_slack_notification(monkeypatch, tmp_path):
@@ -187,12 +197,13 @@ def test_paper_mode_with_live_endpoint_is_blocked():
 
 def test_duplicate_order_blocks_resubmission(monkeypatch, tmp_path):
     history_file = tmp_path / "order_history.csv"
-    pd.DataFrame([{"symbol": "AAPL", "order_date": TODAY, "mode": "PAPER", "dry_run": False}]).to_csv(
-        history_file, index=False
+    _write_history(
+        history_file,
+        [{"symbol": "AAPL", "order_date": TODAY, "mode": "PAPER", "dry_run": False, "status": "SUBMITTED"}],
     )
 
     broker = FakeBroker()
-    slack_calls = _patch_common(monkeypatch, tmp_path, ["AAPL"], broker)
+    slack_calls = _patch_common(monkeypatch, tmp_path, ["AAPL"], broker, init_history=False)
 
     pso.main(broker=broker)
 
@@ -215,21 +226,22 @@ def test_daily_trade_count_limit_blocks_order(monkeypatch, tmp_path):
     broker = FakeBroker()
     _patch_common(monkeypatch, tmp_path, ["AAPL"], broker)
 
-    with pytest.raises(Exception):
+    with pytest.raises(Exception, match="Daily trade count exceeded"):
         pso.main(broker=broker)
 
     assert broker.submit_calls == []
 
 
 def test_daily_trade_count_is_restored_from_history(monkeypatch, tmp_path):
-    pd.DataFrame(
+    _write_history(
+        tmp_path / "order_history.csv",
         [
-            {"symbol": f"OLD{i}", "order_date": TODAY, "mode": "PAPER", "dry_run": False}
+            {"symbol": f"OLD{i}", "order_date": TODAY, "mode": "PAPER", "dry_run": False, "status": "SUBMITTED"}
             for i in range(order_safety.MAX_TRADES_PER_DAY)
-        ]
-    ).to_csv(tmp_path / "order_history.csv", index=False)
+        ],
+    )
     broker = FakeBroker()
-    _patch_common(monkeypatch, tmp_path, ["AAPL"], broker)
+    _patch_common(monkeypatch, tmp_path, ["AAPL"], broker, init_history=False)
 
     with pytest.raises(Exception, match="Daily trade count exceeded"):
         pso.main(broker=broker)
@@ -241,7 +253,7 @@ def test_daily_loss_limit_blocks_all_orders(monkeypatch, tmp_path):
     broker = FakeBroker(account={"equity": "9700", "last_equity": "10000"})
     _patch_common(monkeypatch, tmp_path, ["AAPL"], broker)
 
-    with pytest.raises(Exception):
+    with pytest.raises(Exception, match="Daily loss limit exceeded"):
         pso.main(broker=broker)
 
     assert broker.submit_calls == []
@@ -268,7 +280,7 @@ def test_abnormal_order_value_relative_to_equity_blocks_order(monkeypatch, tmp_p
     # threshold is introduced here; this exercises the real position-value
     # calculation instead of the previous hardcoded 0.01 placeholder.
     broker = FakeBroker(account={"equity": "1000", "last_equity": "1000"})
-    monkeypatch.setattr(pso, "load_watchlist", lambda: ["AAPL"])
+    _patch_common(monkeypatch, tmp_path, ["AAPL"], broker)
     monkeypatch.setattr(
         pso,
         "analyze_stock",
@@ -281,11 +293,8 @@ def test_abnormal_order_value_relative_to_equity_blocks_order(monkeypatch, tmp_p
             "score": 100,
         },
     )
-    monkeypatch.setattr(pso, "get_us_market_session", lambda: "regular")
-    monkeypatch.setattr(pso, "ORDER_HISTORY_FILE", tmp_path / "order_history.csv")
-    monkeypatch.setattr(pso, "send_slack_alert", lambda msg: True)
 
-    with pytest.raises(Exception):
+    with pytest.raises(Exception, match="Position size exceeded"):
         pso.main(broker=broker)
 
     assert broker.submit_calls == []
@@ -318,7 +327,7 @@ def test_broker_timeout_is_handled_safely_and_next_symbol_continues(monkeypatch,
     assert broker.submit_calls == [("AAPL", 1), ("MSFT", 1)]
     history = pd.read_csv(tmp_path / "order_history.csv")
     assert history.loc[history["symbol"] == "AAPL", "status"].iloc[0] == "SUBMISSION_FAILED"
-    assert (history["symbol"] == "MSFT").any()
+    assert history.loc[history["symbol"] == "MSFT", "status"].iloc[0] == "SUBMITTED"
     assert any("Order failed" in msg and "AAPL" in msg for msg in slack_calls)
 
 
@@ -336,12 +345,38 @@ def test_rejected_response_is_recorded_as_rejected(monkeypatch, tmp_path):
 
 
 def test_order_history_save_failure_is_logged_not_raised(monkeypatch, tmp_path, capsys):
-    monkeypatch.setattr(pso, "ORDER_HISTORY_FILE", tmp_path / "missing_dir" / "order_history.csv")
-
-    result = pso.save_order_history(pd.DataFrame([{"symbol": "AAPL", "order_date": TODAY}]))
+    readonly_dir = tmp_path / "readonly"
+    readonly_dir.mkdir()
+    monkeypatch.setattr(pso, "ORDER_HISTORY_FILE", readonly_dir / "order_history.csv")
+    readonly_dir.chmod(0o500)
+    try:
+        result = pso.save_order_history(pd.DataFrame([{"symbol": "AAPL", "order_date": TODAY}]))
+    finally:
+        readonly_dir.chmod(0o700)
 
     assert result is False
     assert "Failed to save order history" in capsys.readouterr().out
+
+
+def test_failed_save_preserves_existing_file(monkeypatch, tmp_path):
+    history_file = tmp_path / "order_history.csv"
+    _write_history(
+        history_file,
+        [{"symbol": "AAPL", "order_date": TODAY, "mode": "PAPER", "dry_run": False, "status": "SUBMITTED"}],
+    )
+    monkeypatch.setattr(pso, "ORDER_HISTORY_FILE", history_file)
+    original_bytes = history_file.read_bytes()
+
+    history_file.parent.chmod(0o500)
+    try:
+        result = pso.save_order_history(
+            pd.DataFrame([{"symbol": "MSFT", "order_date": TODAY, "mode": "PAPER", "dry_run": False, "status": "SUBMITTED"}])
+        )
+    finally:
+        history_file.parent.chmod(0o700)
+
+    assert result is False
+    assert history_file.read_bytes() == original_bytes
 
 
 def test_order_is_not_submitted_when_history_reservation_fails(monkeypatch, tmp_path):
@@ -356,17 +391,12 @@ def test_order_is_not_submitted_when_history_reservation_fails(monkeypatch, tmp_
 
 
 def test_pending_reservation_blocks_duplicate_after_restart(monkeypatch, tmp_path):
-    pd.DataFrame(
-        [{
-            "symbol": "AAPL",
-            "order_date": TODAY,
-            "mode": "PAPER",
-            "dry_run": False,
-            "status": "PENDING_SUBMISSION",
-        }]
-    ).to_csv(tmp_path / "order_history.csv", index=False)
+    _write_history(
+        tmp_path / "order_history.csv",
+        [{"symbol": "AAPL", "order_date": TODAY, "mode": "PAPER", "dry_run": False, "status": "PENDING_SUBMISSION"}],
+    )
     broker = FakeBroker()
-    _patch_common(monkeypatch, tmp_path, ["AAPL"], broker)
+    _patch_common(monkeypatch, tmp_path, ["AAPL"], broker, init_history=False)
 
     pso.main(broker=broker)
 
@@ -375,10 +405,7 @@ def test_pending_reservation_blocks_duplicate_after_restart(monkeypatch, tmp_pat
 
 def test_slack_failure_does_not_prevent_history_save(monkeypatch, tmp_path):
     broker = FakeBroker()
-    monkeypatch.setattr(pso, "load_watchlist", lambda: ["AAPL"])
-    monkeypatch.setattr(pso, "analyze_stock", _high_score_result)
-    monkeypatch.setattr(pso, "get_us_market_session", lambda: "regular")
-    monkeypatch.setattr(pso, "ORDER_HISTORY_FILE", tmp_path / "order_history.csv")
+    _patch_common(monkeypatch, tmp_path, ["AAPL"], broker)
 
     def _raise_slack(message):
         raise requests.exceptions.ConnectionError("slack unreachable")
@@ -389,3 +416,192 @@ def test_slack_failure_does_not_prevent_history_save(monkeypatch, tmp_path):
 
     history = pd.read_csv(tmp_path / "order_history.csv")
     assert (history["symbol"] == "AAPL").any()
+
+
+# ---------------------------------------------------------------------------
+# CODEX-002: order history integrity (fail-closed reads)
+# ---------------------------------------------------------------------------
+
+def test_missing_history_blocks_new_orders(monkeypatch, tmp_path):
+    broker = FakeBroker()
+    _patch_common(monkeypatch, tmp_path, ["AAPL"], broker, init_history=False)
+    # ORDER_HISTORY_FILE deliberately left absent — simulates the file
+    # disappearing mid-operation, not a fresh install.
+
+    with pytest.raises(pso.OrderHistoryUnavailable, match="MISSING_HISTORY"):
+        pso.main(broker=broker)
+
+    assert broker.submit_calls == []
+
+
+def test_corrupted_history_missing_columns_blocks_new_orders(monkeypatch, tmp_path):
+    history_file = tmp_path / "order_history.csv"
+    pd.DataFrame([{"symbol": "AAPL"}]).to_csv(history_file, index=False)  # missing order_date/mode/dry_run/status
+    broker = FakeBroker()
+    _patch_common(monkeypatch, tmp_path, ["AAPL"], broker, init_history=False)
+
+    with pytest.raises(pso.OrderHistoryUnavailable, match="CORRUPTED_HISTORY"):
+        pso.main(broker=broker)
+
+    assert broker.submit_calls == []
+
+
+def test_corrupted_history_bad_date_blocks_new_orders(monkeypatch, tmp_path):
+    history_file = tmp_path / "order_history.csv"
+    _write_history(
+        history_file,
+        [{"symbol": "AAPL", "order_date": "not-a-date", "mode": "PAPER", "dry_run": False, "status": "SUBMITTED"}],
+    )
+    broker = FakeBroker()
+    _patch_common(monkeypatch, tmp_path, ["AAPL"], broker, init_history=False)
+
+    with pytest.raises(pso.OrderHistoryUnavailable, match="CORRUPTED_HISTORY"):
+        pso.main(broker=broker)
+
+    assert broker.submit_calls == []
+
+
+def test_unreadable_history_blocks_new_orders(monkeypatch, tmp_path):
+    history_file = tmp_path / "order_history.csv"
+    history_file.write_text("not,a,valid\ncsv\x00structure,,,")
+    broker = FakeBroker()
+    _patch_common(monkeypatch, tmp_path, ["AAPL"], broker, init_history=False)
+
+    with pytest.raises(pso.OrderHistoryUnavailable):
+        pso.main(broker=broker)
+
+    assert broker.submit_calls == []
+
+
+def test_initialize_order_history_creates_valid_empty_file(monkeypatch, tmp_path):
+    monkeypatch.setattr(pso, "ORDER_HISTORY_FILE", tmp_path / "order_history.csv")
+
+    created = pso.initialize_order_history()
+
+    assert created.empty
+    reloaded = pso.load_order_history()  # must not raise
+    assert reloaded.empty
+    assert list(reloaded.columns) == pso.REQUIRED_HISTORY_COLUMNS
+
+
+def test_daily_trade_date_uses_eastern_time_not_local(monkeypatch):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    # 23:30 in Seoul on 2026-06-15 is still 2026-06-15 10:30 in New York —
+    # this must resolve to the New York calendar date, not the Seoul one.
+    seoul_evening = datetime(2026, 6, 15, 23, 30, tzinfo=ZoneInfo("Asia/Seoul"))
+    ny_date = pso.eastern_now(seoul_evening).strftime("%Y-%m-%d")
+    assert ny_date == "2026-06-15"
+
+    # Conversely, 00:30 in New York on 2026-06-16 is already 13:30 in Seoul
+    # on the same NY calendar day per this call's own reference point.
+    ny_midnight = datetime(2026, 6, 16, 0, 30, tzinfo=ZoneInfo("America/New_York"))
+    assert pso.eastern_now(ny_midnight).strftime("%Y-%m-%d") == "2026-06-16"
+
+
+# ---------------------------------------------------------------------------
+# CODEX-003: atomic, concurrency-safe order history writes
+# ---------------------------------------------------------------------------
+
+def test_concurrent_reservations_same_symbol_only_one_succeeds(tmp_path, monkeypatch):
+    monkeypatch.setattr(pso, "ORDER_HISTORY_FILE", tmp_path / "order_history.csv")
+    monkeypatch.setattr(pso, "ORDER_HISTORY_LOCK_FILE", tmp_path / "order_history.lock")
+    pso.initialize_order_history()
+
+    results = []
+    barrier = threading.Barrier(2)
+
+    def _attempt():
+        barrier.wait(timeout=5)
+        try:
+            pso.try_reserve_order("AAPL", TODAY, "PAPER", False)
+            results.append("ok")
+        except pso.DuplicateOrderError:
+            results.append("duplicate")
+
+    threads = [threading.Thread(target=_attempt) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert sorted(results) == ["duplicate", "ok"]
+    history = pd.read_csv(tmp_path / "order_history.csv")
+    assert len(history[history["symbol"] == "AAPL"]) == 1
+
+
+def test_concurrent_reservations_different_symbols_both_persist(tmp_path, monkeypatch):
+    monkeypatch.setattr(pso, "ORDER_HISTORY_FILE", tmp_path / "order_history.csv")
+    monkeypatch.setattr(pso, "ORDER_HISTORY_LOCK_FILE", tmp_path / "order_history.lock")
+    pso.initialize_order_history()
+
+    errors = []
+    barrier = threading.Barrier(2)
+
+    def _attempt(symbol):
+        barrier.wait(timeout=5)
+        try:
+            pso.try_reserve_order(symbol, TODAY, "PAPER", False)
+        except Exception as exc:  # pragma: no cover - failure path asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_attempt, args=(sym,)) for sym in ("AAPL", "MSFT")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert errors == []
+    history = pd.read_csv(tmp_path / "order_history.csv")
+    assert set(history["symbol"]) == {"AAPL", "MSFT"}
+    assert len(history) == 2  # no lost update
+
+
+def test_concurrent_reservations_respect_daily_trade_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(pso, "ORDER_HISTORY_FILE", tmp_path / "order_history.csv")
+    monkeypatch.setattr(pso, "ORDER_HISTORY_LOCK_FILE", tmp_path / "order_history.lock")
+    monkeypatch.setattr(order_safety, "MAX_TRADES_PER_DAY", 1)
+    pso.initialize_order_history()
+
+    outcomes = []
+    barrier = threading.Barrier(2)
+
+    def _attempt(symbol):
+        barrier.wait(timeout=5)
+        try:
+            pso.try_reserve_order(symbol, TODAY, "PAPER", False)
+            outcomes.append("reserved")
+        except Exception:
+            outcomes.append("blocked")
+
+    threads = [threading.Thread(target=_attempt, args=(sym,)) for sym in ("AAPL", "MSFT")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert sorted(outcomes) == ["blocked", "reserved"]
+    history = pd.read_csv(tmp_path / "order_history.csv")
+    assert len(history) == 1  # the daily limit was not raced past
+
+
+def test_lock_acquisition_timeout_blocks_order(tmp_path, monkeypatch):
+    monkeypatch.setattr(pso, "ORDER_HISTORY_FILE", tmp_path / "order_history.csv")
+    monkeypatch.setattr(pso, "ORDER_HISTORY_LOCK_FILE", tmp_path / "order_history.lock")
+    pso.initialize_order_history()
+
+    import fcntl
+
+    held_lock_file = open(tmp_path / "order_history.lock", "a+")
+    fcntl.flock(held_lock_file, fcntl.LOCK_EX)
+    try:
+        with pytest.raises(RuntimeError, match="Could not acquire order history lock"):
+            pso.try_reserve_order("AAPL", TODAY, "PAPER", False, lock_timeout=0.2)
+    finally:
+        fcntl.flock(held_lock_file, fcntl.LOCK_UN)
+        held_lock_file.close()
+
+    # The file must be untouched — no partial reservation was written.
+    history = pd.read_csv(tmp_path / "order_history.csv")
+    assert history.empty
