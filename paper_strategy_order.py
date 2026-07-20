@@ -2,6 +2,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
+import requests
 import yfinance as yf
 
 from account_risk import check_daily_loss_limit
@@ -98,7 +99,12 @@ def load_order_history():
 
 
 def save_order_history(order_history):
-    order_history.to_csv(ORDER_HISTORY_FILE, index=False)
+    try:
+        order_history.to_csv(ORDER_HISTORY_FILE, index=False)
+        return True
+    except Exception as exc:
+        print(f"Failed to save order history to {ORDER_HISTORY_FILE}: {exc}")
+        return False
 
 
 def is_duplicate_order(order_history, symbol, order_date):
@@ -114,8 +120,16 @@ def _notify_order_blocked(symbol, reason):
     send_slack_alert(f"*Order blocked*\n- Symbol: {symbol}\n- Reason: {reason}")
 
 
-def main():
-    broker = AlpacaBroker()
+def _safe_send_slack_alert(message):
+    try:
+        return send_slack_alert(message)
+    except Exception as exc:
+        print(f"Slack notification failed: {exc}")
+        return False
+
+
+def main(broker=None):
+    broker = broker or AlpacaBroker()
     market_session = get_us_market_session()
     allow_order = market_session == "regular"
 
@@ -173,15 +187,17 @@ def main():
             open_position_count=open_position_count,
         )
 
-        response = submit_order(symbol, qty=1, broker=broker)
+        try:
+            response = submit_order(symbol, qty=1, broker=broker)
+        except requests.exceptions.RequestException as exc:
+            print(f"{symbol} order submission failed: {exc}")
+            _safe_send_slack_alert(
+                f"*Order failed*\n- Symbol: {symbol}\n- Reason: {exc}"
+            )
+            continue
+
         success = response.status_code in [200, 201]
         status = "DRY RUN" if response.dry_run else ("SUBMITTED" if success else "FAILED")
-        send_slack_alert(
-            f"*Paper Strategy Order*\n- Symbol: {symbol}\n- Qty: 1\n"
-            f"- Score: {result['score']}\n- Price: {result['price']:.2f}\n"
-            f"- RSI: {result['rsi']:.2f}\n- Volume ratio: {result['volume_ratio']:.2f}x\n"
-            f"- Broker mode: {broker.config.status_label}\n- Status: {status}"
-        )
 
         if success:
             new_row = pd.DataFrame(
@@ -199,6 +215,13 @@ def main():
             today_trade_count += 1
             if not response.dry_run:
                 open_position_count += 1
+
+        _safe_send_slack_alert(
+            f"*Paper Strategy Order*\n- Symbol: {symbol}\n- Qty: 1\n"
+            f"- Score: {result['score']}\n- Price: {result['price']:.2f}\n"
+            f"- RSI: {result['rsi']:.2f}\n- Volume ratio: {result['volume_ratio']:.2f}x\n"
+            f"- Broker mode: {broker.config.status_label}\n- Status: {status}"
+        )
 
 
 if __name__ == "__main__":
