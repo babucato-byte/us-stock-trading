@@ -11,7 +11,7 @@ per the Phase 2 charter question.
 
 from market_hours import eastern_now, get_us_market_session
 
-from . import eligibility, repository, scorer
+from . import eligibility, freshness, repository, scorer
 from .features import compute_features
 from .models import (
     NOT_EVALUATED,
@@ -72,11 +72,20 @@ def run_scan_cycle(provider, now=None, symbols=None,
 
     for symbol in unique_symbols:
         try:
-            snapshot = provider.get_symbol_snapshot(symbol, session)
+            snapshot = provider.get_symbol_snapshot(symbol, session, now=now_dt)
             data_quality_reasons = []
         except Exception as exc:
             snapshot = None
             data_quality_reasons = [f"PROVIDER_ERROR: {exc}"]
+
+        if snapshot is not None:
+            # CODEX-011: freshness is judged against this pipeline's own
+            # evaluation time (now_dt), never provider_fetched_at — a
+            # provider that fetches quickly but returns an old bar must
+            # still be caught.
+            data_quality_reasons += freshness.check_data_freshness(
+                snapshot.data_as_of, now_dt, session, cfg
+            )
 
         features, feature_reasons = compute_features(snapshot)
         data_quality_reasons = data_quality_reasons + feature_reasons

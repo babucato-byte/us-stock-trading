@@ -54,9 +54,33 @@ MIN_ATR_PERCENT = _env_float("SCALPING_MIN_ATR_PERCENT", 1.5)
 MIN_LIQUIDITY_SCORE = _env_float("SCALPING_MIN_LIQUIDITY_SCORE", 20.0)
 MAX_SPREAD_PERCENT = _env_float("SCALPING_MAX_SPREAD_PERCENT", 0.5)
 
+# Data freshness (CODEX-011). A scan cycle runs roughly every 15 minutes
+# (REPEAT_WINDOW_MINUTES below), so data older than one cycle is treated
+# as stale rather than a fresh read of the current session.
+MAX_PREMARKET_DATA_AGE_MINUTES = _env_float("SCALPING_MAX_PREMARKET_DATA_AGE_MINUTES", 15.0)
+MAX_REGULAR_DATA_AGE_MINUTES = _env_float("SCALPING_MAX_REGULAR_DATA_AGE_MINUTES", 15.0)
+MAX_AFTER_HOURS_DATA_AGE_MINUTES = _env_float("SCALPING_MAX_AFTER_HOURS_DATA_AGE_MINUTES", 15.0)
+
+# Allowed trading sessions and the regular-session window (CODEX-012).
+# Phase 2's charter (section 1) is explicitly premarket + "정규장 초반"
+# (early regular session), not the full regular session — scanning the
+# entire day at low frequency is Phase 2's job already handled elsewhere;
+# this engine's job is the narrow early window feeding Phase 3. Decision
+# and rationale recorded in DECISION_LOG.md.
+ALLOWED_SESSIONS = ("premarket", "regular")
+REGULAR_OPEN_WINDOW_MINUTES = _env_int("SCALPING_REGULAR_OPEN_WINDOW_MINUTES", 30)
+
 # Stage D: persistence / repeat detection
 MIN_REPEAT_COUNT = _env_int("SCALPING_MIN_REPEAT_COUNT", 1)
 REPEAT_WINDOW_MINUTES = _env_int("SCALPING_REPEAT_WINDOW_MINUTES", 15)
+
+# Average volume window (CODEX-015): the current/most recent trading day
+# is always excluded before averaging (its volume is necessarily partial
+# while the market is open), then the trailing LOOKBACK_DAYS of complete
+# days are used, requiring at least MIN_VALID_VOLUME_DAYS to avoid
+# computing an average from too little history.
+AVERAGE_VOLUME_LOOKBACK_DAYS = _env_int("SCALPING_AVERAGE_VOLUME_LOOKBACK_DAYS", 20)
+MIN_VALID_VOLUME_DAYS = _env_int("SCALPING_MIN_VALID_VOLUME_DAYS", 10)
 
 # Watchlist sizing and lifecycle
 MAX_WATCHLIST_SIZE = _env_int("SCALPING_MAX_WATCHLIST_SIZE", 30)

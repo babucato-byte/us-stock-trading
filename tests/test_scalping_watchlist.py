@@ -576,3 +576,150 @@ def test_scorer_never_returns_non_finite_score():
     score, sub_scores = scorer.compute_scalping_score(features)
     assert is_finite_number(score)
     assert all(is_finite_number(v) for v in sub_scores.values())
+
+
+# ---------------------------------------------------------------------------
+# CODEX-011: market data freshness
+# ---------------------------------------------------------------------------
+
+from datetime import timedelta, timezone as _timezone  # noqa: E402
+
+from scalping_watchlist import freshness  # noqa: E402
+
+
+def test_fresh_premarket_data_passes(monkeypatch, tmp_path):
+    _patch_paths(monkeypatch, tmp_path)
+    now = PREMARKET_NOW
+    snapshot = _good_snapshot(data_as_of=now - timedelta(minutes=5))
+    provider = FakeMarketDataProvider(universe_symbols=["AAPL"], snapshots={"AAPL": snapshot})
+
+    result = run_scan_cycle(provider, now=now)
+
+    assert [r["symbol"] for r in result["selected"]] == ["AAPL"]
+
+
+def test_stale_premarket_data_is_blocked(monkeypatch, tmp_path):
+    _patch_paths(monkeypatch, tmp_path)
+    now = PREMARKET_NOW
+    snapshot = _good_snapshot(data_as_of=now - timedelta(minutes=30))
+    provider = FakeMarketDataProvider(universe_symbols=["AAPL"], snapshots={"AAPL": snapshot})
+
+    result = run_scan_cycle(provider, now=now)
+
+    assert result["selected"] == []
+    assert any("STALE_MARKET_DATA" in r["rejection_reasons"] for r in result["rejected"])
+
+
+def test_fresh_regular_data_passes(monkeypatch, tmp_path):
+    _patch_paths(monkeypatch, tmp_path)
+    snapshot = _good_snapshot(data_as_of=REGULAR_NOW - timedelta(minutes=5))
+    provider = FakeMarketDataProvider(universe_symbols=["AAPL"], snapshots={"AAPL": snapshot})
+
+    result = run_scan_cycle(provider, now=REGULAR_NOW)
+
+    assert [r["symbol"] for r in result["selected"]] == ["AAPL"]
+
+
+def test_stale_regular_data_is_blocked(monkeypatch, tmp_path):
+    _patch_paths(monkeypatch, tmp_path)
+    snapshot = _good_snapshot(data_as_of=REGULAR_NOW - timedelta(minutes=45))
+    provider = FakeMarketDataProvider(universe_symbols=["AAPL"], snapshots={"AAPL": snapshot})
+
+    result = run_scan_cycle(provider, now=REGULAR_NOW)
+
+    assert result["selected"] == []
+    assert any("STALE_MARKET_DATA" in r["rejection_reasons"] for r in result["rejected"])
+
+
+def test_naive_data_as_of_timestamp_is_blocked(monkeypatch, tmp_path):
+    _patch_paths(monkeypatch, tmp_path)
+    naive = datetime(2026, 6, 15, 9, 55)  # no tzinfo
+    snapshot = _good_snapshot(data_as_of=naive)
+    provider = FakeMarketDataProvider(universe_symbols=["AAPL"], snapshots={"AAPL": snapshot})
+
+    result = run_scan_cycle(provider, now=REGULAR_NOW)
+
+    assert result["selected"] == []
+    assert any("NAIVE_TIMESTAMP" in r["rejection_reasons"] for r in result["rejected"])
+
+
+def test_utc_timezone_aware_timestamp_passes():
+    data_as_of = REGULAR_NOW.astimezone(_timezone.utc) - timedelta(minutes=5)
+    reasons = freshness.check_data_freshness(data_as_of, REGULAR_NOW, "regular", cfg)
+    assert reasons == []
+
+
+def test_et_timestamp_converts_correctly():
+    # 09:58 ET is 2 minutes before REGULAR_NOW (10:00 ET) — should be fresh.
+    data_as_of = REGULAR_NOW.replace(hour=9, minute=58)
+    reasons = freshness.check_data_freshness(data_as_of, REGULAR_NOW, "regular", cfg)
+    assert reasons == []
+
+
+def test_future_timestamp_is_blocked(monkeypatch, tmp_path):
+    _patch_paths(monkeypatch, tmp_path)
+    snapshot = _good_snapshot(data_as_of=REGULAR_NOW + timedelta(hours=1))
+    provider = FakeMarketDataProvider(universe_symbols=["AAPL"], snapshots={"AAPL": snapshot})
+
+    result = run_scan_cycle(provider, now=REGULAR_NOW)
+
+    assert result["selected"] == []
+    assert any("FUTURE_TIMESTAMP" in r["rejection_reasons"] for r in result["rejected"])
+
+
+def test_missing_data_as_of_is_blocked():
+    reasons = freshness.check_data_freshness(None, REGULAR_NOW, "regular", cfg)
+    assert reasons == ["MISSING_DATA_TIMESTAMP"]
+
+
+def test_recent_fetch_does_not_excuse_an_old_bar(monkeypatch, tmp_path):
+    # provider_fetched_at is "just now" but data_as_of (the actual bar) is
+    # old — freshness must be judged against data_as_of, not fetch time.
+    _patch_paths(monkeypatch, tmp_path)
+    snapshot = _good_snapshot(
+        data_as_of=REGULAR_NOW - timedelta(hours=2),
+        provider_fetched_at=REGULAR_NOW,
+    )
+    provider = FakeMarketDataProvider(universe_symbols=["AAPL"], snapshots={"AAPL": snapshot})
+
+    result = run_scan_cycle(provider, now=REGULAR_NOW)
+
+    assert result["selected"] == []
+    assert any("STALE_MARKET_DATA" in r["rejection_reasons"] for r in result["rejected"])
+
+
+def test_freshness_check_uses_evaluated_at_not_provider_fetched_at():
+    # Even if provider_fetched_at were passed by mistake as the comparison
+    # basis, check_data_freshness's signature only accepts data_as_of and
+    # evaluated_at — there is no way to accidentally substitute fetched_at.
+    old_bar = REGULAR_NOW - timedelta(minutes=45)
+    reasons = freshness.check_data_freshness(old_bar, REGULAR_NOW, "regular", cfg)
+    assert any("STALE_MARKET_DATA" in r for r in reasons)
+
+
+def test_stale_data_across_all_candidates_yields_zero_selected(monkeypatch, tmp_path):
+    _patch_paths(monkeypatch, tmp_path)
+    provider = FakeMarketDataProvider(
+        universe_symbols=["AAPL", "MSFT"],
+        snapshots={
+            "AAPL": _good_snapshot(symbol="AAPL", data_as_of=REGULAR_NOW - timedelta(hours=5)),
+            "MSFT": _good_snapshot(symbol="MSFT", data_as_of=REGULAR_NOW - timedelta(hours=5)),
+        },
+    )
+
+    result = run_scan_cycle(provider, now=REGULAR_NOW)
+
+    assert result["selected"] == []
+    assert len(result["rejected"]) == 2
+
+
+def test_fake_provider_used_for_freshness_tests_makes_no_real_calls(monkeypatch, tmp_path):
+    _patch_paths(monkeypatch, tmp_path)
+    provider = FakeMarketDataProvider(
+        universe_symbols=["AAPL"],
+        snapshots={"AAPL": _good_snapshot(data_as_of=REGULAR_NOW - timedelta(hours=5))},
+    )
+
+    run_scan_cycle(provider, now=REGULAR_NOW)
+
+    assert provider.requested_symbols == ["AAPL"]  # only the fake was ever touched
