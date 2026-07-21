@@ -58,6 +58,47 @@
 - 처리 상태: RESOLVED
 - 커밋 해시: `16a1ee4`
 
-## 요약
+## 요약 (Phase 1, CODEX-001~009)
 
 CRITICAL 0건. HIGH 전부(001/002/003/005/006/007/008 — 003/005는 이전 사이클에서 이미 RESOLVED로 재확인) RESOLVED. MEDIUM 전부(004/009) RESOLVED. 남은 항목은 CODEX Finding이 아니라 Phase 1 자체 승인 기준(부분 체결의 포지션 상태 반영, Phase 5 범위)과, `order_history.csv`/`order_reconciliation.csv` 간 교차 파일 트랜잭션 정합성(`DECISION_LOG.md`에 `NEEDS_USER_DECISION`으로 기록, SQLite 전환 후보 — 아래 참고)이다.
+
+---
+
+## Phase 2 수정 사이클 — CODEX-010~015
+
+검증 기준: 사용자가 전달한 `CODEX_REVIEW.md` 결과, overall verdict **FAIL**, Phase 2 **FAIL**, Phase 3 **DO_NOT_PROCEED**. 처리 순서 지시: `CODEX-010 → 011 → 012 → 013 → 014 → 015`. 이번 사이클은 Phase 3 코드(1분봉 감시, VWAP/EMA 전략, 주문 로직)를 일절 포함하지 않음.
+
+### CODEX-010 — NaN/Infinity가 후보 통과를 우회함 (HIGH) — RESOLVED
+- 원인: `features.py`의 수치 계산이 `<`/`>` 비교 기반이라 NaN이 모든 비교에서 False가 되어 임계값 체크를 통과했다.
+- 수정: `numeric_guard.require_finite_number()`(명시적 `math.isnan`/`math.isinf`) 신설, raw/derived 전 수치 필드에 적용.
+- 커밋: `a7736d5`
+
+### CODEX-011 — 운영 provider의 데이터 최신성 검증이 사실상 비활성 (HIGH) — RESOLVED
+- 원인: 최신성 게이트가 provider 요청 시각(`provider_fetched_at`)만 보고 실제 시세 시각(`data_as_of`)을 보지 않아, 오래된 봉도 "방금 조회했으니 신선함"으로 오판했다.
+- 수정: `SymbolSnapshot`에 `data_as_of`/`provider_fetched_at` 분리, `freshness.py` 신설(세션별 최대 허용 지연), 파이프라인이 `now_dt` 기준으로 `data_as_of`만으로 신선도 판정. Provider 레벨에서도 타임존 없음/미래시각/미정렬/중복 인덱스를 fail-closed 처리.
+- 커밋: `427958a`
+
+### CODEX-012 — 휴장일/비허용 세션 차단 없음 (MEDIUM) — RESOLVED
+- 원인: 파이프라인이 주말/공휴일/장외 시간에도 그대로 실행되어 오래되거나 무의미한 데이터로 워치리스트를 갱신할 수 있었다.
+- 수정: `calendar_guard.check_pipeline_allowed()` 신설, provider/파일 접근 이전에 게이트. 차단 시 `SKIPPED` 반환(빈 워치리스트를 "정상"으로 저장하지 않음).
+- 커밋: `044df60`
+
+### CODEX-013 — 저장 실패가 성공처럼 보임 (MEDIUM) — RESOLVED
+- 원인: `save_watchlist_cycle()`이 단순 bool만 반환해, 쓰기 실패/부분 실패가 호출자에게 성공과 동일하게 보였다.
+- 수정: `{success, persisted_count, error_code, error_message}` 구조로 반환, 쓰기 후 재읽기로 행 수/컬럼/중복 심볼을 재검증(`_verify_after_write`). `run_scan_cycle()` 결과에 `status`(`SUCCESS`/`SKIPPED`/`FAILED_PERSISTENCE`)/`error_code`/`error_message` 포함.
+- 커밋: `ac2b4b3`
+
+### CODEX-014 — lifecycle 상태머신이 문서와 불일치, 손상 timestamp가 TTL 우회 (MEDIUM) — RESOLVED
+- 원인: 신규 선정 행이 곧바로 `ACTIVE`로 생성되어 문서화된 `NEW → ACTIVE` 전이가 실제로 발생하지 않았고, `_apply_expiry()`가 타임스탬프 파싱 실패 시 해당 행을 그대로 방치해 손상된 값이 TTL/만료 비교 자체를 우회, 행이 영구히 ACTIVE로 남을 수 있었다.
+- 수정: `first_detected_at`/`last_detected_at`/`updated_at` 3필드로 분리(모두 timezone-aware ISO 8601 필수), `repeat_tracker`의 `detect_count`를 기준으로 최초 탐지=`NEW`, 2회차부터=`ACTIVE`로 실제 전이. `models.validate_lifecycle_timestamps()`가 존재/비-sentinel/timezone-aware/파싱 가능/순서(`last_detected_at`, `expires_at` ≥ `first_detected_at`)를 모두 검사, 실패 시 해당 행을 `REJECTED`(사유 `INVALID_LIFECYCLE_TIMESTAMP`)로 즉시 처리.
+- 정책 기록: 만료 후 같은 거래일 내 재탐지는 `repeat_tracker`의 `detect_count` 기억이 워치리스트 행의 영속 상태와 독립적이므로 `NEW`가 아니라 `ACTIVE`로 재개(이미 지속성을 증명한 심볼이라는 판단, `DECISION_LOG.md` 기록).
+- 커밋: `7ab8db7`
+
+### CODEX-015 — 평균거래량/premarket 시간 범위 계산 오류 (LOW) — RESOLVED
+- 원인: 평균거래량 계산이 당일(미완료) 거래 봉을 포함해 장중에 평균을 인위적으로 낮추고 `relative_volume`을 부풀렸다. premarket 구간 필터링 로직이 실yfinance 호출 내부에 묻혀 있어 순수 단위 테스트가 불가능했다.
+- 수정: `_compute_average_volume()`이 최근(당일) 봉을 제외 후 `AVERAGE_VOLUME_LOOKBACK_DAYS` 범위에서 평균, `MIN_VALID_VOLUME_DAYS` 미만이면 `None`. premarket 04:00~09:30 ET 필터링을 `filter_premarket_rows()` 순수함수로 분리(UTC/ET 변환, DST 포함 단위 테스트 가능), `premarket_coverage_complete` 필드로 부분 구간 여부를 명시.
+- 커밋: `4f1f89d`
+
+## 요약 (Phase 2, CODEX-010~015)
+
+CRITICAL 0건. HIGH 전부(010/011) RESOLVED. MEDIUM 전부(012/013/014) RESOLVED. LOW(015) RESOLVED. 미해결 Finding 없음. Phase 3 코드는 이번 사이클에서 작성하지 않음. Codex 재검증(`PROCEED` 여부) 대기 — Claude 자체 판정으로 `VALIDATED` 승격하지 않음.
