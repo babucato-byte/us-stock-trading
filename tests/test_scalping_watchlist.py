@@ -463,3 +463,116 @@ def test_provider_error_for_one_symbol_does_not_block_others(monkeypatch, tmp_pa
     assert [r["symbol"] for r in result["selected"]] == ["AAPL"]
     bad_row = next(r for r in result["rejected"] if r["symbol"] == "BAD")
     assert "PROVIDER_ERROR" in bad_row["rejection_reasons"]
+
+
+# ---------------------------------------------------------------------------
+# CODEX-010: explicit finite-number validation
+# ---------------------------------------------------------------------------
+
+from scalping_watchlist.numeric_guard import InvalidNumber, is_finite_number, require_finite_number  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, float("nan"), float("inf"), float("-inf"), "5", "", True, False],
+)
+def test_require_finite_number_rejects_invalid_types_and_values(value):
+    with pytest.raises(InvalidNumber):
+        require_finite_number(value, field_name="test_field")
+
+
+@pytest.mark.parametrize("value", [-1.0, 0])
+def test_require_finite_number_rejects_negative_and_zero_when_configured(value):
+    with pytest.raises(InvalidNumber):
+        require_finite_number(value, field_name="price", min_value=0, allow_zero=False, min_exclusive=True)
+
+
+def test_require_finite_number_accepts_normal_value():
+    assert require_finite_number(100.5, field_name="price", min_value=0, min_exclusive=True) == 100.5
+
+
+def test_require_finite_number_reason_code_matches_field_name():
+    with pytest.raises(InvalidNumber) as exc_info:
+        require_finite_number(float("nan"), field_name="latest_price")
+    assert exc_info.value.reason_code == "INVALID_LATEST_PRICE"
+
+
+def test_is_finite_number_helper():
+    assert is_finite_number(1.0) is True
+    assert is_finite_number(float("nan")) is False
+    assert is_finite_number(float("inf")) is False
+    assert is_finite_number(None) is False
+    assert is_finite_number(True) is False
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("price", float("nan")),
+        ("previous_close", float("nan")),
+        ("average_volume", float("nan")),
+        ("atr", float("nan")),
+        ("price", float("inf")),
+    ],
+)
+def test_nan_or_infinite_snapshot_field_blocks_candidate(field, value):
+    from scalping_watchlist.features import compute_features
+
+    kwargs = {"symbol": "X", "price": 100.0, "previous_close": 95.0,
+              "current_volume": 5_000_000, "average_volume": 1_000_000, "atr": 3.0}
+    kwargs[field] = value
+    snapshot = SymbolSnapshot(**kwargs)
+
+    features, reasons = compute_features(snapshot)
+
+    assert reasons  # at least one rejection reason recorded
+    assert any(is_sentinel_or_str(v) for v in features.values())
+
+
+def is_sentinel_or_str(value):
+    from scalping_watchlist.models import is_sentinel
+    return is_sentinel(value)
+
+
+def test_nan_price_produces_nan_gap_percent_which_is_also_blocked():
+    from scalping_watchlist.features import compute_features
+
+    snapshot = SymbolSnapshot(symbol="X", price=float("nan"), previous_close=95.0,
+                               current_volume=5_000_000, average_volume=1_000_000, atr=3.0)
+    features, reasons = compute_features(snapshot)
+
+    assert features["gap_percent"] == "NOT_AVAILABLE"
+    assert any("INVALID_LATEST_PRICE" in r for r in reasons)
+
+
+def test_nan_volume_inputs_block_relative_volume():
+    from scalping_watchlist.features import compute_features
+
+    snapshot = SymbolSnapshot(symbol="X", price=100.0, previous_close=95.0,
+                               current_volume=float("nan"), average_volume=1_000_000, atr=3.0)
+    features, reasons = compute_features(snapshot)
+
+    assert features["relative_volume"] == "NOT_AVAILABLE"
+    assert any("INVALID_CURRENT_VOLUME" in r for r in reasons)
+
+
+def test_single_nan_field_excludes_symbol_from_pipeline_selection(monkeypatch, tmp_path):
+    _patch_paths(monkeypatch, tmp_path)
+    provider = FakeMarketDataProvider(
+        universe_symbols=["AAPL"],
+        snapshots={"AAPL": _good_snapshot(atr=float("nan"))},
+    )
+
+    result = run_scan_cycle(provider, now=REGULAR_NOW)
+
+    assert result["selected"] == []
+    assert any("INVALID_ATR" in r["rejection_reasons"] for r in result["rejected"])
+
+
+def test_scorer_never_returns_non_finite_score():
+    features = {"latest_price": 100.0, "relative_volume": float("nan"),
+                "gap_percent": float("inf"), "atr_percent": float("-inf"),
+                "liquidity_score": float("nan")}
+    score, sub_scores = scorer.compute_scalping_score(features)
+    assert is_finite_number(score)
+    assert all(is_finite_number(v) for v in sub_scores.values())

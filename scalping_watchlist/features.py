@@ -1,6 +1,12 @@
 """Feature calculation and data-quality gating (Phase 2 instructions,
-sections 4/6). Turns a raw SymbolSnapshot into either a dict of computed
-features, or a rejection reason — never a fabricated number.
+sections 4/6, hardened per CODEX-010).
+
+Every number — both raw snapshot fields and every derived value — goes
+through numeric_guard.require_finite_number() before being used further.
+A plain `value < MIN_PRICE`-style comparison is not sufficient: NaN
+compares False against every threshold in both directions, so it silently
+survives naive range checks. Only require_finite_number()'s explicit
+math.isnan()/math.isinf() test can be trusted to catch it.
 
 Formulas (all newly written for Phase 2 — no equivalent existed in the
 repo per DECISION_LOG.md's reuse-scope entry):
@@ -16,35 +22,31 @@ repo per DECISION_LOG.md's reuse-scope entry):
 """
 
 from .models import NOT_AVAILABLE
+from .numeric_guard import InvalidNumber, require_finite_number
 
 # A gap this large is far more likely a bad print, a split, or a data glitch
 # than a real tradable gap; treated as a data-quality rejection, not a
 # business-rule rejection (distinct from MIN/MAX_GAP_PERCENT in config).
 GAP_SANITY_LIMIT_PERCENT = 500.0
 
+_FEATURE_KEYS = (
+    "latest_price", "previous_close", "gap_percent", "current_volume",
+    "average_volume", "relative_volume", "average_dollar_volume", "atr",
+    "atr_percent", "liquidity_score", "premarket_volume",
+)
+
 
 def compute_features(snapshot):
     """Returns (features: dict, rejection_reasons: list[str]).
 
-    features always has all keys; a key is NOT_AVAILABLE when data-quality
-    checks failed early enough that a downstream number can't be trusted.
-    Multiple rejection reasons can apply — none of them are mutually
-    exclusive short-circuits, so operators see the full picture.
+    features always has all keys; a key is NOT_AVAILABLE when its own
+    validation failed, or when it could not be derived because an input it
+    depends on was already invalid. Multiple rejection reasons can apply —
+    every check runs regardless of earlier failures, so operators see the
+    full picture (Phase 2 instructions section 6).
     """
     reasons = []
-    features = {
-        "latest_price": NOT_AVAILABLE,
-        "previous_close": NOT_AVAILABLE,
-        "gap_percent": NOT_AVAILABLE,
-        "current_volume": NOT_AVAILABLE,
-        "average_volume": NOT_AVAILABLE,
-        "relative_volume": NOT_AVAILABLE,
-        "average_dollar_volume": NOT_AVAILABLE,
-        "atr": NOT_AVAILABLE,
-        "atr_percent": NOT_AVAILABLE,
-        "liquidity_score": NOT_AVAILABLE,
-        "premarket_volume": NOT_AVAILABLE,
-    }
+    features = {key: NOT_AVAILABLE for key in _FEATURE_KEYS}
 
     if snapshot is None:
         reasons.append("DATA_UNAVAILABLE: provider returned no snapshot")
@@ -54,48 +56,63 @@ def compute_features(snapshot):
         reasons.append("STALE_DATA: snapshot flagged stale by provider")
         return features, reasons
 
-    price = snapshot.price
-    previous_close = snapshot.previous_close
-    current_volume = snapshot.current_volume
-    average_volume = snapshot.average_volume
-    atr = snapshot.atr
+    price = _validate(snapshot.price, "latest_price", reasons, min_value=0, min_exclusive=True)
+    if price is not None:
+        features["latest_price"] = price
 
-    if price is None or price <= 0:
-        reasons.append("INVALID_PRICE: price is missing, zero, or negative")
-        return features, reasons
-    features["latest_price"] = price
-
-    if previous_close is None or previous_close <= 0:
-        reasons.append("INVALID_PREVIOUS_CLOSE: previous_close is missing, zero, or negative")
-    else:
+    previous_close = _validate(snapshot.previous_close, "previous_close", reasons, min_value=0, min_exclusive=True)
+    if previous_close is not None:
         features["previous_close"] = previous_close
-        gap_percent = (price - previous_close) / previous_close * 100
-        if abs(gap_percent) > GAP_SANITY_LIMIT_PERCENT:
-            reasons.append(f"DATA_ANOMALY: gap_percent {gap_percent:.1f}% exceeds sanity limit")
-        else:
-            features["gap_percent"] = gap_percent
 
-    if current_volume is None or current_volume < 0:
-        reasons.append("CORRUPTED_VOLUME: current_volume is missing or negative")
-    else:
+    if price is not None and previous_close is not None:
+        raw_gap = (price - previous_close) / previous_close * 100
+        gap_percent = _validate(raw_gap, "gap_percent", reasons)
+        if gap_percent is not None:
+            if abs(gap_percent) > GAP_SANITY_LIMIT_PERCENT:
+                reasons.append(f"DATA_ANOMALY: gap_percent {gap_percent:.1f}% exceeds sanity limit")
+            else:
+                features["gap_percent"] = gap_percent
+
+    current_volume = _validate(snapshot.current_volume, "current_volume", reasons, min_value=0)
+    if current_volume is not None:
         features["current_volume"] = current_volume
 
-    if average_volume is None or average_volume <= 0:
-        reasons.append("AVERAGE_VOLUME_UNAVAILABLE: cannot compute a positive average volume")
-    else:
+    average_volume = _validate(snapshot.average_volume, "average_volume", reasons, min_value=0, allow_zero=False)
+    if average_volume is not None:
         features["average_volume"] = average_volume
-        features["average_dollar_volume"] = price * average_volume
-        features["liquidity_score"] = min(100.0, (price * average_volume) / 1_000_000)
-        if current_volume is not None and current_volume >= 0:
-            features["relative_volume"] = current_volume / average_volume
 
-    if atr is None or atr < 0:
-        reasons.append("ATR_UNAVAILABLE: cannot compute a valid ATR")
-    else:
+    if price is not None and average_volume is not None:
+        dollar_volume = _validate(price * average_volume, "average_dollar_volume", reasons, min_value=0)
+        if dollar_volume is not None:
+            features["average_dollar_volume"] = dollar_volume
+            liquidity_score = _validate(min(100.0, dollar_volume / 1_000_000), "liquidity_score", reasons, min_value=0)
+            if liquidity_score is not None:
+                features["liquidity_score"] = liquidity_score
+
+    if current_volume is not None and average_volume is not None:
+        relative_volume = _validate(current_volume / average_volume, "relative_volume", reasons, min_value=0)
+        if relative_volume is not None:
+            features["relative_volume"] = relative_volume
+
+    atr = _validate(snapshot.atr, "atr", reasons, min_value=0)
+    if atr is not None:
         features["atr"] = atr
-        features["atr_percent"] = atr / price * 100
+        if price is not None:
+            atr_percent = _validate(atr / price * 100, "atr_percent", reasons, min_value=0)
+            if atr_percent is not None:
+                features["atr_percent"] = atr_percent
 
     if snapshot.premarket_volume is not None:
-        features["premarket_volume"] = snapshot.premarket_volume
+        premarket_volume = _validate(snapshot.premarket_volume, "premarket_volume", reasons, min_value=0)
+        if premarket_volume is not None:
+            features["premarket_volume"] = premarket_volume
 
     return features, reasons
+
+
+def _validate(value, field_name, reasons, **kwargs):
+    try:
+        return require_finite_number(value, field_name=field_name, **kwargs)
+    except InvalidNumber as exc:
+        reasons.append(f"{exc.reason_code}: {exc}")
+        return None
