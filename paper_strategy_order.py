@@ -14,7 +14,8 @@ import yfinance as yf
 
 import order_intent_ledger
 from account_risk import check_account_exposure_limits, check_daily_loss_limit
-from broker import AlpacaBroker
+from broker import AlpacaBroker, BrokerResponse
+from kill_switch import is_trading_halted
 from market_hours import eastern_now, get_us_market_session
 from order_safety import check_daily_trade_count, run_order_safety_check
 from slack_utils import send_slack_alert
@@ -167,6 +168,14 @@ def calculate_rsi(df, period=14):
 
 
 def submit_order(symbol, qty=1, broker=None, client_order_id=None):
+    if is_trading_halted():
+        print(f"Kill switch engaged: {symbol} order not submitted.")
+        return BrokerResponse(
+            status_code=423,
+            text="Kill switch engaged: trading halted, order not submitted.",
+            data={"halted": True},
+            dry_run=False,
+        )
     broker = broker or AlpacaBroker()
     response = broker.submit_order(symbol, qty=qty, client_order_id=client_order_id)
     print(f"{symbol} order result: {response.status_code} {response.text[:500]}")
@@ -793,6 +802,10 @@ def _safe_send_slack_alert(message):
 
 
 def main(broker=None):
+    if is_trading_halted():
+        print("Kill switch engaged: trading halted, no orders will be submitted.")
+        return {"halted": True, "submitted": 0}
+
     broker = broker or AlpacaBroker()
     market_session = get_us_market_session()
     allow_order = market_session == "regular"
