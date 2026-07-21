@@ -12,6 +12,7 @@ import pandas as pd
 import requests
 import yfinance as yf
 
+import order_intent_ledger
 from account_risk import check_daily_loss_limit
 from broker import AlpacaBroker
 from market_hours import eastern_now, get_us_market_session
@@ -50,8 +51,16 @@ RECONCILIATION_COLUMNS = [
 # Local status vocabulary for reconciliation rows. PENDING_SUBMISSION/
 # SUBMITTED/PARTIALLY_FILLED/UNKNOWN are non-terminal (still worth
 # re-checking on a future run); the rest are terminal and sticky.
+#
+# SUBMISSION_FAILED is set directly by main()'s RequestException handler
+# (never by reconcile_pending_orders itself): it means the ledger already
+# determined this specific client_order_id never reached the broker, so the
+# row must never be re-checked and flipped to MANUAL_REVIEW on a later run --
+# that would erase the one signal (is_duplicate_order's SUBMISSION_FAILED
+# exemption, see below) that lets a retry for the same (symbol, order_date)
+# proceed.
 RECONCILIATION_NON_TERMINAL_STATUSES = {"PENDING_SUBMISSION", "SUBMITTED", "PARTIALLY_FILLED", "UNKNOWN"}
-RECONCILIATION_TERMINAL_STATUSES = {"FILLED", "REJECTED", "CANCELLED", "EXPIRED", "MANUAL_REVIEW"}
+RECONCILIATION_TERMINAL_STATUSES = {"FILLED", "REJECTED", "CANCELLED", "EXPIRED", "MANUAL_REVIEW", "SUBMISSION_FAILED"}
 
 # Monotonic progression rank used by merge_reconciliation_state(). Terminal
 # statuses (including FILLED) are handled separately: once existing status
@@ -631,12 +640,25 @@ def _reconciliation_lock(timeout=ORDER_HISTORY_LOCK_TIMEOUT_SECONDS):
 
 
 def is_duplicate_order(order_history, symbol, order_date):
+    """True if an existing order_history row occupies this (symbol, order_date).
+
+    A row with status SUBMISSION_FAILED is excluded from this match: it means
+    order_intent_ledger already recorded (via an explicit abort()) that this
+    specific prior attempt never reached the broker, so it is safe to let a
+    fresh attempt through to try_reserve_order() -- which replaces that stale
+    row rather than appending, keeping at most one row per (symbol,
+    order_date). Every other status (including PENDING_SUBMISSION, which
+    means the previous run's outcome is still unknown) continues to block.
+    """
     if order_history.empty or "symbol" not in order_history.columns or "order_date" not in order_history.columns:
         return False
-    return (
+    mask = (
         (order_history["symbol"].astype(str) == symbol)
         & (order_history["order_date"].astype(str) == order_date)
-    ).any()
+    )
+    if "status" in order_history.columns:
+        mask = mask & (order_history["status"].astype(str) != "SUBMISSION_FAILED")
+    return bool(mask.any())
 
 
 def count_orders_for_date(order_history, order_date):
@@ -653,7 +675,18 @@ def count_orders_for_date(order_history, order_date):
     return int((order_history["order_date"].astype(str) == order_date).sum())
 
 
-def try_reserve_order(symbol, order_date, mode, dry_run, qty=1, lock_timeout=ORDER_HISTORY_LOCK_TIMEOUT_SECONDS):
+def _intent_ledger_paths():
+    """Order-intent-ledger file/lock paths, derived from ORDER_HISTORY_FILE's
+    current directory so tests that monkeypatch ORDER_HISTORY_FILE to a
+    tmp_path automatically get an isolated ledger too, with no separate
+    monkeypatch of their own required.
+    """
+    base_dir = ORDER_HISTORY_FILE.parent
+    return base_dir / "order_intent_ledger.csv", base_dir / "order_intent_ledger.lock"
+
+
+def try_reserve_order(symbol, order_date, mode, dry_run, qty=1, broker=None,
+                       lock_timeout=ORDER_HISTORY_LOCK_TIMEOUT_SECONDS):
     """Atomically reserve an order slot: lock -> reread -> check -> write -> unlock.
 
     Re-reads order history from disk under an exclusive lock (not the
@@ -665,6 +698,13 @@ def try_reserve_order(symbol, order_date, mode, dry_run, qty=1, lock_timeout=ORD
     stop). Returns (updated_history, client_order_id) on success; the
     client_order_id is what ties this reservation to the broker's own order
     record for later reconciliation.
+
+    Before writing anything, this also reserves the same (symbol, order_date)
+    in order_intent_ledger.py -- a restart-safe two-phase (reserve -> commit
+    on submission / abort on submission failure) record kept independently
+    of order_history.csv. `broker`, if given, lets a stale RESERVED row left
+    over from a crashed prior run be re-checked against the broker's own
+    truth by client_order_id instead of always failing closed.
     """
     with _order_history_lock(timeout=lock_timeout):
         order_history = load_order_history()
@@ -672,6 +712,17 @@ def try_reserve_order(symbol, order_date, mode, dry_run, qty=1, lock_timeout=ORD
             raise DuplicateOrderError(symbol)
         today_trade_count = count_orders_for_date(order_history, order_date)
         check_daily_trade_count(today_trade_count)
+
+        client_order_id = f"scalp-{symbol}-{order_date}-{uuid.uuid4().hex[:10]}"
+        ledger_path, ledger_lock_path = _intent_ledger_paths()
+        try:
+            order_intent_ledger.reserve(
+                ledger_path, ledger_lock_path, symbol, order_date,
+                client_order_id=client_order_id, broker=broker, lock_timeout=lock_timeout,
+            )
+        except order_intent_ledger.DuplicateIntentError as exc:
+            raise DuplicateOrderError(symbol) from exc
+
         new_row = pd.DataFrame(
             [
                 {
@@ -683,11 +734,28 @@ def try_reserve_order(symbol, order_date, mode, dry_run, qty=1, lock_timeout=ORD
                 }
             ]
         )
+        # is_duplicate_order() above only let this reservation through when
+        # every existing row for (symbol, order_date) is SUBMISSION_FAILED (a
+        # prior attempt the ledger confirmed never reached the broker).
+        # Replace that stale row rather than appending, so order_history.csv
+        # keeps at most one row per (symbol, order_date) -- the invariant
+        # update_order_status() and reconciliation's symbol/order_date
+        # correlation both rely on.
+        if not order_history.empty:
+            stale_mask = (
+                (order_history["symbol"].astype(str) == symbol)
+                & (order_history["order_date"].astype(str) == order_date)
+            )
+            order_history = order_history[~stale_mask]
         reserved_history = pd.concat([order_history, new_row], ignore_index=True)
         if not save_order_history(reserved_history):
+            order_intent_ledger.abort(ledger_path, ledger_lock_path, client_order_id, lock_timeout=lock_timeout)
             raise RuntimeError("Order history reservation failed; order submission blocked")
-        client_order_id = f"scalp-{symbol}-{order_date}-{uuid.uuid4().hex[:10]}"
-        _record_pending_reconciliation(client_order_id, symbol, order_date, qty)
+        try:
+            _record_pending_reconciliation(client_order_id, symbol, order_date, qty)
+        except Exception:
+            order_intent_ledger.abort(ledger_path, ledger_lock_path, client_order_id, lock_timeout=lock_timeout)
+            raise
         return reserved_history, client_order_id
 
 
@@ -805,6 +873,7 @@ def main(broker=None):
                 broker.config.status_label,
                 False,
                 qty=order_qty,
+                broker=broker,
             )
         except DuplicateOrderError:
             _notify_order_blocked(symbol, "Duplicate order prevented for today")
@@ -817,15 +886,38 @@ def main(broker=None):
 
         today_trade_count = count_orders_for_date(order_history, today)
 
+        ledger_path, ledger_lock_path = _intent_ledger_paths()
         try:
             response = submit_order(symbol, qty=order_qty, broker=broker, client_order_id=client_order_id)
         except requests.exceptions.RequestException as exc:
             update_order_status(symbol, today, "SUBMISSION_FAILED")
+            try:
+                order_intent_ledger.abort(ledger_path, ledger_lock_path, client_order_id)
+            except Exception as ledger_exc:
+                print(f"Order intent ledger abort failed for {client_order_id}: {ledger_exc}")
+            # Settle this attempt's reconciliation row as terminal too (not
+            # just order_history's status): otherwise reconcile_pending_orders()
+            # would re-check this never-reached-broker client_order_id on the
+            # next run, get no match, and overwrite order_history's
+            # SUBMISSION_FAILED status with MANUAL_REVIEW before the retry
+            # this abort() just unblocked ever reaches try_reserve_order().
+            _update_reconciliation_row(
+                client_order_id, symbol, today,
+                {"local_status": "SUBMISSION_FAILED", "last_reconciled_at": eastern_now().isoformat()},
+            )
             print(f"{symbol} order submission failed: {exc}")
             _safe_send_slack_alert(
                 f"*Order failed*\n- Symbol: {symbol}\n- Reason: {exc}"
             )
             continue
+
+        # The broker gave a definitive response (accepted or rejected) --
+        # either way client_order_id is now known to it, so the reservation
+        # is settled and must never be retried under a new one.
+        try:
+            order_intent_ledger.commit(ledger_path, ledger_lock_path, client_order_id)
+        except Exception as ledger_exc:
+            print(f"Order intent ledger commit failed for {client_order_id}: {ledger_exc}")
 
         success = response.status_code in [200, 201]
         status = "DRY RUN" if response.dry_run else ("SUBMITTED" if success else "FAILED")
