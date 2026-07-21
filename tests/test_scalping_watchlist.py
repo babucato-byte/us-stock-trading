@@ -55,7 +55,7 @@ def test_symbol_meeting_all_criteria_is_selected(monkeypatch, tmp_path):
     result = run_scan_cycle(provider, now=REGULAR_NOW)
 
     assert [r["symbol"] for r in result["selected"]] == ["AAPL"]
-    assert result["selected"][0]["status"] == "ACTIVE"
+    assert result["selected"][0]["status"] == "NEW"  # first-ever detection; ACTIVE starts on the 2nd (CODEX-014)
     assert result["selected"][0]["eligibility_reasons"] == "PASSED_STAGE_A_THROUGH_C"
 
 
@@ -83,8 +83,10 @@ def test_max_watchlist_size_caps_persisted_active_entries(monkeypatch, tmp_path)
     run_scan_cycle(provider, now=REGULAR_NOW, max_watchlist_size=2)
 
     watchlist = repository.load_watchlist()
-    active_rows = watchlist[watchlist["status"] == "ACTIVE"]
-    assert len(active_rows) == 2
+    # First-ever detection -> NEW, not ACTIVE (CODEX-014); the cap applies
+    # to the whole non-expired selected pool regardless of NEW vs ACTIVE.
+    tracked_rows = watchlist[watchlist["status"].isin(["NEW", "ACTIVE"])]
+    assert len(tracked_rows) == 2
 
 
 def test_tie_scores_break_deterministically_by_symbol(monkeypatch, tmp_path):
@@ -968,3 +970,176 @@ def test_pipeline_result_includes_error_code_on_failure(monkeypatch, tmp_path):
 
 
 from scalping_watchlist.atomic_io import FileUnavailable as atomic_io_FileUnavailable  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# CODEX-014: lifecycle state machine and timestamp validation
+# ---------------------------------------------------------------------------
+
+from scalping_watchlist.models import (  # noqa: E402
+    STATUS_ACTIVE as _STATUS_ACTIVE,
+    STATUS_COOLING as _STATUS_COOLING,
+    STATUS_EXPIRED as _STATUS_EXPIRED,
+    STATUS_NEW as _STATUS_NEW,
+    STATUS_REJECTED as _STATUS_REJECTED,
+    VALID_STATUSES,
+    validate_lifecycle_timestamps,
+)
+
+
+_UNSET = object()
+
+
+def _lifecycle_row(status=_STATUS_ACTIVE, first_detected_at=_UNSET, last_detected_at=_UNSET,
+                    expires_at=_UNSET, symbol="AAPL"):
+    # Explicit _UNSET sentinel (not a plain default-arg `or`) so a test can
+    # deliberately pass "" or None to exercise validate_lifecycle_timestamps'
+    # empty/None handling without it being silently replaced by the default.
+    if first_detected_at is _UNSET:
+        first_detected_at = REGULAR_NOW.isoformat()
+    if last_detected_at is _UNSET:
+        last_detected_at = REGULAR_NOW.isoformat()
+    if expires_at is _UNSET:
+        expires_at = (REGULAR_NOW + timedelta(hours=1)).isoformat()
+    return {
+        "symbol": symbol, "status": status,
+        "first_detected_at": first_detected_at, "last_detected_at": last_detected_at,
+        "expires_at": expires_at, "updated_at": REGULAR_NOW.isoformat(),
+        "scalping_score": 50.0, "rejection_reasons": "",
+    }
+
+
+def test_new_entry_created_on_first_detection(monkeypatch, tmp_path):
+    _patch_paths(monkeypatch, tmp_path)
+    provider = FakeMarketDataProvider(universe_symbols=["AAPL"], snapshots={"AAPL": _good_snapshot()})
+
+    result = run_scan_cycle(provider, now=REGULAR_NOW)
+
+    assert result["selected"][0]["status"] == _STATUS_NEW
+
+
+def test_second_detection_promotes_to_active(monkeypatch, tmp_path):
+    _patch_paths(monkeypatch, tmp_path)
+    provider = FakeMarketDataProvider(universe_symbols=["AAPL"], snapshots={"AAPL": _good_snapshot()})
+
+    run_scan_cycle(provider, now=REGULAR_NOW)
+    result = run_scan_cycle(provider, now=REGULAR_NOW.replace(minute=59))
+
+    assert result["selected"][0]["status"] == _STATUS_ACTIVE
+
+
+def test_missed_detection_transitions_to_cooling():
+    now = REGULAR_NOW
+    row = _lifecycle_row(
+        status=_STATUS_ACTIVE,
+        first_detected_at=(now - timedelta(hours=2)).isoformat(),  # must precede last_detected_at
+        last_detected_at=(now - timedelta(minutes=40)).isoformat(),
+    )
+
+    result = repository._apply_expiry([row], now, ttl_minutes=30, expire_minutes=60)
+
+    assert result[0]["status"] == _STATUS_COOLING
+
+
+def test_ttl_exceeded_transitions_to_expired():
+    now = REGULAR_NOW
+    row = _lifecycle_row(
+        status=_STATUS_ACTIVE,
+        first_detected_at=(now - timedelta(hours=2)).isoformat(),
+        last_detected_at=(now - timedelta(minutes=90)).isoformat(),
+    )
+
+    result = repository._apply_expiry([row], now, ttl_minutes=30, expire_minutes=60)
+
+    assert result[0]["status"] == _STATUS_EXPIRED
+
+
+def test_reappearance_after_expiry_same_day_resumes_active(monkeypatch, tmp_path):
+    # Documented policy (DECISION_LOG.md): NEW vs ACTIVE is driven by
+    # repeat_tracker's same-trading-day detection memory, which is
+    # independent of the watchlist row's own persisted status. A symbol
+    # already proven persistent this trading day (>=2 detections) resumes
+    # ACTIVE immediately on reappearance even if its watchlist row had
+    # expired in between — it does not have to "re-earn" NEW status within
+    # the same day. Only a new trading day resets the streak (see the
+    # separate different_trading_day_resets_streak test).
+    _patch_paths(monkeypatch, tmp_path)
+    provider = FakeMarketDataProvider(universe_symbols=["AAPL"], snapshots={"AAPL": _good_snapshot()})
+    run_scan_cycle(provider, now=REGULAR_NOW)  # cycle 1: NEW
+    run_scan_cycle(provider, now=REGULAR_NOW.replace(minute=59))  # cycle 2: ACTIVE
+
+    # Manually force the persisted row to EXPIRED, simulating time passing
+    # well beyond the pipeline's own allowed session window without
+    # touching repeat_tracker's separate same-day memory.
+    df = repository.load_watchlist()
+    df.loc[df["symbol"] == "AAPL", "status"] = _STATUS_EXPIRED
+    df.loc[df["symbol"] == "AAPL", "last_detected_at"] = (REGULAR_NOW - timedelta(hours=3)).isoformat()
+    repository.atomic_write_csv(repository.WATCHLIST_FILE, df)
+
+    result = run_scan_cycle(provider, now=REGULAR_NOW)  # reappears, same trading day
+
+    assert result["selected"][0]["status"] == _STATUS_ACTIVE
+
+
+@pytest.mark.parametrize("field", ["first_detected_at", "last_detected_at", "expires_at"])
+def test_corrupted_timestamp_field_invalidates_the_row(field):
+    row = _lifecycle_row()
+    row[field] = "not-a-timestamp"
+
+    problems = validate_lifecycle_timestamps(row)
+
+    assert any(field in p for p in problems)
+
+
+def test_timezone_naive_timestamp_is_invalid():
+    row = _lifecycle_row(first_detected_at="2026-06-15T09:45:00")  # no offset
+
+    problems = validate_lifecycle_timestamps(row)
+
+    assert problems
+
+
+def test_empty_and_none_timestamps_are_invalid():
+    for bad_value in ("", None):
+        row = _lifecycle_row(first_detected_at=bad_value)
+        assert validate_lifecycle_timestamps(row)
+
+
+def test_future_first_detected_at_does_not_crash_validation():
+    # A wildly-future first_detected_at isn't itself an ISO-format error,
+    # but the resulting expires_at < first_detected_at ordering check
+    # still catches the inconsistency.
+    far_future = (REGULAR_NOW + timedelta(days=3650)).isoformat()
+    row = _lifecycle_row(first_detected_at=far_future, expires_at=REGULAR_NOW.isoformat())
+
+    problems = validate_lifecycle_timestamps(row)
+
+    assert any("expires_at" in p for p in problems)
+
+
+def test_last_detected_before_first_detected_is_invalid():
+    row = _lifecycle_row(
+        first_detected_at=REGULAR_NOW.isoformat(),
+        last_detected_at=(REGULAR_NOW - timedelta(hours=1)).isoformat(),
+    )
+
+    problems = validate_lifecycle_timestamps(row)
+
+    assert any("last_detected_at" in p for p in problems)
+
+
+def test_corrupted_timestamp_forces_rejection_not_indefinite_active():
+    # Reproduces the CODEX-014 evidence directly: a corrupted last_detected_at
+    # must not let a row stay ACTIVE forever by skipping the TTL check.
+    now = REGULAR_NOW
+    row = _lifecycle_row(status=_STATUS_ACTIVE, last_detected_at="not-a-timestamp")
+
+    result = repository._apply_expiry([row], now, ttl_minutes=30, expire_minutes=60)
+
+    assert result[0]["status"] == _STATUS_REJECTED
+    assert "INVALID_LIFECYCLE_TIMESTAMP" in result[0]["rejection_reasons"]
+
+
+def test_code_status_enum_matches_documented_lifecycle_states():
+    # SCALPING_V1_ROADMAP.md documents exactly these five states.
+    assert VALID_STATUSES == {"NEW", "ACTIVE", "COOLING", "EXPIRED", "REJECTED"}

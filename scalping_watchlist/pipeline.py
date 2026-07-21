@@ -16,6 +16,7 @@ from .features import compute_features
 from .models import (
     NOT_EVALUATED,
     STATUS_ACTIVE,
+    STATUS_NEW,
     STATUS_REJECTED,
     WatchlistEntry,
 )
@@ -129,9 +130,15 @@ def run_scan_cycle(provider, now=None, symbols=None,
     selected_dicts = []
     for symbol, features, elig_reasons in eligible_rows:
         repeat_info = repeat_results.get(symbol)
+        # CODEX-014: NEW on the first-ever detection, ACTIVE from the
+        # second consecutive/total detection onward — a symbol seen only
+        # once has not yet demonstrated persistence (Phase 2 instructions
+        # section 8's documented NEW -> ACTIVE transition).
+        detect_count = int(repeat_info.get("detect_count", 1)) if repeat_info else 1
+        entry_status = STATUS_NEW if detect_count <= 1 else STATUS_ACTIVE
         entry = _build_entry(
             symbol, session, detected_at, features, elig_reasons, [],
-            status=STATUS_ACTIVE, repeat_info=repeat_info, smart_money_score=NOT_EVALUATED,
+            status=entry_status, repeat_info=repeat_info, smart_money_score=NOT_EVALUATED,
             expire_minutes=expire_minutes,
         )
         selected_dicts.append(entry.__dict__)
@@ -187,9 +194,17 @@ def _build_entry(symbol, session, detected_at, features, eligibility_reasons, re
         if expire_minutes is not None:
             expires_at = _add_minutes_iso(detected_at, expire_minutes)
 
+    # repeat_info (from repeat_tracker.py) already carries the true
+    # first_detected_at across cycles; a REJECTED row (repeat_info=None)
+    # has no history, so "now" is both its first and last detection.
+    first_detected_at = repeat_info.get("first_detected_at", detected_at) if repeat_info else detected_at
+    last_detected_at = repeat_info.get("last_detected_at", detected_at) if repeat_info else detected_at
+
     return WatchlistEntry(
         symbol=symbol,
-        detected_at=detected_at,
+        first_detected_at=first_detected_at,
+        last_detected_at=last_detected_at,
+        updated_at=detected_at,
         trading_session=session,
         latest_price=features.get("latest_price", "UNKNOWN") if features else "UNKNOWN",
         previous_close=features.get("previous_close", "UNKNOWN") if features else "UNKNOWN",
