@@ -13,7 +13,7 @@ import requests
 import yfinance as yf
 
 import order_intent_ledger
-from account_risk import check_daily_loss_limit
+from account_risk import check_account_exposure_limits, check_daily_loss_limit
 from broker import AlpacaBroker
 from market_hours import eastern_now, get_us_market_session
 from order_safety import check_daily_trade_count, run_order_safety_check
@@ -854,6 +854,10 @@ def main(broker=None):
                 f"*Order review only*\n- Symbol: {symbol}\n- Score: {result['score']}\n"
                 f"- Market session: {market_session}\n- Status: no order submitted"
             )
+            continue
+
+        if not check_account_exposure_limits(positions, account):
+            _notify_order_blocked(symbol, "Account-wide open position count or total exposure limit reached")
             continue
 
         order_qty = 1
