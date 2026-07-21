@@ -58,6 +58,11 @@ RECONCILIATION_TERMINAL_STATUSES = {"FILLED", "REJECTED", "CANCELLED", "EXPIRED"
 # is terminal, no incoming value may change it.
 _STATUS_PROGRESS_RANK = {
     "PENDING_SUBMISSION": 0,
+    # UNKNOWN ranks alongside SUBMITTED: it means the broker responded with
+    # a status string we don't recognize, which is more informative than
+    # never having heard back (PENDING_SUBMISSION) but must never regress a
+    # more advanced state (PARTIALLY_FILLED/FILLED) back down.
+    "UNKNOWN": 1,
     "SUBMITTED": 1,
     "PARTIALLY_FILLED": 2,
     "FILLED": 3,
@@ -306,26 +311,45 @@ def save_order_history(order_history):
     return _atomic_write_csv(ORDER_HISTORY_FILE, order_history)
 
 
+class ReconciliationUnavailable(Exception):
+    """order_reconciliation.csv exists but could not be safely read.
+
+    Unlike a missing file (a legitimate empty state before any order has
+    ever been reserved), a file that fails to parse or is missing required
+    columns must not be silently replaced with an empty DataFrame — that
+    would erase whatever fill/status history it held. Writes are refused
+    until a human resolves it; the file itself is left untouched.
+    """
+
+
 def load_reconciliation():
-    """Read order_reconciliation.csv. Unlike order_history, this is
-    supplementary tracking data, not the duplicate/daily-limit safety gate,
-    so a missing or unreadable file degrades to an empty DataFrame rather
-    than failing closed."""
+    """Read order_reconciliation.csv.
+
+    A missing file returns an empty DataFrame (no order has been reserved
+    yet, or none survived — order_history.csv remains the actual
+    duplicate/daily-limit safety gate regardless). A file that exists but
+    fails to parse or is missing required columns raises
+    ReconciliationUnavailable instead of degrading to empty, so corrupted
+    tracking data is never silently discarded (CODEX-008).
+    """
     if not ORDER_RECONCILIATION_FILE.exists():
         df = pd.DataFrame(columns=RECONCILIATION_COLUMNS)
     else:
         try:
             df = pd.read_csv(ORDER_RECONCILIATION_FILE)
         except Exception as exc:
-            print(f"Failed to read {ORDER_RECONCILIATION_FILE}: {exc}")
-            df = pd.DataFrame(columns=RECONCILIATION_COLUMNS)
-        for col in RECONCILIATION_COLUMNS:
-            if col not in df.columns:
-                df[col] = None
+            raise ReconciliationUnavailable(
+                f"CORRUPTED: failed to parse {ORDER_RECONCILIATION_FILE}: {exc}"
+            )
+        missing_columns = [c for c in RECONCILIATION_COLUMNS if c not in df.columns]
+        if missing_columns:
+            raise ReconciliationUnavailable(
+                f"CORRUPTED: {ORDER_RECONCILIATION_FILE} is missing required columns {missing_columns}"
+            )
     # object dtype throughout: columns mix numbers, ISO timestamp strings and
     # None across their lifetime, so a narrower inferred dtype (e.g. an
     # all-empty column defaulting to float64) would warn/fail on later
-    # string assignments in _update_reconciliation_from_response / reconcile_pending_orders.
+    # string assignments.
     return df.astype({col: "object" for col in RECONCILIATION_COLUMNS})
 
 
@@ -333,30 +357,150 @@ def save_reconciliation(reconciliation):
     return _atomic_write_csv(ORDER_RECONCILIATION_FILE, reconciliation)
 
 
-def _record_pending_reconciliation(client_order_id, symbol, order_date, requested_qty):
-    df = load_reconciliation()
-    new_row = pd.DataFrame(
-        [
-            {
-                "client_order_id": client_order_id,
-                "symbol": symbol,
-                "order_date": order_date,
-                "requested_qty": requested_qty,
-                "filled_qty": 0,
-                "remaining_qty": requested_qty,
-                "average_fill_price": None,
-                "broker_status": None,
-                "local_status": "PENDING_SUBMISSION",
-                "last_reconciled_at": None,
-            }
-        ]
-    )
-    save_reconciliation(pd.concat([df, new_row], ignore_index=True))
+def _safe_float(value):
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _status_should_apply(existing_status, incoming_status):
+    """CODEX-008 monotonic transition rule, used by merge_reconciliation_state.
+
+    - Once a row reaches a terminal status (including FILLED), no incoming
+      status changes it — no regression, no lateral flip to a different
+      terminal status, and specifically UNKNOWN can never overwrite FILLED
+      (it ranks below FILLED and existing-terminal is checked first anyway).
+    - Otherwise, progression only moves forward or holds
+      (PENDING_SUBMISSION -> {SUBMITTED, UNKNOWN} -> PARTIALLY_FILLED ->
+      FILLED). UNKNOWN ranks alongside SUBMITTED: more informative than
+      never having heard back, but must not regress a later PARTIALLY_FILLED.
+    - A terminal status arriving from a non-terminal existing status is
+      always accepted (the broker gave a definitive answer).
+    """
+    if incoming_status is None:
+        return False
+    if existing_status in RECONCILIATION_TERMINAL_STATUSES:
+        return False
+    existing_rank = _STATUS_PROGRESS_RANK.get(existing_status, -1)
+    incoming_rank = _STATUS_PROGRESS_RANK.get(incoming_status)
+    if incoming_rank is not None:
+        return incoming_rank >= existing_rank
+    return True  # incoming is itself a terminal status; existing is not
+
+
+def merge_reconciliation_state(existing, incoming):
+    """Combine an existing reconciliation row (dict) with a new observation
+    (dict), enforcing CODEX-008's monotonic guarantees:
+
+    - local_status only ever moves forward per _status_should_apply().
+    - filled_qty never decreases (max of existing/incoming).
+    - average_fill_price is never cleared once set; only overwritten by a
+      new non-null value.
+    - remaining_qty is recomputed from requested_qty - merged filled_qty.
+    - broker_status is recorded whenever the local_status is applied.
+
+    `existing` and `incoming` are plain dicts (row-shaped); returns a new
+    merged dict. Pure function — no I/O, easy to unit test directly.
+    """
+    merged = dict(existing)
+
+    incoming_status = incoming.get("local_status")
+    if _status_should_apply(existing.get("local_status"), incoming_status):
+        merged["local_status"] = incoming_status
+        if incoming.get("broker_status") is not None:
+            merged["broker_status"] = incoming["broker_status"]
+
+    existing_filled = _safe_float(existing.get("filled_qty")) or 0.0
+    incoming_filled = _safe_float(incoming.get("filled_qty")) or 0.0
+    merged_filled = max(existing_filled, incoming_filled)
+    merged["filled_qty"] = merged_filled
+
+    requested = _safe_float(existing.get("requested_qty"))
+    if requested is not None:
+        merged["remaining_qty"] = max(requested - merged_filled, 0.0)
+
+    incoming_price = incoming.get("average_fill_price")
+    if incoming_price not in (None, ""):
+        merged["average_fill_price"] = incoming_price
+
+    merged["last_reconciled_at"] = incoming.get("last_reconciled_at") or existing.get("last_reconciled_at")
+    return merged
+
+
+def _update_reconciliation_row(client_order_id, symbol, order_date, incoming,
+                                lock_timeout=ORDER_HISTORY_LOCK_TIMEOUT_SECONDS):
+    """Lock -> reread -> merge (monotonic) -> write -> unlock for one row.
+
+    Creates the row if this is the first observation for client_order_id.
+    Returns False (never raises) on a lock timeout, a corrupted file, or a
+    write failure — the caller decides whether that should block the
+    broader operation (try_reserve_order does; reconcile_pending_orders
+    logs and moves to the next row).
+    """
+    try:
+        with _reconciliation_lock(timeout=lock_timeout):
+            try:
+                df = load_reconciliation()
+            except ReconciliationUnavailable as exc:
+                print(f"Reconciliation update for {client_order_id} refused: {exc}")
+                return False
+            mask = df["client_order_id"].astype(str) == str(client_order_id)
+            if mask.any():
+                idx = df[mask].index[0]
+                merged = merge_reconciliation_state(df.loc[idx].to_dict(), incoming)
+                for key, value in merged.items():
+                    df.at[idx, key] = value
+            else:
+                new_row = {
+                    "client_order_id": client_order_id,
+                    "symbol": symbol,
+                    "order_date": order_date,
+                    "requested_qty": incoming.get("requested_qty"),
+                    "filled_qty": _safe_float(incoming.get("filled_qty")) or 0.0,
+                    "remaining_qty": incoming.get("remaining_qty"),
+                    "average_fill_price": incoming.get("average_fill_price"),
+                    "broker_status": incoming.get("broker_status"),
+                    "local_status": incoming.get("local_status", "PENDING_SUBMISSION"),
+                    "last_reconciled_at": incoming.get("last_reconciled_at"),
+                }
+                new_row_df = pd.DataFrame([new_row]).astype({col: "object" for col in RECONCILIATION_COLUMNS})
+                df = pd.concat([df, new_row_df], ignore_index=True)
+            return save_reconciliation(df)
+    except (RuntimeError, OSError) as exc:
+        # RuntimeError: lock acquisition timeout from _reconciliation_lock.
+        # OSError: e.g. the lock file itself can't be opened/created
+        # (permissions, missing directory). Either way this is a failure to
+        # update, not a crash — the caller decides how to react.
+        print(f"Reconciliation update for {client_order_id} could not acquire lock: {exc}")
+        return False
+
+
+def _record_pending_reconciliation(client_order_id, symbol, order_date, requested_qty,
+                                    lock_timeout=ORDER_HISTORY_LOCK_TIMEOUT_SECONDS):
+    incoming = {
+        "requested_qty": requested_qty,
+        "filled_qty": 0,
+        "remaining_qty": requested_qty,
+        "average_fill_price": None,
+        "broker_status": None,
+        "local_status": "PENDING_SUBMISSION",
+        "last_reconciled_at": None,
+    }
+    success = _update_reconciliation_row(client_order_id, symbol, order_date, incoming, lock_timeout=lock_timeout)
+    if not success:
+        # CODEX-008: a silently-ignored failure here previously let
+        # try_reserve_order return a client_order_id with no reconciliation
+        # row behind it, so a later fill could never be tracked. Now this
+        # is a hard failure, same severity as an order_history save failure.
+        raise RuntimeError("Reconciliation record failed; order submission blocked")
 
 
 def _local_status_from_response(response):
     if response.dry_run:
-        return "SUBMITTED"
+        return "DRY_RUN"
     data = response.data if isinstance(response.data, dict) else {}
     broker_status = data.get("status")
     if broker_status in _BROKER_STATUS_TO_LOCAL_STATUS:
@@ -364,45 +508,43 @@ def _local_status_from_response(response):
     return "SUBMITTED" if response.status_code in (200, 201) else "REJECTED"
 
 
-def _update_reconciliation_from_response(client_order_id, response):
+def _update_reconciliation_from_response(client_order_id, symbol, order_date, response):
     """Record whatever fill data the immediate submit response carried.
 
-    This is a best-effort snapshot, not the authoritative reconciliation
-    pass — partially_filled is never collapsed into filled here either.
+    This is a best-effort snapshot merged with the same monotonic rules as
+    the authoritative reconcile_pending_orders() pass — partially_filled is
+    never collapsed into filled, and a stale/duplicate response can never
+    move the row backwards.
     """
-    df = load_reconciliation()
-    mask = df["client_order_id"].astype(str) == str(client_order_id)
-    if not mask.any():
-        return
     data = response.data if isinstance(response.data, dict) else {}
-    broker_status = data.get("status")
-    filled_qty = data.get("filled_qty")
-    requested_qty = df.loc[mask, "requested_qty"].iloc[0]
-
-    filled_qty_val = float(filled_qty) if filled_qty not in (None, "") else 0.0
-    remaining_qty_val = (
-        float(requested_qty) - filled_qty_val if requested_qty not in (None, "") else None
-    )
-
-    df.loc[mask, "broker_status"] = broker_status
-    df.loc[mask, "filled_qty"] = filled_qty_val
-    df.loc[mask, "remaining_qty"] = remaining_qty_val
-    df.loc[mask, "average_fill_price"] = data.get("filled_avg_price")
-    df.loc[mask, "local_status"] = _local_status_from_response(response)
-    df.loc[mask, "last_reconciled_at"] = eastern_now().isoformat()
-    save_reconciliation(df)
+    incoming = {
+        "broker_status": data.get("status"),
+        "filled_qty": data.get("filled_qty"),
+        "average_fill_price": data.get("filled_avg_price"),
+        "local_status": _local_status_from_response(response),
+        "last_reconciled_at": eastern_now().isoformat(),
+    }
+    return _update_reconciliation_row(client_order_id, symbol, order_date, incoming)
 
 
 def reconcile_pending_orders(broker):
     """Resolve non-terminal reconciliation rows against the broker's truth.
 
-    Never resubmits. A row the broker no longer recognizes (a submission
-    whose local status-update write failed after a real broker request was
-    made, for example) is marked MANUAL_REVIEW instead of being retried
-    automatically. Safe to call repeatedly: always updates rows in place by
-    client_order_id rather than appending, so nothing is recorded twice.
+    Never resubmits. A row the broker no longer recognizes is marked
+    MANUAL_REVIEW instead of being retried automatically. Safe to call
+    repeatedly: always updates rows in place by client_order_id rather than
+    appending, and every write goes through the same locked,
+    monotonic-merge path as the immediate post-submit update, so re-running
+    this never regresses a status or duplicates a row (CODEX-008).
     """
-    df = load_reconciliation()
+    try:
+        df = load_reconciliation()
+    except ReconciliationUnavailable as exc:
+        # Corrupted tracking data blocks further reconciliation writes, but
+        # must not block new-candidate evaluation: order_history.csv (not
+        # this file) is the actual duplicate/daily-limit safety gate.
+        print(f"Reconciliation skipped this run: {exc}")
+        return
     if df.empty:
         return
     pending_mask = df["local_status"].isin(RECONCILIATION_NON_TERMINAL_STATUSES)
@@ -420,41 +562,40 @@ def reconcile_pending_orders(broker):
             continue
 
         if broker_order is None:
-            df.at[idx, "local_status"] = "MANUAL_REVIEW"
-            df.at[idx, "last_reconciled_at"] = eastern_now().isoformat()
-            update_order_status(symbol, order_date, "MANUAL_REVIEW")
+            incoming = {"local_status": "MANUAL_REVIEW", "last_reconciled_at": eastern_now().isoformat()}
+        else:
+            broker_status = broker_order.get("status")
+            incoming = {
+                "broker_status": broker_status,
+                "filled_qty": broker_order.get("filled_qty"),
+                "average_fill_price": broker_order.get("filled_avg_price"),
+                "local_status": _BROKER_STATUS_TO_LOCAL_STATUS.get(broker_status, "UNKNOWN"),
+                "last_reconciled_at": eastern_now().isoformat(),
+            }
+
+        if not _update_reconciliation_row(client_order_id, symbol, order_date, incoming):
+            continue  # already logged; leave order_history untouched too
+
+        try:
+            updated = load_reconciliation()
+        except ReconciliationUnavailable:
             continue
-
-        broker_status = broker_order.get("status")
-        local_status = _BROKER_STATUS_TO_LOCAL_STATUS.get(broker_status, "UNKNOWN")
-        filled_qty = broker_order.get("filled_qty")
-        requested_qty = df.at[idx, "requested_qty"]
-        filled_qty_val = float(filled_qty) if filled_qty not in (None, "") else 0.0
-        remaining_qty_val = (
-            float(requested_qty) - filled_qty_val if requested_qty not in (None, "") else None
-        )
-
-        df.at[idx, "broker_status"] = broker_status
-        df.at[idx, "filled_qty"] = filled_qty_val
-        df.at[idx, "remaining_qty"] = remaining_qty_val
-        df.at[idx, "average_fill_price"] = broker_order.get("filled_avg_price")
-        df.at[idx, "local_status"] = local_status
-        df.at[idx, "last_reconciled_at"] = eastern_now().isoformat()
-        update_order_status(symbol, order_date, local_status)
-
-    save_reconciliation(df)
+        row_mask = updated["client_order_id"].astype(str) == str(client_order_id)
+        if row_mask.any():
+            update_order_status(symbol, order_date, updated.loc[row_mask, "local_status"].iloc[0])
 
 
 @contextmanager
-def _order_history_lock(timeout=ORDER_HISTORY_LOCK_TIMEOUT_SECONDS):
-    """Process-level exclusive lock guarding read-check-write of order history.
-
-    Uses fcntl.flock (macOS/Ubuntu); Windows compatibility is out of scope
-    for this project. Failure to acquire the lock within `timeout` blocks
-    the order rather than proceeding without mutual exclusion.
+def _file_lock(lock_path, timeout, label):
+    """Process-level exclusive lock via fcntl.flock (macOS/Ubuntu; Windows
+    compatibility is out of scope for this project). Failure to acquire the
+    lock within `timeout` raises RuntimeError rather than proceeding without
+    mutual exclusion — the lock file itself is left untouched either way,
+    and the finally block guarantees unlock/close even on an exception
+    raised by the caller's code inside the `with` block.
     """
-    ORDER_HISTORY_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-    lock_file = open(ORDER_HISTORY_LOCK_FILE, "a+")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = open(lock_path, "a+")
     try:
         deadline = time.monotonic() + timeout
         while True:
@@ -464,8 +605,7 @@ def _order_history_lock(timeout=ORDER_HISTORY_LOCK_TIMEOUT_SECONDS):
             except OSError:
                 if time.monotonic() >= deadline:
                     raise RuntimeError(
-                        f"Could not acquire order history lock "
-                        f"({ORDER_HISTORY_LOCK_FILE}) within {timeout}s; order blocked"
+                        f"Could not acquire {label} lock ({lock_path}) within {timeout}s; order blocked"
                     )
                 time.sleep(0.05)
         yield
@@ -474,6 +614,20 @@ def _order_history_lock(timeout=ORDER_HISTORY_LOCK_TIMEOUT_SECONDS):
             fcntl.flock(lock_file, fcntl.LOCK_UN)
         finally:
             lock_file.close()
+
+
+@contextmanager
+def _order_history_lock(timeout=ORDER_HISTORY_LOCK_TIMEOUT_SECONDS):
+    """Guards read-check-write of order_history.csv (the duplicate/daily-limit safety gate)."""
+    with _file_lock(ORDER_HISTORY_LOCK_FILE, timeout, "order history"):
+        yield
+
+
+@contextmanager
+def _reconciliation_lock(timeout=ORDER_HISTORY_LOCK_TIMEOUT_SECONDS):
+    """Guards read-check-write of order_reconciliation.csv (CODEX-008)."""
+    with _file_lock(ORDER_RECONCILIATION_LOCK_FILE, timeout, "reconciliation"):
+        yield
 
 
 def is_duplicate_order(order_history, symbol, order_date):
@@ -675,14 +829,15 @@ def main(broker=None):
 
         success = response.status_code in [200, 201]
         status = "DRY RUN" if response.dry_run else ("SUBMITTED" if success else "FAILED")
-        _update_reconciliation_from_response(client_order_id, response)
+        # CODEX-008: order_history.csv and order_reconciliation.csv must not
+        # record two different immediate outcomes for the same submission
+        # (e.g. reconciliation says PARTIALLY_FILLED while history says
+        # SUBMITTED). Both now derive the same value from the same response.
+        immediate_local_status = _local_status_from_response(response)
+        _update_reconciliation_from_response(client_order_id, symbol, today, response)
 
         if success:
-            update_order_status(
-                symbol,
-                today,
-                "DRY_RUN" if response.dry_run else "SUBMITTED",
-            )
+            update_order_status(symbol, today, immediate_local_status)
             if not response.dry_run:
                 open_position_count += 1
         else:

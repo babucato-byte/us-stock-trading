@@ -1,3 +1,4 @@
+import multiprocessing
 import threading
 
 import pandas as pd
@@ -7,6 +8,23 @@ import requests
 import order_safety
 import paper_strategy_order as pso
 from broker import AlpacaBroker, BrokerConfig
+
+
+def _mp_update_reconciliation(reconciliation_path, lock_path, client_order_id, symbol, order_date, incoming, barrier):
+    """Module-level so it's picklable for multiprocessing.Process (spawn).
+
+    Runs in a fresh child interpreter: re-imports paper_strategy_order and
+    points its file/lock constants at the test's tmp_path directly (no
+    monkeypatch, which doesn't cross process boundaries), then performs one
+    locked reconciliation update, synchronized against the sibling process
+    via a shared Barrier so both actually contend for the lock.
+    """
+    import paper_strategy_order as pso_child
+
+    pso_child.ORDER_RECONCILIATION_FILE = reconciliation_path
+    pso_child.ORDER_RECONCILIATION_LOCK_FILE = lock_path
+    barrier.wait(timeout=10)
+    pso_child._update_reconciliation_row(client_order_id, symbol, order_date, incoming)
 
 
 TODAY = pso.eastern_now().strftime("%Y-%m-%d")
@@ -93,6 +111,7 @@ def _patch_common(monkeypatch, tmp_path, tickers, broker, market_session="regula
     monkeypatch.setattr(pso, "ORDER_HISTORY_FILE", tmp_path / "order_history.csv")
     monkeypatch.setattr(pso, "ORDER_HISTORY_LOCK_FILE", tmp_path / "order_history.lock")
     monkeypatch.setattr(pso, "ORDER_RECONCILIATION_FILE", tmp_path / "order_reconciliation.csv")
+    monkeypatch.setattr(pso, "ORDER_RECONCILIATION_LOCK_FILE", tmp_path / "order_reconciliation.lock")
     if init_history:
         pso.initialize_order_history()
     slack_calls = []
@@ -661,6 +680,7 @@ def test_concurrent_reservations_same_symbol_only_one_succeeds(tmp_path, monkeyp
     monkeypatch.setattr(pso, "ORDER_HISTORY_FILE", tmp_path / "order_history.csv")
     monkeypatch.setattr(pso, "ORDER_HISTORY_LOCK_FILE", tmp_path / "order_history.lock")
     monkeypatch.setattr(pso, "ORDER_RECONCILIATION_FILE", tmp_path / "order_reconciliation.csv")
+    monkeypatch.setattr(pso, "ORDER_RECONCILIATION_LOCK_FILE", tmp_path / "order_reconciliation.lock")
     pso.initialize_order_history()
 
     results = []
@@ -689,6 +709,7 @@ def test_concurrent_reservations_different_symbols_both_persist(tmp_path, monkey
     monkeypatch.setattr(pso, "ORDER_HISTORY_FILE", tmp_path / "order_history.csv")
     monkeypatch.setattr(pso, "ORDER_HISTORY_LOCK_FILE", tmp_path / "order_history.lock")
     monkeypatch.setattr(pso, "ORDER_RECONCILIATION_FILE", tmp_path / "order_reconciliation.csv")
+    monkeypatch.setattr(pso, "ORDER_RECONCILIATION_LOCK_FILE", tmp_path / "order_reconciliation.lock")
     pso.initialize_order_history()
 
     errors = []
@@ -717,6 +738,7 @@ def test_concurrent_reservations_respect_daily_trade_limit(tmp_path, monkeypatch
     monkeypatch.setattr(pso, "ORDER_HISTORY_FILE", tmp_path / "order_history.csv")
     monkeypatch.setattr(pso, "ORDER_HISTORY_LOCK_FILE", tmp_path / "order_history.lock")
     monkeypatch.setattr(pso, "ORDER_RECONCILIATION_FILE", tmp_path / "order_reconciliation.csv")
+    monkeypatch.setattr(pso, "ORDER_RECONCILIATION_LOCK_FILE", tmp_path / "order_reconciliation.lock")
     monkeypatch.setattr(order_safety, "MAX_TRADES_PER_DAY", 1)
     pso.initialize_order_history()
 
@@ -746,6 +768,7 @@ def test_lock_acquisition_timeout_blocks_order(tmp_path, monkeypatch):
     monkeypatch.setattr(pso, "ORDER_HISTORY_FILE", tmp_path / "order_history.csv")
     monkeypatch.setattr(pso, "ORDER_HISTORY_LOCK_FILE", tmp_path / "order_history.lock")
     monkeypatch.setattr(pso, "ORDER_RECONCILIATION_FILE", tmp_path / "order_reconciliation.csv")
+    monkeypatch.setattr(pso, "ORDER_RECONCILIATION_LOCK_FILE", tmp_path / "order_reconciliation.lock")
     pso.initialize_order_history()
 
     import fcntl
@@ -772,6 +795,7 @@ def _reserve_pending(monkeypatch, tmp_path, symbol="AAPL", qty=1):
     monkeypatch.setattr(pso, "ORDER_HISTORY_FILE", tmp_path / "order_history.csv")
     monkeypatch.setattr(pso, "ORDER_HISTORY_LOCK_FILE", tmp_path / "order_history.lock")
     monkeypatch.setattr(pso, "ORDER_RECONCILIATION_FILE", tmp_path / "order_reconciliation.csv")
+    monkeypatch.setattr(pso, "ORDER_RECONCILIATION_LOCK_FILE", tmp_path / "order_reconciliation.lock")
     pso.initialize_order_history()
     _, client_order_id = pso.try_reserve_order(symbol, TODAY, "PAPER", False, qty=qty)
     return client_order_id
@@ -892,3 +916,236 @@ def test_reconcile_is_idempotent_no_duplicate_rows(monkeypatch, tmp_path):
     reconciliation = pd.read_csv(tmp_path / "order_reconciliation.csv")
     assert len(reconciliation) == 1
     assert reconciliation.iloc[0]["local_status"] == "FILLED"
+
+
+# ---------------------------------------------------------------------------
+# CODEX-008: reconciliation locking and monotonic state merge
+# ---------------------------------------------------------------------------
+
+def test_merge_never_regresses_status():
+    existing = {"local_status": "FILLED", "filled_qty": 1, "requested_qty": 1, "average_fill_price": 101.5}
+    incoming = {"local_status": "SUBMITTED", "filled_qty": 0}
+
+    merged = pso.merge_reconciliation_state(existing, incoming)
+
+    assert merged["local_status"] == "FILLED"
+
+
+def test_merge_unknown_never_overwrites_filled():
+    existing = {"local_status": "FILLED", "filled_qty": 1, "requested_qty": 1, "average_fill_price": 101.5}
+    incoming = {"local_status": "UNKNOWN"}
+
+    merged = pso.merge_reconciliation_state(existing, incoming)
+
+    assert merged["local_status"] == "FILLED"
+
+
+def test_merge_unknown_is_accepted_from_pending_submission():
+    existing = {"local_status": "PENDING_SUBMISSION", "filled_qty": 0, "requested_qty": 1}
+    incoming = {"local_status": "UNKNOWN"}
+
+    merged = pso.merge_reconciliation_state(existing, incoming)
+
+    assert merged["local_status"] == "UNKNOWN"
+
+
+def test_merge_filled_qty_never_decreases():
+    existing = {"local_status": "PARTIALLY_FILLED", "filled_qty": 70, "requested_qty": 100}
+    incoming = {"local_status": "PARTIALLY_FILLED", "filled_qty": 30}
+
+    merged = pso.merge_reconciliation_state(existing, incoming)
+
+    assert merged["filled_qty"] == 70
+
+
+def test_merge_average_fill_price_never_cleared():
+    existing = {"local_status": "FILLED", "filled_qty": 1, "requested_qty": 1, "average_fill_price": 101.5}
+    incoming = {"local_status": "FILLED", "filled_qty": 1, "average_fill_price": None}
+
+    merged = pso.merge_reconciliation_state(existing, incoming)
+
+    assert merged["average_fill_price"] == 101.5
+
+
+def test_merge_progression_is_allowed_forward():
+    existing = {"local_status": "SUBMITTED", "filled_qty": 0, "requested_qty": 1}
+    incoming = {"local_status": "PARTIALLY_FILLED", "filled_qty": 0.5}
+
+    merged = pso.merge_reconciliation_state(existing, incoming)
+
+    assert merged["local_status"] == "PARTIALLY_FILLED"
+    assert merged["filled_qty"] == 0.5
+
+
+def test_corrupted_reconciliation_file_fails_closed_not_reinitialized(monkeypatch, tmp_path):
+    reconciliation_file = tmp_path / "order_reconciliation.csv"
+    reconciliation_file.write_text("not,the,right,columns\n1,2,3,4\n")
+    monkeypatch.setattr(pso, "ORDER_RECONCILIATION_FILE", reconciliation_file)
+    original_bytes = reconciliation_file.read_bytes()
+
+    with pytest.raises(pso.ReconciliationUnavailable):
+        pso.load_reconciliation()
+
+    assert reconciliation_file.read_bytes() == original_bytes  # never silently reinitialized
+
+
+def test_reconciliation_write_failure_blocks_order_reservation(monkeypatch, tmp_path):
+    broker = FakeBroker()
+    _patch_common(monkeypatch, tmp_path, ["AAPL"], broker)
+    monkeypatch.setattr(pso, "save_reconciliation", lambda df: False)
+
+    with pytest.raises(RuntimeError, match="Reconciliation record failed"):
+        pso.main(broker=broker)
+
+    assert broker.submit_calls == []  # never reached broker without a tracked reservation
+
+
+def test_reconciliation_lock_timeout_leaves_file_unchanged(tmp_path, monkeypatch):
+    reconciliation_file = tmp_path / "order_reconciliation.csv"
+    lock_file = tmp_path / "order_reconciliation.lock"
+    monkeypatch.setattr(pso, "ORDER_RECONCILIATION_FILE", reconciliation_file)
+    monkeypatch.setattr(pso, "ORDER_RECONCILIATION_LOCK_FILE", lock_file)
+    pso.save_reconciliation(pd.DataFrame(columns=pso.RECONCILIATION_COLUMNS))
+    original_bytes = reconciliation_file.read_bytes()
+
+    import fcntl
+
+    held = open(lock_file, "a+")
+    fcntl.flock(held, fcntl.LOCK_EX)
+    try:
+        result = pso._update_reconciliation_row(
+            "some-id", "AAPL", TODAY, {"local_status": "FILLED", "filled_qty": 1}, lock_timeout=0.2
+        )
+    finally:
+        fcntl.flock(held, fcntl.LOCK_UN)
+        held.close()
+
+    assert result is False
+    assert reconciliation_file.read_bytes() == original_bytes
+
+
+def test_reconciliation_save_failure_preserves_existing_file(monkeypatch, tmp_path):
+    reconciliation_file = tmp_path / "order_reconciliation.csv"
+    lock_file = tmp_path / "order_reconciliation.lock"
+    monkeypatch.setattr(pso, "ORDER_RECONCILIATION_FILE", reconciliation_file)
+    monkeypatch.setattr(pso, "ORDER_RECONCILIATION_LOCK_FILE", lock_file)
+    pd.DataFrame(
+        [{"client_order_id": "id-1", "symbol": "AAPL", "order_date": TODAY, "requested_qty": 1,
+          "filled_qty": 0, "remaining_qty": 1, "average_fill_price": None, "broker_status": None,
+          "local_status": "PENDING_SUBMISSION", "last_reconciled_at": None}],
+        columns=pso.RECONCILIATION_COLUMNS,
+    ).to_csv(reconciliation_file, index=False)
+    lock_file.touch()  # pre-create so the read-only dir below blocks the *write*, not lock-file creation
+    original_bytes = reconciliation_file.read_bytes()
+
+    reconciliation_file.parent.chmod(0o500)
+    try:
+        result = pso._update_reconciliation_row(
+            "id-1", "AAPL", TODAY, {"local_status": "FILLED", "filled_qty": 1}
+        )
+    finally:
+        reconciliation_file.parent.chmod(0o700)
+
+    assert result is False
+    assert reconciliation_file.read_bytes() == original_bytes
+
+
+def test_immediate_response_and_history_agree_on_partial_fill(monkeypatch, tmp_path):
+    # Reproduces the CODEX-008 evidence directly: an immediate partially_filled
+    # broker response must leave order_history.csv and order_reconciliation.csv
+    # in agreement, not history=SUBMITTED / reconciliation=PARTIALLY_FILLED.
+    broker = FakeBroker(
+        default_response=FakeBrokerResponse(
+            status_code=200,
+            text="OK",
+            dry_run=False,
+            data={"status": "partially_filled", "filled_qty": "0.5", "filled_avg_price": "101.50"},
+        )
+    )
+    _patch_common(monkeypatch, tmp_path, ["AAPL"], broker)
+
+    pso.main(broker=broker)
+
+    history = pd.read_csv(tmp_path / "order_history.csv")
+    reconciliation = pd.read_csv(tmp_path / "order_reconciliation.csv")
+    assert history.loc[history["symbol"] == "AAPL", "status"].iloc[0] == "PARTIALLY_FILLED"
+    assert reconciliation.iloc[0]["local_status"] == "PARTIALLY_FILLED"
+
+
+def test_repeated_reconcile_pending_orders_is_idempotent_with_locking(monkeypatch, tmp_path):
+    client_order_id = _reserve_pending(monkeypatch, tmp_path)
+    broker = FakeBroker(
+        orders_by_client_id={
+            client_order_id: {"status": "filled", "filled_qty": "1", "filled_avg_price": "101.50"}
+        }
+    )
+
+    for _ in range(3):
+        pso.reconcile_pending_orders(broker)
+
+    reconciliation = pd.read_csv(tmp_path / "order_reconciliation.csv")
+    assert len(reconciliation) == 1
+    assert reconciliation.iloc[0]["local_status"] == "FILLED"
+
+
+def test_multiprocessing_concurrent_updates_resolve_to_filled_with_max_qty(tmp_path):
+    reconciliation_file = tmp_path / "order_reconciliation.csv"
+    lock_file = tmp_path / "order_reconciliation.lock"
+    seed = pd.DataFrame(
+        [{"client_order_id": "order-x", "symbol": "AAPL", "order_date": TODAY, "requested_qty": 100,
+          "filled_qty": 0, "remaining_qty": 100, "average_fill_price": None, "broker_status": None,
+          "local_status": "PENDING_SUBMISSION", "last_reconciled_at": None}],
+        columns=pso.RECONCILIATION_COLUMNS,
+    )
+    seed.to_csv(reconciliation_file, index=False)
+
+    barrier = multiprocessing.Barrier(2)
+    proc_a = multiprocessing.Process(
+        target=_mp_update_reconciliation,
+        args=(reconciliation_file, lock_file, "order-x", "AAPL", TODAY,
+              {"local_status": "PARTIALLY_FILLED", "filled_qty": 30}, barrier),
+    )
+    proc_b = multiprocessing.Process(
+        target=_mp_update_reconciliation,
+        args=(reconciliation_file, lock_file, "order-x", "AAPL", TODAY,
+              {"local_status": "FILLED", "filled_qty": 70}, barrier),
+    )
+    proc_a.start()
+    proc_b.start()
+    proc_a.join(timeout=15)
+    proc_b.join(timeout=15)
+    assert proc_a.exitcode == 0
+    assert proc_b.exitcode == 0
+
+    result = pd.read_csv(reconciliation_file)
+    assert len(result) == 1  # no lost update, no duplicate row
+    assert result.iloc[0]["local_status"] == "FILLED"
+    assert result.iloc[0]["filled_qty"] >= 70
+
+
+def test_multiprocessing_concurrent_different_orders_both_preserved(tmp_path):
+    reconciliation_file = tmp_path / "order_reconciliation.csv"
+    lock_file = tmp_path / "order_reconciliation.lock"
+    pd.DataFrame(columns=pso.RECONCILIATION_COLUMNS).to_csv(reconciliation_file, index=False)
+
+    barrier = multiprocessing.Barrier(2)
+    proc_a = multiprocessing.Process(
+        target=_mp_update_reconciliation,
+        args=(reconciliation_file, lock_file, "order-a", "AAPL", TODAY,
+              {"local_status": "SUBMITTED", "filled_qty": 0, "requested_qty": 1}, barrier),
+    )
+    proc_b = multiprocessing.Process(
+        target=_mp_update_reconciliation,
+        args=(reconciliation_file, lock_file, "order-m", "MSFT", TODAY,
+              {"local_status": "SUBMITTED", "filled_qty": 0, "requested_qty": 1}, barrier),
+    )
+    proc_a.start()
+    proc_b.start()
+    proc_a.join(timeout=15)
+    proc_b.join(timeout=15)
+    assert proc_a.exitcode == 0
+    assert proc_b.exitcode == 0
+
+    result = pd.read_csv(reconciliation_file)
+    assert set(result["client_order_id"]) == {"order-a", "order-m"}
+    assert len(result) == 2  # no lost update
