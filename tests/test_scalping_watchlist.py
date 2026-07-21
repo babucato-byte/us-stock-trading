@@ -18,7 +18,11 @@ from scalping_watchlist.repeat_tracker import (
     update_repeat_tracker,
 )
 
-REGULAR_NOW = datetime(2026, 6, 15, 10, 0, tzinfo=ZoneInfo("America/New_York"))
+# 09:45 ET is comfortably inside the default REGULAR_OPEN_WINDOW_MINUTES=60
+# window (09:30-10:30) that calendar_guard.py enforces (CODEX-012); several
+# tests below add up to +30 minutes on top of this to exercise multi-cycle
+# repeat-tracking within the same allowed window.
+REGULAR_NOW = datetime(2026, 6, 15, 9, 45, tzinfo=ZoneInfo("America/New_York"))
 PREMARKET_NOW = datetime(2026, 6, 15, 8, 0, tzinfo=ZoneInfo("America/New_York"))
 
 
@@ -650,8 +654,8 @@ def test_utc_timezone_aware_timestamp_passes():
 
 
 def test_et_timestamp_converts_correctly():
-    # 09:58 ET is 2 minutes before REGULAR_NOW (10:00 ET) — should be fresh.
-    data_as_of = REGULAR_NOW.replace(hour=9, minute=58)
+    # 09:40 ET is 5 minutes before REGULAR_NOW (09:45 ET) — should be fresh.
+    data_as_of = REGULAR_NOW.replace(hour=9, minute=40)
     reasons = freshness.check_data_freshness(data_as_of, REGULAR_NOW, "regular", cfg)
     assert reasons == []
 
@@ -723,3 +727,103 @@ def test_fake_provider_used_for_freshness_tests_makes_no_real_calls(monkeypatch,
     run_scan_cycle(provider, now=REGULAR_NOW)
 
     assert provider.requested_symbols == ["AAPL"]  # only the fake was ever touched
+
+
+# ---------------------------------------------------------------------------
+# CODEX-012: holiday and allowed-session gating
+# ---------------------------------------------------------------------------
+
+from scalping_watchlist import calendar_guard  # noqa: E402
+from market_guard import is_us_trading_day as market_guard_is_us_trading_day  # noqa: E402
+
+
+def _run_and_get_status(now, monkeypatch, tmp_path, session_hint_symbol="AAPL"):
+    _patch_paths(monkeypatch, tmp_path)
+    provider = FakeMarketDataProvider(
+        universe_symbols=[session_hint_symbol], snapshots={session_hint_symbol: _good_snapshot()}
+    )
+    return run_scan_cycle(provider, now=now)
+
+
+def test_normal_trading_day_premarket_is_allowed(monkeypatch, tmp_path):
+    # Monday 2026-06-15, 08:00 ET premarket.
+    now = datetime(2026, 6, 15, 8, 0, tzinfo=ZoneInfo("America/New_York"))
+    result = _run_and_get_status(now, monkeypatch, tmp_path)
+    assert result.get("status") != "SKIPPED"
+    assert [r["symbol"] for r in result["selected"]] == ["AAPL"]
+
+
+def test_normal_trading_day_regular_open_window_is_allowed(monkeypatch, tmp_path):
+    result = _run_and_get_status(REGULAR_NOW, monkeypatch, tmp_path)  # Monday 09:45 ET
+    assert result.get("status") != "SKIPPED"
+    assert [r["symbol"] for r in result["selected"]] == ["AAPL"]
+
+
+def test_weekend_saturday_is_skipped(monkeypatch, tmp_path):
+    saturday = datetime(2026, 6, 13, 10, 0, tzinfo=ZoneInfo("America/New_York"))
+    result = _run_and_get_status(saturday, monkeypatch, tmp_path)
+    assert result["status"] == "SKIPPED"
+    assert result["skip_reason"] == "MARKET_CLOSED"
+    assert result["selected"] == []
+
+
+def test_weekend_sunday_is_skipped(monkeypatch, tmp_path):
+    sunday = datetime(2026, 6, 14, 10, 0, tzinfo=ZoneInfo("America/New_York"))
+    result = _run_and_get_status(sunday, monkeypatch, tmp_path)
+    assert result["status"] == "SKIPPED"
+    assert result["skip_reason"] == "MARKET_CLOSED"
+
+
+def test_official_holiday_is_skipped(monkeypatch, tmp_path):
+    new_years_day = datetime(2026, 1, 1, 10, 0, tzinfo=ZoneInfo("America/New_York"))
+    result = _run_and_get_status(new_years_day, monkeypatch, tmp_path)
+    assert result["status"] == "SKIPPED"
+    assert result["skip_reason"] == "MARKET_CLOSED"
+
+
+def test_early_close_day_is_still_a_trading_day(monkeypatch, tmp_path):
+    # Day after Thanksgiving 2026 (2026-11-27) is an early-close trading day,
+    # not a holiday — the morning open-window scan must still run.
+    early_close_morning = datetime(2026, 11, 27, 9, 45, tzinfo=ZoneInfo("America/New_York"))
+    result = _run_and_get_status(early_close_morning, monkeypatch, tmp_path)
+    assert result.get("status") != "SKIPPED"
+
+
+def test_before_premarket_start_is_not_allowed(monkeypatch, tmp_path):
+    before_premarket = datetime(2026, 6, 15, 3, 0, tzinfo=ZoneInfo("America/New_York"))
+    result = _run_and_get_status(before_premarket, monkeypatch, tmp_path)
+    assert result["status"] == "SKIPPED"
+    assert result["skip_reason"] == "SESSION_NOT_ALLOWED"
+
+
+def test_after_regular_open_window_is_not_allowed(monkeypatch, tmp_path):
+    # 14:00 ET is well within the regular session but outside the
+    # REGULAR_OPEN_WINDOW_MINUTES=60 opening window (09:30-10:30).
+    mid_afternoon = datetime(2026, 6, 15, 14, 0, tzinfo=ZoneInfo("America/New_York"))
+    result = _run_and_get_status(mid_afternoon, monkeypatch, tmp_path)
+    assert result["status"] == "SKIPPED"
+    assert result["skip_reason"] == "SESSION_NOT_ALLOWED"
+
+
+def test_after_hours_is_not_allowed(monkeypatch, tmp_path):
+    after_hours = datetime(2026, 6, 15, 17, 0, tzinfo=ZoneInfo("America/New_York"))
+    result = _run_and_get_status(after_hours, monkeypatch, tmp_path)
+    assert result["status"] == "SKIPPED"
+    assert result["skip_reason"] == "SESSION_NOT_ALLOWED"
+
+
+def test_et_utc_date_boundary_does_not_misjudge_trading_day():
+    # 2026-06-16 03:00 UTC is 2026-06-15 23:00 ET (Monday night) — the
+    # trading-day check must convert to ET before comparing dates, not use
+    # the UTC calendar date directly.
+    utc_time = datetime(2026, 6, 16, 3, 0, tzinfo=_timezone.utc)
+    assert market_guard_is_us_trading_day(utc_time) is True  # still Monday in ET
+
+
+def test_dst_period_trading_day_check_is_consistent():
+    # DST-active date (June) vs. standard-time date (December), both
+    # ordinary weekday trading days — is_us_trading_day must agree for both.
+    dst_date = datetime(2026, 6, 15, 10, 0, tzinfo=ZoneInfo("America/New_York"))
+    standard_time_date = datetime(2026, 12, 15, 10, 0, tzinfo=ZoneInfo("America/New_York"))
+    assert market_guard_is_us_trading_day(dst_date) is True
+    assert market_guard_is_us_trading_day(standard_time_date) is True

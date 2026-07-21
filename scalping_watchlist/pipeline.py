@@ -11,7 +11,7 @@ per the Phase 2 charter question.
 
 from market_hours import eastern_now, get_us_market_session
 
-from . import eligibility, freshness, repository, scorer
+from . import calendar_guard, eligibility, freshness, repository, scorer
 from .features import compute_features
 from .models import (
     NOT_EVALUATED,
@@ -55,6 +55,18 @@ def run_scan_cycle(provider, now=None, symbols=None,
     trading_date = now_dt.strftime("%Y-%m-%d")
     detected_at = now_dt.isoformat()
     session = get_us_market_session(now_dt)
+
+    # CODEX-012: holiday/session gate runs before anything else touches the
+    # provider or the persisted watchlist. A skip must never look like a
+    # successful empty run (a persisted empty watchlist could otherwise be
+    # mistaken for "genuinely no candidates today"), so the file is not
+    # written to at all in this branch.
+    skip_reason = calendar_guard.check_pipeline_allowed(now_dt, session, cfg)
+    if skip_reason is not None:
+        return {
+            "selected": [], "rejected": [], "trading_date": trading_date,
+            "status": "SKIPPED", "skip_reason": skip_reason,
+        }
 
     candidate_symbols = symbols if symbols is not None else provider.get_universe_symbols()
     unique_symbols, duplicate_symbols = _dedupe_symbols(candidate_symbols)

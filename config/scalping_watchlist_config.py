@@ -68,7 +68,7 @@ MAX_AFTER_HOURS_DATA_AGE_MINUTES = _env_float("SCALPING_MAX_AFTER_HOURS_DATA_AGE
 # this engine's job is the narrow early window feeding Phase 3. Decision
 # and rationale recorded in DECISION_LOG.md.
 ALLOWED_SESSIONS = ("premarket", "regular")
-REGULAR_OPEN_WINDOW_MINUTES = _env_int("SCALPING_REGULAR_OPEN_WINDOW_MINUTES", 30)
+REGULAR_OPEN_WINDOW_MINUTES = _env_int("SCALPING_REGULAR_OPEN_WINDOW_MINUTES", 60)
 
 # Stage D: persistence / repeat detection
 MIN_REPEAT_COUNT = _env_int("SCALPING_MIN_REPEAT_COUNT", 1)
