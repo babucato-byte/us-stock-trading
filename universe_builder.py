@@ -1,52 +1,49 @@
-import os
-import requests
 import pandas as pd
-from dotenv import load_dotenv
 
-load_dotenv()
+from broker import AlpacaBroker
 
-API_KEY = os.getenv("ALPACA_API_KEY")
-SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
-# Legacy ALPACA_BASE_URL is honored for backward compatibility with existing
-# server .env files; new setups should rely on ALPACA_PAPER_BASE_URL. The
-# fallback default is the paper endpoint, never live, if neither is set.
-BASE_URL = (
-    os.getenv("ALPACA_PAPER_BASE_URL")
-    or os.getenv("ALPACA_BASE_URL")
-    or "https://paper-api.alpaca.markets"
-)
+UNIVERSE_OUTPUT_PATH = "universe.csv"
 
-headers = {
-    "APCA-API-KEY-ID": API_KEY,
-    "APCA-API-SECRET-KEY": SECRET_KEY
-}
 
-url = f"{BASE_URL}/v2/assets"
-response = requests.get(url, headers=headers, timeout=20)
-response.raise_for_status()
+def fetch_active_us_equity_rows(broker=None):
+    """Fetch tradable US equity assets via the broker's safety-gated GET.
 
-assets = response.json()
+    Replaces a previous version that built the Alpaca base URL directly
+    from ALPACA_PAPER_BASE_URL/ALPACA_BASE_URL and called requests.get()
+    with no endpoint validation (CODEX-009) — AlpacaBroker.get_assets()
+    goes through the same validate_order_allowed() gate as every other
+    broker call, so a misconfigured or malicious endpoint is rejected
+    before any network access, exactly like account/position/order calls.
+    """
+    broker = broker or AlpacaBroker()
+    assets = broker.get_assets()
+    rows = []
+    for asset in assets:
+        if (
+            asset.get("status") == "active"
+            and asset.get("tradable") is True
+            and asset.get("class") == "us_equity"
+        ):
+            rows.append({
+                "symbol": asset.get("symbol"),
+                "name": asset.get("name"),
+                "exchange": asset.get("exchange"),
+                "tradable": asset.get("tradable"),
+                "shortable": asset.get("shortable"),
+            })
+    return rows
 
-rows = []
 
-for asset in assets:
-    if (
-        asset.get("status") == "active"
-        and asset.get("tradable") is True
-        and asset.get("class") == "us_equity"
-    ):
-        rows.append({
-            "symbol": asset.get("symbol"),
-            "name": asset.get("name"),
-            "exchange": asset.get("exchange"),
-            "tradable": asset.get("tradable"),
-            "shortable": asset.get("shortable")
-        })
+def build_universe(broker=None, output_path=UNIVERSE_OUTPUT_PATH):
+    rows = fetch_active_us_equity_rows(broker)
+    df = pd.DataFrame(rows)
+    df = df.dropna(subset=["symbol"])
+    df = df.drop_duplicates(subset=["symbol"])
+    df.to_csv(output_path, index=False)
+    print(f"거래 가능 종목 저장 완료: {len(df)}개")
+    print(f"파일: {output_path}")
+    return df
 
-df = pd.DataFrame(rows)
-df = df.dropna(subset=["symbol"])
-df = df.drop_duplicates(subset=["symbol"])
-df.to_csv("universe.csv", index=False)
 
-print(f"거래 가능 종목 저장 완료: {len(df)}개")
-print("파일: universe.csv")
+if __name__ == "__main__":
+    build_universe()

@@ -51,6 +51,16 @@ class AlpacaBroker:
     def get_recent_orders(self, limit=10):
         return self._request("GET", f"/v2/orders?status=all&limit={limit}")
 
+    def get_assets(self):
+        """List tradable assets (used to build the trading universe).
+
+        Goes through the same _request() safety gate as every other broker
+        call — CODEX-009 closed a gap where universe_builder.py built its
+        own URL from ALPACA_BASE_URL/ALPACA_PAPER_BASE_URL directly and
+        called requests.get() without any endpoint validation.
+        """
+        return self._request("GET", "/v2/assets")
+
     def get_order_by_client_order_id(self, client_order_id):
         """Look up a submitted order by the id we generated at reservation time.
 
