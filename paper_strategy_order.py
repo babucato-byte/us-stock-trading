@@ -789,16 +789,20 @@ def update_order_status(symbol, order_date, status, lock_timeout=ORDER_HISTORY_L
         return save_order_history(order_history)
 
 
-def _notify_order_blocked(symbol, reason):
-    send_slack_alert(f"*Order blocked*\n- Symbol: {symbol}\n- Reason: {reason}")
-
-
 def _safe_send_slack_alert(message):
     try:
         return send_slack_alert(message)
     except Exception as exc:
         print(f"Slack notification failed: {exc}")
         return False
+
+
+def _notify_order_blocked(symbol, reason):
+    # A Slack outage must never propagate out of here: this is called from
+    # inside the per-symbol loop in main(), and an unhandled exception would
+    # abort processing of every remaining symbol over a side channel that
+    # has no bearing on order correctness.
+    _safe_send_slack_alert(f"*Order blocked*\n- Symbol: {symbol}\n- Reason: {reason}")
 
 
 def main(broker=None):
@@ -844,33 +848,45 @@ def main(broker=None):
     print(f"Open positions: {open_position_count}")
     print(f"Held symbols: {held_symbols}")
 
+    # Per-symbol outcome aggregation, returned to the caller. A symbol lands
+    # in exactly one bucket; nothing here ever gets promoted to "submitted"
+    # except the branch below that requires both a broker accept AND a
+    # durable order_history write (fail-closed).
+    results = {"submitted": [], "failed": [], "blocked": [], "skipped": []}
+
     for symbol in tickers:
         if symbol in held_symbols:
             _notify_order_blocked(symbol, "Already held")
+            results["blocked"].append(symbol)
             continue
 
         if is_duplicate_order(order_history, symbol, today):
             _notify_order_blocked(symbol, "Duplicate order prevented for today")
+            results["blocked"].append(symbol)
             continue
 
         result = analyze_stock(symbol)
         if not result:
             print(f"{symbol} analysis failed")
+            results["skipped"].append(symbol)
             continue
 
         if result["score"] < 70:
             print(f"{symbol} did not meet order score threshold: {result['score']}")
+            results["skipped"].append(symbol)
             continue
 
         if not allow_order:
-            send_slack_alert(
+            _safe_send_slack_alert(
                 f"*Order review only*\n- Symbol: {symbol}\n- Score: {result['score']}\n"
                 f"- Market session: {market_session}\n- Status: no order submitted"
             )
+            results["skipped"].append(symbol)
             continue
 
         if not check_account_exposure_limits(positions, account):
             _notify_order_blocked(symbol, "Account-wide open position count or total exposure limit reached")
+            results["blocked"].append(symbol)
             continue
 
         order_qty = 1
@@ -894,6 +910,7 @@ def main(broker=None):
             )
         except DuplicateOrderError:
             _notify_order_blocked(symbol, "Duplicate order prevented for today")
+            results["blocked"].append(symbol)
             continue
         # Any other exception here (OrderHistoryUnavailable, the daily trade
         # count check re-verified fresh under lock, or a reservation-save
@@ -926,6 +943,7 @@ def main(broker=None):
             _safe_send_slack_alert(
                 f"*Order failed*\n- Symbol: {symbol}\n- Reason: {exc}"
             )
+            results["failed"].append(symbol)
             continue
 
         # The broker gave a definitive response (accepted or rejected) --
@@ -946,11 +964,25 @@ def main(broker=None):
         _update_reconciliation_from_response(client_order_id, symbol, today, response)
 
         if success:
-            update_order_status(symbol, today, immediate_local_status)
+            history_saved = update_order_status(symbol, today, immediate_local_status)
             if not response.dry_run:
                 open_position_count += 1
         else:
-            update_order_status(symbol, today, "REJECTED")
+            history_saved = update_order_status(symbol, today, "REJECTED")
+
+        # Fail-closed aggregation (CODEX-008 companion): a broker accept is
+        # only counted as "submitted" if order_history.csv was durably
+        # updated to match. A broker accept whose local persistence failed
+        # is recorded as "failed", never silently promoted to a success --
+        # order_history.csv is the source of truth other runs re-read
+        # (duplicate/daily-limit checks), so a local write failure here
+        # must not be reported as an order this run actually recorded.
+        if success and history_saved:
+            results["submitted"].append(symbol)
+        else:
+            results["failed"].append(symbol)
+            if success and not history_saved:
+                print(f"{symbol}: broker accepted the order but order_history persistence failed; not counted as submitted")
 
         _safe_send_slack_alert(
             f"*Paper Strategy Order*\n- Symbol: {symbol}\n- Qty: {order_qty}\n"
@@ -958,6 +990,8 @@ def main(broker=None):
             f"- RSI: {result['rsi']:.2f}\n- Volume ratio: {result['volume_ratio']:.2f}x\n"
             f"- Broker mode: {broker.config.status_label}\n- Status: {status}"
         )
+
+    return results
 
 
 if __name__ == "__main__":
