@@ -45,3 +45,20 @@
 ---
 
 향후 CODEX_REVIEW.md 지적사항에 대한 ACCEPTED/REJECTED_WITH_REASON 결정도 이 로그에 이어서 기록한다.
+
+### 2026-07-21 — Phase 2 관심종목 선별 엔진: 재사용 범위와 초기 설정값 근거
+- 재사용: `calculate_rsi`/`calculate_atr`(`daily_candidate_scanner.py`, 순수 함수), `market_hours.eastern_now`/`get_us_market_session`, `market_guard.is_us_trading_day` — 그대로 import해 재사용.
+- **재사용하지 않기로 결정**: `daily_candidate_scanner.py`의 JSON 룰 엔진(`evaluate_filter`)은 지원하지 않는 필드/연산자를 만나면 **경고 후 통과(fail-open)**시키도록 설계되어 있다. Phase 2의 명시적 원칙("불명확하면 포함하지 않는다")과 정면으로 배치되므로, Stage A~E 필터는 Phase 2 전용의 명시적 함수로 새로 작성한다(기존 로직을 억지로 재해석하지 않는다는 지시서 2절 원칙과 일치).
+- 반복탐지: 저장소에 다중 사이클 "연속 등장 횟수" 추적 로직이 존재하지 않음(확인됨 — `daily_candidate_scanner.py`의 `previous_candidates.csv` 비교는 직전 1회 사이클과의 단순 집합 차이일 뿐 스트릭 카운트가 아님). Phase 2에서 신규 구현.
+- 스프레드/유동성: 저장소 전체에 스프레드 관련 로직이 전혀 없음(grep 확인). 실제 호가창 데이터 소스가 없으므로 `spread_estimate`는 이번 버전에서 항상 `NOT_AVAILABLE`로 기록하고 하드 필터로 사용하지 않는다. 대신 `avg_dollar_volume` 기반 `liquidity_score`(실제 계산 가능한 대체 지표)를 유동성 게이트로 사용한다. 이 결정은 허위 값을 만들지 않는다는 원칙을 지키기 위함이며, 실제 호가 데이터 소스 확보 시 재검토한다.
+- 파일 잠금/원자적 쓰기: `paper_strategy_order.py`의 기법(temp file + fsync + os.replace, `fcntl.flock`)은 **재사용하되 코드는 재사용하지 않는다** — Phase 1 주문 실행 파일을 이번 Phase에서 변경하지 않는다는 원칙(12절) 때문에, 동일 기법을 Phase 2 전용 소규모 모듈(`scalping_watchlist/atomic_io.py`)로 독립 구현한다.
+- 초기 설정값(보수적 가정, 과거 성과로 검증되지 않음 — Phase 6 백테스트 전까지 잠정값):
+  - `MIN_PRICE=5`, `MAX_PRICE=500`: 최소값은 기존 `config/scanner_rules.json`의 `price>=5`를 그대로 채택. 최대값은 신규 가정(소액 계좌에서 다루기 어려운 초고가 종목 배제).
+  - `MIN_AVERAGE_DOLLAR_VOLUME=20_000_000`: 기존 `scanner_rules.json`과 동일값 그대로 채택(이미 운영 중인 보수적 유동성 기준).
+  - `MIN_RELATIVE_VOLUME=3.0`: `score_scanner/premarket_momentum_score.py`가 이미 사용 중인 `volume_multiple > 3` 임계값을 그대로 채택(초단타 맥락에서 검증된 유일한 기존 값).
+  - `MIN_GAP_PERCENT=2.0`, `MAX_GAP_PERCENT=50.0`: 신규 가정. 프리마켓 스코어러의 10%는 "이미 강한 신호"용이라 관심종목 선별(더 넓은 후보군)에는 과함 — 낮춰서 채택. 상한은 정지/역병합 등 비정상치 배제용.
+  - `MIN_ATR_PERCENT=1.5`: 신규 가정, 기존 코드에 참조값 없음.
+  - `MAX_WATCHLIST_SIZE=30`: 신규 가정(1분봉 수작업 감시가 현실적인 상한).
+  - `WATCHLIST_TTL_MINUTES=30`: 신규 가정(재탐지 없이 30분 경과 시 COOLING, 60분 경과 시 EXPIRED).
+  - `SCORING_WEIGHTS`: liquidity/volume/gap/volatility/repeat/smart_money 6개 요소에 각 0.15~0.25 사이 가중치 균등 분배(합계 1.0), 과거 성과 근거 없음 — 명시적으로 잠정값.
+- 승인 필요 여부: 아니오(지시서 4절이 초기값을 "보수적으로 결정하고 근거를 기록"하도록 위임함, 사용자 승인은 Phase 6 백테스트 이후 조정 시점에 재확인).
