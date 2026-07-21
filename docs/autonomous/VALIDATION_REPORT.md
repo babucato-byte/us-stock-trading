@@ -1,5 +1,21 @@
 # VALIDATION_REPORT
 
+## 2026-07-21 — Phase 1 추가 수정 사이클 (CODEX-007~009)
+
+독립 재검증(대상 커밋 `9688a13`/`b93a08a`/`22a6651`/`962eb69`/`1cc784b`, verdict FAIL)이 CODEX-003/004/005는 RESOLVED로 최종 확인했지만, CODEX-001/002/006을 PARTIALLY_RESOLVED로 되돌리고 신규 CODEX-007(HIGH)/008(HIGH)/009(MEDIUM)를 제기했다. 지시서 우선순위(007→008→009)대로 처리했다.
+
+- **CODEX-007**: `load_order_history()`가 날짜 파싱 성공 여부만 확인하던 것을 `validate_order_date_str()`(정규식+실제 달력 유효성+원본 왕복 일치)로 교체. 단 하나의 비정규 `order_date`도 전체 이력을 `CORRUPTED_HISTORY`로 판정해 신규 주문을 차단한다(자동 마이그레이션 없음, 진단 전용 `diagnose_order_history_dates()` 별도 제공). 이로써 CODEX-002의 잔여 위험이 해소되어 CODEX-002도 RESOLVED로 승격. (`05757fe`)
+- **CODEX-008**: `order_reconciliation.csv` 전용 `fcntl.flock` 잠금 도입(`order_history`용 잠금 로직을 `_file_lock()`으로 일반화해 재사용). `merge_reconciliation_state()`가 상태 후퇴 금지·`filled_qty` 비감소·가격 비소거를 강제하는 단조 병합을 수행하며, 손상된 reconciliation 파일은 `ReconciliationUnavailable`로 fail-closed(자동 재초기화 금지). reconciliation 저장 실패는 이제 주문 예약 자체를 차단하도록 전파되고, `main()`의 즉시 상태 갱신과 reconciliation 스냅샷이 동일한 함수 결과를 공유해 두 파일이 서로 다른 즉시 상태를 기록하는 문제도 제거. **실제 `multiprocessing.Process` 2건**으로 동시 갱신 시 최종 상태가 후퇴하지 않고 lost update가 없음을 재현 검증. 이로써 CODEX-006의 잔여 위험도 해소되어 RESOLVED로 승격. (`0c2dab4`)
+- **CODEX-009**: `universe_builder.py`가 공통 broker 안전검사를 우회해 환경변수 기반 URL로 직접 GET하던 것을, `AlpacaBroker.get_assets()`(기존 `_request()` 게이트 재사용)로 교체. 8종 endpoint 변조 시나리오(스킴 다운그레이드·유사 호스트명·비표준 포트·경로/쿼리 조작·userinfo·빈값/공백)를 파라미터라이즈드 테스트로 검증. 저장소 전체 grep으로 다른 Alpaca 직접 호출 경로가 없음(스크래치 파일 2개 제외, 이미 collect_ignore 대상)을 확인. 이로써 CODEX-001의 잔여 위험도 해소되어 RESOLVED로 승격. (`16a1ee4`)
+
+검증: 저장소 루트/상위 디렉터리 4가지 pytest 조합 모두 **149 passed, 0 failed**. 집중 테스트(broker_safety + paper_order_execution + universe_builder) **106 passed**. 동시성 관련 테스트(threading + multiprocessing) 5회 반복 모두 **6 passed**로 안정. `git diff --check` 통과. `order_history.csv` 해시/크기/mtime 사이클 전후 불변.
+
+**잔여 판단(NEEDS_USER_DECISION)**: `order_history.csv`와 `order_reconciliation.csv`는 각각 자체 잠금과 원자적 쓰기를 갖지만, 두 파일에 걸친 단일 트랜잭션은 없다. 안전 크리티컬 판단(중복/일일한도)은 전적으로 `order_history.csv`에만 의존하므로 이 잔여 위험이 실거래 안전성 자체를 위협하지는 않지만, 프로세스가 두 파일에 대한 쓰기 사이에 강제 종료되면 다음 `reconcile_pending_orders()` 실행 전까지 두 파일이 일시적으로 불일치할 수 있다. SQLite 전환 여부는 `DECISION_LOG.md`에 사용자 판단 대기 항목으로 기록했다(임의 전환하지 않음).
+
+CRITICAL 0건, HIGH 전부(001/002/003/005/006/007/008) RESOLVED, MEDIUM 전부(004/009) RESOLVED. Phase 1은 부분 체결의 "포지션 상태" 완전 반영이 Phase 5 범위라 여전히 `IN_PROGRESS`.
+
+---
+
 ## 2026-07-21 — Phase 1 재수정 사이클 (CODEX-001~006)
 
 `CODEX_REVIEW.md`(대상 커밋 `fe2988c`/`dc9bff9`, verdict FAIL, Phase 2 DO_NOT_PROCEED)의 지시서 우선순위(001→002→003→006→005→004)대로 재수정했다.

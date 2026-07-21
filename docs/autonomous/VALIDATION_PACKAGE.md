@@ -4,120 +4,121 @@
 
 ---
 
-## 이번 패키지: Phase 1 재수정 사이클 — CODEX-001~006 (2026-07-21)
+## 이번 패키지: Phase 1 추가 수정 사이클 — CODEX-007~009 (2026-07-21)
 
 ### 검증 대상
-- 이전 리뷰: `CODEX_REVIEW.md`, 대상 커밋 `fe2988c`/`dc9bff9`, **overall verdict FAIL**, **Phase 2 recommendation DO_NOT_PROCEED**.
-- 이번 패키지가 다루는 수정 커밋: `9688a13`, `b93a08a`, `22a6651`, `962eb69` (순서대로 CODEX-001 / CODEX-002+003 / CODEX-006 / CODEX-005+004).
-- Phase 상태: `IN_PROGRESS` (부분 체결의 "포지션 상태" 완전 반영은 Phase 5 선행 필요 — CODEX Finding이 아니라 Phase 1 자체 승인 기준).
+- 이전 리뷰: `CODEX_REVIEW.md`, 대상 커밋 `9688a13`/`b93a08a`/`22a6651`/`962eb69`/`1cc784b`, **overall verdict FAIL**. CODEX-003/004/005 RESOLVED 확인, CODEX-001/002/006 PARTIALLY_RESOLVED로 되돌림, 신규 CODEX-007(HIGH)/008(HIGH)/009(MEDIUM) 제기.
+- 이번 패키지가 다루는 수정 커밋: `05757fe`(CODEX-007), `0c2dab4`(CODEX-008), `16a1ee4`(CODEX-009).
+- Phase 상태: `IN_PROGRESS` (부분 체결의 "포지션 상태" 완전 반영은 Phase 5 선행 필요 — CODEX Finding 아님).
 
 ### Finding 처리 결과
 
 | ID | 심각도 | 이전 판정 | 이번 처리 | 커밋 |
 |---|---|---|---|---|
-| CODEX-001 | HIGH | PARTIALLY_RESOLVED | RESOLVED | `9688a13` |
-| CODEX-002 | HIGH | PARTIALLY_RESOLVED | RESOLVED | `b93a08a` |
-| CODEX-003 | HIGH | PARTIALLY_RESOLVED | RESOLVED | `b93a08a` |
-| CODEX-004 | MEDIUM | PARTIALLY_RESOLVED | RESOLVED | `962eb69` |
-| CODEX-005 | HIGH (신규) | PARTIALLY_RESOLVED | RESOLVED | `962eb69` |
-| CODEX-006 | HIGH (신규) | PARTIALLY_RESOLVED | RESOLVED | `22a6651` |
+| CODEX-001 | HIGH | PARTIALLY_RESOLVED | RESOLVED (CODEX-009로 흡수) | `16a1ee4` |
+| CODEX-002 | HIGH | PARTIALLY_RESOLVED | RESOLVED (CODEX-007로 흡수) | `05757fe` |
+| CODEX-003 | HIGH | RESOLVED | RESOLVED (변경 없음) | `b93a08a` |
+| CODEX-004 | MEDIUM | RESOLVED | RESOLVED (변경 없음) | `962eb69` |
+| CODEX-005 | HIGH | RESOLVED | RESOLVED (변경 없음) | `962eb69` |
+| CODEX-006 | HIGH | PARTIALLY_RESOLVED | RESOLVED (CODEX-008로 흡수) | `0c2dab4` |
+| CODEX-007 | HIGH (신규) | — | RESOLVED | `05757fe` |
+| CODEX-008 | HIGH (신규) | — | RESOLVED | `0c2dab4` |
+| CODEX-009 | MEDIUM (신규) | — | RESOLVED | `16a1ee4` |
 
-CRITICAL 0건, 미해결 HIGH 0건, 미해결 MEDIUM 0건. 상세 원인/수정 방안/테스트는 `REMEDIATION_PLAN.md` 참고.
+CRITICAL 0건, 미해결 HIGH 0건, 미해결 MEDIUM 0건. 상세는 `REMEDIATION_PLAN.md` 참고.
 
 ### 변경 파일
 
-- `broker/alpaca_client.py` — GET 경로 안전검사, `get_order_by_client_order_id`, `submit_order`의 `client_order_id` 파라미터
-- `paper_strategy_order.py` — fail-closed 이력 읽기, ET 날짜, 원자적 쓰기, 프로세스 잠금, `try_reserve_order`/`update_order_status` 재설계, `order_reconciliation.csv` 관련 함수 일체, `reconcile_pending_orders`
-- `conftest.py` (신규) — `collect_ignore` + `sys.path` 삽입
-- `tests/test_broker_safety.py` — CODEX-001 테스트 6건
-- `tests/test_paper_order_execution.py` — CODEX-002/003/006 테스트 다수 추가, 기존 테스트를 fail-closed 이력 요구사항에 맞게 재작성
-- `docs/autonomous/REMEDIATION_PLAN.md`, `VALIDATION_REPORT.md`, `CURRENT_STATUS.md`, `SCALPING_V1_ROADMAP.md`, `CODEX_REVIEW.md`(리뷰 원문 보존, 삭제 없음)
+- `paper_strategy_order.py` — `validate_order_date_str()`, `diagnose_order_history_dates()`, `load_order_history()`의 엄격한 날짜 검증(CODEX-007); `_file_lock()` 일반화, `ReconciliationUnavailable`, `merge_reconciliation_state()`, `_status_should_apply()`, `_update_reconciliation_row()`, `_reconciliation_lock`, `reconcile_pending_orders()`/`_update_reconciliation_from_response()` 재작성(CODEX-008)
+- `broker/alpaca_client.py` — `get_assets()` 추가(CODEX-009)
+- `universe_builder.py` — `AlpacaBroker.get_assets()` 기반으로 전면 재작성, `if __name__ == "__main__":` 가드(CODEX-009)
+- `tests/test_paper_order_execution.py` — CODEX-007 테스트 8건, CODEX-008 테스트 15건 추가
+- `tests/test_universe_builder.py` (신규) — CODEX-009 테스트 15건
+- `docs/autonomous/{REMEDIATION_PLAN,VALIDATION_REPORT,CURRENT_STATUS,SCALPING_V1_ROADMAP,DECISION_LOG}.md`, `CODEX_REVIEW.md`(리뷰 원문 보존, 삭제 없음)
 
 ### 핵심 diff (요약)
 
 ```python
-# broker/alpaca_client.py::_request
-+ self.config.validate_order_allowed()   # GET도 POST와 동일한 게이트를 통과
+# paper_strategy_order.py::load_order_history (CODEX-007)
+- pd.to_datetime(df["order_date"], errors="raise")   # 파싱만 확인, 정규 형식 강제 없음
++ for row_index, raw_value in df["order_date"].items():
++     validate_order_date_str(raw_value)  # 정규식 + 실제 날짜 + 원본 왕복 일치
 
-# paper_strategy_order.py::load_order_history
-- except Exception: return pd.DataFrame(columns=[...])   # fail-open
-+ if not ORDER_HISTORY_FILE.exists(): raise OrderHistoryUnavailable(...)  # fail-closed
-+ (파싱/컬럼/날짜 검증 실패 시에도 동일하게 raise)
+# paper_strategy_order.py::merge_reconciliation_state (CODEX-008, 신규)
+def merge_reconciliation_state(existing, incoming):
+    if _status_should_apply(existing.get("local_status"), incoming.get("local_status")):
+        merged["local_status"] = incoming["local_status"]  # 후퇴/UNKNOWN의 FILLED 덮어쓰기 차단
+    merged["filled_qty"] = max(existing_filled, incoming_filled)  # 비감소
+    if incoming.get("average_fill_price") not in (None, ""):
+        merged["average_fill_price"] = incoming["average_fill_price"]  # 비소거
 
-# paper_strategy_order.py::main
-- today = datetime.now().strftime("%Y-%m-%d")
-+ today = eastern_now().strftime("%Y-%m-%d")   # America/New_York
-
-# paper_strategy_order.py::try_reserve_order (신규, 잠금+재조회+client_order_id)
-with _order_history_lock(timeout=lock_timeout):
-    order_history = load_order_history()          # 최신 재조회
-    if is_duplicate_order(...): raise DuplicateOrderError(...)
-    check_daily_trade_count(...)                    # 잠금 하 재검증
-    ... save_order_history(reserved_history) ...
-    client_order_id = f"scalp-{symbol}-{order_date}-{uuid4().hex[:10]}"
-    _record_pending_reconciliation(client_order_id, ...)
-    return reserved_history, client_order_id
+# universe_builder.py (CODEX-009)
+- BASE_URL = os.getenv("ALPACA_PAPER_BASE_URL") or os.getenv("ALPACA_BASE_URL") or "..."
+- response = requests.get(f"{BASE_URL}/v2/assets", headers=headers, timeout=20)  # 안전검사 없음
++ broker = broker or AlpacaBroker()
++ assets = broker.get_assets()  # _request()의 validate_order_allowed() 게이트 재사용
 ```
 
-전체 diff는 `git show 9688a13`, `git show b93a08a`, `git show 22a6651`, `git show 962eb69`로 확인 가능.
+전체 diff는 `git show 05757fe`, `git show 0c2dab4`, `git show 16a1ee4`로 확인 가능.
 
 ### 실행 명령 및 결과
 
 ```bash
 # 저장소 루트
-venv/bin/pytest -q                              # 97 passed, 2 warnings
-venv/bin/python -m pytest -q                    # 97 passed, 2 warnings
+venv/bin/pytest -q                              # 149 passed, 2 warnings
+venv/bin/python -m pytest -q                    # 149 passed, 2 warnings
 
-# 저장소 상위 디렉터리, 경로 명시 (CODEX-005가 요구한 정확한 두 형태)
+# 저장소 상위 디렉터리, 경로 명시
 cd ..
-us-stock-trading/venv/bin/pytest -q us-stock-trading            # 97 passed, 2 warnings
-us-stock-trading/venv/bin/python -m pytest -q us-stock-trading  # 97 passed, 2 warnings
+us-stock-trading/venv/bin/pytest -q us-stock-trading            # 149 passed, 2 warnings
+us-stock-trading/venv/bin/python -m pytest -q us-stock-trading  # 149 passed, 2 warnings
 
 # 집중 테스트
-venv/bin/pytest -q tests/test_broker_safety.py tests/test_paper_order_execution.py
-# 54 passed, 1 warning
+venv/bin/pytest -q tests/test_broker_safety.py tests/test_paper_order_execution.py tests/test_universe_builder.py
+# 106 passed, 1 warning
 
-# 동시성 테스트 안정성(5회 반복)
-venv/bin/pytest -q tests/test_paper_order_execution.py -k "concurrent or lock_acquisition"
-# 매회 4 passed, 40 deselected — 5/5 안정
+# 동시성 테스트 안정성(5회 반복, threading + multiprocessing 포함)
+venv/bin/pytest -q tests/test_paper_order_execution.py -k "concurrent or lock_acquisition or multiprocessing"
+# 매회 6 passed — 5/5 안정
 
 # 정적 검증
-git diff --check 6ea2c13 HEAD   # 통과, 출력 없음
-grep -rn "api.alpaca.markets" --include="*.py" .   # LIVE_BASE_URL 상수 정의/테스트 부정 케이스 외 실사용 없음
-md5 order_history.csv           # a61104cf03499860ae89d4e194dc8c07 — 사이클 전후 동일(실제 운영 파일 미변경)
+git diff --check eef3a13 HEAD   # 통과, 출력 없음
+grep -rn "requests.get\|requests.post\|ALPACA_.*_BASE_URL\|api.alpaca.markets" --include="*.py" .
+  # broker/ 외 Alpaca 직접 호출은 collect_ignore 대상 스크래치 파일 2개뿐
+md5 order_history.csv           # a61104cf03499860ae89d4e194dc8c07 — 사이클 전후 동일
 ```
 
-warning 2건은 기존에도 존재하던 urllib3/LibreSSL 환경 경고와 unknown scanner field 테스트 경고이며, 이번 변경과 무관하고 실패는 없다.
+warning 2건은 기존 urllib3/LibreSSL 환경 경고와 unknown scanner field 테스트 경고로 이번 변경과 무관.
 
 ### 안전 재검증
 
-- 실제 Alpaca/Slack API 호출 없음: 모든 broker 상호작용은 `FakeBroker`/`DummySession`/monkeypatch. 4가지 pytest 호출 형태 모두에서 스크래치 스크립트(실네트워크 코드 포함)가 수집되지 않음을 확인.
-- Live Trading 활성화 없음. Live URL은 상수 정의와 "차단되어야 함"을 검증하는 부정 테스트에만 등장하며, 어떤 실행 경로에서도 기본값/폴백으로 쓰이지 않음(grep 재확인).
+- 실제 Alpaca/Slack API 호출 없음: 모든 broker 상호작용은 FakeBroker/DummySession/RecordingSession/monkeypatch. `universe_builder` 테스트도 동일 패턴.
+- Live Trading 활성화 없음. Live URL은 상수 정의와 "차단되어야 함"을 검증하는 부정 테스트에만 등장.
 - 운영 서버 접속/설정 변경 없음. systemd/cron/nginx 미변경.
 - `origin/main`에 push하지 않음(로컬 커밋만).
 - API Key/Secret/Slack Webhook 신규 노출 없음.
-- 기존 리스크 한도(`risk_config.py`) 값 미변경. 전략 로직 미변경. `order_history.csv` 컬럼 스키마 미변경(신규 추적 데이터는 별도 파일 `order_reconciliation.csv`).
-- 테스트 중 실제 `order_history.csv`/`order_reconciliation.csv` 변경 없음(전부 `tmp_path`, 매 테스트마다 세 경로 — 이력/잠금/조정 파일 — 모두 명시적으로 리다이렉트).
+- 기존 리스크 한도/전략 로직 미변경. `order_history.csv` 컬럼 스키마 미변경(신규 추적은 별도 파일).
+- 테스트 중 실제 `order_history.csv`/`order_reconciliation.csv`/`universe.csv` 변경 없음(전부 `tmp_path`).
 
 ### 운영 영향
 
-- 없음(즉시). 다만 다음 배포 시 참고할 사항:
-  - 운영 서버의 `order_history.csv`가 아직 없다면(또는 스키마가 다르다면) `paper_strategy_order.initialize_order_history()`를 배포 절차에 한 번 포함해야 한다 — 이제 파일이 없으면 신규 주문이 fail-closed로 전부 차단된다(의도된 동작).
-  - 신규 파일 `order_reconciliation.csv`/`order_history.lock`이 실행 디렉터리에 생성된다. `.gitignore`의 `*.csv`/`*.lock` 규칙으로 이미 커버됨.
+- 없음(즉시). 참고 사항:
+  - `universe_builder.py`가 이제 `AlpacaBroker`를 통해 인증하므로, 운영 서버 `.env`에 `ALPACA_API_KEY`/`ALPACA_SECRET_KEY`가 이미 설정돼 있다면 그대로 동작한다. 레거시 `ALPACA_BASE_URL` 환경변수는 더 이상 이 스크립트에 영향을 주지 않는다(표준 `ALPACA_PAPER_BASE_URL` 또는 기본값 사용) — 운영 `.env`가 `ALPACA_BASE_URL`만으로 파이프라인을 우회하고 있었다면 이제는 표준 Paper URL로 안전하게 고정된다(동작 개선, 회귀 아님).
+  - 기존 `order_history.csv`에 비정규 `order_date` 값이 있다면(수동 편집 등) 다음 실행에서 전체 이력이 `CORRUPTED_HISTORY`로 판정되어 신규 주문이 차단된다. 배포 전 `diagnose_order_history_dates()`로 운영 파일을 점검 권장(자동 마이그레이션 없음, 의도된 동작).
 
 ### 남은 위험
 
-- 부분 체결이 broker와 대조(reconciliation)되어 상태로는 기록되지만, 이를 "포지션"으로서 손절/익절/강제청산과 연결하는 것은 Phase 5(포지션 생명주기 상태 머신) 범위다. Phase 1은 이 때문에 `VALIDATED`로 승격하지 않았다.
-- `order_reconciliation.csv`는 duplicate/일일한도 판단에 쓰이는 안전 크리티컬 파일이 아니므로 `order_history.csv`와 달리 자체 `fcntl` 잠금이 없다. 동시 실행 시 이 파일에 한정된 낮은 확률의 lost update 가능성이 이론적으로 남아있으나, 안전 게이트(duplicate/일일한도)는 전부 잠금이 걸린 `order_history.csv`에서만 판단하므로 주문 안전성 자체에는 영향이 없다.
-- `run_order_safety_check`/`try_reserve_order`에서 예외가 발생하면 해당 실행의 나머지 후보 심볼도 함께 처리되지 않는다(의도된 보수적 동작, `DECISION_LOG.md` 참고).
+- `order_history.csv`와 `order_reconciliation.csv`는 각자 원자적/잠금이지만 두 파일에 걸친 단일 트랜잭션은 없음. 안전 크리티컬 판단(중복/일일한도)은 `order_history.csv`에만 의존하므로 직접적 안전 위협은 아니나, `DECISION_LOG.md`에 SQLite 전환 필요성을 **NEEDS_USER_DECISION**으로 기록했다(Phase 5 착수 전 사용자 판단 필요).
+- 부분 체결의 "포지션 상태" 완전 반영은 여전히 Phase 5 범위.
+- `run_order_safety_check`/`try_reserve_order` 예외 발생 시 해당 실행의 나머지 후보도 함께 스킵됨(의도된 보수적 동작, 유지).
 
 ### Codex가 집중 검토해야 할 항목
 
-1. CODEX-001의 GET 경로 수정이 실제로 모든 broker 진입점(get_account/get_positions/get_recent_orders/submit_order)을 커버하는지, 우회 경로가 남아있지 않은지.
-2. CODEX-003의 `threading` 기반 동시성 테스트가 `fcntl.flock`의 실제 프로세스 간 보장을 충분히 대표하는지(같은 프로세스 내 다른 파일 디스크립터 기준 테스트의 한계).
-3. CODEX-006에서 `order_reconciliation.csv`에 자체 잠금이 없다는 판단이 타당한지(위 "남은 위험" 참고) — 안전 크리티컬 여부에 대한 재검토 요청.
-4. CODEX-005의 `collect_ignore` 방식이 향후 새로운 루트 스크래치 파일이 추가될 경우에도 견고한지, 아니면 더 구조적인 해법(예: 스크래치 파일을 `scratch/` 디렉터리로 이동)이 필요한지.
+1. `validate_order_date_str()`의 round-trip 검증이 `strptime`/`strftime`의 로캘 의존성 없이 항상 결정적인지(테스트 환경 로캘 변경 시에도).
+2. `merge_reconciliation_state()`의 상태 랭크 설계(UNKNOWN=SUBMITTED와 동순위)가 실제 Alpaca가 보낼 수 있는 모든 상태 문자열에 대해 안전한 기본값인지.
+3. `order_history.csv`/`order_reconciliation.csv` 교차 파일 트랜잭션 부재에 대한 `DECISION_LOG.md`의 위험 평가(NEEDS_USER_DECISION)에 동의하는지, 아니면 이를 실제로 HIGH로 재평가해야 하는지.
+4. `universe_builder.py`의 `AlpacaBroker.get_assets()` 전환이 기존 `universe_daily_runner.py`(subprocess로 `python universe_builder.py` 호출)와의 통합에서 `if __name__ == "__main__":` 가드 도입에도 불구하고 동일하게 동작하는지(정적 검토, 실제 cron 환경 미실행).
 
 ### 현재 커밋 해시
 
-`962eb69` (Harden pytest collection and project imports) — 이번 패키지가 다루는 마지막 코드 커밋. 본 문서 자체를 포함한 문서 갱신은 다음 커밋에서 기록됨.
+`16a1ee4` (Gate universe collection behind paper endpoint validation) — 이번 패키지가 다루는 마지막 코드 커밋. 본 문서 자체를 포함한 문서 갱신은 다음 커밋에서 기록됨.

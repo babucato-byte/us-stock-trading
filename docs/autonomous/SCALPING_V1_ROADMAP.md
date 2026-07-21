@@ -54,13 +54,14 @@ daily_candidate_scanner.py (전체 시장 스캔, RSI/MA200/거래량/breakout/t
 - 목적: candidate → scoring → account risk → duplicate/held check → market/session check → order safety → broker submission → order history → Slack notification 전 경로를 mock 기반으로 검증.
 - 1차 완료(커밋 `946caea`, 16개 테스트): 정상 Paper 주문, Live URL 차단, Paper 모드 미확인 차단, 중복 주문 차단, 보유 종목 재매수 차단, 일일 거래 제한, 일일 손실 한도, 시장 외 주문 차단, API timeout 안전 처리, rejected 주문 처리, 주문 이력 저장 실패 로깅, Slack 실패 격리.
 - 2차 완료(커밋 `fe2988c`): 명시적 Paper 모드/공식 Paper endpoint 강제, 재시작 후 당일 주문 횟수 복구, 제출 전 `PENDING_SUBMISSION` 예약 영속화 — **단, 독립 재검증(`CODEX_REVIEW.md`)에서 PARTIALLY_RESOLVED 판정**(GET 경로 안전검사 누락, fail-open 이력 읽기, 로컬시간 날짜, 비원자적/무잠금 쓰기 등).
-- 3차 완료(커밋 `9688a13`/`b93a08a`/`22a6651`/`962eb69`, CODEX-001~006 재수정): broker GET 호출에도 동일 안전검사 강제, 이력 fail-closed 전환, America/New_York 기준 날짜, 원자적 쓰기+프로세스 잠금+잠금 하 재조회, `order_reconciliation.csv`를 통한 client_order_id/체결 상태 추적(+broker 대조, 재주문 없음), 저장소 루트 `conftest.py`로 상위 디렉터리 실행 시 스크래치 스크립트 수집 차단+import 경로 고정. 상세는 `REMEDIATION_PLAN.md` 참고. CRITICAL/HIGH 미해결 0건.
-- **아직 미충족(명시적 잔여 항목, Phase 1 완료 기준 자체)**: 부분 체결이 broker와의 최소 reconciliation(CODEX-006)까지는 반영되지만, "포지션 상태"로의 완전한 반영은 Phase 5(포지션 생명주기 상태 머신)가 선행되어야 함. 이번 사이클에서는 강제로 구현하지 않고 **명시적 잔여 위험으로 기록**한다.
+- 3차 완료(커밋 `9688a13`/`b93a08a`/`22a6651`/`962eb69`, CODEX-001~006 재수정): broker GET 호출에도 동일 안전검사 강제, 이력 fail-closed 전환, America/New_York 기준 날짜, 원자적 쓰기+프로세스 잠금+잠금 하 재조회, `order_reconciliation.csv`를 통한 client_order_id/체결 상태 추적(+broker 대조, 재주문 없음), 저장소 루트 `conftest.py`로 상위 디렉터리 실행 시 스크래치 스크립트 수집 차단+import 경로 고정 — **단, 독립 재검증에서 CODEX-001/002/006이 다시 PARTIALLY_RESOLVED로 판정**(universe_builder.py의 endpoint 우회, 비정규 날짜의 일일한도 우회, reconciliation 무잠금 lost update).
+- 4차 완료(커밋 `05757fe`/`0c2dab4`/`16a1ee4`, CODEX-007~009 재수정): `order_date`를 정확히 `YYYY-MM-DD`로만 엄격 검증(비정규 값 하나라도 있으면 전체 이력 차단), `order_reconciliation.csv` 전용 잠금+상태 후퇴 방지 단조 병합(실제 multiprocessing으로 검증), `universe_builder.py`가 broker 공통 endpoint 안전검사를 거치도록 재작성. 이로써 CODEX-001/002/006도 함께 RESOLVED로 승격. 상세는 `REMEDIATION_PLAN.md` 참고. CRITICAL/HIGH 미해결 0건.
+- **아직 미충족(명시적 잔여 항목, Phase 1 완료 기준 자체)**: 부분 체결이 broker와의 reconciliation까지는 반영되지만, "포지션 상태"로의 완전한 반영은 Phase 5(포지션 생명주기 상태 머신)가 선행되어야 함. **명시적 잔여 위험으로 기록**.
 - 완료 조건: 실제 API 호출 0회, 실제 Slack 발송 0회, 전체 테스트 통과, 주문 경로 잔여 위험 문서화 — 앞의 3개는 충족, 마지막(부분 체결의 포지션 상태 반영)은 Phase 5로 이관 조건부 충족.
-- 관련 파일: `paper_strategy_order.py`, `account_risk.py`, `order_safety.py`, `risk_config.py`, `broker/broker_config.py`, `broker/alpaca_client.py`, `conftest.py`, `tests/test_broker_safety.py`, `tests/test_paper_order_execution.py`
-- 테스트 결과: **97 passed, 0 failed, 2 warnings.** 저장소 루트/상위 디렉터리(`pytest`/`python -m pytest`, 경로 명시) 4가지 조합 전부 동일 결과.
-- 커밋 해시: `946caea`(1차) → `fe2988c`/`dc9bff9`(2차, 독립검증 후 PARTIALLY_RESOLVED) → `9688a13`/`b93a08a`/`22a6651`/`962eb69`(3차, CODEX-001~006 RESOLVED)
-- 잔여 위험: 부분 체결의 "포지션 상태" 완전 반영은 Phase 5 선행 필요(reconciliation 자체는 CODEX-006으로 구현됨). `run_order_safety_check` 예외 발생 시 해당 실행의 나머지 후보가 함께 스킵됨(의도된 보수적 동작). `order_reconciliation.csv`는 duplicate/일일한도 안전장치가 아닌 보조 추적 데이터라 `order_history.csv`와 달리 자체 파일 잠금이 없음(낮은 우선순위로 기록, 안전 크리티컬 아님).
+- 관련 파일: `paper_strategy_order.py`, `account_risk.py`, `order_safety.py`, `risk_config.py`, `broker/broker_config.py`, `broker/alpaca_client.py`, `universe_builder.py`, `conftest.py`, `tests/test_broker_safety.py`, `tests/test_paper_order_execution.py`, `tests/test_universe_builder.py`
+- 테스트 결과: **149 passed, 0 failed, 2 warnings.** 저장소 루트/상위 디렉터리(`pytest`/`python -m pytest`, 경로 명시) 4가지 조합 전부 동일 결과. 동시성(threading+multiprocessing) 테스트 5회 반복 안정.
+- 커밋 해시: `946caea`(1차) → `fe2988c`/`dc9bff9`(2차) → `9688a13`/`b93a08a`/`22a6651`/`962eb69`(3차) → `05757fe`/`0c2dab4`/`16a1ee4`(4차, CODEX-001~009 전부 RESOLVED)
+- 잔여 위험: 부분 체결의 "포지션 상태" 완전 반영은 Phase 5 선행 필요. `run_order_safety_check` 예외 발생 시 해당 실행의 나머지 후보가 함께 스킵됨(의도된 보수적 동작). `order_history.csv`와 `order_reconciliation.csv`는 각자 원자적/잠금이지만 두 파일에 걸친 단일 트랜잭션은 없음(안전 크리티컬 판단은 `order_history.csv`에만 의존하므로 실거래 안전성 자체는 영향 없음) — SQLite 전환 필요성을 `DECISION_LOG.md`에 `NEEDS_USER_DECISION`으로 기록.
 
 ---
 
