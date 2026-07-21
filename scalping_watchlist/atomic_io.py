@@ -21,7 +21,19 @@ DEFAULT_LOCK_TIMEOUT_SECONDS = 5.0
 
 @contextmanager
 def file_lock(lock_path, timeout=DEFAULT_LOCK_TIMEOUT_SECONDS):
-    """Process-level exclusive lock via fcntl.flock (macOS/Ubuntu only)."""
+    """Process-level exclusive lock via fcntl.flock (macOS/Ubuntu only).
+
+    Crash recovery is intentional, not incidental: fcntl.flock locks are
+    held by the kernel against the process's open file descriptors, so a
+    process that dies for any reason (including SIGKILL, before it can run
+    its `finally` block or delete `lock_path`) has every lock it held
+    released automatically on exit. A `.lock` file left behind by a dead
+    process therefore never blocks the next acquirer — the retry loop
+    below simply succeeds on its next attempt instead of waiting out
+    `timeout`. If the lock is genuinely still held (owner process alive),
+    acquisition fails closed with a raised exception once `timeout`
+    elapses, rather than blocking forever.
+    """
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_file = open(lock_path, "a+")
     try:
@@ -42,10 +54,26 @@ def file_lock(lock_path, timeout=DEFAULT_LOCK_TIMEOUT_SECONDS):
             lock_file.close()
 
 
+def _discard_stale_tmp_files(path):
+    """Remove leftover `.{stem}_*.tmp` files for `path` from a previous
+    write that crashed before its os.replace() ran. Such a file was never
+    fsynced-and-renamed into place, so it cannot be valid data — only
+    clutter that must never be mistaken for, or promoted to, the real
+    file. Safe to call while holding `path`'s lock, since that is the same
+    lock every writer of `path` is required to hold before calling
+    atomic_write_csv."""
+    for stale in path.parent.glob(f".{path.stem}_*.tmp"):
+        try:
+            os.remove(stale)
+        except OSError:
+            pass
+
+
 def atomic_write_csv(path, dataframe):
     """Write `dataframe` to `path` atomically. Returns True/False; never raises."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        _discard_stale_tmp_files(path)
         fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.stem}_", suffix=".tmp")
         try:
             with os.fdopen(fd, "w", newline="") as tmp_file:
