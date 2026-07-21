@@ -70,25 +70,34 @@ def save_watchlist_cycle(selected_entries, rejected_entries, now, ttl_minutes, e
     rest), then replace the REJECTED rows wholesale with this cycle's
     rejections. All under one lock so a concurrent reader never observes a
     half-written merge.
+
+    CODEX-013: returns a result dict instead of a bare bool — computation
+    success and persistence success are different things, and the caller
+    (pipeline.py) must be able to tell "the write itself failed" apart
+    from "the write succeeded but the file doesn't read back correctly".
+    {
+        "success": bool,
+        "persisted_count": int,       # rows actually confirmed on disk (0 on any failure)
+        "error_code": str,            # "" on success
+        "error_message": str,         # "" on success
+    }
+    Never raises for a persistence problem — always returns a result dict,
+    even when the underlying write or the post-write verification fails.
     """
     with file_lock(WATCHLIST_LOCK_FILE, timeout=lock_timeout):
         try:
             existing = load_watchlist()
         except WatchlistUnavailable as exc:
             print(f"Watchlist update refused: {exc}")
-            return False
+            return _failure("FAILED_VALIDATION", f"Existing watchlist unreadable: {exc}")
 
         existing_selected = [
             dict(row) for _, row in existing.iterrows() if row.get("status") in _SELECTED_STATUSES
         ]
-        by_symbol = {row["symbol"]: row for row in existing_selected}
 
         selected_symbols_this_cycle = {e["symbol"] for e in selected_entries}
         untouched = [row for row in existing_selected if row["symbol"] not in selected_symbols_this_cycle]
         untouched = _apply_expiry(untouched, now, ttl_minutes, expire_minutes)
-
-        for entry in selected_entries:
-            by_symbol[entry["symbol"]] = entry
 
         merged_selected = list({row["symbol"]: row for row in (untouched + selected_entries)}.values())
         # Highest scalping_score first; MAX_WATCHLIST_SIZE caps only the
@@ -100,8 +109,46 @@ def save_watchlist_cycle(selected_entries, rejected_entries, now, ttl_minutes, e
         capped = active_ish[:max_watchlist_size] + expired
 
         all_rows = capped + list(rejected_entries)
+        expected_symbols = [r["symbol"] for r in capped]  # REJECTED rows may legitimately repeat across cycles
         new_df = pd.DataFrame(all_rows, columns=CSV_COLUMNS)
-        return atomic_write_csv(WATCHLIST_FILE, new_df)
+
+        if not atomic_write_csv(WATCHLIST_FILE, new_df):
+            return _failure("FAILED_PERSISTENCE", f"atomic write to {WATCHLIST_FILE} failed")
+
+        return _verify_after_write(len(all_rows), expected_symbols)
+
+
+def _verify_after_write(expected_row_count, expected_selected_symbols):
+    """CODEX-013 post-write check: re-read what was just written and
+    confirm it is actually usable, not just "the OS said the write
+    succeeded". A write can succeed at the filesystem level and still not
+    be what the caller intended (e.g. a concurrent process interleaving
+    incorrectly, or a serialization bug)."""
+    try:
+        reread = read_csv_fail_closed(WATCHLIST_FILE, CSV_COLUMNS)
+    except Exception as exc:
+        return _failure("FAILED_PERSISTENCE", f"post-write reread failed: {exc}")
+
+    if len(reread) != expected_row_count:
+        return _failure(
+            "FAILED_PERSISTENCE",
+            f"row count mismatch after write: expected {expected_row_count}, found {len(reread)}",
+        )
+
+    selected_rows = reread[reread["status"].isin(_SELECTED_STATUSES)]
+    duplicate_symbols = selected_rows["symbol"][selected_rows["symbol"].duplicated()].unique().tolist()
+    if duplicate_symbols:
+        return _failure("FAILED_PERSISTENCE", f"duplicate symbols in selected rows after write: {duplicate_symbols}")
+
+    if set(selected_rows["symbol"]) != set(expected_selected_symbols):
+        return _failure("FAILED_PERSISTENCE", "selected symbol set after write does not match what was intended")
+
+    return {"success": True, "persisted_count": len(reread), "error_code": "", "error_message": ""}
+
+
+def _failure(error_code, error_message):
+    print(f"Watchlist persistence failed ({error_code}): {error_message}")
+    return {"success": False, "persisted_count": 0, "error_code": error_code, "error_message": error_message}
 
 
 def _safe_score(value):

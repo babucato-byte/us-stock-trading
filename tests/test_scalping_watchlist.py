@@ -827,3 +827,144 @@ def test_dst_period_trading_day_check_is_consistent():
     standard_time_date = datetime(2026, 12, 15, 10, 0, tzinfo=ZoneInfo("America/New_York"))
     assert market_guard_is_us_trading_day(dst_date) is True
     assert market_guard_is_us_trading_day(standard_time_date) is True
+
+
+# ---------------------------------------------------------------------------
+# CODEX-013: watchlist persistence failure must never look like success
+# ---------------------------------------------------------------------------
+
+def test_normal_save_reports_success_with_persisted_count(monkeypatch, tmp_path):
+    _patch_paths(monkeypatch, tmp_path)
+    provider = FakeMarketDataProvider(universe_symbols=["AAPL"], snapshots={"AAPL": _good_snapshot()})
+
+    result = run_scan_cycle(provider, now=REGULAR_NOW)
+
+    assert result["status"] == "SUCCESS"
+    assert result["persisted_count"] == 1
+    assert result["error_code"] == ""
+
+
+def test_forced_save_failure_reports_failed_persistence_status(monkeypatch, tmp_path):
+    _patch_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(repository, "save_watchlist_cycle", lambda *a, **k: {
+        "success": False, "persisted_count": 0, "error_code": "FAILED_PERSISTENCE", "error_message": "forced",
+    })
+    provider = FakeMarketDataProvider(universe_symbols=["AAPL"], snapshots={"AAPL": _good_snapshot()})
+
+    result = run_scan_cycle(provider, now=REGULAR_NOW)
+
+    assert result["status"] == "FAILED_PERSISTENCE"
+    assert result["error_code"] == "FAILED_PERSISTENCE"
+    assert result["persisted_count"] == 0
+
+
+def test_temp_write_failure_is_reported_as_failed_persistence(monkeypatch, tmp_path):
+    _patch_paths(monkeypatch, tmp_path)
+    # Isolate the watchlist file in its own read-only subdirectory so only
+    # its write fails — repeat_tracker's own (unrelated) file in tmp_path
+    # must remain writable, or Stage D fails first for the wrong reason.
+    watchlist_dir = tmp_path / "watchlist_only"
+    watchlist_dir.mkdir()
+    monkeypatch.setattr(repository, "WATCHLIST_FILE", watchlist_dir / "scalping_watchlist.csv")
+    monkeypatch.setattr(repository, "WATCHLIST_LOCK_FILE", watchlist_dir / "scalping_watchlist.lock")
+    (watchlist_dir / "scalping_watchlist.lock").touch()
+    watchlist_dir.chmod(0o500)
+    try:
+        provider = FakeMarketDataProvider(universe_symbols=["AAPL"], snapshots={"AAPL": _good_snapshot()})
+        result = run_scan_cycle(provider, now=REGULAR_NOW)
+    finally:
+        watchlist_dir.chmod(0o700)
+
+    assert result["status"] == "FAILED_PERSISTENCE"
+    assert result["error_code"] == "FAILED_PERSISTENCE"
+
+
+def test_post_write_reread_failure_is_reported(monkeypatch, tmp_path):
+    _patch_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(repository, "read_csv_fail_closed", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("corrupt")))
+    provider = FakeMarketDataProvider(universe_symbols=["AAPL"], snapshots={"AAPL": _good_snapshot()})
+
+    result = run_scan_cycle(provider, now=REGULAR_NOW)
+
+    assert result["status"] == "FAILED_PERSISTENCE"
+
+
+def test_row_count_mismatch_after_write_is_detected(monkeypatch, tmp_path):
+    _patch_paths(monkeypatch, tmp_path)
+    # Force the post-write reread to return fewer rows than were written,
+    # simulating a corrupted/incomplete write that the OS still reported as
+    # successful.
+    real_read = repository.read_csv_fail_closed
+
+    def _truncated_read(path, columns):
+        df = real_read(path, columns)
+        return df.iloc[0:0]  # pretend nothing persisted
+
+    monkeypatch.setattr(repository, "read_csv_fail_closed", _truncated_read)
+    provider = FakeMarketDataProvider(universe_symbols=["AAPL"], snapshots={"AAPL": _good_snapshot()})
+
+    result = run_scan_cycle(provider, now=REGULAR_NOW)
+
+    assert result["status"] == "FAILED_PERSISTENCE"
+    assert "row count mismatch" in result["error_message"]
+
+
+def test_missing_required_columns_after_write_is_detected(monkeypatch, tmp_path):
+    _patch_paths(monkeypatch, tmp_path)
+
+    def _bad_columns_read(path, columns):
+        raise atomic_io_FileUnavailable("simulated missing columns")
+
+    monkeypatch.setattr(repository, "read_csv_fail_closed", _bad_columns_read)
+    provider = FakeMarketDataProvider(universe_symbols=["AAPL"], snapshots={"AAPL": _good_snapshot()})
+
+    result = run_scan_cycle(provider, now=REGULAR_NOW)
+
+    assert result["status"] == "FAILED_PERSISTENCE"
+
+
+def test_failure_status_is_never_success(monkeypatch, tmp_path):
+    _patch_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(repository, "save_watchlist_cycle", lambda *a, **k: {
+        "success": False, "persisted_count": 0, "error_code": "FAILED_PERSISTENCE", "error_message": "x",
+    })
+    provider = FakeMarketDataProvider(universe_symbols=["AAPL"], snapshots={"AAPL": _good_snapshot()})
+
+    result = run_scan_cycle(provider, now=REGULAR_NOW)
+
+    assert result["status"] != "SUCCESS"
+
+
+def test_previous_valid_watchlist_file_preserved_on_save_failure(monkeypatch, tmp_path):
+    _patch_paths(monkeypatch, tmp_path)
+    watchlist_dir = tmp_path / "watchlist_only"
+    watchlist_dir.mkdir()
+    monkeypatch.setattr(repository, "WATCHLIST_FILE", watchlist_dir / "scalping_watchlist.csv")
+    monkeypatch.setattr(repository, "WATCHLIST_LOCK_FILE", watchlist_dir / "scalping_watchlist.lock")
+    provider = FakeMarketDataProvider(universe_symbols=["AAPL"], snapshots={"AAPL": _good_snapshot()})
+    run_scan_cycle(provider, now=REGULAR_NOW)  # establish a valid prior file
+    original_bytes = repository.WATCHLIST_FILE.read_bytes()
+
+    watchlist_dir.chmod(0o500)
+    try:
+        run_scan_cycle(provider, now=REGULAR_NOW.replace(minute=59))
+    finally:
+        watchlist_dir.chmod(0o700)
+
+    assert repository.WATCHLIST_FILE.read_bytes() == original_bytes
+
+
+def test_pipeline_result_includes_error_code_on_failure(monkeypatch, tmp_path):
+    _patch_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(repository, "save_watchlist_cycle", lambda *a, **k: {
+        "success": False, "persisted_count": 0, "error_code": "FAILED_PERSISTENCE", "error_message": "disk full",
+    })
+    provider = FakeMarketDataProvider(universe_symbols=["AAPL"], snapshots={"AAPL": _good_snapshot()})
+
+    result = run_scan_cycle(provider, now=REGULAR_NOW)
+
+    assert result["error_code"]
+    assert result["error_message"]
+
+
+from scalping_watchlist.atomic_io import FileUnavailable as atomic_io_FileUnavailable  # noqa: E402

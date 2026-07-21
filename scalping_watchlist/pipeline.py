@@ -66,6 +66,8 @@ def run_scan_cycle(provider, now=None, symbols=None,
         return {
             "selected": [], "rejected": [], "trading_date": trading_date,
             "status": "SKIPPED", "skip_reason": skip_reason,
+            "candidate_count": 0, "persisted_count": 0, "output_path": "",
+            "error_code": "", "error_message": "", "evaluated_at": detected_at,
         }
 
     candidate_symbols = symbols if symbols is not None else provider.get_universe_symbols()
@@ -137,13 +139,35 @@ def run_scan_cycle(provider, now=None, symbols=None,
     # Deterministic order: score desc, symbol asc as a stable tiebreaker.
     selected_dicts.sort(key=lambda r: (-_safe_float(r.get("scalping_score")), r["symbol"]))
 
+    result = {
+        "selected": selected_dicts,
+        "rejected": rejected_rows,
+        "trading_date": trading_date,
+        "status": "SUCCESS",
+        "candidate_count": len(selected_dicts),
+        "persisted_count": 0,
+        "output_path": str(repository.WATCHLIST_FILE) if persist else "",
+        "error_code": "",
+        "error_message": "",
+        "evaluated_at": detected_at,
+    }
+
     if persist:
-        repository.save_watchlist_cycle(
+        # CODEX-013: the caller must be able to tell "computed successfully
+        # but failed to persist" apart from a genuine success — a silently
+        # dropped return value here is exactly how a save failure used to
+        # look identical to a successful run.
+        persistence = repository.save_watchlist_cycle(
             selected_dicts, rejected_rows, now_dt, ttl_minutes, expire_minutes,
             max_watchlist_size, lock_timeout=lock_timeout,
         )
+        result["persisted_count"] = persistence["persisted_count"]
+        if not persistence["success"]:
+            result["status"] = "FAILED_PERSISTENCE"
+            result["error_code"] = persistence["error_code"]
+            result["error_message"] = persistence["error_message"]
 
-    return {"selected": selected_dicts, "rejected": rejected_rows, "trading_date": trading_date}
+    return result
 
 
 def _safe_float(value):
