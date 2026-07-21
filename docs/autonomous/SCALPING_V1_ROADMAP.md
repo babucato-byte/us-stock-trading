@@ -72,16 +72,20 @@ Phase 1은 두 부분으로 나뉜다:
 
 ## Phase 2 — 초단타 관심종목 선별 엔진
 
-**상태: IN_PROGRESS**
+**상태: IMPLEMENTED** (Claude 자체 테스트 통과 — Codex `PROCEED` 판정 전까지 `VALIDATED`로 승격하지 않음)
 
 - 목적: 미국주식 전체를 매분 조회하지 않고, 기존 저빈도 시장 스캐너를 재사용해 초단타(`VWAP_MICRO_PULLBACK_MOMENTUM_V1`)가 1분봉으로 집중 감시할 관심종목만 선별. 결과물은 주문 신호가 아니며, VWAP/EMA 진입 판단은 Phase 3·4 범위.
-- 작업 목록: Stage A(거래 가능성) → B(가격/유동성) → C(당일 움직임) → D(지속성/반복탐지) → E(설명 가능한 가중합 점수) 5단계 선별 파이프라인. 세부 계획/재사용 분석은 진행하며 본 절과 `DECISION_LOG.md`에 갱신.
-- 완료 조건: `scalping_watchlist.csv` 생성(지시서 지정 22개 필드), 모든 종목에 포함/제외 사유 기록, 반복탐지 추적, ET 기준 만료 처리, 손상/누락 데이터 fail-closed, 실제 외부 API 호출 없는 테스트, 운영 파일 변경 없는 테스트, 기존 전체 테스트 통과, 신규 테스트 통과, 기존 주문/리스크 로직 미변경, Codex 검증용 패키지 생성.
-- 관련 파일(예정): 구현 진행에 따라 갱신.
-- 테스트 결과: 진행 중.
-- 커밋 해시: 진행 중.
-- 잔여 위험: 진행 중 파악되는 대로 기록.
-- 판정 기준: 이번 사이클 자체 테스트만으로는 `IMPLEMENTED`까지만 표기하며, Codex의 `PROCEED` 판정을 받은 뒤에만 `VALIDATED`로 승격한다.
+- 구현: Stage A(거래 가능성, `universe_builder.py`가 이미 필터링한 결과 재검증만 수행) → B(가격/유동성) → C(당일 움직임) → D(지속성/반복탐지) → E(설명 가능한 가중합 점수) 5단계 파이프라인. 재사용/신규 판단 근거는 `DECISION_LOG.md` 참고 — `calculate_rsi`/`calculate_atr`/`market_hours`/`market_guard`는 그대로 재사용, 기존 JSON 룰 엔진(fail-open 설계)은 "불명확하면 포함하지 않는다" 원칙과 배치되어 재사용하지 않고 Phase 2 전용 명시적 필터 함수로 새로 작성.
+- 완료 조건 충족 현황: `scalping_watchlist.csv` 생성(23개 필드, 지시서 22개 필드 + `expires_at` 계산 포함) ✅, 모든 종목 포함/제외 사유 기록 ✅, 반복탐지 추적(ET 기준, 중간탈락 재등장 구분, 동시성 lost-update 방지) ✅, TTL 기반 NEW→ACTIVE→COOLING→EXPIRED 만료 처리 ✅, 손상/누락 데이터 fail-closed(watchlist 파일) 또는 개별 심볼 제외(provider 오류) ✅, 실제 외부 API 호출 0회(FakeMarketDataProvider) ✅, 운영 파일 변경 없음(`order_history.csv` 해시 불변 확인) ✅, 기존 전체 테스트 통과(183 passed) ✅, 기존 주문/리스크 로직 미변경 ✅, Codex 검증용 패키지 생성 ✅(`VALIDATION_PACKAGE.md`).
+- 관련 파일: `config/scalping_watchlist_config.py`(신규), `scalping_watchlist/`(신규 패키지: `models.py`, `data_provider.py`, `features.py`, `eligibility.py`, `repeat_tracker.py`, `scorer.py`, `repository.py`, `atomic_io.py`, `pipeline.py`), `tests/test_scalping_watchlist.py`(신규, 34건).
+- 테스트 결과: 신규 34 passed(동시성 5회 반복 안정), 전체 회귀 183 passed(기존 149 + 신규 34), 저장소 루트/상위 디렉터리 모두 동일.
+- 커밋 해시: `4a96883` (Add scalping watchlist selection engine)
+- 잔여 위험/알려진 한계:
+  - `spread_estimate`는 실제 호가 데이터 소스가 없어 항상 `NOT_AVAILABLE`(허위 값 생성 금지 원칙 준수). 대신 `average_dollar_volume` 기반 `liquidity_score` 대체 지표를 유동성 게이트로 사용 — 실제 호가 데이터 확보 시 재검토 필요(`DECISION_LOG.md`).
+  - `smart_money_score`는 이번 버전에서 `NOT_EVALUATED`(daily_candidate_scanner의 MA200/RSI 전체 재계산이 필요해 시간/스코프 제약으로 보류) — 점수 가중치의 해당 성분은 항상 0으로 기여, 향후 통합 여지 있음.
+  - 모든 `SCORING_WEIGHTS`와 Stage B/C 임계값은 과거 성과로 검증되지 않은 초기 가정(`DECISION_LOG.md`에 근거 기록) — Phase 6 백테스트 이전까지 잠정값.
+  - `scalping_watchlist.csv`/`scalping_repeat_state.csv`는 각자 독립적인 파일 잠금을 가지나(Phase 1의 `order_history.csv`/`order_reconciliation.csv`와 마찬가지로) 두 파일 간 단일 트랜잭션은 없음 — 안전 크리티컬이 아닌 후보 선별 데이터이므로 Phase 1의 SQLite 논의와는 별개로 낮은 우선순위로 기록.
+- 판정: `IMPLEMENTED`. Codex 재검증에서 `PROCEED` 판정을 받은 뒤에만 `VALIDATED`로 승격한다.
 
 ---
 

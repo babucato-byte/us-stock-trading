@@ -1,5 +1,22 @@
 # VALIDATION_REPORT
 
+## 2026-07-22 — Phase 2 구현 완료 (초단타 관심종목 선별 엔진)
+
+`scalping_watchlist/` 패키지로 Stage A(거래가능성 재검증)~E(설명 가능한 가중합 점수) 파이프라인을 구현했다(커밋 `4a96883`).
+
+- 재사용: `daily_candidate_scanner.calculate_rsi`/`calculate_atr`, `market_hours.eastern_now`/`get_us_market_session`, `market_guard.is_us_trading_day`.
+- 재사용하지 않기로 한 것: 기존 JSON 룰 엔진(`evaluate_filter`, 불명확 필드 시 fail-open) — Phase 2 원칙("불명확하면 포함하지 않는다")과 배치되어 전용 함수로 신규 작성. 근거는 `DECISION_LOG.md`.
+- 신규 구현(저장소에 대응 로직 없었음, 확인됨): 다중 사이클 반복탐지 스트릭 추적(`repeat_tracker.py`), 유동성 대체지표(`liquidity_score`, `spread_estimate`는 데이터 소스 부재로 항상 `NOT_AVAILABLE`), Stage E 점수 엔진.
+- 파일 안전성: `order_history.csv`와 동일한 기법(temp file+fsync+os.replace, `fcntl.flock`)을 `scalping_watchlist/atomic_io.py`에 독립 재구현(Phase 1 파일 미변경 원칙 준수).
+
+테스트: 신규 34건(정상 선별/점수순 정렬/최대 관심종목 수/동점 결정성, 가격·거래량·거래대금·상대거래량·변동성·유동성 부족 차단, 데이터 누락·지연·비정상치 차단, 최초/재등장/타거래일 초기화/ET 경계/재등장 구분/동시성 lost-update 방지, 하위점수-가중치 일치/점수 범위/NaN·Infinity 차단/입력순서 무관성, 원자적쓰기 실패 시 원본 보존/잠금 타임아웃/손상파일 fail-closed, Fake provider only/개별 provider 오류 격리) 전부 통과, 동시성 테스트 5회 반복 안정.
+
+전체 회귀: **183 passed, 0 failed** (기존 149 + 신규 34), 저장소 루트/상위 디렉터리 동일 결과. 실제 Alpaca/Slack/Yahoo 호출 0회. `order_history.csv` 해시 불변 — Phase 1 운영 로직/파일 미변경 확인.
+
+Phase 2 상태: **`IMPLEMENTED`**(Claude 자체 검증). Codex의 `PROCEED` 판정 전까지 `VALIDATED`로 승격하지 않음.
+
+---
+
 ## 2026-07-21 — Phase 1 최종 Codex 판정 및 Phase 2 착수
 
 `CODEX_REVIEW.md` 최종 독립 검증(대상 커밋 `05757fe`/`0c2dab4`/`16a1ee4`/`56e11be`) 결과: **overall verdict PASS_WITH_CONDITIONS**. CODEX-001~009 전부 RESOLVED, 신규 Finding 없음, 회귀 없음. 전체 테스트 149 passed, 집중 테스트 106 passed, 동시성 테스트 6 passed×5회, 실제 외부 API 호출 0회, 운영 CSV/runtime 변경 없음.
