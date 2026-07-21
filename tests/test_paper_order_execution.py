@@ -509,6 +509,151 @@ def test_daily_trade_date_uses_eastern_time_not_local(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# CODEX-007: strict canonical order_date validation
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("value", ["2026-07-21", "2024-02-29"])
+def test_validate_order_date_str_accepts_canonical_dates(value):
+    assert pso.validate_order_date_str(value) == value
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "2026/07/21",
+        "07-21-2026",
+        "2026-7-21",
+        "2026-07-1",
+        "2026-07-21T00:00:00",
+        "2026-07-21 00:00:00",
+        "2026-07-21Z",
+        "2026-07-21+09:00",
+        " 2026-07-21",
+        "2026-07-21 ",
+        "2026-02-30",
+        "not-a-date",
+        "",
+        None,
+        float("nan"),
+    ],
+)
+def test_validate_order_date_str_rejects_non_canonical_values(value):
+    with pytest.raises(ValueError):
+        pso.validate_order_date_str(value)
+
+
+def test_non_canonical_order_date_blocks_all_new_orders(monkeypatch, tmp_path):
+    _write_history(
+        tmp_path / "order_history.csv",
+        [
+            {"symbol": "OLD", "order_date": TODAY, "mode": "PAPER", "dry_run": False, "status": "SUBMITTED"},
+            {"symbol": "MSFT", "order_date": "2026-07-20 10:30:00", "mode": "PAPER", "dry_run": False, "status": "SUBMITTED"},
+        ],
+    )
+    broker = FakeBroker()
+    _patch_common(monkeypatch, tmp_path, ["AAPL"], broker, init_history=False)
+
+    with pytest.raises(pso.OrderHistoryUnavailable, match="CORRUPTED_HISTORY"):
+        pso.main(broker=broker)
+
+    assert broker.submit_calls == []
+
+
+def test_non_canonical_date_is_not_silently_undercounted(monkeypatch, tmp_path):
+    # Directly reproduces the CODEX-007 evidence: a parseable-but-non-canonical
+    # order_date must not let count_orders_for_date() silently return 0 for
+    # today's canonical date.
+    history_file = tmp_path / "order_history.csv"
+    pd.DataFrame(
+        [{"symbol": "AAPL", "order_date": "2026-07-20 10:30:00", "mode": "PAPER", "dry_run": False, "status": "SUBMITTED"}],
+        columns=pso.REQUIRED_HISTORY_COLUMNS,
+    ).to_csv(history_file, index=False)
+    monkeypatch.setattr(pso, "ORDER_HISTORY_FILE", history_file)
+
+    with pytest.raises(pso.OrderHistoryUnavailable):
+        pso.load_order_history()  # must fail closed, never silently return count 0
+
+
+def test_valid_and_non_canonical_dates_together_still_block(monkeypatch, tmp_path):
+    # A normal past date and today's canonical date coexist with one bad row
+    # — the single bad row must still corrupt the whole file (fail-closed).
+    _write_history(
+        tmp_path / "order_history.csv",
+        [
+            {"symbol": "OLD1", "order_date": "2026-01-05", "mode": "PAPER", "dry_run": False, "status": "SUBMITTED"},
+            {"symbol": "OLD2", "order_date": TODAY, "mode": "PAPER", "dry_run": False, "status": "SUBMITTED"},
+            {"symbol": "BAD", "order_date": "2026-1-5", "mode": "PAPER", "dry_run": False, "status": "SUBMITTED"},
+        ],
+    )
+    monkeypatch.setattr(pso, "ORDER_HISTORY_FILE", tmp_path / "order_history.csv")
+
+    with pytest.raises(pso.OrderHistoryUnavailable, match="CORRUPTED_HISTORY"):
+        pso.load_order_history()
+
+
+def test_et_midnight_boundary_daily_count_is_exact(monkeypatch, tmp_path):
+    # Two canonical-date rows for "today" and one for "yesterday" must count
+    # exactly 2 for today, regardless of ET midnight boundary phrasing.
+    from datetime import datetime as dt_class
+    from datetime import timedelta
+
+    yesterday = (dt_class.strptime(TODAY, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+    history_file = tmp_path / "order_history.csv"
+    _write_history(
+        history_file,
+        [
+            {"symbol": "A", "order_date": TODAY, "mode": "PAPER", "dry_run": False, "status": "SUBMITTED"},
+            {"symbol": "B", "order_date": TODAY, "mode": "PAPER", "dry_run": False, "status": "SUBMITTED"},
+            {"symbol": "C", "order_date": yesterday, "mode": "PAPER", "dry_run": False, "status": "SUBMITTED"},
+        ],
+    )
+    monkeypatch.setattr(pso, "ORDER_HISTORY_FILE", history_file)
+
+    history = pso.load_order_history()
+    assert pso.count_orders_for_date(history, TODAY) == 2
+    assert pso.count_orders_for_date(history, yesterday) == 1
+
+
+def test_date_validation_runs_before_duplicate_check(monkeypatch, tmp_path):
+    # Even when a symbol/date pair would also be flagged as a duplicate,
+    # the corrupted-date failure must surface first (load_order_history()
+    # raises before is_duplicate_order() is ever reached).
+    _write_history(
+        tmp_path / "order_history.csv",
+        [
+            {"symbol": "AAPL", "order_date": TODAY, "mode": "PAPER", "dry_run": False, "status": "SUBMITTED"},
+            {"symbol": "AAPL", "order_date": "2026/07/20", "mode": "PAPER", "dry_run": False, "status": "SUBMITTED"},
+        ],
+    )
+    broker = FakeBroker()
+    _patch_common(monkeypatch, tmp_path, ["AAPL"], broker, init_history=False)
+
+    with pytest.raises(pso.OrderHistoryUnavailable):
+        pso.main(broker=broker)
+
+    assert broker.submit_calls == []
+
+
+def test_diagnose_order_history_dates_reports_problems_without_mutating_file(monkeypatch, tmp_path):
+    history_file = tmp_path / "order_history.csv"
+    _write_history(
+        history_file,
+        [
+            {"symbol": "AAPL", "order_date": TODAY, "mode": "PAPER", "dry_run": False, "status": "SUBMITTED"},
+            {"symbol": "MSFT", "order_date": "2026-7-20", "mode": "PAPER", "dry_run": False, "status": "SUBMITTED"},
+        ],
+    )
+    monkeypatch.setattr(pso, "ORDER_HISTORY_FILE", history_file)
+    original_bytes = history_file.read_bytes()
+
+    problems = pso.diagnose_order_history_dates()
+
+    assert len(problems) == 1
+    assert problems[0]["raw_value"] == "2026-7-20"
+    assert history_file.read_bytes() == original_bytes  # diagnostic only, never rewrites
+
+
+# ---------------------------------------------------------------------------
 # CODEX-003: atomic, concurrency-safe order history writes
 # ---------------------------------------------------------------------------
 

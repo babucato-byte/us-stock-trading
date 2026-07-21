@@ -1,9 +1,11 @@
 import fcntl
 import os
+import re
 import tempfile
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import datetime as _datetime
 from pathlib import Path
 
 import pandas as pd
@@ -31,6 +33,7 @@ REQUIRED_HISTORY_COLUMNS = ["symbol", "order_date", "mode", "dry_run", "status"]
 # order_history.csv by (symbol, order_date), which is already a unique key
 # there (duplicate-order prevention guarantees at most one row per pair).
 ORDER_RECONCILIATION_FILE = BASE_DIR / "order_reconciliation.csv"
+ORDER_RECONCILIATION_LOCK_FILE = BASE_DIR / "order_reconciliation.lock"
 RECONCILIATION_COLUMNS = [
     "client_order_id",
     "symbol",
@@ -45,9 +48,20 @@ RECONCILIATION_COLUMNS = [
 ]
 
 # Local status vocabulary for reconciliation rows. PENDING_SUBMISSION/
-# SUBMITTED/PARTIALLY_FILLED are non-terminal (still worth re-checking on a
-# future run); the rest are terminal.
-RECONCILIATION_NON_TERMINAL_STATUSES = {"PENDING_SUBMISSION", "SUBMITTED", "PARTIALLY_FILLED"}
+# SUBMITTED/PARTIALLY_FILLED/UNKNOWN are non-terminal (still worth
+# re-checking on a future run); the rest are terminal and sticky.
+RECONCILIATION_NON_TERMINAL_STATUSES = {"PENDING_SUBMISSION", "SUBMITTED", "PARTIALLY_FILLED", "UNKNOWN"}
+RECONCILIATION_TERMINAL_STATUSES = {"FILLED", "REJECTED", "CANCELLED", "EXPIRED", "MANUAL_REVIEW"}
+
+# Monotonic progression rank used by merge_reconciliation_state(). Terminal
+# statuses (including FILLED) are handled separately: once existing status
+# is terminal, no incoming value may change it.
+_STATUS_PROGRESS_RANK = {
+    "PENDING_SUBMISSION": 0,
+    "SUBMITTED": 1,
+    "PARTIALLY_FILLED": 2,
+    "FILLED": 3,
+}
 
 _BROKER_STATUS_TO_LOCAL_STATUS = {
     "new": "SUBMITTED",
@@ -60,6 +74,64 @@ _BROKER_STATUS_TO_LOCAL_STATUS = {
     "cancelled": "CANCELLED",
     "expired": "EXPIRED",
 }
+
+# CODEX-007: order_date must be exactly YYYY-MM-DD, America/New_York
+# calendar date. No datetime forms, no timezone suffixes, no whitespace, no
+# missing zero-padding — a parseable-but-non-canonical value (e.g.
+# "2026-07-20 10:30:00") would otherwise round-trip through pandas fine
+# while count_orders_for_date()'s exact string comparison against "today"
+# silently treats it as a different day, undercounting the daily limit.
+_ORDER_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def validate_order_date_str(value):
+    """Validate that `value` is a canonical YYYY-MM-DD order date string.
+
+    Returns the validated string on success. Raises ValueError otherwise —
+    including for non-string input (None, NaN, numbers), leading/trailing
+    whitespace (never auto-stripped), any datetime/timezone suffix, missing
+    zero-padding, and dates that don't exist on the calendar (e.g. Feb 30).
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"order_date must be a string, got {type(value).__name__}: {value!r}")
+    if value != value.strip():
+        raise ValueError(f"order_date has leading/trailing whitespace: {value!r}")
+    if not _ORDER_DATE_PATTERN.match(value):
+        raise ValueError(f"order_date is not in YYYY-MM-DD form: {value!r}")
+    try:
+        parsed = _datetime.strptime(value, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError(f"order_date is not a real calendar date: {value!r} ({exc})")
+    if parsed.strftime("%Y-%m-%d") != value:
+        raise ValueError(f"order_date does not round-trip to itself: {value!r}")
+    return value
+
+
+def diagnose_order_history_dates():
+    """Read order_history.csv without validation and report which order_date
+    values (if any) are non-canonical, for operator use.
+
+    Never used to auto-migrate data: CODEX-007 requires that a corrupted or
+    non-canonical history be surfaced for explicit human review rather than
+    silently rewritten. Returns a list of {row, raw_value, error} dicts;
+    empty if the file is missing, unreadable as CSV, or every value is
+    already canonical.
+    """
+    if not ORDER_HISTORY_FILE.exists():
+        return []
+    try:
+        df = pd.read_csv(ORDER_HISTORY_FILE)
+    except Exception as exc:
+        return [{"row": None, "raw_value": None, "error": f"file unreadable as CSV: {exc}"}]
+    if "order_date" not in df.columns:
+        return [{"row": None, "raw_value": None, "error": "order_date column missing"}]
+    problems = []
+    for row_index, raw_value in df["order_date"].items():
+        try:
+            validate_order_date_str(raw_value)
+        except ValueError as exc:
+            problems.append({"row": int(row_index), "raw_value": raw_value, "error": str(exc)})
+    return problems
 
 
 class OrderHistoryUnavailable(Exception):
@@ -171,12 +243,22 @@ def load_order_history():
             f"CORRUPTED_HISTORY: {ORDER_HISTORY_FILE} is missing required columns {missing_columns}"
         )
     if not df.empty:
-        try:
-            pd.to_datetime(df["order_date"], errors="raise")
-        except Exception as exc:
-            raise OrderHistoryUnavailable(
-                f"CORRUPTED_HISTORY: order_date column in {ORDER_HISTORY_FILE} failed to parse: {exc}"
-            )
+        # CODEX-007: a loose pd.to_datetime(errors="raise") check accepts
+        # parseable-but-non-canonical values (e.g. "2026-07-20 10:30:00",
+        # "2026-7-20", " 2026-07-20") that then silently fail an exact
+        # string comparison against today's canonical date, undercounting
+        # the daily order limit. Every row must be exactly YYYY-MM-DD; a
+        # single non-canonical value marks the whole history CORRUPTED
+        # rather than being coerced or skipped, per fail-closed policy.
+        for row_index, raw_value in df["order_date"].items():
+            try:
+                validate_order_date_str(raw_value)
+            except ValueError as exc:
+                raise OrderHistoryUnavailable(
+                    f"CORRUPTED_HISTORY: order_date at row {row_index} in {ORDER_HISTORY_FILE} "
+                    f"is not canonical: {exc}. Run diagnose_order_history_dates() for a full report; "
+                    "non-canonical values are never auto-migrated."
+                )
     return df
 
 
