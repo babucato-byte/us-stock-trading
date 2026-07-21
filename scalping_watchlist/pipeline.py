@@ -210,6 +210,7 @@ def _build_entry(symbol, session, detected_at, features, eligibility_reasons, re
         previous_close=features.get("previous_close", "UNKNOWN") if features else "UNKNOWN",
         gap_percent=features.get("gap_percent", "UNKNOWN") if features else "UNKNOWN",
         premarket_volume=features.get("premarket_volume", "NOT_EVALUATED") if features else "NOT_EVALUATED",
+        premarket_coverage_complete=features.get("premarket_coverage_complete", "NOT_EVALUATED") if features else "NOT_EVALUATED",
         current_volume=features.get("current_volume", "UNKNOWN") if features else "UNKNOWN",
         average_volume=features.get("average_volume", "UNKNOWN") if features else "UNKNOWN",
         relative_volume=features.get("relative_volume", "UNKNOWN") if features else "UNKNOWN",

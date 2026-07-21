@@ -1143,3 +1143,167 @@ def test_corrupted_timestamp_forces_rejection_not_indefinite_active():
 def test_code_status_enum_matches_documented_lifecycle_states():
     # SCALPING_V1_ROADMAP.md documents exactly these five states.
     assert VALID_STATUSES == {"NEW", "ACTIVE", "COOLING", "EXPIRED", "REJECTED"}
+
+
+# CODEX-015: average volume must exclude the current/incomplete trading day
+# and require a minimum number of completed days; premarket volume must be
+# read from exactly the 04:00-09:30 ET window regardless of the source
+# timezone or DST. Both are pure-function tests — no yfinance call involved.
+
+from scalping_watchlist.data_provider import YFinanceMarketDataProvider, filter_premarket_rows  # noqa: E402
+
+_provider = YFinanceMarketDataProvider()
+
+
+def _volume_df(values, freq="D", tz="UTC", start="2026-05-01"):
+    index = pd.date_range(start=start, periods=len(values), freq=freq, tz=tz)
+    return pd.DataFrame({"Volume": values}, index=index)
+
+
+def test_average_volume_excludes_current_incomplete_day(monkeypatch):
+    monkeypatch.setattr(cfg, "AVERAGE_VOLUME_LOOKBACK_DAYS", 3)
+    monkeypatch.setattr(cfg, "MIN_VALID_VOLUME_DAYS", 2)
+    # Last row (100) is "today", excluded; average of the prior 3 completed
+    # days (10, 20, 30) must be used, not including 100.
+    df = _volume_df([10, 20, 30, 100])
+    assert _provider._compute_average_volume(df, "SYMA") == pytest.approx(20.0)
+
+
+def test_average_volume_uses_only_completed_days_within_lookback(monkeypatch):
+    monkeypatch.setattr(cfg, "AVERAGE_VOLUME_LOOKBACK_DAYS", 2)
+    monkeypatch.setattr(cfg, "MIN_VALID_VOLUME_DAYS", 2)
+    # 5 completed days plus 1 current-day row; lookback=2 means only the
+    # last two completed days (30, 40) are averaged.
+    df = _volume_df([10, 20, 30, 40, 999])
+    assert _provider._compute_average_volume(df, "SYMB") == pytest.approx(35.0)
+
+
+def test_average_volume_blocked_when_lookback_insufficient(monkeypatch):
+    monkeypatch.setattr(cfg, "AVERAGE_VOLUME_LOOKBACK_DAYS", 20)
+    monkeypatch.setattr(cfg, "MIN_VALID_VOLUME_DAYS", 5)
+    # Only 3 completed days available (4 rows minus the excluded current day).
+    df = _volume_df([10, 20, 30, 999])
+    assert _provider._compute_average_volume(df, "SYMC") is None
+
+
+def test_average_volume_exactly_at_minimum_is_allowed(monkeypatch):
+    monkeypatch.setattr(cfg, "AVERAGE_VOLUME_LOOKBACK_DAYS", 20)
+    monkeypatch.setattr(cfg, "MIN_VALID_VOLUME_DAYS", 3)
+    df = _volume_df([10, 20, 30, 999])
+    assert _provider._compute_average_volume(df, "SYMD") == pytest.approx(20.0)
+
+
+def test_premarket_window_includes_0400_excludes_0930():
+    today = pd.Timestamp("2026-06-15", tz="America/New_York").date()
+    index = pd.to_datetime([
+        "2026-06-15 03:59:00", "2026-06-15 04:00:00",
+        "2026-06-15 09:29:00", "2026-06-15 09:30:00",
+    ]).tz_localize("America/New_York")
+    df = pd.DataFrame({"Volume": [1, 2, 4, 8]}, index=index)
+    volume, start, end, complete = filter_premarket_rows(df, today)
+    # 03:59 and 09:30 excluded; 04:00 and 09:29 included -> sum = 2 + 4 = 6.
+    assert volume == pytest.approx(6.0)
+    assert (start, end) == ("04:00", "09:30")
+    assert complete is True
+
+
+def test_premarket_window_converts_utc_to_eastern():
+    today = pd.Timestamp("2026-06-15", tz="America/New_York").date()
+    # 2026-06-15 is EDT (UTC-4): 08:00 UTC == 04:00 ET, 13:30 UTC == 09:30 ET.
+    index = pd.to_datetime([
+        "2026-06-15 08:00:00", "2026-06-15 12:00:00", "2026-06-15 13:30:00",
+    ]).tz_localize("UTC")
+    df = pd.DataFrame({"Volume": [5, 7, 100]}, index=index)
+    volume, _, _, complete = filter_premarket_rows(df, today)
+    assert volume == pytest.approx(12.0)
+    assert complete is True
+
+
+def test_premarket_window_handles_dst_correctly():
+    # 2026-01-15 is EST (UTC-5): 09:00 UTC == 04:00 ET, 14:30 UTC == 09:30 ET.
+    today = pd.Timestamp("2026-01-15", tz="America/New_York").date()
+    index = pd.to_datetime([
+        "2026-01-15 09:00:00", "2026-01-15 14:29:00", "2026-01-15 14:30:00",
+    ]).tz_localize("UTC")
+    df = pd.DataFrame({"Volume": [3, 6, 999]}, index=index)
+    volume, _, _, complete = filter_premarket_rows(df, today)
+    assert volume == pytest.approx(9.0)
+    assert complete is True
+
+
+def test_premarket_partial_coverage_is_flagged_incomplete():
+    today = pd.Timestamp("2026-06-15", tz="America/New_York").date()
+    # Data only starts at 07:00 ET, not the full 04:00-09:30 window.
+    index = pd.to_datetime([
+        "2026-06-15 07:00:00", "2026-06-15 08:00:00",
+    ]).tz_localize("America/New_York")
+    df = pd.DataFrame({"Volume": [10, 20]}, index=index)
+    volume, _, _, complete = filter_premarket_rows(df, today)
+    assert volume == pytest.approx(30.0)
+    assert complete is False
+
+
+def test_premarket_no_data_in_window_returns_none_and_incomplete():
+    today = pd.Timestamp("2026-06-15", tz="America/New_York").date()
+    index = pd.to_datetime(["2026-06-15 10:00:00"]).tz_localize("America/New_York")
+    df = pd.DataFrame({"Volume": [50]}, index=index)
+    volume, start, end, complete = filter_premarket_rows(df, today)
+    assert volume is None
+    assert (start, end) == ("04:00", "09:30")
+    assert complete is False
+
+
+def test_regular_session_volume_does_not_leak_into_premarket():
+    today = pd.Timestamp("2026-06-15", tz="America/New_York").date()
+    index = pd.to_datetime([
+        "2026-06-15 04:00:00", "2026-06-15 09:30:00", "2026-06-15 11:00:00",
+    ]).tz_localize("America/New_York")
+    df = pd.DataFrame({"Volume": [1, 999, 999]}, index=index)
+    volume, _, _, _ = filter_premarket_rows(df, today)
+    assert volume == pytest.approx(1.0)
+
+
+def test_premarket_rows_from_a_different_day_are_excluded():
+    today = pd.Timestamp("2026-06-15", tz="America/New_York").date()
+    index = pd.to_datetime([
+        "2026-06-14 05:00:00", "2026-06-15 05:00:00",
+    ]).tz_localize("America/New_York")
+    df = pd.DataFrame({"Volume": [500, 7]}, index=index)
+    volume, _, _, _ = filter_premarket_rows(df, today)
+    assert volume == pytest.approx(7.0)
+
+
+def test_features_carries_premarket_coverage_complete_flag():
+    from scalping_watchlist.features import compute_features
+
+    snap = _good_snapshot(premarket_volume=12345, premarket_coverage_complete=True)
+    features, reasons = compute_features(snap)
+    assert features["premarket_coverage_complete"] is True
+    assert reasons == []
+
+
+def test_features_flags_incomplete_premarket_coverage():
+    from scalping_watchlist.features import compute_features
+
+    snap = _good_snapshot(premarket_volume=100, premarket_coverage_complete=False)
+    features, _ = compute_features(snap)
+    assert features["premarket_coverage_complete"] is False
+
+
+def test_features_default_premarket_coverage_is_not_evaluated_when_no_premarket_volume():
+    from scalping_watchlist.features import compute_features
+
+    snap = _good_snapshot()  # premarket_volume left as None (default)
+    features, _ = compute_features(snap)
+    assert features["premarket_coverage_complete"] == NOT_EVALUATED
+
+
+def test_watchlist_entry_persists_premarket_coverage_field(monkeypatch, tmp_path):
+    _patch_paths(monkeypatch, tmp_path)
+    provider = FakeMarketDataProvider(
+        universe_symbols=["SYME"],
+        snapshots={"SYME": _good_snapshot(symbol="SYME", premarket_volume=5000, premarket_coverage_complete=True)},
+    )
+    result = run_scan_cycle(provider, now=PREMARKET_NOW, symbols=["SYME"])
+    assert result["selected"], "expected SYME to be selected"
+    assert result["selected"][0]["premarket_coverage_complete"] is True

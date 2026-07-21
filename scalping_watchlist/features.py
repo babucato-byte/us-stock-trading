@@ -21,7 +21,7 @@ repo per DECISION_LOG.md's reuse-scope entry):
   see DECISION_LOG.md for why no real spread source is used.
 """
 
-from .models import NOT_AVAILABLE
+from .models import NOT_AVAILABLE, NOT_EVALUATED
 from .numeric_guard import InvalidNumber, require_finite_number
 
 # A gap this large is far more likely a bad print, a split, or a data glitch
@@ -32,7 +32,7 @@ GAP_SANITY_LIMIT_PERCENT = 500.0
 _FEATURE_KEYS = (
     "latest_price", "previous_close", "gap_percent", "current_volume",
     "average_volume", "relative_volume", "average_dollar_volume", "atr",
-    "atr_percent", "liquidity_score", "premarket_volume",
+    "atr_percent", "liquidity_score", "premarket_volume", "premarket_coverage_complete",
 )
 
 
@@ -47,6 +47,7 @@ def compute_features(snapshot):
     """
     reasons = []
     features = {key: NOT_AVAILABLE for key in _FEATURE_KEYS}
+    features["premarket_coverage_complete"] = NOT_EVALUATED  # boolean metadata, not a numeric-unavailable field
 
     if snapshot is None:
         reasons.append("DATA_UNAVAILABLE: provider returned no snapshot")
@@ -106,6 +107,10 @@ def compute_features(snapshot):
         premarket_volume = _validate(snapshot.premarket_volume, "premarket_volume", reasons, min_value=0)
         if premarket_volume is not None:
             features["premarket_volume"] = premarket_volume
+            # CODEX-015: never call a partial-session read "the" premarket
+            # volume without saying so — this flag distinguishes a full
+            # 04:00-09:30 ET read from a provider that only had part of it.
+            features["premarket_coverage_complete"] = bool(snapshot.premarket_coverage_complete)
 
     return features, reasons
 

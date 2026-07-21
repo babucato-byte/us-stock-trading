@@ -47,6 +47,10 @@ class WatchlistEntry:
     previous_close: Numeric = UNKNOWN
     gap_percent: Numeric = UNKNOWN
     premarket_volume: Numeric = NOT_EVALUATED
+    # CODEX-015: whether premarket_volume covers the full 04:00-09:30 ET
+    # window or only part of it (provider-dependent) — never presented as
+    # "the" premarket volume without this caveat.
+    premarket_coverage_complete: Numeric = NOT_EVALUATED
     current_volume: Numeric = UNKNOWN
     average_volume: Numeric = UNKNOWN
     relative_volume: Numeric = UNKNOWN

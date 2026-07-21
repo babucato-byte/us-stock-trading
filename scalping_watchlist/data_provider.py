@@ -145,8 +145,7 @@ class YFinanceMarketDataProvider(MarketDataProvider):
         price = float(df["Close"].iloc[-1])
         previous_close = float(df["Close"].iloc[-2])
         current_volume = float(df["Volume"].iloc[-1])
-        window = df["Volume"].tail(self.avg_volume_window)
-        average_volume = float(window.mean()) if not window.empty else None
+        average_volume = self._compute_average_volume(df, symbol)
         atr_series = calculate_atr(df)
         atr = float(atr_series.iloc[-1]) if not atr_series.empty and pd.notna(atr_series.iloc[-1]) else None
 
@@ -172,6 +171,29 @@ class YFinanceMarketDataProvider(MarketDataProvider):
             premarket_coverage_complete=coverage_complete,
         )
 
+    def _compute_average_volume(self, df, symbol):
+        """CODEX-015: the current/most recent bar is assumed to be the
+        current (possibly still-open) trading day and is always excluded
+        before averaging — including it would let a partial day's volume
+        drag the average down mid-session, which then inflates
+        relative_volume (current_volume / average_volume) artificially.
+        Requires at least MIN_VALID_VOLUME_DAYS of completed history;
+        returns None (never a value computed from too little data) if
+        that isn't met, which features.py's finite-number validation
+        (CODEX-010) will correctly turn into AVERAGE_VOLUME_UNAVAILABLE.
+        """
+        from config import scalping_watchlist_config as cfg
+
+        completed_days = df["Volume"].iloc[:-1]
+        lookback = completed_days.tail(cfg.AVERAGE_VOLUME_LOOKBACK_DAYS)
+        if len(lookback) < cfg.MIN_VALID_VOLUME_DAYS:
+            print(
+                f"{symbol}: insufficient completed trading days for average volume "
+                f"({len(lookback)} < {cfg.MIN_VALID_VOLUME_DAYS})"
+            )
+            return None
+        return float(lookback.mean())
+
     def _fetch_premarket_volume(self, symbol):
         import yfinance as yf
         from market_hours import eastern_now
@@ -184,19 +206,31 @@ class YFinanceMarketDataProvider(MarketDataProvider):
         if intraday.empty:
             return None, None, None, False
         today = eastern_now().date()
-        et_index = intraday.index.tz_convert("America/New_York")
-        # CODEX-015: 04:00 (inclusive) through 09:30 (exclusive) ET.
-        premarket_mask = (
-            (et_index.date == today)
-            & (et_index.time >= _PREMARKET_START)
-            & (et_index.time < _PREMARKET_END)
-        )
-        premarket_rows = intraday[premarket_mask]
-        if premarket_rows.empty:
-            return None, "04:00", "09:30", False
-        observed_start = et_index[premarket_mask].min().time()
-        coverage_complete = observed_start <= _PREMARKET_START
-        return float(premarket_rows["Volume"].sum()), "04:00", "09:30", coverage_complete
+        return filter_premarket_rows(intraday, today)
+
+
+def filter_premarket_rows(intraday, today_et_date):
+    """CODEX-015: pure function isolating the premarket time-boundary
+    filtering (04:00 inclusive through 09:30 exclusive ET) so it can be
+    unit tested with a constructed DataFrame, without invoking yfinance.
+
+    `intraday` must have a tz-aware DatetimeIndex (any timezone; converted
+    to America/New_York here) with a "Volume" column. Returns
+    (volume_sum_or_None, "04:00", "09:30", coverage_complete) — mirrors
+    the tuple shape `_fetch_premarket_volume` returns to callers.
+    """
+    et_index = intraday.index.tz_convert("America/New_York")
+    premarket_mask = (
+        (et_index.date == today_et_date)
+        & (et_index.time >= _PREMARKET_START)
+        & (et_index.time < _PREMARKET_END)
+    )
+    premarket_rows = intraday[premarket_mask]
+    if premarket_rows.empty:
+        return None, "04:00", "09:30", False
+    observed_start = et_index[premarket_mask].min().time()
+    coverage_complete = observed_start <= _PREMARKET_START
+    return float(premarket_rows["Volume"].sum()), "04:00", "09:30", coverage_complete
 
 
 class FakeMarketDataProvider(MarketDataProvider):
