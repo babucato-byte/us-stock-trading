@@ -36,6 +36,12 @@
 - 대안: 지금 바로 SQLite로 전환 — 이번 사이클의 스코프(Phase 1 HIGH/MEDIUM 해결)를 넘어서고 "한 번에 대규모 리팩터링 금지" 원칙과 충돌하여 기각.
 - 승인 필요 여부: **예** — 위 NEEDS_USER_DECISION 항목.
 
+### 2026-07-21 — Phase 1 최종 Codex 판정 반영, Phase 2 착수
+- 결정: Codex 최종 독립 검증(verdict `PASS_WITH_CONDITIONS`, CODEX-001~009 전부 RESOLVED, Phase 2 판정 `PROCEED`)을 그대로 반영해 Phase 1을 `Phase 1A: VALIDATED` / `Phase 1B: DEFERRED_TO_PHASE_5`로 기록하고 Phase 2(초단타 관심종목 선별 엔진)를 `IN_PROGRESS`로 착수.
+- 근거: 지시서가 명시적으로 이 판정을 문서에 반영한 뒤 Phase 2를 자율 진행하도록 지시.
+- 위 SQLite `NEEDS_USER_DECISION` 항목은 **Phase 2에서는 요구되지 않음**(Codex도 "Phase 2 관심종목 선별과 독립적"이라고 명시) — Phase 5 착수 전에만 재확인 필요. Phase 2 구현에서 이 결정을 선결 조건으로 취급하지 않는다.
+- 승인 필요 여부: 아니오(Codex 판정 반영 및 자율 진행 범위).
+
 ---
 
 향후 CODEX_REVIEW.md 지적사항에 대한 ACCEPTED/REJECTED_WITH_REASON 결정도 이 로그에 이어서 기록한다.

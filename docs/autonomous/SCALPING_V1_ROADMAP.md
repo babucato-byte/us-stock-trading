@@ -49,7 +49,11 @@ daily_candidate_scanner.py (전체 시장 스캔, RSI/MA200/거래량/breakout/t
 
 ## Phase 1 — 주문 안전성과 실행 경로 검증
 
-**상태: IN_PROGRESS**
+**상태: Phase 1A VALIDATED / Phase 1B DEFERRED_TO_PHASE_5**
+
+Phase 1은 두 부분으로 나뉜다:
+- **Phase 1A — 주문 진입 안전성**: candidate → scoring → account risk → duplicate/held check → market/session check → order safety → broker submission → order history → Slack notification. **VALIDATED** (Codex 최종 검증 `PASS_WITH_CONDITIONS`, CODEX-001~009 전부 RESOLVED, 신규 Finding 없음, 회귀 없음).
+- **Phase 1B — 부분 체결 및 포지션 생명주기 통합**: reconciliation 데이터를 실제 "포지션 상태"(손절/익절/강제청산 판단)로 연결하는 부분. **DEFERRED_TO_PHASE_5** — Phase 5(포지션 생명주기 상태 머신)가 선행되어야 하는 별도 범위이며, Codex도 이를 "Phase 2 관심종목 선별과 독립적"이라고 명시함.
 
 - 목적: candidate → scoring → account risk → duplicate/held check → market/session check → order safety → broker submission → order history → Slack notification 전 경로를 mock 기반으로 검증.
 - 1차 완료(커밋 `946caea`, 16개 테스트): 정상 Paper 주문, Live URL 차단, Paper 모드 미확인 차단, 중복 주문 차단, 보유 종목 재매수 차단, 일일 거래 제한, 일일 손실 한도, 시장 외 주문 차단, API timeout 안전 처리, rejected 주문 처리, 주문 이력 저장 실패 로깅, Slack 실패 격리.
@@ -61,21 +65,23 @@ daily_candidate_scanner.py (전체 시장 스캔, RSI/MA200/거래량/breakout/t
 - 관련 파일: `paper_strategy_order.py`, `account_risk.py`, `order_safety.py`, `risk_config.py`, `broker/broker_config.py`, `broker/alpaca_client.py`, `universe_builder.py`, `conftest.py`, `tests/test_broker_safety.py`, `tests/test_paper_order_execution.py`, `tests/test_universe_builder.py`
 - 테스트 결과: **149 passed, 0 failed, 2 warnings.** 저장소 루트/상위 디렉터리(`pytest`/`python -m pytest`, 경로 명시) 4가지 조합 전부 동일 결과. 동시성(threading+multiprocessing) 테스트 5회 반복 안정.
 - 커밋 해시: `946caea`(1차) → `fe2988c`/`dc9bff9`(2차) → `9688a13`/`b93a08a`/`22a6651`/`962eb69`(3차) → `05757fe`/`0c2dab4`/`16a1ee4`(4차, CODEX-001~009 전부 RESOLVED)
-- 잔여 위험: 부분 체결의 "포지션 상태" 완전 반영은 Phase 5 선행 필요. `run_order_safety_check` 예외 발생 시 해당 실행의 나머지 후보가 함께 스킵됨(의도된 보수적 동작). `order_history.csv`와 `order_reconciliation.csv`는 각자 원자적/잠금이지만 두 파일에 걸친 단일 트랜잭션은 없음(안전 크리티컬 판단은 `order_history.csv`에만 의존하므로 실거래 안전성 자체는 영향 없음) — SQLite 전환 필요성을 `DECISION_LOG.md`에 `NEEDS_USER_DECISION`으로 기록.
+- 잔여 위험: (Phase 1B로 이관) 부분 체결의 "포지션 상태" 완전 반영은 Phase 5 선행 필요. `run_order_safety_check` 예외 발생 시 해당 실행의 나머지 후보가 함께 스킵됨(의도된 보수적 동작, Phase 1A 범위 내에서는 수용 가능한 설계로 판단). `order_history.csv`와 `order_reconciliation.csv`는 각자 원자적/잠금이지만 두 파일에 걸친 단일 트랜잭션은 없음(안전 크리티컬 판단은 `order_history.csv`에만 의존하므로 실거래 안전성 자체는 영향 없음) — **Phase 5 착수 전 SQLite 전환 여부를 사용자가 결정해야 함**(`DECISION_LOG.md`의 `NEEDS_USER_DECISION` 참고, Phase 2에서는 이 결정을 요구하지 않음).
+- **Codex 최종 판정 (2026-07-21)**: Overall verdict `PASS_WITH_CONDITIONS`. CODEX-001~009 전부 RESOLVED, 신규 Finding 없음. 전체 테스트 149 passed, 집중 테스트 106 passed, 동시성 테스트 6 passed×5회, 실제 외부 API 호출 0회, 운영 CSV/runtime 변경 없음. Phase 1 자체 판정은 `KEEP_IN_PROGRESS`(Phase 1B가 Phase 5 선행 조건으로 남아있어), **Phase 2 판정은 `PROCEED`**.
 
 ---
 
 ## Phase 2 — 초단타 관심종목 선별 엔진
 
-**상태: NOT_STARTED**
+**상태: IN_PROGRESS**
 
-- 목적: 기존 전체 시장 스캐너(`daily_candidate_scanner.py`)를 재사용하되, 초단타 감시에 적합한 관심종목만 별도로 축소한 `scalping_watchlist.csv`를 생성.
-- 작업 목록: 거래 가능 여부/최소가/최소평균거래량/최소평균거래대금/당일 상대거래량/프리마켓 거래량/갭 상승률/스프레드 또는 유동성 대체지표/ATR/뉴스의존성 표시/반복탐지횟수/smart_money_score 재사용 판단 로직 구현. 시장 전체를 1분마다 조회하지 않도록 스캐너와 실시간 감시 대상을 분리.
-- 완료 조건: `scalping_watchlist.csv`(필드: symbol, detected_at, latest_price, gap_percent, relative_volume, average_dollar_volume, spread_estimate/liquidity_score, repeat_count, source_score, eligibility_reason, rejection_reason, status) 생성 로직 + 단위 테스트.
-- 관련 파일(예정): `scalping/watchlist_builder.py`(신규), `config/scalping_watchlist_rules.json`(신규)
-- 테스트 결과: 미착수
-- 커밋 해시: 없음
-- 잔여 위험: 스프레드/유동성 대체지표 산출 방식은 Alpaca가 실시간 호가창을 제공하는지 확인 필요(무료 티어 제약 가능성) — 착수 시 재검토.
+- 목적: 미국주식 전체를 매분 조회하지 않고, 기존 저빈도 시장 스캐너를 재사용해 초단타(`VWAP_MICRO_PULLBACK_MOMENTUM_V1`)가 1분봉으로 집중 감시할 관심종목만 선별. 결과물은 주문 신호가 아니며, VWAP/EMA 진입 판단은 Phase 3·4 범위.
+- 작업 목록: Stage A(거래 가능성) → B(가격/유동성) → C(당일 움직임) → D(지속성/반복탐지) → E(설명 가능한 가중합 점수) 5단계 선별 파이프라인. 세부 계획/재사용 분석은 진행하며 본 절과 `DECISION_LOG.md`에 갱신.
+- 완료 조건: `scalping_watchlist.csv` 생성(지시서 지정 22개 필드), 모든 종목에 포함/제외 사유 기록, 반복탐지 추적, ET 기준 만료 처리, 손상/누락 데이터 fail-closed, 실제 외부 API 호출 없는 테스트, 운영 파일 변경 없는 테스트, 기존 전체 테스트 통과, 신규 테스트 통과, 기존 주문/리스크 로직 미변경, Codex 검증용 패키지 생성.
+- 관련 파일(예정): 구현 진행에 따라 갱신.
+- 테스트 결과: 진행 중.
+- 커밋 해시: 진행 중.
+- 잔여 위험: 진행 중 파악되는 대로 기록.
+- 판정 기준: 이번 사이클 자체 테스트만으로는 `IMPLEMENTED`까지만 표기하며, Codex의 `PROCEED` 판정을 받은 뒤에만 `VALIDATED`로 승격한다.
 
 ---
 

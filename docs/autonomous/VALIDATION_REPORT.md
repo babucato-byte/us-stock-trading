@@ -1,5 +1,18 @@
 # VALIDATION_REPORT
 
+## 2026-07-21 — Phase 1 최종 Codex 판정 및 Phase 2 착수
+
+`CODEX_REVIEW.md` 최종 독립 검증(대상 커밋 `05757fe`/`0c2dab4`/`16a1ee4`/`56e11be`) 결과: **overall verdict PASS_WITH_CONDITIONS**. CODEX-001~009 전부 RESOLVED, 신규 Finding 없음, 회귀 없음. 전체 테스트 149 passed, 집중 테스트 106 passed, 동시성 테스트 6 passed×5회, 실제 외부 API 호출 0회, 운영 CSV/runtime 변경 없음.
+
+Phase 판정:
+- **Phase 1A(주문 진입 안전성): VALIDATED**
+- **Phase 1B(부분체결·포지션 생명주기): DEFERRED_TO_PHASE_5** — Phase 1 자체 판정은 `KEEP_IN_PROGRESS`(Codex 표현), Codex Finding이 아니라 Phase 1 승인 기준 자체의 미충족 항목.
+- **Phase 2: PROCEED**
+
+이 결과를 `SCALPING_V1_ROADMAP.md`/`CURRENT_STATUS.md`/`DECISION_LOG.md`에 반영하고 Phase 2(초단타 관심종목 선별 엔진) 착수. Phase 2는 Claude 자체 테스트만으로 `VALIDATED` 처리하지 않고 `IMPLEMENTED`로 표기하며, Codex의 `PROCEED` 판정 후에만 `VALIDATED`로 승격한다.
+
+---
+
 ## 2026-07-21 — Phase 1 추가 수정 사이클 (CODEX-007~009)
 
 독립 재검증(대상 커밋 `9688a13`/`b93a08a`/`22a6651`/`962eb69`/`1cc784b`, verdict FAIL)이 CODEX-003/004/005는 RESOLVED로 최종 확인했지만, CODEX-001/002/006을 PARTIALLY_RESOLVED로 되돌리고 신규 CODEX-007(HIGH)/008(HIGH)/009(MEDIUM)를 제기했다. 지시서 우선순위(007→008→009)대로 처리했다.
