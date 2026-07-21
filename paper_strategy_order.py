@@ -805,6 +805,22 @@ def _notify_order_blocked(symbol, reason):
     _safe_send_slack_alert(f"*Order blocked*\n- Symbol: {symbol}\n- Reason: {reason}")
 
 
+def _notify_order_filled(symbol, response, local_status):
+    data = response.data if isinstance(response.data, dict) else {}
+    _safe_send_slack_alert(
+        f"*Order filled*\n- Symbol: {symbol}\n- Status: {local_status}\n"
+        f"- Filled qty: {data.get('filled_qty')}\n"
+        f"- Avg fill price: {data.get('filled_avg_price')}"
+    )
+
+
+def _notify_order_rejected(symbol, response):
+    _safe_send_slack_alert(
+        f"*Order rejected*\n- Symbol: {symbol}\n"
+        f"- Broker response: {response.status_code} {response.text[:200]}"
+    )
+
+
 def main(broker=None):
     if is_trading_halted():
         print("Kill switch engaged: trading halted, no orders will be submitted.")
@@ -967,8 +983,11 @@ def main(broker=None):
             history_saved = update_order_status(symbol, today, immediate_local_status)
             if not response.dry_run:
                 open_position_count += 1
+            if immediate_local_status in ("FILLED", "PARTIALLY_FILLED"):
+                _notify_order_filled(symbol, response, immediate_local_status)
         else:
             history_saved = update_order_status(symbol, today, "REJECTED")
+            _notify_order_rejected(symbol, response)
 
         # Fail-closed aggregation (CODEX-008 companion): a broker accept is
         # only counted as "submitted" if order_history.csv was durably
