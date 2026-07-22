@@ -12,6 +12,7 @@ import pandas as pd
 import requests
 import yfinance as yf
 
+import notification_health
 import order_intent_ledger
 from account_risk import check_account_exposure_limits, check_daily_loss_limit
 from broker import AlpacaBroker, BrokerResponse
@@ -815,8 +816,14 @@ def update_order_status(symbol, order_date, status, lock_timeout=ORDER_HISTORY_L
 
 
 def _safe_send_slack_alert(message):
+    # Routed through notification_health so every send outcome is recorded
+    # (record_success()/record_failure()) and a persistently broken Slack
+    # channel escalates kill_switch_state on its own -- see notification_health.
+    # send_with_health_tracking never raises, but this stays defensive so a
+    # Slack outage can never propagate out of a caller that has no bearing on
+    # order correctness.
     try:
-        return send_slack_alert(message)
+        return notification_health.send_with_health_tracking(send_slack_alert, message)
     except Exception as exc:
         print(f"Slack notification failed: {exc}")
         return False
