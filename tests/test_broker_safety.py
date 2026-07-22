@@ -326,16 +326,15 @@ def test_partial_credentials_missing_api_key_blocks_request():
         config.validate_for_request()
 
 
-# HUMAN_REVIEW_FINDINGS.md 2026-07-22: BrokerConfig's dataclass field
-# defaults are computed once when broker_config.py is first imported, not
-# re-read from os.environ per BrokerConfig() call. This pins that CURRENT
-# behavior (not the desired behavior): changing TRADING_MODE /
-# ENABLE_REAL_TRADING / LIVE_DRY_RUN in the environment of an already-running
-# process (e.g. dashboard/app.py, which calls BrokerConfig() fresh on every
-# request) has no effect until the process restarts. Do not "fix" this by
-# editing broker/broker_config.py -- broker/** is out of scope for this
-# task; see the findings doc for the reproduction and recommended direction.
-def test_env_change_after_first_import_is_not_observed_without_reload(monkeypatch):
+# HUMAN_REVIEW_FINDINGS.md 2026-07-22: BrokerConfig's dataclass fields used
+# to be plain os.getenv(...)-derived defaults, computed once when
+# broker_config.py was first imported, so a running process never observed
+# env changes without a restart/reload. That gap is now fixed: fields use a
+# default_factory that re-reads os.environ on every BrokerConfig() call, so
+# a fresh instance in a long-running process (e.g. dashboard/app.py) always
+# reflects the current environment without needing importlib.reload(). This
+# test now pins that fixed behavior instead of the old bug.
+def test_env_change_after_first_import_is_observed_without_reload(monkeypatch):
     baseline_mode = broker_config_module.BrokerConfig().trading_mode
     flipped_mode = "live" if baseline_mode == "paper" else "paper"
 
@@ -345,4 +344,4 @@ def test_env_change_after_first_import_is_not_observed_without_reload(monkeypatc
 
     config = broker_config_module.BrokerConfig()
 
-    assert config.trading_mode == baseline_mode
+    assert config.trading_mode == flipped_mode
