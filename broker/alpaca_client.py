@@ -3,7 +3,7 @@ from typing import Optional, Union
 
 import requests
 
-from .broker_config import BrokerConfig
+from .broker_config import BrokerConfig, validate_order_allowed_now
 
 
 @dataclass
@@ -38,6 +38,13 @@ class AlpacaBroker:
         self.config.validate_order_allowed()
         self.config.validate_for_request()
         url = f"{self.config.base_url}{path}"
+        # self.config is a frozen snapshot captured once (at construction, or
+        # whenever it was last (re)assigned) -- it does not observe env
+        # changes made afterward. validate_order_allowed_now() re-reads
+        # os.environ right here, immediately before the network call, to
+        # close the window where TRADING_MODE/ALPACA_*_BASE_URL/etc. change
+        # between broker construction and this specific request.
+        validate_order_allowed_now()
         response = self.session.request(method, url, headers=self.headers, timeout=30, **kwargs)
         response.raise_for_status()
         return response.json()
