@@ -24,3 +24,23 @@ def is_trading_halted():
     if os.environ.get("TRADING_HALTED", "").strip().lower() == "true":
         return True
     return _resolve_kill_switch_path().exists()
+
+
+# Re-exported multi-level kill switch state machine (kill_switch_state.py) so
+# callers that only import kill_switch get both mechanisms from one place.
+# is_trading_halted() above is untouched by this -- it is the pre-existing,
+# fail-open binary halt check and stays exactly as it was.
+from kill_switch_state import (  # noqa: E402,F401
+    ACTIVE,
+    ENTRY_DISABLED,
+    ALL_TRADING_DISABLED,
+    MANUAL_REVIEW,
+    KillSwitchStateError,
+    get_state,
+    get_current_record,
+    get_history,
+    is_entry_allowed,
+    is_liquidation_allowed,
+    activate,
+    release,
+)
