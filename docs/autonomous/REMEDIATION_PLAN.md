@@ -102,3 +102,101 @@ CRITICAL 0건. HIGH 전부(001/002/003/005/006/007/008 — 003/005는 이전 사
 ## 요약 (Phase 2, CODEX-010~015)
 
 CRITICAL 0건. HIGH 전부(010/011) RESOLVED. MEDIUM 전부(012/013/014) RESOLVED. LOW(015) RESOLVED. 미해결 Finding 없음. Phase 3 코드는 이번 사이클에서 작성하지 않음. Codex 재검증(`PROCEED` 여부) 대기 — Claude 자체 판정으로 `VALIDATED` 승격하지 않음.
+
+---
+
+## 제한적 실거래 검토 사이클 — CODEX-016~019
+
+검증 기준: `docs/autonomous/CODEX_REVIEW.md`(커밋 `e0dc855`에서 그대로 기록, 대상 커밋
+`337ba16`~`b6f4924`). Overall verdict **FAIL**, Limited live review **BLOCKED**, Live trading
+recommendation **DO_NOT_ENABLE**. 판정 요지: 이전 사이클(모듈 t1~t5)이 만든 다단계 kill switch
+(`kill_switch_state.py`)와 Slack 헬스 모니터(`notification_health.py`)는 정확히 구현·단위테스트
+되었지만 실제 주문/알림 경로(`paper_strategy_order.py`)에는 배선되지 않았다.
+
+### [CODEX-016] HIGH — 다단계 kill switch가 실제 주문 경로를 차단하지 않음
+
+```
+Finding ID: CODEX-016
+Severity: HIGH
+Reproduced: 예 — Codex가 ENTRY_DISABLED 상태에서 paper_strategy_order.submit_order()를 호출해
+  broker가 실제로 1회 호출되고 HTTP 200이 반환됨을 격리 재현으로 확인. is_entry_allowed()/
+  is_liquidation_allowed()는 저장소 전체 운영 코드에서 호출되지 않고 테스트에만 존재함을 확인.
+Root cause: paper_strategy_order.py가 kill_switch.is_trading_halted()(기존 binary halt)만 검사하고,
+  이전 사이클에서 만든 kill_switch_state.py의 4단계 상태 모델은 실제 주문 진입점에 연결되지 않았다.
+Affected path: paper_strategy_order.py (submit_order, main)
+Required behavior: submit_order()가 매 호출마다 kill_switch_state의 현재 상태를 재조회해, 매수(entry)면
+  is_entry_allowed(), 매도/청산이면 is_liquidation_allowed()를 확인하고 불허 시 broker 호출 없이 안전
+  차단 응답을 반환한다. 기존 binary halt 체크는 유지(두 게이트 모두 통과해야 주문 진행). 상태 파일
+  손상 시 fail-closed.
+Implementation: (수정 진행 중 — 아래 상태 참고)
+Regression tests: (수정 진행 중)
+Status: 진행 예정
+Commit: (진행 중)
+Remaining risk: (수정 완료 후 기록)
+```
+
+### [CODEX-017] HIGH — Slack health monitor가 운영 알림 경로에 연결되지 않음
+
+```
+Finding ID: CODEX-017
+Severity: HIGH
+Reproduced: 예 — 운영 Slack wrapper가 실패를 반환하도록 격리 재현한 결과 notification status가
+  UNKNOWN으로 남고 상태 파일이 생성되지 않음을 확인.
+Root cause: paper_strategy_order._safe_send_slack_alert()가 notification_health.py의
+  send_with_health_tracking()/record_success()/record_failure()를 거치지 않고 send_slack_alert()를
+  직접 호출한다.
+Affected path: paper_strategy_order.py (_safe_send_slack_alert)
+Required behavior: _safe_send_slack_alert()가 notification_health.send_with_health_tracking()을 통해
+  발송하도록 변경, 성공/실패가 실제로 기록되고 연속 실패 임계값 도달 시 kill switch가 ENTRY_DISABLED로
+  자동 상승(ACTIVE일 때만)하며, 이 상승이 CODEX-016의 배선을 통해 실제 주문 차단으로 이어진다.
+Implementation: (수정 진행 중)
+Regression tests: (수정 진행 중)
+Status: 진행 예정
+Commit: (진행 중)
+Remaining risk: (수정 완료 후 기록)
+```
+
+### [CODEX-018] MEDIUM — 주문 직전 환경 재검증 함수가 선언만 되고 사용되지 않음
+
+```
+Finding ID: CODEX-018
+Severity: MEDIUM
+Reproduced: 예(정적 분석) — validate_order_allowed_now()는 broker_config.py와 테스트에서만 참조되고
+  AlpacaBroker._request()/get_order_by_client_order_id()/submit_order()는 생성 시점의 self.config만
+  검증함을 확인.
+Root cause: BrokerConfig.from_env()로 import-time 고정 문제는 해결됐으나(CODEX-011 사이클 전 항목,
+  이전 run), "주문 직전 재검증" 함수 자체가 실제 배선 없이 선언만 되어 있음.
+Affected path: broker/alpaca_client.py (AlpacaBroker._request 및 이를 경유하는 모든 메서드)
+Required behavior: _request()가 실제 요청 직전에 validate_order_allowed_now()(또는 동등한 최신 환경
+  재검증)를 호출해 불안전하면 요청을 보내지 않고 예외를 발생시킨다. 기존 endpoint 검증/Live 차단
+  로직은 그대로 유지, 추가로 재검증을 더한다.
+Implementation: (수정 진행 중 — broker/alpaca_client.py는 이 항목 범위로만 한시 개방)
+Regression tests: (수정 진행 중)
+Status: 진행 예정
+Commit: (진행 중)
+Remaining risk: (수정 완료 후 기록)
+```
+
+### [CODEX-019] MEDIUM — 신규 상태 저장소의 동시 갱신 lost-update 가능성
+
+```
+Finding ID: CODEX-019
+Severity: MEDIUM
+Reproduced: 예(정적 분석) — kill_switch_state.activate()/release()와 notification_health.
+  record_success()/record_failure()가 read-modify-write 전체에 파일 잠금을 쓰지 않음을 확인.
+  concurrency 회귀 테스트 없음.
+Root cause: temp+os.replace로 단일 파일 쓰기 원자성은 확보했으나, 두 프로세스가 동시에 읽고 쓰면
+  감사 이력/연속 실패 카운트가 마지막 writer 값으로 덮일 수 있다.
+Affected path: kill_switch_state.py, notification_health.py
+Required behavior: order_history.csv/order_reconciliation.csv(CODEX-008)와 atomic_io.py가 쓰는 것과
+  동일한 fcntl.flock 기반 락을 재사용해, 락 안에서 최신 파일을 재읽기 후 병합·쓰기.
+Implementation: (수정 진행 중)
+Regression tests: (수정 진행 중 — multiprocessing 2프로세스 이상 동시 갱신 테스트 필요)
+Status: 진행 예정
+Commit: (진행 중)
+Remaining risk: (수정 완료 후 기록)
+```
+
+## 요약 (제한적 실거래 검토 사이클, CODEX-016~019)
+
+(수정 완료 후 갱신 — 진행 중)
