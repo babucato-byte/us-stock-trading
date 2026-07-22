@@ -29,14 +29,18 @@ auto-reactivate -- an expired kill switch stays engaged until a human
 releases it.
 """
 
+import fcntl
 import json
 import os
 import tempfile
+import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 STATE_FILE = BASE_DIR / "KILL_SWITCH_STATE.json"
+LOCK_TIMEOUT_SECONDS = 5.0
 
 ACTIVE = "ACTIVE"
 ENTRY_DISABLED = "ENTRY_DISABLED"
@@ -61,6 +65,50 @@ class KillSwitchStateError(Exception):
 def _resolve_state_path():
     override = os.environ.get("KILL_SWITCH_STATE_FILE")
     return Path(override) if override else STATE_FILE
+
+
+def _resolve_lock_path():
+    # Derived from the state path (not a separate module constant) so tests
+    # that point STATE_FILE at tmp_path automatically get an isolated lock
+    # file too, with no separate monkeypatch of their own required.
+    return _resolve_state_path().with_suffix(".lock")
+
+
+@contextmanager
+def _state_lock(timeout=LOCK_TIMEOUT_SECONDS):
+    """Process-level exclusive lock (fcntl.flock) guarding read-modify-write
+    of the kill switch state file -- same technique as
+    paper_strategy_order.py's order_history.csv / order_reconciliation.csv
+    locks and scalping_watchlist/atomic_io.py's file_lock.
+
+    A dead lock holder's flock is released by the kernel on process exit, so
+    a stale lock file left behind by a crashed process never blocks the next
+    acquirer. Genuine contention that outlasts `timeout` fails closed: a
+    KillSwitchStateError is raised and the state file itself is left
+    completely untouched -- activate()/release() must never proceed to
+    write without holding this lock.
+    """
+    lock_path = _resolve_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = open(lock_path, "a+")
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise KillSwitchStateError(
+                        f"Could not acquire kill switch state lock ({lock_path}) within {timeout}s"
+                    )
+                time.sleep(0.05)
+        yield
+    finally:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+        finally:
+            lock_file.close()
 
 
 def _now_iso():
@@ -145,13 +193,20 @@ def is_liquidation_allowed():
     return get_state() in (ACTIVE, ENTRY_DISABLED)
 
 
-def activate(state, reason, activated_by, expires_at=None, incident_id=None):
+def activate(state, reason, activated_by, expires_at=None, incident_id=None,
+             lock_timeout=LOCK_TIMEOUT_SECONDS):
     """Transition into `state`, recording an audit entry.
 
     Idempotent: re-activating the same state that is already current does
     not reset activated_at or otherwise corrupt the record -- it refreshes
     reason/expires_at/incident_id and still appends a fresh snapshot to the
     audit history so the repeat attempt itself is recorded.
+
+    Holds _state_lock() for the full reread -> merge -> write so two
+    concurrent activate()/release() calls can't both read the same stale
+    current/history and clobber each other's write (lost update). Raises
+    KillSwitchStateError, without writing anything, if the lock can't be
+    acquired within `lock_timeout`.
     """
     if state not in VALID_STATES:
         raise KillSwitchStateError(f"Unknown kill switch state: {state!r}")
@@ -159,55 +214,61 @@ def activate(state, reason, activated_by, expires_at=None, incident_id=None):
         raise KillSwitchStateError("activate() requires both reason and activated_by")
 
     path = _resolve_state_path()
-    payload = _load(path)
-    current = payload["current"]
-    history = payload["history"]
+    with _state_lock(timeout=lock_timeout):
+        payload = _load(path)
+        current = payload["current"]
+        history = payload["history"]
 
-    if current.get("state") == state:
-        record = dict(current)
-        record["reason"] = reason
-        record["activated_by"] = activated_by
-        record["expires_at"] = expires_at
-        record["incident_id"] = incident_id or current.get("incident_id")
-    else:
-        record = _empty_record()
-        record["state"] = state
-        record["reason"] = reason
-        record["activated_at"] = _now_iso()
-        record["activated_by"] = activated_by
-        record["expires_at"] = expires_at
-        record["incident_id"] = incident_id
+        if current.get("state") == state:
+            record = dict(current)
+            record["reason"] = reason
+            record["activated_by"] = activated_by
+            record["expires_at"] = expires_at
+            record["incident_id"] = incident_id or current.get("incident_id")
+        else:
+            record = _empty_record()
+            record["state"] = state
+            record["reason"] = reason
+            record["activated_at"] = _now_iso()
+            record["activated_by"] = activated_by
+            record["expires_at"] = expires_at
+            record["incident_id"] = incident_id
 
-    history.append(dict(record))
-    _atomic_write(path, {"current": record, "history": history})
-    return record
+        history.append(dict(record))
+        _atomic_write(path, {"current": record, "history": history})
+        return record
 
 
-def release(released_by, reason=None):
+def release(released_by, reason=None, lock_timeout=LOCK_TIMEOUT_SECONDS):
     """Explicitly return to ACTIVE. Requires the approving operator's identity.
 
     Never automatic: expires_at on the current record is not consulted here,
     so an expired kill switch stays engaged until this is called directly.
+
+    Same lock -> reread -> merge -> write discipline as activate() (see its
+    docstring); raises KillSwitchStateError without writing anything if the
+    lock can't be acquired within `lock_timeout`.
     """
     if not released_by:
         raise KillSwitchStateError("release() requires released_by (explicit operator approval)")
 
     path = _resolve_state_path()
-    payload = _load(path)
-    current = payload["current"]
-    history = payload["history"]
+    with _state_lock(timeout=lock_timeout):
+        payload = _load(path)
+        current = payload["current"]
+        history = payload["history"]
 
-    if current.get("state") == ACTIVE:
-        return dict(current)
+        if current.get("state") == ACTIVE:
+            return dict(current)
 
-    record = _empty_record()
-    record["state"] = ACTIVE
-    record["reason"] = reason
-    record["activated_at"] = _now_iso()
-    record["activated_by"] = released_by
-    record["released_at"] = _now_iso()
-    record["released_by"] = released_by
+        record = _empty_record()
+        record["state"] = ACTIVE
+        record["reason"] = reason
+        record["activated_at"] = _now_iso()
+        record["activated_by"] = released_by
+        record["released_at"] = _now_iso()
+        record["released_by"] = released_by
 
-    history.append(dict(record))
-    _atomic_write(path, {"current": record, "history": history})
-    return record
+        history.append(dict(record))
+        _atomic_write(path, {"current": record, "history": history})
+        return record

@@ -32,9 +32,12 @@ env var) so the fact that a notification attempt happened -- and whether it
 worked -- survives even a total Slack outage.
 """
 
+import fcntl
 import json
 import os
 import tempfile
+import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -43,6 +46,7 @@ import kill_switch_state as kss
 BASE_DIR = Path(__file__).resolve().parent
 STATE_FILE = BASE_DIR / "NOTIFICATION_HEALTH_STATE.json"
 LOG_FILE = BASE_DIR / "notification_health.log"
+LOCK_TIMEOUT_SECONDS = 5.0
 
 HEALTHY = "HEALTHY"
 DEGRADED = "DEGRADED"
@@ -70,6 +74,49 @@ def _resolve_state_path():
 def _resolve_log_path():
     override = os.environ.get("NOTIFICATION_HEALTH_LOG_FILE")
     return Path(override) if override else LOG_FILE
+
+
+def _resolve_lock_path():
+    # Derived from the state path (not a separate module constant) so tests
+    # that point STATE_FILE at tmp_path automatically get an isolated lock
+    # file too, with no separate monkeypatch of their own required.
+    return _resolve_state_path().with_suffix(".lock")
+
+
+@contextmanager
+def _state_lock(timeout=LOCK_TIMEOUT_SECONDS):
+    """Process-level exclusive lock (fcntl.flock) guarding read-modify-write
+    of the health state file -- same technique as kill_switch_state.py /
+    paper_strategy_order.py's order_history.csv / order_reconciliation.csv
+    locks.
+
+    Raises RuntimeError, without touching the state file, if the lock can't
+    be acquired within `timeout`. record_success()/record_failure() catch
+    this themselves (never raises is part of their contract -- a broken
+    alert channel must not become a second outage) and fail closed instead
+    of ever writing unsynchronized.
+    """
+    lock_path = _resolve_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = open(lock_path, "a+")
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"Could not acquire notification health lock ({lock_path}) within {timeout}s"
+                    )
+                time.sleep(0.05)
+        yield
+    finally:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+        finally:
+            lock_file.close()
 
 
 def failure_threshold():
@@ -147,33 +194,58 @@ def _fallback_log(event, record, detail=None):
         log_file.write(line + "\n")
 
 
-def record_success(status_code=None, retry_result=None):
-    """Record a successful Slack send. Resets the consecutive-failure streak."""
-    record, _ = _load()
-    record["consecutive_failures"] = 0
-    record["last_success_at"] = _now_iso()
-    record["last_status_code"] = status_code
-    record["last_error_kind"] = None
-    record["last_retry_result"] = retry_result
-    _save(record)
+def record_success(status_code=None, retry_result=None, lock_timeout=LOCK_TIMEOUT_SECONDS):
+    """Record a successful Slack send. Resets the consecutive-failure streak.
+
+    Locks -> rereads -> merges -> writes so a concurrent record_success()/
+    record_failure() can't both read the same stale record and clobber each
+    other's write (lost update). Never raises: on a lock timeout (or any
+    other OS-level failure to acquire it) this leaves the state file
+    completely untouched and returns the last-persisted record instead.
+    """
+    try:
+        with _state_lock(timeout=lock_timeout):
+            record, _ = _load()
+            record["consecutive_failures"] = 0
+            record["last_success_at"] = _now_iso()
+            record["last_status_code"] = status_code
+            record["last_error_kind"] = None
+            record["last_retry_result"] = retry_result
+            _save(record)
+    except (RuntimeError, OSError) as exc:
+        record, _ = _load()
+        _fallback_log("success_lock_timeout", record, detail=str(exc))
+        return record
+
     _fallback_log("success", record, detail=status_code)
     return record
 
 
-def record_failure(error_kind=None, status_code=None, retry_result=None):
+def record_failure(error_kind=None, status_code=None, retry_result=None, lock_timeout=LOCK_TIMEOUT_SECONDS):
     """Record a failed Slack send attempt.
 
     Never raises -- a broken alert channel must not become a second outage
-    on top of the first. Once the streak reaches failure_threshold(), escalates
+    on top of the first. Locks -> rereads -> merges -> writes (see
+    record_success()); on a lock timeout the consecutive-failure streak is
+    left untouched on disk (never incremented against stale data) and no
+    kill-switch escalation is attempted for an update that didn't actually
+    persist. Once a persisted streak reaches failure_threshold(), escalates
     the kill switch to ENTRY_DISABLED (see _escalate_kill_switch).
     """
-    record, _ = _load()
-    record["consecutive_failures"] = record.get("consecutive_failures", 0) + 1
-    record["last_failure_at"] = _now_iso()
-    record["last_status_code"] = status_code
-    record["last_error_kind"] = error_kind
-    record["last_retry_result"] = retry_result
-    _save(record)
+    try:
+        with _state_lock(timeout=lock_timeout):
+            record, _ = _load()
+            record["consecutive_failures"] = record.get("consecutive_failures", 0) + 1
+            record["last_failure_at"] = _now_iso()
+            record["last_status_code"] = status_code
+            record["last_error_kind"] = error_kind
+            record["last_retry_result"] = retry_result
+            _save(record)
+    except (RuntimeError, OSError) as exc:
+        record, _ = _load()
+        _fallback_log("failure_lock_timeout", record, detail=str(exc))
+        return record
+
     _fallback_log("failure", record, detail=error_kind or status_code)
 
     if record["consecutive_failures"] >= failure_threshold():
