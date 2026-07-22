@@ -22,22 +22,33 @@
 venv/bin/python -m pytest -q
 ```
 
-실측 출력(요약):
+실측 출력(요약, 최종 회귀 확인 재실행 결과):
 
 ```
-384 passed, 2 warnings in 30.90s
+384 passed, 2 warnings in 28.26s
 ```
 
-- collected: **384** (`venv/bin/python -m pytest -q --collect-only` → `384 tests collected`, collected 수와 passed 수 일치)
+- collected: **384** (수집된 테스트 수 = 통과 수, 스킵/xfail 없이 전량 실행됨)
 - passed: **384**
 - failed: **0**
 - warnings: **2건**
   - `urllib3` `NotOpenSSLWarning` (macOS 로컬 LibreSSL 관련, 코드 문제 아님)
   - `tests/test_scanner.py::test_unknown_field_skips_with_warning`가 의도적으로 유발하는 `RuntimeWarning`
+- exit code: **0**
 
 이 수치는 `docs/autonomous/PAPER_TRADING_READINESS_REPORT.md`의 t0~t7 시점 수치(336 passed)와 다르다.
 그 문서 이후 t8~t11 커밋에서 테스트가 추가되었기 때문이며, 본 체크리스트는 위 커밋 해시 기준
 최신 실측값을 우선한다.
+
+### 1.1 최종 회귀 확인 (2026-07-23, 코드 수정 없이 확인만 수행)
+
+| 확인 항목 | 결과 | 근거 |
+|---|---|---|
+| `venv/bin/python -m pytest -q` 전체 실행 | exit code 0, **384 passed, 0 failed, 2 warnings** | 위 실측 출력 |
+| 기존 테스트 삭제/완화/skip/xfail 여부 | 없음 | `grep -rn "skip\|xfail" tests/` 결과 실제 `pytest.mark.skip`/`pytest.mark.xfail` 데코레이터 없음(매치된 문자열은 모두 비즈니스 로직상의 `skip_reason` 값·변수명일 뿐임). `git diff --stat main...HEAD -- tests/`는 10개 파일 전량 신규 추가(`insertions`만 존재, `deletions` 없음) — 기존 테스트 파일 수정/삭제 없음 |
+| 금지 파일 변경 여부 (`broker/alpaca_client.py`, `broker/__init__.py`, `order_safety.py`, `config/scanner_presets.json`) | 변경 없음 | `git diff --name-only main...HEAD` 목록에 위 4개 파일 모두 미포함 |
+| 운영 데이터 파일 변경 여부 (`order_history.csv`, `strategy_performance.csv`, `universe.csv`) | 변경 없음 | `git diff --name-only main...HEAD -- order_history.csv strategy_performance.csv universe.csv` → 빈 결과 |
+| 테스트 실행 부작용(신규/변경 파일) 여부 | 없음 | 테스트 실행 직후 `git status --porcelain` → 빈 출력(본 문서 편집 전 시점 기준). 운영 데이터 파일, lock 파일, 상태 파일(`KILL_SWITCH_STATE.json`, `NOTIFICATION_HEALTH_STATE.json` 등) 생성/변경 없음 |
 
 ## 2. Broker 설정 (실측: `broker/broker_config.py`, `risk_config.py`)
 
