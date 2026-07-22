@@ -128,11 +128,25 @@ Required behavior: submit_order()가 매 호출마다 kill_switch_state의 현�
   is_entry_allowed(), 매도/청산이면 is_liquidation_allowed()를 확인하고 불허 시 broker 호출 없이 안전
   차단 응답을 반환한다. 기존 binary halt 체크는 유지(두 게이트 모두 통과해야 주문 진행). 상태 파일
   손상 시 fail-closed.
-Implementation: (수정 진행 중 — 아래 상태 참고)
-Regression tests: (수정 진행 중)
-Status: 진행 예정
-Commit: (진행 중)
-Remaining risk: (수정 완료 후 기록)
+Implementation: `paper_strategy_order.py`에 `kill_switch_state.is_entry_allowed`/`is_liquidation_allowed`
+  import 추가. `submit_order(symbol, qty=1, broker=None, client_order_id=None, side="buy")`에 `side`
+  파라미터 신규 추가, 기존 `kill_switch.is_trading_halted()` 게이트 통과 직후 `is_liquidation_allowed()`
+  (side="sell") 또는 `is_entry_allowed()`(그 외)를 재조회해 불허 시 `broker.submit_order()` 호출 전에
+  HTTP 423 `BrokerResponse(data={"halted": True, "side": side})`를 반환한다. `main()`의 신규 진입 호출부는
+  `submit_order(..., side="buy")`로 명시 배선.
+Regression tests: `tests/test_paper_strategy_order_kill_switch_state.py` (12건) —
+  `test_active_state_allows_buy_order`/`test_active_state_allows_sell_order`(ACTIVE에서 양방향 허용),
+  `test_entry_disabled_blocks_buy_order`/`test_entry_disabled_allows_liquidation_sell_order`(ENTRY_DISABLED는
+  신규 진입만 차단, 청산은 허용), `test_all_trading_disabled_and_manual_review_block_both_sides`(파라미터라이즈,
+  ALL_TRADING_DISABLED/MANUAL_REVIEW는 양방향 차단), `test_corrupted_state_file_blocks_order_fail_closed`,
+  `test_missing_state_file_defaults_to_active_existing_behavior`(기존 동작 회귀 없음),
+  `test_binary_halt_still_blocks_even_when_state_is_active`(기존 binary halt 게이트 유지 확인),
+  `test_main_blocks_new_orders_when_entry_disabled`/`test_main_submits_normally_when_active`/
+  `test_main_blocks_new_orders_in_all_trading_disabled_and_manual_review`(main() 진입점까지 실제 배선 검증).
+Status: RESOLVED
+Commit: `6ad4841`
+Remaining risk: 없음. `main()`의 청산/포지션 정리 경로가 향후 별도 함수로 분리될 경우 해당 호출부도
+  `side="sell"`로 배선해야 함(현재는 `submit_order` 단일 진입점만 존재).
 ```
 
 ### [CODEX-017] HIGH — Slack health monitor가 운영 알림 경로에 연결되지 않음
@@ -149,11 +163,24 @@ Affected path: paper_strategy_order.py (_safe_send_slack_alert)
 Required behavior: _safe_send_slack_alert()가 notification_health.send_with_health_tracking()을 통해
   발송하도록 변경, 성공/실패가 실제로 기록되고 연속 실패 임계값 도달 시 kill switch가 ENTRY_DISABLED로
   자동 상승(ACTIVE일 때만)하며, 이 상승이 CODEX-016의 배선을 통해 실제 주문 차단으로 이어진다.
-Implementation: (수정 진행 중)
-Regression tests: (수정 진행 중)
-Status: 진행 예정
-Commit: (진행 중)
-Remaining risk: (수정 완료 후 기록)
+Implementation: `paper_strategy_order.py`에 `import notification_health` 추가.
+  `_safe_send_slack_alert(message)`가 기존처럼 `send_slack_alert()`를 직접 호출하는 대신
+  `notification_health.send_with_health_tracking(send_slack_alert, message)`를 호출하도록 변경
+  (send_with_health_tracking이 내부에서 성공/실패를 `record_success()`/`record_failure()`로 기록하고
+  임계값 도달 시 kill switch를 자동 상승시킴 — `notification_health.py` 자체 로직은 이전 사이클에서
+  이미 구현·단위테스트됨, 이번 변경은 운영 호출부 배선). 외부 `try/except`는 이중 안전장치로 유지.
+Regression tests: `tests/test_paper_strategy_order_notification_health.py` (6건, `tests/conftest.py`에
+  공용 fixture 28줄 추가) — `test_safe_send_slack_alert_records_failure_via_health`/
+  `test_safe_send_slack_alert_records_success_via_health`(실제 호출부가 상태 파일에 기록됨을 확인),
+  `test_safe_send_slack_alert_swallows_exception_and_records_failure`(예외 발생 시에도 기록되고 호출자에
+  전파되지 않음), `test_consecutive_slack_failures_escalate_and_block_buy_order`(연속 실패 임계값 도달 시
+  kill switch가 ENTRY_DISABLED로 상승하고 CODEX-016 배선을 통해 실제 매수 주문이 차단됨을 end-to-end로
+  확인), `test_recovery_after_failures_restores_healthy`(성공 시 연속 실패 카운트 리셋),
+  `test_slack_failure_does_not_change_order_outcome_via_main`(Slack 장애 자체는 정상 주문 흐름을 막지
+  않음 — kill switch 상승 전까지는 주문 결과에 영향 없음).
+Status: RESOLVED
+Commit: `79eaa81`
+Remaining risk: 없음. 실제 Slack webhook 호출은 여전히 monkeypatch로 대체(외부 호출 금지 원칙 유지).
 ```
 
 ### [CODEX-018] MEDIUM — 주문 직전 환경 재검증 함수가 선언만 되고 사용되지 않음
@@ -170,11 +197,23 @@ Affected path: broker/alpaca_client.py (AlpacaBroker._request 및 이를 경유�
 Required behavior: _request()가 실제 요청 직전에 validate_order_allowed_now()(또는 동등한 최신 환경
   재검증)를 호출해 불안전하면 요청을 보내지 않고 예외를 발생시킨다. 기존 endpoint 검증/Live 차단
   로직은 그대로 유지, 추가로 재검증을 더한다.
-Implementation: (수정 진행 중 — broker/alpaca_client.py는 이 항목 범위로만 한시 개방)
-Regression tests: (수정 진행 중)
-Status: 진행 예정
-Commit: (진행 중)
-Remaining risk: (수정 완료 후 기록)
+Implementation: `broker/alpaca_client.py`(이 항목 범위로만 한시 개방)에서
+  `from .broker_config import BrokerConfig, validate_order_allowed_now`로 import 확장.
+  `AlpacaBroker._request()`가 기존 `self.config.validate_order_allowed()`/`validate_for_request()`
+  (생성 시점 스냅샷 검증) 직후, 실제 `self.session.request()` 호출 바로 직전에
+  `validate_order_allowed_now()`를 호출해 `os.environ`을 그 자리에서 다시 읽는다. 모든 메서드가
+  `_request()`를 경유하므로 `get_account`/`get_positions`/`submit_order`/
+  `get_order_by_client_order_id` 전부 동일하게 재검증을 거친다.
+Regression tests: `tests/test_alpaca_client_runtime_revalidation.py` (6건) —
+  `test_env_flipped_to_bad_live_endpoint_after_construction_blocks_request`(broker 생성 후 환경변수를
+  안전하지 않은 값으로 바꾸면 이후 요청이 차단됨), `test_paper_mode_with_correct_endpoint_proceeds_normally`,
+  `test_live_mode_with_arbitrary_endpoint_blocks_request`, `test_get_account_blocked_when_env_flips_before_request`/
+  `test_get_positions_blocked_when_env_flips_before_request`(_request()를 경유하는 다른 메서드에도 재검증이
+  적용됨을 확인), `test_get_positions_proceeds_normally_when_env_stays_safe`(안전한 환경에서는 기존 동작
+  회귀 없음).
+Status: RESOLVED
+Commit: `00b0f68`
+Remaining risk: 없음.
 ```
 
 ### [CODEX-019] MEDIUM — 신규 상태 저장소의 동시 갱신 lost-update 가능성
@@ -190,13 +229,43 @@ Root cause: temp+os.replace로 단일 파일 쓰기 원자성은 확보했으나
 Affected path: kill_switch_state.py, notification_health.py
 Required behavior: order_history.csv/order_reconciliation.csv(CODEX-008)와 atomic_io.py가 쓰는 것과
   동일한 fcntl.flock 기반 락을 재사용해, 락 안에서 최신 파일을 재읽기 후 병합·쓰기.
-Implementation: (수정 진행 중)
-Regression tests: (수정 진행 중 — multiprocessing 2프로세스 이상 동시 갱신 테스트 필요)
-Status: 진행 예정
-Commit: (진행 중)
-Remaining risk: (수정 완료 후 기록)
+Implementation: `kill_switch_state.py`, `notification_health.py` 양쪽에 동일한 구조로
+  `_resolve_lock_path()`(상태 파일 경로에서 `.lock` 확장자로 파생 — 테스트가 `STATE_FILE`을 `tmp_path`로
+  monkeypatch하면 락 파일도 자동으로 격리됨)와 `_state_lock(timeout=LOCK_TIMEOUT_SECONDS=5.0)`
+  contextmanager(`fcntl.flock(LOCK_EX | LOCK_NB)` 폴링, 0.05s 간격)를 추가.
+  `kill_switch_state.activate()`/`release()`는 각각 `path = _resolve_state_path()` 이후
+  `with _state_lock(timeout=lock_timeout):` 블록 안에서 재읽기(`_load`)→병합→`_atomic_write`를 수행하고,
+  락 획득 실패 시 파일에 아무것도 쓰지 않고 `KillSwitchStateError`를 raise한다(양쪽 다 신규 `lock_timeout`
+  키워드 인자 추가, 기본값은 상수와 동일해 기존 호출부 무변경).
+  `notification_health.record_success()`/`record_failure()`도 동일한 락 안에서 재읽기→병합→저장하되,
+  이 둘은 "절대 raise하지 않는다"는 기존 계약을 유지하기 위해 락 타임아웃을 `RuntimeError`/`OSError`로
+  잡아 상태 파일은 손대지 않은 채 마지막으로 영속화된 레코드를 반환하고 `_fallback_log()`에
+  `success_lock_timeout`/`failure_lock_timeout` 이벤트를 남긴다.
+Regression tests: `tests/test_state_store_concurrency.py` (6건, `multiprocessing` 기반) —
+  `test_concurrent_activate_preserves_every_audit_entry`(여러 프로세스가 동시에 `activate()`를 호출해도
+  감사 이력(history)의 모든 항목이 유실 없이 보존됨), `test_concurrent_record_failure_preserves_every_increment`
+  (동시 `record_failure()` 호출의 `consecutive_failures` 증가분이 하나도 유실되지 않음 — lost-update 재현),
+  `test_kill_switch_activate_lock_timeout_leaves_file_unchanged`/
+  `test_notification_health_record_failure_lock_timeout_leaves_file_unchanged`(락을 고의로 선점한 상태에서
+  타임아웃이 발생해도 상태 파일이 전혀 변경되지 않음을 확인), `test_corrupted_kill_switch_state_file_still_fails_closed`/
+  `test_corrupted_notification_health_state_file_does_not_crash`(락 도입 후에도 기존 손상 파일 fail-closed
+  동작이 회귀하지 않음).
+Status: RESOLVED
+Commit: `50a097d`
+Remaining risk: 없음. 5초 락 타임아웃은 임의 값이며 실제 동시 접근 빈도에 대한 프로덕션 관측치는 아직
+  없음(운영 중 관찰 후 조정 가능).
 ```
 
 ## 요약 (제한적 실거래 검토 사이클, CODEX-016~019)
 
-(수정 완료 후 갱신 — 진행 중)
+CRITICAL 0건. HIGH 전부(016/017) RESOLVED. MEDIUM 전부(018/019) RESOLVED. 미해결 Finding 없음. 신규
+회귀 테스트 4개 파일 30건(`tests/test_paper_strategy_order_kill_switch_state.py` 12건,
+`tests/test_paper_strategy_order_notification_health.py` 6건(+`tests/conftest.py` 공용 fixture),
+`tests/test_alpaca_client_runtime_revalidation.py` 6건, `tests/test_state_store_concurrency.py` 6건)
+추가. 대상 커밋: `6ad4841`(CODEX-016), `79eaa81`(CODEX-017), `00b0f68`(CODEX-018), `50a097d`(CODEX-019).
+전체 회귀 `venv/bin/python -m pytest -q` 417 passed, 0 failed, 2 warnings(기존과 동일한 urllib3/scanner
+경고만, 신규 안전 관련 warning 없음). `order_history.csv` 등 운영 파일과 `.env`는 미변경, 실제
+Alpaca/Slack/Yahoo 호출 0회(전부 monkeypatch/fake). Claude 자체 판정으로 `VALIDATED` 승격하지 않으며,
+run 상태는 **`READY_FOR_CODEX_REVALIDATION`**으로 기록한다 — Codex의 독립 재검증(CODEX-016~019 재확인,
+`PROCEED`/`FAIL` 여부) 없이는 제한적 실거래 검토를 재개하지 않는다. 상세 근거는
+`docs/autonomous/VALIDATION_PACKAGE.md`의 "CODEX-016~019 수정 완료" 패키지 참고.

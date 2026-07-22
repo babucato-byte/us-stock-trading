@@ -4,7 +4,72 @@
 
 ---
 
-## 이번 패키지: 제한적 실거래 검토 전 안전조건 완료 (2026-07-23)
+## 이번 패키지: CODEX-016~019 수정 완료 (2026-07-23)
+
+### 배경
+`docs/autonomous/CODEX_REVIEW.md`(커밋 `e0dc855`, 대상 `337ba16`~`b6f4924`)의 독립 재검증 결과는
+Overall verdict **FAIL**, Limited live review **BLOCKED**였다. 신규 HIGH Finding 2건(CODEX-016,
+CODEX-017)이 다단계 kill switch(`kill_switch_state.py`)와 Slack health monitor(`notification_health.py`)가
+모듈 내부에서는 정확히 구현·단위테스트되었으나 실제 운영 주문/알림 경로(`paper_strategy_order.py`)에는
+배선되지 않았다고 지적했고, MEDIUM Finding 2건(CODEX-018, CODEX-019)이 각각 주문 직전 환경 재검증
+함수 미사용과 상태 저장소 동시 갱신 lost-update 가능성을 지적했다. 이번 오케스트레이터 run(t1~t4,
+전부 PASS)에서 4건 전부를 수정했다. 각 항목의 상세 Finding 원문·Root cause·Required behavior와
+Implementation/Regression tests/Commit/Remaining risk는 `docs/autonomous/REMEDIATION_PLAN.md`의
+"제한적 실거래 검토 사이클 — CODEX-016~019" 절에 기록되어 있다(이 패키지는 요약만 제공).
+
+### 이번 run에서 완료한 항목 (커밋 순서대로)
+1. **[CODEX-016] HIGH — 다단계 kill switch를 실제 주문 경로에 배선** (`6ad4841`).
+   `paper_strategy_order.submit_order()`에 `side` 파라미터를 추가하고, 기존 `kill_switch.is_trading_halted()`
+   binary 게이트 통과 직후 `kill_switch_state.is_entry_allowed()`(매수)/`is_liquidation_allowed()`(매도)를
+   재조회해 불허 시 broker 호출 전에 HTTP 423을 반환하도록 배선. `main()`의 신규 진입 호출부는
+   `side="buy"`로 명시. 신규 테스트: `tests/test_paper_strategy_order_kill_switch_state.py`(12건).
+2. **[CODEX-017] HIGH — Slack health monitor를 운영 알림 경로에 배선** (`79eaa81`).
+   `paper_strategy_order._safe_send_slack_alert()`가 `send_slack_alert()`를 직접 호출하는 대신
+   `notification_health.send_with_health_tracking(send_slack_alert, message)`를 경유하도록 변경 —
+   모든 발송 결과가 실제로 기록되고, 연속 실패가 임계값에 도달하면 CODEX-016 배선을 통해 실제 매수
+   주문이 차단됨을 end-to-end로 확인. 신규 테스트:
+   `tests/test_paper_strategy_order_notification_health.py`(6건, `tests/conftest.py`에 공용 fixture 추가).
+3. **[CODEX-018] MEDIUM — 주문 직전 환경 재검증 함수를 실제 요청 경로에 배선** (`00b0f68`).
+   `broker/alpaca_client.py`(이 항목 범위로만 한시 개방)의 `AlpacaBroker._request()`가 실제
+   `self.session.request()` 호출 직전에 `validate_order_allowed_now()`를 호출해 `os.environ`을 그
+   자리에서 재검증하도록 배선. `_request()`를 경유하는 모든 메서드(`get_account`/`get_positions`/
+   `submit_order`/`get_order_by_client_order_id`)에 자동 적용. 신규 테스트:
+   `tests/test_alpaca_client_runtime_revalidation.py`(6건).
+4. **[CODEX-019] MEDIUM — 상태 저장소 read-modify-write에 파일 잠금 적용** (`50a097d`).
+   `kill_switch_state.py`/`notification_health.py` 양쪽에 `order_history.csv`/`atomic_io.py`와 동일한
+   `fcntl.flock` 기반 `_state_lock()`을 도입, `activate()`/`release()`/`record_success()`/
+   `record_failure()`가 락 안에서 재읽기→병합→쓰기를 수행하도록 변경(락 타임아웃 시 kill_switch_state는
+   raise, notification_health는 절대 raise하지 않는 기존 계약을 유지하며 파일 미변경). 신규 테스트:
+   `tests/test_state_store_concurrency.py`(6건, `multiprocessing` 기반 동시 갱신 재현 포함).
+
+### 변경 파일 (이번 run, t1~t4)
+- 수정: `paper_strategy_order.py`(t1, t2), `broker/alpaca_client.py`(t3, 이 항목 범위로만 한시 개방),
+  `kill_switch_state.py`(t4), `notification_health.py`(t4), `tests/conftest.py`(t2, 공용 fixture 28줄).
+- 신규: `tests/test_paper_strategy_order_kill_switch_state.py`,
+  `tests/test_paper_strategy_order_notification_health.py`,
+  `tests/test_alpaca_client_runtime_revalidation.py`, `tests/test_state_store_concurrency.py`.
+- `docs/autonomous/CODEX_REVIEW.md`(Codex 독립 검증 기록)와 이전 run들의 문서는 수정하지 않음(그대로 보존).
+
+### 실행 명령 및 결과
+```bash
+venv/bin/python -m pytest -q     # 417 passed, 0 failed, 2 warnings (기존과 동일한 urllib3/scanner 경고만)
+```
+신규 안전 관련 warning 없음. 실제 Alpaca/Slack/Yahoo API 호출 0회(전부 monkeypatch/fake). 운영 파일
+(`order_history.csv` 등)과 `.env`, 실거래 관련 환경변수는 이번 run에서 변경되지 않았다.
+
+### 최종 상태
+**`READY_FOR_CODEX_REVALIDATION`** — CODEX-016~019 전부 Claude 측 수정 및 회귀 테스트 완료. Claude 자체
+판정만으로 `VALIDATED`/`RESOLVED` 확정하지 않으며, Codex의 독립 재검증(각 항목 재확인 및
+`PROCEED`/`FAIL` 여부) 전까지 제한적 실거래 검토(`docs/live_review/`)는 재개하지 않는다. `approved: false`,
+`live_enabled: false`는 변경하지 않았다.
+
+### 현재 커밋 해시
+`50a097d` (t4: CODEX-019 상태 저장소 read-modify-write 파일 잠금 적용) — 브랜치
+`orchestrator/20260723-020935-us-stock-trading` tip. main 미병합, push 없음.
+
+---
+
+## 이전 패키지: 제한적 실거래 검토 전 안전조건 완료 (2026-07-23)
 
 ### 배경
 CODEX-010~015(HIGH/MEDIUM/LOW) 수정 완료 후, AI 오케스트레이터(`~/Projects/ai-orchestrator`,

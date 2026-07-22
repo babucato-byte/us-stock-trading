@@ -1,6 +1,6 @@
 # CURRENT_STATUS
 
-마지막 갱신: 2026-07-22
+마지막 갱신: 2026-07-23
 
 ## 현재 Phase
 Phase 2 — 초단타 관심종목 선별 엔진 (`IMPLEMENTED`, CODEX-010~015 수정 완료, Codex 재검증 대기)
@@ -8,6 +8,16 @@ Phase 2 — 초단타 관심종목 선별 엔진 (`IMPLEMENTED`, CODEX-010~015 �
 Phase 1 최종 판정(유지): **Phase 1A(주문 진입 안전성) = VALIDATED**, **Phase 1B(부분체결·포지션 생명주기) = DEFERRED_TO_PHASE_5**.
 
 Phase 3(1분봉 감시/지표/주문 로직)은 이번 사이클에서 착수하지 않음 — 사용자 지시에 따라 범위 외.
+
+## 제한적 실거래 검토 사이클 — CODEX-016~019 (run 완료, 2026-07-23)
+Codex 독립 검증(`docs/autonomous/CODEX_REVIEW.md`, 커밋 `e0dc855`) 판정 Overall verdict **FAIL**,
+Limited live review **BLOCKED**에 따라 HIGH 2건(CODEX-016, CODEX-017)·MEDIUM 2건(CODEX-018, CODEX-019)을
+전부 수정(t1~t4, 커밋 `6ad4841`/`79eaa81`/`00b0f68`/`50a097d`). 상세는
+`docs/autonomous/REMEDIATION_PLAN.md`("제한적 실거래 검토 사이클 — CODEX-016~019")와
+`docs/autonomous/VALIDATION_PACKAGE.md`("CODEX-016~019 수정 완료") 참고. 전체 회귀
+`venv/bin/python -m pytest -q` 417 passed, 0 failed. **run 상태: `READY_FOR_CODEX_REVALIDATION`** —
+Claude 자체 판정으로 확정하지 않으며 Codex의 독립 재검증 전까지 `docs/live_review/`의 제한적 실거래
+검토는 재개하지 않는다. `docs/autonomous/CODEX_REVIEW.md`는 이번 run에서 수정하지 않고 그대로 보존.
 
 ## 마지막 완료 작업 (CODEX-010~015 수정 사이클)
 - CODEX-010 (HIGH): `numeric_guard.require_finite_number()` 도입, `features.py`의 모든 raw/derived 수치에 NaN/Infinity 명시 차단 적용.
