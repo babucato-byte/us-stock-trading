@@ -16,6 +16,7 @@ import order_intent_ledger
 from account_risk import check_account_exposure_limits, check_daily_loss_limit
 from broker import AlpacaBroker, BrokerResponse
 from kill_switch import is_trading_halted
+from kill_switch_state import is_entry_allowed, is_liquidation_allowed
 from market_hours import eastern_now, get_us_market_session
 from order_safety import check_daily_trade_count, run_order_safety_check
 from slack_utils import send_slack_alert
@@ -167,7 +168,20 @@ def calculate_rsi(df, period=14):
     return 100 - (100 / (1 + rs))
 
 
-def submit_order(symbol, qty=1, broker=None, client_order_id=None):
+def submit_order(symbol, qty=1, broker=None, client_order_id=None, side="buy"):
+    """Submit one order, gated by two independent kill switches, both
+    re-checked fresh on every call (never cached):
+
+    1. kill_switch.is_trading_halted() -- the original binary halt file.
+    2. kill_switch_state's multi-level state machine -- is_entry_allowed()
+       for side="buy", is_liquidation_allowed() for side="sell". A corrupted
+       state file fails closed via kill_switch_state's own
+       _fail_closed_snapshot, so is_entry_allowed()/is_liquidation_allowed()
+       both return False in that case without any special-casing here.
+
+    Both gates must pass for the broker to be called; either one blocking
+    returns a 423 response without ever reaching `broker`.
+    """
     if is_trading_halted():
         print(f"Kill switch engaged: {symbol} order not submitted.")
         return BrokerResponse(
@@ -176,6 +190,17 @@ def submit_order(symbol, qty=1, broker=None, client_order_id=None):
             data={"halted": True},
             dry_run=False,
         )
+
+    state_allows = is_liquidation_allowed() if side == "sell" else is_entry_allowed()
+    if not state_allows:
+        print(f"Kill switch state blocked {side} order for {symbol}.")
+        return BrokerResponse(
+            status_code=423,
+            text=f"Kill switch state engaged: {side} orders not permitted, order not submitted.",
+            data={"halted": True, "side": side},
+            dry_run=False,
+        )
+
     broker = broker or AlpacaBroker()
     response = broker.submit_order(symbol, qty=qty, client_order_id=client_order_id)
     print(f"{symbol} order result: {response.status_code} {response.text[:500]}")
@@ -938,7 +963,7 @@ def main(broker=None):
 
         ledger_path, ledger_lock_path = _intent_ledger_paths()
         try:
-            response = submit_order(symbol, qty=order_qty, broker=broker, client_order_id=client_order_id)
+            response = submit_order(symbol, qty=order_qty, broker=broker, client_order_id=client_order_id, side="buy")
         except requests.exceptions.RequestException as exc:
             update_order_status(symbol, today, "SUBMISSION_FAILED")
             try:
