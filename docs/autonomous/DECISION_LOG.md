@@ -62,3 +62,27 @@
   - `WATCHLIST_TTL_MINUTES=30`: 신규 가정(재탐지 없이 30분 경과 시 COOLING, 60분 경과 시 EXPIRED).
   - `SCORING_WEIGHTS`: liquidity/volume/gap/volatility/repeat/smart_money 6개 요소에 각 0.15~0.25 사이 가중치 균등 분배(합계 1.0), 과거 성과 근거 없음 — 명시적으로 잠정값.
 - 승인 필요 여부: 아니오(지시서 4절이 초기값을 "보수적으로 결정하고 근거를 기록"하도록 위임함, 사용자 승인은 Phase 6 백테스트 이후 조정 시점에 재확인).
+
+### 2026-07-24 — CODEX-020(HIGH)·CODEX-018 잔여분(MEDIUM)을 broker 공통 요청 경로에서 처리, wrapper 레벨 수정으로는 대체하지 않음
+- 상황: Codex 독립 재검증(`CODEX_REVIEW.md`, overall verdict `FAIL`)이 `paper_strategy_order.py`
+  wrapper의 kill switch 게이트를 우회해 `AlpacaBroker.submit_order()`를 직접 호출하면 binary halt와
+  4-state kill switch가 모두 무시된 채 HTTP가 실제로 나간다고 지적(CODEX-020). 동시에
+  `_validate_runtime_safety()`가 mode/endpoint는 재검증하면서도 현재 process 환경의 credentials
+  자체는 재검증하지 않는다고 재지적(CODEX-018 잔여분).
+- 결정: 두 항목 모두 `paper_strategy_order.py`가 아니라 `broker/alpaca_client.py`의
+  `AlpacaBroker._request()` 공통 경로에서 처리한다. wrapper에 더 강한 검사를 추가하는 방식은
+  기각 — wrapper를 거치지 않는 모든 direct 호출(현재와 향후 신규 호출부 포함)이 계속 우회 가능한
+  상태로 남기 때문에, Finding의 근본 원인("network boundary 자체가 무방비")을 고치지 못한다.
+- 근거: CODEX-020 원문의 Required behavior가 "모든 주문 POST 직전 broker network boundary에서"
+  재검사를 요구했고, 조회/취소 경로는 정책을 명시적으로 분리해야 한다고 명시했다. 이는 wrapper
+  레벨이 아니라 broker 레벨 개입을 요구하는 것으로 해석했다.
+- 구현: `_request()`에 `order_side`(주문 아니면 `None`) 키워드 전용 필수 인자를 추가해 모든 호출부가
+  의도를 명시하도록 강제(기본값 없음 → 생략 시 `TypeError`로 즉시 차단). 조회·취소 경로는
+  `order_side=None`으로 kill switch 정책에서 명시적으로 제외. credential 재검증은 동일 공통 경로
+  (`_validate_runtime_safety()`) 안에 `_validate_current_credentials_match_captured()`로 추가.
+- 대안: (a) wrapper의 `submit_order()`만 강화 — 위 이유로 기각. (b) 조회 경로도 포함해 모든 요청을
+  kill switch로 차단 — CODEX-020 원문이 "read-only 조회를 허용할지 정책을 명시적으로 분리"하라고
+  요구했고, 조회 자체를 막으면 reconciliation/포지션 확인 등 기존 안전 동작이 깨지므로 기각.
+- 승인 필요 여부: 아니오(CODEX Finding에 대한 직접 수정, 자율 진행 범위). Codex 독립 재검증
+  (`PROCEED`/`FAIL` 여부) 전까지 Limited live review는 `BLOCKED`, Live trading은 `DO_NOT_ENABLE`을
+  유지한다.

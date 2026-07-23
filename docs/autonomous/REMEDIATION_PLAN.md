@@ -314,3 +314,76 @@ RESOLVED 상태를 유지하며 변경하지 않았다.
 - broker 내부 직접 session 호출은 `_request()` 한 곳만 남았다.
 - 실제 Alpaca/Slack/Yahoo 호출 0회, 운영 CSV 내용·크기·mtime 불변.
 - main 병합, origin push, 운영 배포, 실거래 활성화 없음.
+
+---
+
+## CODEX-020·CODEX-018 잔여분 수정 사이클 (2026-07-24)
+
+검증 기준: `docs/autonomous/CODEX_REVIEW.md`(대상 커밋 `47ee8d6`/`03962d3`/`cf4ada9`, overall
+verdict **FAIL**). CODEX-016/017/019는 RESOLVED로 재확인되어 변경하지 않았다. CODEX-018(MEDIUM)이
+PARTIALLY_RESOLVED로 남았고, 신규 **CODEX-020(HIGH)**이 제기됐다.
+
+### CODEX-020 — direct broker network boundary가 Kill Switch를 우회함 (HIGH)
+
+- 재현: binary halt와 `ENTRY_DISABLED` 각각에서 `AlpacaBroker.submit_order()`를
+  `paper_strategy_order.py` wrapper를 거치지 않고 직접 호출하면 fake session request가 1회
+  실제로 나가는 것을 격리 재현으로 확인했다.
+- 원인: `broker/alpaca_client.py`가 kill-switch 모듈을 import하거나 검사하지 않았다. wrapper의
+  binary/4-state gate는 `paper_strategy_order.submit_order()`에만 있었고 broker를 직접 호출하면
+  이 계층을 완전히 우회했다.
+- 수정: `AlpacaBroker._request()`에 `order_side` 키워드 전용 필수 인자(주문이 아니면 `None`,
+  매수/매도면 `"buy"`/`"sell"`)를 추가했다. 신규 `_check_kill_switch(order_side)`가 매 호출마다
+  `kill_switch.is_trading_halted()`(binary)와 `order_side`에 따라
+  `kill_switch_state.is_entry_allowed()`(buy)/`is_liquidation_allowed()`(sell)를 다시 조회해,
+  불허 시 세션 요청 전에 `RuntimeError`를 발생시킨다. `order_side`가 `None`이면 kill switch 검사
+  자체를 건너뛴다. `get_account`/`get_positions`/`get_recent_orders`/`get_assets`/
+  `get_order_by_client_order_id`/`cancel_order` 등 조회·취소 경로는 `order_side=None`으로
+  명시해 kill switch 정책과 무관하게 계속 동작하도록 분리했다. `order_side`는 기본값이 없으므로
+  `_request()`를 우회해 이 인자를 생략하면 네트워크 호출 전에 `TypeError`로 즉시 차단된다.
+- 수정 파일: `broker/alpaca_client.py`
+- 테스트: `tests/test_broker_kill_switch_gate.py`(신규, 25건) — direct broker 호출이 binary
+  halt/4-state(ENTRY_DISABLED·ALL_TRADING_DISABLED·MANUAL_REVIEW) 각각에서 차단되는지, buy/sell
+  구분이 정확한지(ENTRY_DISABLED에서 sell/청산은 허용), 조회·취소 경로가 kill switch와 무관하게
+  계속 동작하는지, `order_side` 생략 시 `TypeError`가 세션 호출 전에 발생하는지, wrapper 경로와
+  direct 경로의 판정이 일치하는지 검증한다.
+- 처리 상태: **IMPLEMENTED — READY_FOR_CODEX_REVALIDATION**
+- 구현 커밋: `66eda8a`
+
+### CODEX-018 잔여분 — 공통 gate에서 현재 credentials 재검증 누락 (MEDIUM)
+
+- 재현: `_validate_runtime_safety()`가 `validate_order_allowed_now()`(mode/endpoint 재검증)는
+  호출하지만, kill switch와 현재 credentials(API key/secret)까지 포함하는 검증 요청 기준에는
+  미달했다 — credential이 rotation/삭제된 뒤에도 생성 시점에 캡처된 값으로 계속 요청이 나갔다.
+- 원인: 주문 직전 환경 재검증(`validate_order_allowed_now()`)은 CODEX-018 이전 사이클에서 이미
+  배선됐지만, credential 자체의 최신성은 검사 대상이 아니었다.
+- 수정: `_validate_runtime_safety()`에 `_validate_current_credentials_match_captured()`를
+  추가했다. 매 요청마다 `BrokerConfig.from_env()`로 현재 프로세스 환경의 API key/secret을 다시
+  읽어, `self.config`가 생성 시점에 캡처한 값과 `hmac.compare_digest()`로 상수시간 비교한다.
+  현재 값이 누락/공백이거나, 환경 읽기 자체가 실패하거나, 캡처된 값과 하나라도 다르면 세션 요청
+  전에 `RuntimeError`를 발생시킨다. credential 값 자체는 예외 메시지에 포함하지 않는다(존재
+  여부/일치 여부만 노출). Credential rotation은 새 `BrokerConfig`/`AlpacaBroker` 인스턴스를
+  만드는 방식으로만 가능하며, 이 gate는 기존 인스턴스의 값을 자동으로 재캡처하지 않고 오직
+  차단만 한다.
+- 수정 파일: `broker/alpaca_client.py`
+- 테스트: `tests/test_alpaca_client_runtime_revalidation.py` 확장(44건) — credential
+  삭제/회전/공백/환경 읽기 실패 각각을 POST(order)·GET(account/positions/reconciliation)·
+  DELETE(cancel) 3개 경로에 파라미터라이즈해 세션 호출 전에 차단되는지 검증. 기존
+  `tests/test_broker_safety.py`, `tests/test_universe_builder.py`의 fake broker 호출부를
+  `order_side` 키워드 인자에 맞춰 갱신(회귀 아님, 시그니처 변경 반영).
+- 처리 상태: **IMPLEMENTED — READY_FOR_CODEX_REVALIDATION**
+- 구현 커밋: `ed452da`
+
+### 검증 결과
+
+- 집중 안전 테스트(`test_broker_kill_switch_gate.py` + `test_alpaca_client_runtime_revalidation.py`
+  + `test_broker_safety.py` + `test_universe_builder.py` + `test_paper_strategy_order_kill_switch_state.py`
+  + `test_paper_order_execution.py`): **208 passed, 1 warning**
+- 전체: `venv/bin/python -m pytest -q` **489 passed, 0 failed, 2 warnings**(신규 안전 관련
+  warning 없음, 기존 urllib3/scanner 경고만).
+- broker 내부 직접 session 호출은 `_request()` 한 곳만 유지, kill switch 검사와 credential
+  재검증 모두 이 경로 안에 포함됐다.
+- 실제 Alpaca/Slack/Yahoo 호출 0회, `order_history.csv`/`universe.csv` SHA-256 불변, `.env`·kill
+  switch/notification 상태 파일 변경 없음.
+- main 병합, origin push, 운영 배포, 실거래 활성화 없음.
+- 상태는 **`READY_FOR_CODEX_REVALIDATION`**이며, 독립 재검증 전까지 **Limited live review:
+  BLOCKED**, **Live trading: DO_NOT_ENABLE**을 유지한다.

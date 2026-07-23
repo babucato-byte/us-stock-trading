@@ -1,8 +1,13 @@
 # Incident Response Runbook
 
-이 문서는 Kill Switch(`kill_switch_state.py`) 활성화가 필요할 수 있는 사고 유형 후보 8종과
+이 문서는 Kill Switch(`kill_switch_state.py`) 활성화가 필요할 수 있는 사고 유형 후보 9종과
 각각의 대응 절차를 정리한다. 상태 정의·활성화/해제 절차 자체는
 [KILL_SWITCH_RUNBOOK.md](./KILL_SWITCH_RUNBOOK.md)를 따른다.
+
+2026-07-24부터(CODEX-020 수정, 커밋 `66eda8a`) kill switch 판정은 `paper_strategy_order.py`
+wrapper뿐 아니라 `broker/alpaca_client.py::AlpacaBroker._request()` 자체에서도 재조회되므로,
+아래 절차로 `kss.activate()`를 호출하면 wrapper를 거치지 않은 direct broker 호출(예: 수동
+스크립트, 향후 신규 호출부)에도 동일하게 적용된다. Codex 독립 재검증은 아직 완료되지 않았다.
 
 각 시나리오의 "권장 상태"는 후보이며, 실제 판단(어느 상태로 얼마나 활성화할지)은 운영자가
 사고 현장의 구체적 정황을 보고 결정한다.
@@ -110,6 +115,27 @@
   1. `kss.activate(state, reason="TBD(운영자 기입: 구체적 사유)", activated_by="TBD(운영자 기입)")`
   2. 사유가 해소되었다고 판단되면 해제 체크리스트([KILL_SWITCH_RUNBOOK.md](./KILL_SWITCH_RUNBOOK.md)
      3.1절)를 모두 확인한 뒤 `release()`.
+
+## 9. API credential 회전/삭제/노출 의심
+
+- **감지**: `ALPACA_API_KEY`/`ALPACA_SECRET_KEY`가 회전, 삭제되거나 유출이 의심되는 경우.
+  이미 생성된 `AlpacaBroker` 인스턴스는 생성 시점에 credentials를 캡처하므로, 환경변수만
+  바꾼다고 실행 중인 프로세스가 즉시 새 값을 쓰지는 않는다 — CODEX-018 잔여분 수정(커밋
+  `ed452da`)에 따라 `_validate_runtime_safety()`가 매 요청마다 현재 환경 credentials를
+  다시 읽어 생성 시점 캡처값과 비교하므로, 값이 더 이상 일치하지 않으면(회전/삭제/공백) 그
+  프로세스의 이후 모든 요청이 세션 호출 전에 차단된다(`RuntimeError`, credential 값 자체는
+  예외 메시지에 노출되지 않음).
+- **권장 상태**: `ALL_TRADING_DISABLED` — credential 유출이 의심되면 신규 진입뿐 아니라 청산
+  판단도 신뢰할 수 없는 계정 상태에서 이루어질 수 있으므로 전면 차단.
+- **절차**:
+  1. `kss.activate(kss.ALL_TRADING_DISABLED, reason="API credential 회전/유출 의심", activated_by=...)`
+  2. Alpaca 대시보드에서 즉시 기존 키를 폐기(revoke)하고 신규 키를 발급.
+  3. `.env`(또는 배포 secret store)를 신규 값으로 갱신. **기존에 이미 실행 중인 프로세스는
+     재시작 없이는 새 값을 읽지 않는다** — credential 재검증 gate는 새 값을 자동으로 재캡처하지
+     않고 오직 불일치를 차단만 하므로, 프로세스를 재시작해 새 `BrokerConfig`/`AlpacaBroker`를
+     생성해야 정상 동작이 재개된다.
+  4. 재시작 후 새 credential로 정상 조회(`get_account`)가 되는지 확인.
+  5. 확인 완료 후 해제 체크리스트를 거쳐 `release()`.
 
 ## 공통 유의사항
 

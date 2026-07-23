@@ -1,5 +1,46 @@
 # VALIDATION_REPORT
 
+## 2026-07-24 — CODEX-020·CODEX-018 잔여분 수정
+
+Codex 독립 재검증(`CODEX_REVIEW.md`, 대상 커밋 `47ee8d6`/`03962d3`/`cf4ada9`, overall verdict
+**FAIL**)에서 CODEX-016/017/019는 RESOLVED로 재확인됐으나, CODEX-018(MEDIUM)이
+PARTIALLY_RESOLVED로 남았고 신규 CODEX-020(HIGH)이 제기됐다: direct
+`AlpacaBroker.submit_order()`가 `paper_strategy_order.py` wrapper의 kill switch 게이트를 거치지
+않고 호출되면 binary halt와 다단계 kill switch 상태(`ENTRY_DISABLED` 등)를 모두 우회해 실제
+HTTP가 나갔다. CODEX-018은 `_validate_runtime_safety()`가 현재 credentials(API key/secret)를
+재검증하지 않는다는 지적이었다.
+
+- **CODEX-020**: `broker/alpaca_client.py`의 `AlpacaBroker._request()`에 `order_side` 키워드
+  전용 필수 인자(주문이 아니면 `None`, 매수/매도면 `"buy"`/`"sell"`)를 추가하고, 신규
+  `_check_kill_switch()`가 `kill_switch.is_trading_halted()`와
+  `kill_switch_state.is_entry_allowed()`/`is_liquidation_allowed()`를 매 호출마다 재조회해
+  불허 시 세션 요청 전에 `RuntimeError`를 발생시킨다. 조회·취소 경로(`get_account`,
+  `get_positions`, `get_recent_orders`, `get_assets`, `get_order_by_client_order_id`,
+  `cancel_order`)는 `order_side=None`으로 명시해 kill switch와 무관하게 계속 동작한다.
+  `order_side`를 생략하고 `_request()`를 호출하면 네트워크 접근 전에 `TypeError`가 발생한다.
+  커밋 `66eda8a`.
+- **CODEX-018 잔여분**: `_validate_runtime_safety()`에 `_validate_current_credentials_match_captured()`를
+  추가해 매 요청마다 `BrokerConfig.from_env()`로 현재 환경 credentials를 다시 읽고, 생성 시점에
+  캡처된 값과 `hmac.compare_digest()`로 비교한다. 누락/공백/회전/삭제/환경 읽기 실패는 모두
+  요청 전에 차단한다. 커밋 `ed452da`.
+
+검증: 신규 회귀 `tests/test_broker_kill_switch_gate.py`(25건, direct broker 호출이 binary/4-state
+kill switch를 준수하는지, 조회·취소 경로는 영향받지 않는지, wrapper 경로와 direct 경로 판정이
+일치하는지 검증) + `tests/test_alpaca_client_runtime_revalidation.py` 확장(44건, credential
+삭제/회전/공백/읽기실패 각각 POST·GET·DELETE 3경로 파라미터라이즈) + `tests/test_broker_safety.py`,
+`tests/test_universe_builder.py` 기존 fake broker 호출부를 `order_side` 키워드에 맞춰 갱신.
+
+전체: `venv/bin/python -m pytest -q` **489 passed, 0 failed, 2 warnings**(신규 경고 없음, 기존
+urllib3/scanner 경고만). 집중 안전 테스트(`test_broker_kill_switch_gate.py` +
+`test_alpaca_client_runtime_revalidation.py` + `test_broker_safety.py` + `test_universe_builder.py`
++ `test_paper_strategy_order_kill_switch_state.py` + `test_paper_order_execution.py`) **208 passed,
+1 warning**. 실제 Alpaca/Slack/Yahoo 호출 0회. `order_history.csv`/`universe.csv` SHA-256이
+`CODEX_REVIEW.md`에 기록된 값과 동일(불변). `.env`, kill switch/notification 상태 파일, 승인
+레코드는 변경하지 않았다. 상태는 `READY_FOR_CODEX_REVALIDATION`이며 독립 재검증 전
+Limited live review는 `BLOCKED`, 실거래는 `DO_NOT_ENABLE`이다.
+
+---
+
 ## 2026-07-23 — CODEX-016·018 최종 보완
 
 Codex 재검증에서 남은 CODEX-016(HIGH, sell side 누락)과 CODEX-018(MEDIUM,

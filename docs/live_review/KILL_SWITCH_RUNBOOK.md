@@ -18,6 +18,24 @@
 - `is_entry_allowed()` → `get_state() == ACTIVE`일 때만 `True` (`kill_switch_state.py:138-140`)
 - `is_liquidation_allowed()` → `get_state() in (ACTIVE, ENTRY_DISABLED)`일 때 `True` (`kill_switch_state.py:143-145`)
 
+### 1.1 강제 지점 — wrapper와 broker 양쪽 (2026-07-24 갱신, CODEX-020)
+
+이 판정 함수들은 두 곳에서 각각 독립적으로 재조회된다:
+
+1. `paper_strategy_order.submit_order()` — 신규 진입/청산 주문 wrapper.
+2. `broker/alpaca_client.py::AlpacaBroker._request()`의 `_check_kill_switch(order_side)` —
+   broker network boundary 자체. `submit_order()`는 `order_side="buy"`/`"sell"`을 전달하고,
+   `get_account`/`get_positions`/`get_recent_orders`/`get_assets`/
+   `get_order_by_client_order_id`/`cancel_order`는 `order_side=None`을 전달해 kill switch 판정
+   대상에서 명시적으로 제외된다(조회·취소는 어떤 kill switch 상태에서도 계속 동작).
+
+Codex 재검증(`CODEX-020`, HIGH)이 wrapper만으로는 `AlpacaBroker.submit_order()`를
+`paper_strategy_order.py`를 거치지 않고 직접 호출하는 경로가 두 kill switch 메커니즘을 모두
+우회한다고 지적한 뒤(구현 커밋 `66eda8a`, Codex 독립 재검증 대기 중), 2번 지점이 추가됐다.
+운영자가 kill switch를 켜거나 끌 때 이 이중 강제 지점을 별도로 다룰 필요는 없다 — `activate()`/
+`release()`가 갱신하는 상태 파일은 두 지점 모두에서 공유되며, `_check_kill_switch()`는 매 요청마다
+`kill_switch_state.get_state()`를 다시 조회하므로 캐시된 값을 쓰지 않는다.
+
 Fail-closed 설계: 상태 파일(`KILL_SWITCH_STATE.json`, 경로는 `KILL_SWITCH_STATE_FILE` 환경변수로
 override 가능, 기본값은 모듈과 같은 디렉터리)이 없으면 `ACTIVE`(과거 동작과 호환), 있는데 파싱이
 실패하거나 구조가 깨졌으면 `ACTIVE`가 아니라 가장 보수적인 `MANUAL_REVIEW`로 처리한다
@@ -99,6 +117,12 @@ kss.release(
    해제 후 즉시 재상승하지 않도록 알림 채널 자체를 먼저 복구한다.
 7. **운영자 명시 승인** — 위 1~6 확인 결과를 `release()`의 `reason` 인자에 기록하고,
    `released_by`에 승인자 식별자를 명시한 뒤에만 호출한다.
+
+참고: kill switch 자체와는 별개로, 매 broker 요청은 CODEX-018 잔여분 수정(커밋 `ed452da`)에 따라
+현재 프로세스 환경의 API credential이 broker 생성 시점에 캡처된 값과 여전히 일치하는지도 함께
+재검증한다(`AlpacaBroker._validate_current_credentials_match_captured()`). credential이
+회전/삭제된 상태에서는 kill switch가 `ACTIVE`여도 해당 broker 인스턴스의 요청은 계속 차단된다 —
+이 경우의 대응은 [INCIDENT_RESPONSE_RUNBOOK.md](./INCIDENT_RESPONSE_RUNBOOK.md) 9절 참조.
 
 ## 4. 조회
 

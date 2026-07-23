@@ -4,7 +4,87 @@
 
 ---
 
-## 이번 패키지: CODEX-016·018 최종 보완 (2026-07-23)
+## 이번 패키지: CODEX-020·CODEX-018 잔여분 수정 (2026-07-24)
+
+### 검증 대상
+
+- 독립 검증 기록: `CODEX_REVIEW.md`(대상 커밋 `47ee8d6`/`03962d3`/`cf4ada9`, overall verdict **FAIL**)
+- 구현 커밋: `66eda8a`(t1, CODEX-020), `ed452da`(t2, CODEX-018 잔여분)
+- 브랜치: `orchestrator/20260723-234154-us-stock-trading`
+- 상태: **`READY_FOR_CODEX_REVALIDATION`**
+- limited live review: **`BLOCKED` 유지**
+- live trading: **`DO_NOT_ENABLE` 유지**
+
+### 배경
+
+이전 재검증에서 CODEX-016/017/019는 RESOLVED로 재확인됐으나 CODEX-018(MEDIUM)이
+PARTIALLY_RESOLVED로 남았고, 신규 CODEX-020(HIGH)이 제기됐다: `AlpacaBroker.submit_order()`를
+`paper_strategy_order.py` wrapper 없이 직접 호출하면 binary kill switch와 4-state kill switch를
+모두 우회해 HTTP가 실제로 나갔다. CODEX-018은 `_validate_runtime_safety()`가 현재 credentials
+(API key/secret)를 재검증하지 않는다는 지적이었다.
+
+### CODEX-020 보완
+
+- `AlpacaBroker._request()`에 `order_side`(주문 아니면 `None`, 매수/매도면 `"buy"`/`"sell"`)
+  키워드 전용 필수 인자를 추가했다.
+- 신규 `_check_kill_switch(order_side)`가 매 호출마다 `kill_switch.is_trading_halted()`와
+  `order_side`별 `kill_switch_state.is_entry_allowed()`/`is_liquidation_allowed()`를 재조회해
+  불허 시 세션 요청 전에 `RuntimeError`를 발생시킨다.
+- 조회·취소 경로(`get_account`/`get_positions`/`get_recent_orders`/`get_assets`/
+  `get_order_by_client_order_id`/`cancel_order`)는 `order_side=None`으로 명시해 kill switch와
+  무관하게 계속 동작한다.
+- `order_side`를 생략하고 `_request()`를 호출하면 네트워크 접근 전에 `TypeError`가 발생한다.
+
+### CODEX-018 잔여분 보완
+
+- `_validate_runtime_safety()`에 `_validate_current_credentials_match_captured()`를 추가해,
+  매 요청마다 `BrokerConfig.from_env()`로 현재 환경 credentials를 다시 읽고 생성 시점 캡처값과
+  `hmac.compare_digest()`로 비교한다.
+- 누락/공백/회전/삭제/환경 읽기 실패는 모두 요청 전에 차단한다. credential 값 자체는 예외
+  메시지에 포함하지 않는다.
+
+### 추가·수정 테스트
+
+- `tests/test_broker_kill_switch_gate.py`(신규, 25건): direct broker 호출의 binary/4-state
+  kill switch 준수, buy/sell 구분, 조회·취소 경로 비영향, `order_side` 생략 시 `TypeError`,
+  wrapper/direct 경로 판정 일치.
+- `tests/test_alpaca_client_runtime_revalidation.py` 확장(44건): credential 삭제/회전/공백/
+  읽기실패 각각 POST/GET/DELETE 3경로 파라미터라이즈.
+- `tests/test_broker_safety.py`, `tests/test_universe_builder.py`: 기존 fake broker 호출부를
+  `order_side` 키워드에 맞춰 갱신(시그니처 반영, 로직 완화 아님).
+- 실패 테스트 삭제, 완화, skip, xfail 없음.
+
+### 실행 결과
+
+```text
+venv/bin/python -m pytest -q:  489 passed, 0 failed, 2 warnings
+집중 안전 테스트:                208 passed, 1 warning
+```
+
+두 warning은 기존 urllib3 LibreSSL 경고와 의도된 scanner unknown-field 경고다.
+
+### 안전 검증
+
+- 실제 Alpaca, Slack, Yahoo 호출 0회. HTTP 검증은 recording session/fake만 사용.
+- broker 내부 `session.get/post/delete` 직접 호출 없음, `session.request`는 공통 `_request()`
+  한 곳에만 존재(kill switch 검사와 credential 재검증이 그 안에 포함됨).
+- `order_history.csv`, `universe.csv`의 SHA-256, 크기, mtime이 검증 전후 동일하다.
+- `.env`, approval/live flag, kill-switch/notification 상태 파일을 변경하지 않았다.
+- `approved: false`, `live_enabled: false` 유지.
+- main 병합과 origin push 없음.
+
+### Codex 재검증 초점
+
+1. direct `AlpacaBroker.submit_order()` 호출이 binary halt와 4-state(ENTRY_DISABLED 포함) 각각에서
+   실제로 차단되는지, buy/sell 구분이 정확한지.
+2. 조회·취소 경로가 kill switch 상태와 무관하게 계속 동작하는지.
+3. credential 삭제/회전/공백이 생성 후 요청에서 실제로 차단되는지, 값 자체가 예외 메시지에
+   노출되지 않는지.
+4. CODEX-016/017/019에 회귀가 없는지.
+
+---
+
+## 이전 패키지: CODEX-016·018 최종 보완 (2026-07-23)
 
 ### 검증 대상
 
@@ -210,12 +290,14 @@ git diff --name-only main | grep -E "^broker/alpaca_client\.py$|^broker/__init__
   브랜치 계열에만 존재. origin push 없음.
 - Kill Switch 기본값은 상태 파일 부재 시 `ACTIVE`(거래 허용)로, 안전 기본값 유지.
 
-### 최종 상태
-`READY_FOR_LIMITED_LIVE_REVIEW` — 상세 근거는 `docs/live_review/LIMITED_LIVE_REVIEW_CHECKLIST.md` 8절.
+### 최종 상태 (이 패키지 당시, 2026-07-23 기준 — 이후 CODEX-016~020 검토에서 수정됨, 아래 최신 패키지 참고)
+이 run 시점의 자체 판정은 "제한적 실거래 검토 준비 완료"였다(상세 근거는
+`docs/live_review/LIMITED_LIVE_REVIEW_CHECKLIST.md` 8절, 당시 상태 문자열은 그 문서와 동일). 이후
+Codex 독립 재검증에서 CODEX-016(HIGH), CODEX-017(HIGH), CODEX-020(HIGH) 등이 추가로 발견되어 최신
+판정은 이 절이 아니라 본 파일 최상단(가장 최근) 패키지의 `READY_FOR_CODEX_REVALIDATION`을 따른다.
 실거래는 여전히 비활성 상태이며(`LIVE_APPROVAL_RECORD.md`의 `approved: false`/`live_enabled: false`),
-이번 run에서 활성화되지 않았다. 미해결 HIGH/CRITICAL finding 없음. 남은 항목은 전부 운영자가 직접
-채워야 하는 `TBD` 필드(허용 종목 범위, 허용 거래 시간, 주문당 최대 금액, 실계좌 종류, 롤백 담당자 등)와
-운영자의 명시적 최종 승인이다.
+이번 run에서 활성화되지 않았다. 남은 항목은 전부 운영자가 직접 채워야 하는 `TBD` 필드(허용 종목 범위,
+허용 거래 시간, 주문당 최대 금액, 실계좌 종류, 롤백 담당자 등)와 운영자의 명시적 최종 승인이다.
 
 ### 현재 커밋 해시
 `fc325b3` (t5: 최종 회귀 확인 및 run 상태 기록) — 브랜치 `orchestrator/20260722-235153-us-stock-trading`
