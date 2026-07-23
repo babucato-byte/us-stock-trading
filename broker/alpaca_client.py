@@ -1,3 +1,4 @@
+import hmac
 from dataclasses import dataclass
 from typing import Optional, Union
 
@@ -34,10 +35,64 @@ class AlpacaBroker:
         }
 
     def _validate_runtime_safety(self):
-        """Validate both the captured config and the current environment."""
+        """Validate both the captured config and the current environment.
+
+        Credential revalidation runs first: it wraps its own
+        BrokerConfig.from_env() call in a try/except (see
+        _validate_current_credentials_match_captured), whereas
+        validate_order_allowed_now() below does not -- running it first
+        means an environment-read failure is always converted into a
+        RuntimeError here rather than propagating as a raw OSError/etc. from
+        deeper in the gate.
+        """
         self.config.validate_order_allowed()
         self.config.validate_for_request()
+        self._validate_current_credentials_match_captured()
         validate_order_allowed_now()
+
+    def _validate_current_credentials_match_captured(self):
+        """CODEX-018: re-read process credentials fresh on every request and
+        require them to still exactly match what self.config captured at
+        construction time.
+
+        Without this, deleting or rotating ALPACA_API_KEY/ALPACA_SECRET_KEY
+        after an AlpacaBroker instance already exists had no effect on that
+        instance -- self.config is a frozen snapshot from construction time,
+        so every subsequent call kept sending the original credentials
+        regardless of what the environment now holds. Credential rotation
+        must go through building a new BrokerConfig/AlpacaBroker; this gate
+        never auto-recaptures the new value, it only blocks.
+
+        Never include the actual key/secret text in any exception message --
+        only whether they are present/blank/matching.
+        """
+        try:
+            current = BrokerConfig.from_env()
+        except Exception:
+            raise RuntimeError(
+                "Credential revalidation failed: could not read current environment credentials."
+            ) from None
+
+        current_api_key = current.api_key
+        current_secret_key = current.secret_key
+
+        if not current_api_key or not current_api_key.strip():
+            raise RuntimeError("Credential revalidation failed: current API key is missing or blank.")
+        if not current_secret_key or not current_secret_key.strip():
+            raise RuntimeError("Credential revalidation failed: current secret key is missing or blank.")
+
+        captured_api_key = self.config.api_key or ""
+        captured_secret_key = self.config.secret_key or ""
+
+        api_key_matches = hmac.compare_digest(current_api_key, captured_api_key)
+        secret_key_matches = hmac.compare_digest(current_secret_key, captured_secret_key)
+
+        if not api_key_matches or not secret_key_matches:
+            raise RuntimeError(
+                "Credential revalidation failed: current environment credentials no longer match "
+                "the credentials captured when this broker instance was constructed. Build a new "
+                "BrokerConfig/AlpacaBroker instead of rotating credentials under an existing instance."
+            )
 
     def _check_kill_switch(self, order_side):
         """Gate order-affecting requests on both kill switch mechanisms,

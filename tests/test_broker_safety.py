@@ -193,7 +193,12 @@ def test_endpoint_tampering_after_construction_blocks_all_calls():
         broker.submit_order("AAPL", qty=1, side="buy")
 
 
-def test_paper_endpoint_allows_mock_account_and_positions_calls():
+def test_paper_endpoint_allows_mock_account_and_positions_calls(monkeypatch):
+    # CODEX-018: the common gate now re-reads current environment
+    # credentials on every request and requires them to match self.config's
+    # captured values, so this success-path test must set matching env vars.
+    monkeypatch.setenv("ALPACA_API_KEY", "key")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "secret")
     config = BrokerConfig(trading_mode="paper", api_key="key", secret_key="secret")
     session = RecordingGetSession()
     broker = AlpacaBroker(config=config, session=session)

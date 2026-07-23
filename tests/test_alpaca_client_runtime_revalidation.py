@@ -304,3 +304,127 @@ def test_env_flip_blocks_cancel_delete(monkeypatch):
         broker.cancel_order("order-1")
 
     assert session.requests == []
+
+
+# --- CODEX-018 residual: per-request re-validation of *credentials*, not
+# just TRADING_MODE/base URL. self.config is a snapshot taken at
+# AlpacaBroker construction time; without a fresh env re-read immediately
+# before every HTTP call, deleting or rotating ALPACA_API_KEY/
+# ALPACA_SECRET_KEY after construction had no effect on an already-built
+# broker instance, and it kept sending the original (possibly now-revoked)
+# credentials indefinitely.
+
+_ORIG_API_KEY = "orig-api-key-4f9c2a"
+_ORIG_SECRET_KEY = "orig-secret-key-7b31d0"
+
+
+def _make_broker_with_captured_env(monkeypatch):
+    monkeypatch.setenv("TRADING_MODE", "paper")
+    monkeypatch.setenv("ALPACA_API_KEY", _ORIG_API_KEY)
+    monkeypatch.setenv("ALPACA_SECRET_KEY", _ORIG_SECRET_KEY)
+    config = BrokerConfig.from_env()
+    session = RecordingSession()
+    broker = AlpacaBroker(config=config, session=session)
+    return broker, session
+
+
+def _assert_no_secret_leak(text):
+    assert _ORIG_API_KEY not in text
+    assert _ORIG_SECRET_KEY not in text
+
+
+_THREE_METHODS = [
+    ("get", lambda broker: broker.get_account()),
+    ("post", lambda broker: broker.submit_order("AAPL", side="buy")),
+    ("delete", lambda broker: broker.cancel_order("order-1")),
+]
+
+
+@pytest.mark.parametrize("verb,call", _THREE_METHODS, ids=[m[0] for m in _THREE_METHODS])
+def test_api_key_deleted_after_construction_blocks_get_post_delete(monkeypatch, verb, call):
+    broker, session = _make_broker_with_captured_env(monkeypatch)
+    monkeypatch.delenv("ALPACA_API_KEY", raising=False)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        call(broker)
+
+    assert session.requests == []
+    _assert_no_secret_leak(str(exc_info.value))
+
+
+@pytest.mark.parametrize("verb,call", _THREE_METHODS, ids=[m[0] for m in _THREE_METHODS])
+def test_secret_key_deleted_after_construction_blocks_get_post_delete(monkeypatch, verb, call):
+    broker, session = _make_broker_with_captured_env(monkeypatch)
+    monkeypatch.delenv("ALPACA_SECRET_KEY", raising=False)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        call(broker)
+
+    assert session.requests == []
+    _assert_no_secret_leak(str(exc_info.value))
+
+
+@pytest.mark.parametrize("verb,call", _THREE_METHODS, ids=[m[0] for m in _THREE_METHODS])
+def test_api_key_rotated_after_construction_blocks_get_post_delete(monkeypatch, verb, call):
+    broker, session = _make_broker_with_captured_env(monkeypatch)
+    monkeypatch.setenv("ALPACA_API_KEY", "rotated-api-key-different")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        call(broker)
+
+    assert session.requests == []
+    _assert_no_secret_leak(str(exc_info.value))
+    assert "rotated-api-key-different" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize("verb,call", _THREE_METHODS, ids=[m[0] for m in _THREE_METHODS])
+def test_secret_key_rotated_after_construction_blocks_get_post_delete(monkeypatch, verb, call):
+    broker, session = _make_broker_with_captured_env(monkeypatch)
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "rotated-secret-key-different")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        call(broker)
+
+    assert session.requests == []
+    _assert_no_secret_leak(str(exc_info.value))
+    assert "rotated-secret-key-different" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize("verb,call", _THREE_METHODS, ids=[m[0] for m in _THREE_METHODS])
+def test_whitespace_only_credentials_after_construction_blocks_get_post_delete(monkeypatch, verb, call):
+    broker, session = _make_broker_with_captured_env(monkeypatch)
+    monkeypatch.setenv("ALPACA_API_KEY", "   ")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "   ")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        call(broker)
+
+    assert session.requests == []
+    _assert_no_secret_leak(str(exc_info.value))
+
+
+@pytest.mark.parametrize("verb,call", _THREE_METHODS, ids=[m[0] for m in _THREE_METHODS])
+def test_credential_read_failure_blocks_get_post_delete(monkeypatch, verb, call):
+    broker, session = _make_broker_with_captured_env(monkeypatch)
+
+    def _broken_from_env(*args, **kwargs):
+        raise OSError("simulated environment read failure")
+
+    monkeypatch.setattr(BrokerConfig, "from_env", _broken_from_env)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        call(broker)
+
+    assert session.requests == []
+    message = str(exc_info.value)
+    _assert_no_secret_leak(message)
+    assert "simulated environment read failure" not in message
+
+
+@pytest.mark.parametrize("verb,call", _THREE_METHODS, ids=[m[0] for m in _THREE_METHODS])
+def test_unchanged_credentials_after_construction_proceed_normally(monkeypatch, verb, call):
+    broker, session = _make_broker_with_captured_env(monkeypatch)
+
+    call(broker)
+
+    assert len(session.requests) == 1

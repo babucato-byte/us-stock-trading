@@ -53,6 +53,18 @@ class RecordingSession:
         return [r for r in self.requests if r[0][0] == "POST"]
 
 
+@pytest.fixture(autouse=True)
+def _matching_env_credentials(monkeypatch):
+    # CODEX-018: the common gate now re-reads current environment
+    # credentials on every request and requires them to match self.config's
+    # captured values -- every broker built by _make_broker() below captures
+    # "key"/"secret", so the environment must hold the same values for the
+    # kill-switch-focused assertions in this file to keep exercising their
+    # intended success/failure paths instead of failing closed here first.
+    monkeypatch.setenv("ALPACA_API_KEY", "key")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "secret")
+
+
 def _make_broker(session=None):
     config = BrokerConfig(trading_mode="paper", api_key="key", secret_key="secret")
     return AlpacaBroker(config=config, session=session or RecordingSession())

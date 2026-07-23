@@ -47,7 +47,12 @@ class RecordingAssetsSession:
         return self._Response()
 
 
-def test_paper_endpoint_allows_get_assets_once():
+def test_paper_endpoint_allows_get_assets_once(monkeypatch):
+    # CODEX-018: the common gate now re-reads current environment
+    # credentials on every request and requires them to match self.config's
+    # captured values, so this success-path test must set matching env vars.
+    monkeypatch.setenv("ALPACA_API_KEY", "key")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "secret")
     config = BrokerConfig(trading_mode="paper", api_key="key", secret_key="secret")
     session = RecordingAssetsSession()
     broker = AlpacaBroker(config=config, session=session)
@@ -124,7 +129,12 @@ def test_tampered_config_after_construction_blocks_get_assets():
         universe_builder.fetch_active_us_equity_rows(broker=broker)
 
 
-def test_build_universe_writes_expected_csv(tmp_path):
+def test_build_universe_writes_expected_csv(tmp_path, monkeypatch):
+    # CODEX-018: the common gate now re-reads current environment
+    # credentials on every request and requires them to match self.config's
+    # captured values, so this success-path test must set matching env vars.
+    monkeypatch.setenv("ALPACA_API_KEY", "key")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "secret")
     config = BrokerConfig(trading_mode="paper", api_key="key", secret_key="secret")
     broker = AlpacaBroker(config=config, session=RecordingAssetsSession())
     output_path = tmp_path / "universe.csv"
