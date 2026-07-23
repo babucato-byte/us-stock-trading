@@ -75,7 +75,7 @@ class FakeBroker:
     def get_positions(self):
         return self._positions
 
-    def submit_order(self, symbol, qty=1, client_order_id=None):
+    def submit_order(self, symbol, qty=1, *, side, client_order_id=None):
         self.submit_calls.append((symbol, qty))
         self.client_order_ids.append(client_order_id)
         effect = self._submit_side_effects.get(symbol)
@@ -169,7 +169,7 @@ def test_live_url_order_blocked():
     broker = AlpacaBroker(config=config, session=DummySession())
 
     with pytest.raises(RuntimeError):
-        broker.submit_order("AAPL", qty=1)
+        broker.submit_order("AAPL", qty=1, side="buy")
 
 
 def test_non_paper_mode_blocked_by_trading_mode_check(monkeypatch):
@@ -206,7 +206,7 @@ def test_unknown_trading_mode_is_blocked():
     broker = AlpacaBroker(config=config, session=DummySession())
 
     with pytest.raises(RuntimeError, match="must be exactly 'paper'"):
-        broker.submit_order("AAPL", qty=1)
+        broker.submit_order("AAPL", qty=1, side="buy")
 
 
 def test_paper_mode_with_live_endpoint_is_blocked():
@@ -219,7 +219,7 @@ def test_paper_mode_with_live_endpoint_is_blocked():
     broker = AlpacaBroker(config=config, session=DummySession())
 
     with pytest.raises(RuntimeError, match="not the official Paper endpoint"):
-        broker.submit_order("AAPL", qty=1)
+        broker.submit_order("AAPL", qty=1, side="buy")
 
 
 def test_duplicate_order_blocks_resubmission(monkeypatch, tmp_path):

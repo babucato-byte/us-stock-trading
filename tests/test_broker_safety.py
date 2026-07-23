@@ -47,7 +47,7 @@ def test_live_dry_run_order_not_submitted():
         ),
         session=session,
     )
-    response = broker.submit_order("AAPL", qty=1)
+    response = broker.submit_order("AAPL", qty=1, side="buy")
     assert response.dry_run is True
     assert session.posts == []
 
@@ -64,7 +64,7 @@ def test_live_real_order_disabled_even_with_flags():
         session=DummySession(),
     )
     try:
-        broker.submit_order("AAPL", qty=1)
+        broker.submit_order("AAPL", qty=1, side="buy")
     except RuntimeError as exc:
         assert "Real live trading is disabled" in str(exc)
     else:
@@ -168,7 +168,7 @@ def test_live_endpoint_blocks_order_post():
     broker = AlpacaBroker(config=config, session=DummySession())
 
     with pytest.raises(RuntimeError):
-        broker.submit_order("AAPL", qty=1)
+        broker.submit_order("AAPL", qty=1, side="buy")
 
 
 def test_endpoint_tampering_after_construction_blocks_all_calls():
@@ -190,7 +190,7 @@ def test_endpoint_tampering_after_construction_blocks_all_calls():
     with pytest.raises(RuntimeError):
         broker.get_positions()
     with pytest.raises(RuntimeError):
-        broker.submit_order("AAPL", qty=1)
+        broker.submit_order("AAPL", qty=1, side="buy")
 
 
 def test_paper_endpoint_allows_mock_account_and_positions_calls():

@@ -169,7 +169,7 @@ def calculate_rsi(df, period=14):
     return 100 - (100 / (1 + rs))
 
 
-def submit_order(symbol, qty=1, broker=None, client_order_id=None, side="buy"):
+def submit_order(symbol, qty=1, broker=None, client_order_id=None, *, side):
     """Submit one order, gated by two independent kill switches, both
     re-checked fresh on every call (never cached):
 
@@ -192,6 +192,9 @@ def submit_order(symbol, qty=1, broker=None, client_order_id=None, side="buy"):
             dry_run=False,
         )
 
+    if side not in {"buy", "sell"}:
+        raise ValueError("side must be exactly 'buy' or 'sell'")
+
     state_allows = is_liquidation_allowed() if side == "sell" else is_entry_allowed()
     if not state_allows:
         print(f"Kill switch state blocked {side} order for {symbol}.")
@@ -203,7 +206,12 @@ def submit_order(symbol, qty=1, broker=None, client_order_id=None, side="buy"):
         )
 
     broker = broker or AlpacaBroker()
-    response = broker.submit_order(symbol, qty=qty, client_order_id=client_order_id)
+    response = broker.submit_order(
+        symbol,
+        qty=qty,
+        side=side,
+        client_order_id=client_order_id,
+    )
     print(f"{symbol} order result: {response.status_code} {response.text[:500]}")
     return response
 

@@ -15,7 +15,7 @@ class FakeBroker:
         self.config = FakeConfig()
         self.submit_calls = []
 
-    def submit_order(self, symbol, qty=1, client_order_id=None):
+    def submit_order(self, symbol, qty=1, *, side, client_order_id=None):
         self.submit_calls.append((symbol, qty))
         raise AssertionError("submit_order must not be called while trading is halted")
 
@@ -107,7 +107,7 @@ def test_submit_order_entry_point_blocks_broker_when_halted_via_env_var(monkeypa
     monkeypatch.setenv("TRADING_HALTED", "true")
     broker = FakeBroker()
 
-    response = pso.submit_order("AAPL", broker=broker)
+    response = pso.submit_order("AAPL", broker=broker, side="buy")
 
     assert broker.submit_calls == []
     assert response.status_code == 423

@@ -27,8 +27,8 @@ class FakeBroker:
         self.config = _FakeConfig()
         self.submit_calls = []
 
-    def submit_order(self, symbol, qty=1, client_order_id=None):
-        self.submit_calls.append((symbol, qty, client_order_id))
+    def submit_order(self, symbol, qty=1, *, side, client_order_id=None):
+        self.submit_calls.append((symbol, qty, side, client_order_id))
         return pso.BrokerResponse(status_code=200, text="OK", data={"status": "accepted"}, dry_run=False)
 
     def get_account(self):
@@ -85,7 +85,7 @@ def test_active_state_allows_buy_order(monkeypatch, tmp_path):
 
     response = pso.submit_order("AAPL", qty=1, broker=broker, side="buy")
 
-    assert broker.submit_calls == [("AAPL", 1, None)]
+    assert broker.submit_calls == [("AAPL", 1, "buy", None)]
     assert response.status_code == 200
 
 
@@ -95,8 +95,29 @@ def test_active_state_allows_sell_order(monkeypatch, tmp_path):
 
     response = pso.submit_order("AAPL", qty=1, broker=broker, side="sell")
 
-    assert broker.submit_calls == [("AAPL", 1, None)]
+    assert broker.submit_calls == [("AAPL", 1, "sell", None)]
     assert response.status_code == 200
+
+
+def test_wrapper_requires_explicit_side(monkeypatch, tmp_path):
+    _isolate_kill_switches(monkeypatch, tmp_path)
+    broker = FakeBroker()
+
+    with pytest.raises(TypeError):
+        pso.submit_order("AAPL", qty=1, broker=broker)
+
+    assert broker.submit_calls == []
+
+
+@pytest.mark.parametrize("side", [None, "", "BUY", "SELL", " buy", "sell ", "hold", 1])
+def test_wrapper_rejects_ambiguous_side_before_broker_call(monkeypatch, tmp_path, side):
+    _isolate_kill_switches(monkeypatch, tmp_path)
+    broker = FakeBroker()
+
+    with pytest.raises(ValueError, match="exactly 'buy' or 'sell'"):
+        pso.submit_order("AAPL", qty=1, broker=broker, side=side)
+
+    assert broker.submit_calls == []
 
 
 def test_entry_disabled_blocks_buy_order(monkeypatch, tmp_path):
@@ -117,7 +138,7 @@ def test_entry_disabled_allows_liquidation_sell_order(monkeypatch, tmp_path):
 
     response = pso.submit_order("AAPL", qty=1, broker=broker, side="sell")
 
-    assert broker.submit_calls == [("AAPL", 1, None)]
+    assert broker.submit_calls == [("AAPL", 1, "sell", None)]
     assert response.status_code == 200
 
 
@@ -151,7 +172,7 @@ def test_missing_state_file_defaults_to_active_existing_behavior(monkeypatch, tm
 
     response = pso.submit_order("AAPL", qty=1, broker=broker, side="buy")
 
-    assert broker.submit_calls == [("AAPL", 1, None)]
+    assert broker.submit_calls == [("AAPL", 1, "buy", None)]
     assert response.status_code == 200
 
 

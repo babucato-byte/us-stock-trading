@@ -65,7 +65,7 @@ class FakeBroker:
         self.config = _FakeConfig()
         self.submit_calls = []
 
-    def submit_order(self, symbol, qty=1, client_order_id=None):
+    def submit_order(self, symbol, qty=1, *, side, client_order_id=None):
         self.submit_calls.append((symbol, qty, client_order_id))
         return pso.BrokerResponse(status_code=200, text="OK", data={"status": "accepted"}, dry_run=False)
 

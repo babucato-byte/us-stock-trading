@@ -48,7 +48,7 @@ class FakeBroker:
     def get_positions(self):
         return self._positions
 
-    def submit_order(self, symbol, qty=1, client_order_id=None):
+    def submit_order(self, symbol, qty=1, *, side, client_order_id=None):
         self.submit_calls.append((symbol, qty))
         self.client_order_ids.append(client_order_id)
         effect = self._submit_side_effects.get(symbol)
@@ -73,9 +73,14 @@ class FlakyOnceBroker(FakeBroker):
         self._flaky_symbol = flaky_symbol
         self._flaky_calls = 0
 
-    def submit_order(self, symbol, qty=1, client_order_id=None):
+    def submit_order(self, symbol, qty=1, *, side, client_order_id=None):
         if symbol != self._flaky_symbol:
-            return super().submit_order(symbol, qty=qty, client_order_id=client_order_id)
+            return super().submit_order(
+                symbol,
+                qty=qty,
+                side=side,
+                client_order_id=client_order_id,
+            )
         self._flaky_calls += 1
         self.submit_calls.append((symbol, qty))
         self.client_order_ids.append(client_order_id)

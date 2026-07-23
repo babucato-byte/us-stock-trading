@@ -47,7 +47,7 @@ class FakeBroker:
     def get_positions(self):
         return self._positions
 
-    def submit_order(self, symbol, qty=1, client_order_id=None):
+    def submit_order(self, symbol, qty=1, *, side, client_order_id=None):
         self.submit_calls.append((symbol, qty))
         effect = self._submit_side_effects.get(symbol)
         if isinstance(effect, Exception):

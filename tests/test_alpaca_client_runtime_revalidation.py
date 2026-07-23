@@ -37,6 +37,7 @@ class RecordingSession:
 
     class _Response:
         status_code = 200
+        text = "OK"
 
         def raise_for_status(self):
             return None
@@ -162,3 +163,144 @@ def test_get_positions_proceeds_normally_when_env_stays_safe(monkeypatch):
 
     assert result == {"ok": True}
     assert len(session.requests) == 1
+
+
+@pytest.mark.parametrize("side", ["buy", "sell"])
+def test_submit_order_payload_preserves_explicit_side(monkeypatch, side):
+    monkeypatch.setenv("TRADING_MODE", "paper")
+    monkeypatch.setenv("ALPACA_API_KEY", "key")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "secret")
+    session = RecordingSession()
+    broker = AlpacaBroker(config=BrokerConfig.from_env(), session=session)
+
+    response = broker.submit_order("AAPL", qty=2, side=side)
+
+    assert response.status_code == 200
+    assert len(session.requests) == 1
+    args, kwargs = session.requests[0]
+    assert args[0] == "POST"
+    assert kwargs["json"]["side"] == side
+
+
+def test_submit_order_requires_explicit_side(monkeypatch):
+    monkeypatch.setenv("TRADING_MODE", "paper")
+    monkeypatch.setenv("ALPACA_API_KEY", "key")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "secret")
+    session = RecordingSession()
+    broker = AlpacaBroker(config=BrokerConfig.from_env(), session=session)
+
+    with pytest.raises(TypeError):
+        broker.submit_order("AAPL")
+
+    assert session.requests == []
+
+
+@pytest.mark.parametrize("side", [None, "", "BUY", "SELL", " buy", "sell ", "hold", 1])
+def test_submit_order_rejects_invalid_side_before_http(monkeypatch, side):
+    monkeypatch.setenv("TRADING_MODE", "paper")
+    monkeypatch.setenv("ALPACA_API_KEY", "key")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "secret")
+    session = RecordingSession()
+    broker = AlpacaBroker(config=BrokerConfig.from_env(), session=session)
+
+    with pytest.raises(ValueError, match="exactly 'buy' or 'sell'"):
+        broker.submit_order("AAPL", side=side)
+
+    assert session.requests == []
+
+
+def test_env_flip_blocks_order_post(monkeypatch):
+    monkeypatch.setenv("TRADING_MODE", "paper")
+    monkeypatch.setenv("ALPACA_API_KEY", "key")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "secret")
+    session = RecordingSession()
+    broker = AlpacaBroker(config=BrokerConfig.from_env(), session=session)
+
+    monkeypatch.setenv("TRADING_MODE", "live")
+    monkeypatch.setenv("ENABLE_REAL_TRADING", "true")
+    monkeypatch.setenv("LIVE_DRY_RUN", "false")
+
+    with pytest.raises(RuntimeError):
+        broker.submit_order("AAPL", side="buy")
+
+    assert session.requests == []
+
+
+def test_config_replacement_blocks_order_post(monkeypatch):
+    monkeypatch.setenv("TRADING_MODE", "paper")
+    monkeypatch.setenv("ALPACA_API_KEY", "key")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "secret")
+    session = RecordingSession()
+    broker = AlpacaBroker(config=BrokerConfig.from_env(), session=session)
+    broker.config = BrokerConfig(
+        trading_mode="paper",
+        paper_base_url="https://api.alpaca.markets",
+        api_key="key",
+        secret_key="secret",
+    )
+
+    with pytest.raises(RuntimeError):
+        broker.submit_order("AAPL", side="buy")
+
+    assert session.requests == []
+
+
+def test_env_flip_blocks_reconciliation_lookup(monkeypatch):
+    monkeypatch.setenv("TRADING_MODE", "paper")
+    monkeypatch.setenv("ALPACA_API_KEY", "key")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "secret")
+    session = RecordingSession()
+    broker = AlpacaBroker(config=BrokerConfig.from_env(), session=session)
+
+    monkeypatch.setenv("ALPACA_PAPER_BASE_URL", "https://api.alpaca.markets")
+
+    with pytest.raises(RuntimeError):
+        broker.get_order_by_client_order_id("cid-1")
+
+    assert session.requests == []
+
+
+def test_config_replacement_blocks_reconciliation_lookup(monkeypatch):
+    monkeypatch.setenv("TRADING_MODE", "paper")
+    monkeypatch.setenv("ALPACA_API_KEY", "key")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "secret")
+    session = RecordingSession()
+    broker = AlpacaBroker(config=BrokerConfig.from_env(), session=session)
+    broker.config = BrokerConfig(
+        trading_mode="papre",
+        api_key="key",
+        secret_key="secret",
+    )
+
+    with pytest.raises(RuntimeError):
+        broker.get_order_by_client_order_id("cid-1")
+
+    assert session.requests == []
+
+
+def test_cancel_delete_uses_common_runtime_gate(monkeypatch):
+    monkeypatch.setenv("TRADING_MODE", "paper")
+    monkeypatch.setenv("ALPACA_API_KEY", "key")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "secret")
+    session = RecordingSession()
+    broker = AlpacaBroker(config=BrokerConfig.from_env(), session=session)
+
+    result = broker.cancel_order("order-1")
+
+    assert result == {"ok": True}
+    assert len(session.requests) == 1
+    assert session.requests[0][0][0] == "DELETE"
+
+
+def test_env_flip_blocks_cancel_delete(monkeypatch):
+    monkeypatch.setenv("TRADING_MODE", "paper")
+    monkeypatch.setenv("ALPACA_API_KEY", "key")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "secret")
+    session = RecordingSession()
+    broker = AlpacaBroker(config=BrokerConfig.from_env(), session=session)
+    monkeypatch.setenv("TRADING_MODE", "invalid")
+
+    with pytest.raises(RuntimeError):
+        broker.cancel_order("order-1")
+
+    assert session.requests == []

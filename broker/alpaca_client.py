@@ -30,24 +30,24 @@ class AlpacaBroker:
             "Content-Type": "application/json",
         }
 
-    def _request(self, method, path, **kwargs):
+    def _validate_runtime_safety(self):
+        """Validate both the captured config and the current environment."""
+        self.config.validate_order_allowed()
+        self.config.validate_for_request()
+        validate_order_allowed_now()
+
+    def _request(self, method, path, *, return_response=False, not_found_is_none=False, **kwargs):
         # Safety gate must run before any network access, not just before
         # order submission: without this, a misconfigured Paper mode whose
         # ALPACA_PAPER_BASE_URL was overwritten with the Live URL could still
         # reach account/position endpoints on the Live host via this method.
-        self.config.validate_order_allowed()
-        self.config.validate_for_request()
+        self._validate_runtime_safety()
         url = f"{self.config.base_url}{path}"
-        # self.config is a frozen snapshot captured once (at construction, or
-        # whenever it was last (re)assigned) -- it does not observe env
-        # changes made afterward. validate_order_allowed_now() re-reads
-        # os.environ right here, immediately before the network call, to
-        # close the window where TRADING_MODE/ALPACA_*_BASE_URL/etc. change
-        # between broker construction and this specific request.
-        validate_order_allowed_now()
         response = self.session.request(method, url, headers=self.headers, timeout=30, **kwargs)
+        if not_found_is_none and response.status_code == 404:
+            return None
         response.raise_for_status()
-        return response.json()
+        return response if return_response else response.json()
 
     def get_account(self):
         return self._request("GET", "/v2/account")
@@ -76,22 +76,17 @@ class AlpacaBroker:
         transport/auth failure, which should be retried rather than treated
         as a definitive answer.
         """
-        self.config.validate_order_allowed()
-        self.config.validate_for_request()
-        url = f"{self.config.base_url}/v2/orders:by_client_order_id"
-        response = self.session.request(
+        return self._request(
             "GET",
-            url,
-            headers=self.headers,
+            "/v2/orders:by_client_order_id",
             params={"client_order_id": client_order_id},
-            timeout=30,
+            not_found_is_none=True,
         )
-        if response.status_code == 404:
-            return None
-        response.raise_for_status()
-        return response.json()
 
-    def submit_order(self, symbol, qty=1, side="buy", order_type="market", time_in_force="day", client_order_id=None):
+    def submit_order(self, symbol, qty=1, *, side, order_type="market", time_in_force="day", client_order_id=None):
+        if side not in {"buy", "sell"}:
+            raise ValueError("side must be exactly 'buy' or 'sell'")
+
         order = {
             "symbol": symbol,
             "qty": str(qty),
@@ -110,16 +105,19 @@ class AlpacaBroker:
                 dry_run=True,
             )
 
-        self.config.validate_order_allowed()
-        self.config.validate_for_request()
-        url = f"{self.config.base_url}/v2/orders"
-        response = self.session.post(url, headers=self.headers, json=order, timeout=30)
+        response = self._request("POST", "/v2/orders", json=order, return_response=True)
         return BrokerResponse(
             status_code=response.status_code,
             text=response.text,
             data=_safe_json(response),
             dry_run=False,
         )
+
+    def cancel_order(self, order_id):
+        """Cancel an order through the same runtime safety gate."""
+        if not order_id or not isinstance(order_id, str):
+            raise ValueError("order_id must be a non-empty string")
+        return self._request("DELETE", f"/v2/orders/{order_id}")
 
 
 def _safe_json(response):
