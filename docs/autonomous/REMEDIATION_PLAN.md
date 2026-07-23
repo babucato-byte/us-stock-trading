@@ -269,3 +269,48 @@ Alpaca/Slack/Yahoo 호출 0회(전부 monkeypatch/fake). Claude 자체 판정으
 run 상태는 **`READY_FOR_CODEX_REVALIDATION`**으로 기록한다 — Codex의 독립 재검증(CODEX-016~019 재확인,
 `PROCEED`/`FAIL` 여부) 없이는 제한적 실거래 검토를 재개하지 않는다. 상세 근거는
 `docs/autonomous/VALIDATION_PACKAGE.md`의 "CODEX-016~019 수정 완료" 패키지 참고.
+
+---
+
+## CODEX-016·018 최종 보완 사이클
+
+검증 기준: `docs/autonomous/CODEX_REVIEW.md` 커밋 `cf4ada9`. CODEX-017과 CODEX-019는
+RESOLVED 상태를 유지하며 변경하지 않았다.
+
+### CODEX-016 — sell side end-to-end 전달 누락 (HIGH)
+
+- 재현: wrapper에 `side="sell"`을 전달해도 fake broker kwargs에 side가 없고 실제
+  `AlpacaBroker.submit_order()` 기본값인 buy가 사용됐다.
+- 원인: wrapper의 side는 kill-switch 판단에만 쓰이고 broker 호출에 전달되지 않았으며 두
+  계층 모두 암묵적 buy 기본값을 제공했다.
+- 수정: `paper_strategy_order.submit_order()`와 `AlpacaBroker.submit_order()`의 side를
+  keyword-only 필수 인자로 변경했다. 정확한 `buy`/`sell`만 허용하고 None, 빈 문자열,
+  대문자, 공백, 오타 및 기타 타입은 broker/HTTP 호출 전에 차단한다. wrapper가 side를
+  broker에 명시적으로 전달하고 POST payload가 같은 값을 보존한다.
+- 회귀 테스트: side 누락·잘못된 값 차단, buy/sell wrapper kwargs, buy/sell POST payload,
+  main의 명시적 buy, sell이 buy로 변환되지 않음을 검증한다.
+- 처리 상태: **IMPLEMENTED — READY_FOR_CODEX_REVALIDATION**
+- 구현 커밋: `47ee8d6`
+
+### CODEX-018 — POST·reconciliation runtime 재검증 우회 (MEDIUM)
+
+- 재현: safe Paper config로 broker를 생성한 뒤 환경을 unsafe Live로 바꿔도
+  `submit_order()`가 직접 `session.post()`를 1회 호출했다.
+- 원인: GET 일부만 `_request()`를 사용하고 주문 POST와 client_order_id reconciliation
+  조회는 직접 session 메서드를 호출했다.
+- 수정: `_validate_runtime_safety()`에서 생성 시점 config와 현재 환경을 모두 검사하고,
+  모든 외부 호출을 단일 `_request()`로 통합했다. 주문 POST, reconciliation GET, account,
+  positions, recent orders, assets 및 신규 cancel DELETE가 동일한 gate를 사용한다.
+- 회귀 테스트: 안전 Paper의 POST/GET/DELETE 허용, 생성 후 env 변경·config 교체·endpoint
+  변조·invalid mode에서 session 호출 0회, reconciliation과 cancel 공통 gate를 검증한다.
+- 처리 상태: **IMPLEMENTED — READY_FOR_CODEX_REVALIDATION**
+- 구현 커밋: `47ee8d6`
+
+### 검증 결과
+
+- 집중 안전 테스트: **188 passed, 0 failed, 1 warning**
+- 전체: 저장소 루트/상위 디렉터리, `pytest`/`python -m pytest` 네 조합 모두
+  **443 passed, 0 failed, 2 warnings**
+- broker 내부 직접 session 호출은 `_request()` 한 곳만 남았다.
+- 실제 Alpaca/Slack/Yahoo 호출 0회, 운영 CSV 내용·크기·mtime 불변.
+- main 병합, origin push, 운영 배포, 실거래 활성화 없음.

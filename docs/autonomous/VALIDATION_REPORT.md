@@ -1,5 +1,19 @@
 # VALIDATION_REPORT
 
+## 2026-07-23 — CODEX-016·018 최종 보완
+
+Codex 재검증에서 남은 CODEX-016(HIGH, sell side 누락)과 CODEX-018(MEDIUM,
+POST/reconciliation runtime gate 우회)을 `47ee8d6`에서 보완했다. side는 두 주문
+계층에서 keyword-only 필수값이며 정확한 `buy`/`sell`만 허용한다. 모든 Alpaca HTTP는
+생성 시점 config와 요청 시점 환경을 검사하는 단일 `_request()`를 사용한다.
+
+검증: 집중 188 passed, 전체 네 실행 방식 모두 **443 passed, 0 failed, 2 warnings**.
+실제 외부 호출 0회, 운영 CSV 해시·크기·mtime 불변. 상태는
+`READY_FOR_CODEX_REVALIDATION`이며 독립 재검증 전 limited live review는 `BLOCKED`,
+실거래는 `DO_NOT_ENABLE`이다.
+
+---
+
 ## 2026-07-22 — Phase 2 구현 완료 (초단타 관심종목 선별 엔진)
 
 `scalping_watchlist/` 패키지로 Stage A(거래가능성 재검증)~E(설명 가능한 가중합 점수) 파이프라인을 구현했다(커밋 `4a96883`).

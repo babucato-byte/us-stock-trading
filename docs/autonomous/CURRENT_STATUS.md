@@ -9,15 +9,17 @@ Phase 1 최종 판정(유지): **Phase 1A(주문 진입 안전성) = VALIDATED**
 
 Phase 3(1분봉 감시/지표/주문 로직)은 이번 사이클에서 착수하지 않음 — 사용자 지시에 따라 범위 외.
 
-## 제한적 실거래 검토 사이클 — CODEX-016~019 (run 완료, 2026-07-23)
-Codex 독립 검증(`docs/autonomous/CODEX_REVIEW.md`, 커밋 `e0dc855`) 판정 Overall verdict **FAIL**,
-Limited live review **BLOCKED**에 따라 HIGH 2건(CODEX-016, CODEX-017)·MEDIUM 2건(CODEX-018, CODEX-019)을
-전부 수정(t1~t4, 커밋 `6ad4841`/`79eaa81`/`00b0f68`/`50a097d`). 상세는
-`docs/autonomous/REMEDIATION_PLAN.md`("제한적 실거래 검토 사이클 — CODEX-016~019")와
-`docs/autonomous/VALIDATION_PACKAGE.md`("CODEX-016~019 수정 완료") 참고. 전체 회귀
-`venv/bin/python -m pytest -q` 417 passed, 0 failed. **run 상태: `READY_FOR_CODEX_REVALIDATION`** —
-Claude 자체 판정으로 확정하지 않으며 Codex의 독립 재검증 전까지 `docs/live_review/`의 제한적 실거래
-검토는 재개하지 않는다. `docs/autonomous/CODEX_REVIEW.md`는 이번 run에서 수정하지 않고 그대로 보존.
+## 제한적 실거래 검토 사이클 — CODEX-016·018 최종 수정 (2026-07-23)
+최신 Codex 재검증(커밋 `cf4ada9`)에서 CODEX-017/019는 RESOLVED, CODEX-016(HIGH)과
+CODEX-018(MEDIUM)은 PARTIALLY_RESOLVED로 판정됐다. `47ee8d6`에서 주문 방향을 keyword-only
+필수값으로 만들고 정확한 `buy`/`sell`만 허용했으며 wrapper→broker→Alpaca payload까지 그대로
+전달하도록 수정했다. 또한 POST·reconciliation GET·DELETE를 포함한 모든 Alpaca HTTP가
+`_validate_runtime_safety()`와 단일 `_request()`를 거치도록 통합했다.
+
+전체 회귀는 저장소 루트와 상위 디렉터리의 `pytest`/`python -m pytest` 네 방식 모두
+**443 passed, 0 failed, 2 warnings**다. CODEX-017/019 코드는 변경하지 않았고 회귀만 확인했다.
+현재 상태는 **`READY_FOR_CODEX_REVALIDATION`**이며, 독립 재검증 전까지 limited live review는
+`BLOCKED`, 실거래는 `DO_NOT_ENABLE`을 유지한다.
 
 ## 마지막 완료 작업 (CODEX-010~015 수정 사이클)
 - CODEX-010 (HIGH): `numeric_guard.require_finite_number()` 도입, `features.py`의 모든 raw/derived 수치에 NaN/Infinity 명시 차단 적용.
@@ -30,13 +32,14 @@ Claude 자체 판정으로 확정하지 않으며 Codex의 독립 재검증 전�
 - 전체 회귀 267 passed(레포 루트 `pytest -q`/`python -m pytest -q` 동일), 실제 외부 API 호출 0회, `order_history.csv` 해시 불변, 운영 파일 변경 없음 확인.
 
 ## 현재 테스트 수
-267 passed, 0 failed (Phase 2 전용 118건 포함)
+443 passed, 0 failed, 2 warnings
 
 ## 실패 테스트
 없음
 
 ## 현재 블로커
-없음. Phase 2는 Claude 자체 테스트 통과만으로 `VALIDATED` 처리하지 않음 — Codex 재검증의 `PROCEED` 판정 대기.
+CODEX-016·018 최종 수정에 대한 Codex 독립 재검증 대기. `approved: false`,
+`live_enabled: false` 유지.
 
 ## 다음 작업
 1. `VALIDATION_PACKAGE.md`/`VALIDATION_REPORT.md`/`REMEDIATION_PLAN.md`/`SCALPING_V1_ROADMAP.md`/`DECISION_LOG.md`를 CODEX-010~015 기준으로 갱신(진행 중).

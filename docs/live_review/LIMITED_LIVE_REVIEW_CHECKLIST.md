@@ -25,7 +25,7 @@ venv/bin/python -m pytest -q
 실측 출력(요약, 최종 회귀 확인 재실행 결과):
 
 ```
-384 passed, 2 warnings in 28.26s
+443 passed, 2 warnings
 ```
 
 - collected: **384** (수집된 테스트 수 = 통과 수, 스킵/xfail 없이 전량 실행됨)
@@ -44,7 +44,7 @@ venv/bin/python -m pytest -q
 
 | 확인 항목 | 결과 | 근거 |
 |---|---|---|
-| `venv/bin/python -m pytest -q` 전체 실행 | exit code 0, **384 passed, 0 failed, 2 warnings** | 위 실측 출력 |
+| `venv/bin/python -m pytest -q` 전체 실행 | exit code 0, **443 passed, 0 failed, 2 warnings** | CODEX-016·018 최종 보완 커밋 `47ee8d6` 기준 |
 | 기존 테스트 삭제/완화/skip/xfail 여부 | 없음 | `grep -rn "skip\|xfail" tests/` 결과 실제 `pytest.mark.skip`/`pytest.mark.xfail` 데코레이터 없음(매치된 문자열은 모두 비즈니스 로직상의 `skip_reason` 값·변수명일 뿐임). `git diff --stat main...HEAD -- tests/`는 10개 파일 전량 신규 추가(`insertions`만 존재, `deletions` 없음) — 기존 테스트 파일 수정/삭제 없음 |
 | 금지 파일 변경 여부 (`broker/alpaca_client.py`, `broker/__init__.py`, `order_safety.py`, `config/scanner_presets.json`) | 변경 없음 | `git diff --name-only main...HEAD` 목록에 위 4개 파일 모두 미포함 |
 | 운영 데이터 파일 변경 여부 (`order_history.csv`, `strategy_performance.csv`, `universe.csv`) | 변경 없음 | `git diff --name-only main...HEAD -- order_history.csv strategy_performance.csv universe.csv` → 빈 결과 |
@@ -112,8 +112,8 @@ venv/bin/python -m pytest -q
 
 이 문서의 최종 상태는 아래 두 값 중 하나로만 표기한다: `READY_FOR_LIMITED_LIVE_REVIEW` 또는 `BLOCKED`.
 
-**최종 상태: `READY_FOR_LIMITED_LIVE_REVIEW`**
+**최종 상태: `BLOCKED`**
 
-근거: 위 1절의 회귀 테스트가 0 failed로 통과하고, 2~5절의 실측값이 모두 코드에서 확인 가능하며,
-Kill Switch가 `ACTIVE`(정상)로 확인됨. 단, 6~7절의 다수 항목이 `TBD(운영자 기입)`로 남아 있으므로
-이 값들이 운영자에 의해 채워지고 명시적으로 승인되기 전까지는 실거래 전환이 허용되지 않는다.
+근거: CODEX-016·018 최종 보완은 전체 회귀를 통과했으나 Codex 독립 재검증 전이다.
+또한 6~7절의 운영자 기입 항목이 남아 있으므로 limited live review 및 실거래 전환을
+재개하지 않는다.

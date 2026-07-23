@@ -33,7 +33,7 @@ live_enabled: false
    항목이 실제 값으로 채워짐.
 2. [KILL_SWITCH_RUNBOOK.md](./KILL_SWITCH_RUNBOOK.md)와 [INCIDENT_RESPONSE_RUNBOOK.md](./INCIDENT_RESPONSE_RUNBOOK.md)의
    절차가 운영팀에 실제로 공유되고 숙지됨.
-3. `venv/bin/python -m pytest -q`가 0 failed로 통과함(문서 작성 시점 실측: `384 passed, 2 warnings`).
+3. `venv/bin/python -m pytest -q`가 0 failed로 통과함(문서 작성 시점 실측: `443 passed, 2 warnings`).
 4. Kill Switch 상태가 `ACTIVE`이고, `notification_health.get_status()`가 `HEALTHY` 또는
    확인 가능한 상태임.
 
@@ -43,8 +43,7 @@ live_enabled: false
 또는 `BLOCKED`. (이 값은 실거래 승인 여부와 별개다 — 위 `approved`/`live_enabled`가 진짜 승인
 여부를 나타낸다.)
 
-**현재 상태: `READY_FOR_LIMITED_LIVE_REVIEW`**
+**현재 상태: `BLOCKED`**
 
-근거: 코드/테스트 기준 사람 검토를 시작할 준비는 되어 있으나(체크리스트 1~5절 실측 완료),
-승인에 필요한 운영자 기입 항목(체크리스트 6~7절, 본 문서의 승인 기록)이 아직 비어 있어
-`approved: false`, `live_enabled: false`를 유지한다.
+근거: CODEX-016·018 최종 보완은 독립 재검증 대기 상태이며 승인에 필요한 운영자 기입
+항목도 비어 있다. `approved: false`, `live_enabled: false`를 유지한다.

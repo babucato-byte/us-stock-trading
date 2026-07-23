@@ -4,6 +4,75 @@
 
 ---
 
+## 이번 패키지: CODEX-016·018 최종 보완 (2026-07-23)
+
+### 검증 대상
+
+- 독립 검증 기록: `cf4ada9`
+- 구현 커밋: `47ee8d6`
+- 브랜치: `orchestrator/20260723-020935-us-stock-trading`
+- 상태: **`READY_FOR_CODEX_REVALIDATION`**
+- limited live review: **`BLOCKED` 유지**
+- live trading: **`DO_NOT_ENABLE` 유지**
+
+### CODEX-016 보완
+
+- `paper_strategy_order.submit_order(..., *, side)`와
+  `AlpacaBroker.submit_order(..., *, side)`에서 side를 필수 keyword로 강제한다.
+- 허용값은 정확히 `buy`, `sell`뿐이다. 누락, None, 빈 문자열, 대문자, 공백,
+  오타와 기타 타입은 fail-closed 처리한다.
+- wrapper는 side를 broker로 전달하며 Alpaca POST JSON payload도 같은 side를 보존한다.
+- 기존 entry 경로 `main()`은 `side="buy"`를 명시한다.
+
+### CODEX-018 보완
+
+- `_validate_runtime_safety()`가 생성 시점 `self.config`와 요청 시점 환경을 모두 검증한다.
+- 모든 Alpaca 네트워크 호출은 `_request()` 한 곳만 사용한다.
+- 포함 경로: account, positions, recent orders, assets, client_order_id reconciliation,
+  order POST, cancel DELETE.
+- unsafe env/config/endpoint에서는 recording session 호출이 0회다.
+
+### 추가·수정 테스트
+
+- `tests/test_alpaca_client_runtime_revalidation.py`: buy/sell payload, side 누락/오류,
+  POST/reconciliation/DELETE runtime gate 추가.
+- `tests/test_paper_strategy_order_kill_switch_state.py`: wrapper side 전달 및 strict validation 추가.
+- 기존 fake broker 8개 테스트 모듈이 keyword-only side를 실제로 받도록 강화됐다.
+- 실패 테스트 삭제, 완화, skip, xfail 없음.
+
+### 실행 결과
+
+```text
+저장소 루트 pytest -q:                    443 passed, 2 warnings
+저장소 루트 python -m pytest -q:          443 passed, 2 warnings
+상위 디렉터리 pytest us-stock-trading -q: 443 passed, 2 warnings
+상위 디렉터리 python -m pytest ... -q:    443 passed, 2 warnings
+집중 안전 테스트:                         188 passed, 1 warning
+```
+
+두 warning은 기존 urllib3 LibreSSL 경고와 의도된 scanner unknown-field 경고다.
+
+### 안전 검증
+
+- 실제 Alpaca, Slack, Yahoo 호출 0회. HTTP 검증은 recording session/fake만 사용.
+- broker 내부 `session.get/post/delete` 직접 호출 없음. `session.request`는 공통
+  `_request()` 한 곳에만 존재.
+- `order_history.csv`, `universe.csv`, `strategy_performance.csv`의 SHA-256, 크기,
+  mtime이 검증 전후 동일하다.
+- `.env`, approval/live flag, kill-switch 상태, 운영 서버를 변경하지 않았다.
+- `approved: false`, `live_enabled: false` 유지.
+- main 병합과 origin push 없음.
+
+### Codex 재검증 초점
+
+1. wrapper buy/sell이 broker kwargs 및 POST payload까지 동일하게 유지되는지.
+2. side 누락 및 모든 비정규 값이 network 호출 전에 차단되는지.
+3. POST와 client_order_id reconciliation이 `_request()` 공통 runtime gate를 거치는지.
+4. broker 생성 후 env/config 변조에서 session 호출이 0회인지.
+5. CODEX-017/019에 회귀가 없는지.
+
+---
+
 ## 이번 패키지: CODEX-016~019 수정 완료 (2026-07-23)
 
 ### 배경
