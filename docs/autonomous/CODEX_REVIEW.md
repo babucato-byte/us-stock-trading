@@ -1,12 +1,12 @@
 # CODEX_REVIEW
 
-Review target: CODEX-016·018 최종 독립 재검증
+Review target: CODEX-018 잔여분 및 CODEX-020 수정 독립 재검증
 
-Commits: `47ee8d6`, `03962d3`, `cf4ada9`
+Commits: `66eda8a`, `ed452da`, `cf5601d`, `edc5ad5`
 
-Validation package SHA-256: `27a36e62daad8aea3f32e82eb614e7e69fe98dcf917ad97669162f62d7aa8330`
+Validation package SHA-256: `173338b830c0b99b329ac7f430480c411f517d7e16e63abb11d7eb77a2154736`
 
-Date: 2026-07-23
+Date: 2026-07-24
 
 Overall verdict: **FAIL**
 
@@ -14,136 +14,122 @@ Limited live review: **BLOCKED**
 
 Live trading: **DO_NOT_ENABLE**
 
-side의 strict 전달과 GET·POST·DELETE 공통 `_request()` 통합은 실제 코드와 payload 재현으로 확인됐다. 그러나 CODEX-018의 필수 runtime 안전 항목 중 현재 Kill Switch와 현재 credentials가 공통 broker gate에 포함되지 않는다. direct `AlpacaBroker.submit_order()`는 binary halt 및 `ENTRY_DISABLED` 상태에서도 HTTP를 각각 1회 호출했다. 운영 안전성과 직접 관련된 미해결 항목이므로 limited live review로 진행할 수 없다.
+public broker 주문의 binary/4-state Kill Switch 적용과 현재 credential 재검증은 해결됐다. 그러나 검증 패키지가 해결했다고 주장한 method+path 백스톱은 구현되지 않았다. `_request("POST", "/v2/orders", order_side=None, ...)`처럼 `None`을 명시하면 Kill Switch 검사를 건너뛰고 ENTRY_DISABLED와 binary halt 상태에서 각각 HTTP가 1회 호출된다. 신규 HIGH Finding이므로 limited live review로 진행할 수 없다.
 
 ## Previous findings
 
-### [CODEX-016]
+### [CODEX-018]
 
 Status: **RESOLVED**
 
 Evidence:
 
-- `paper_strategy_order.submit_order(..., *, side)`와 `AlpacaBroker.submit_order(..., *, side)` 모두 side가 keyword-only 필수값이며 암묵적인 buy 기본값이 없다.
-- wrapper는 `broker.submit_order(..., side=side)`를 명시적으로 호출한다.
-- broker는 정확한 문자열 `buy`, `sell`만 허용한다.
-- 최종 POST JSON의 `side`가 wrapper 입력과 동일함을 fake session으로 확인했다.
-- main의 현재 신규 진입 호출은 `side="buy"`를 명시한다.
+- `_validate_runtime_safety()`가 매 요청 직전 `BrokerConfig.from_env()`로 현재 credentials를 다시 읽는다.
+- 현재 API key/secret의 누락, 공백, 교체 및 환경 조회 예외를 fail-closed 처리한다.
+- captured credentials와 현재 값은 `hmac.compare_digest()`로 비교하며 예외 메시지에 secret 원문을 포함하지 않는다.
+- GET, POST, DELETE 모두 공통 `_request()`를 사용한다.
 
 Direct reproduction:
 
-- `side="buy"` → captured payload `side == "buy"`.
-- `side="sell"` → captured payload `side == "sell"`.
-- None, 빈 문자열, `BUY`, `SELL`, 선행·후행 공백, `short`, `close`, 오타, bool, 숫자는 모두 HTTP delta 0이었다.
-- side 누락은 Python signature 단계에서 TypeError로 차단되고 HTTP 호출은 없다.
+- broker 생성 후 API key 삭제 상태에서 GET·POST·DELETE 총 session 호출 0회.
+- unsafe mode/endpoint 변경 차단 테스트와 기존 reconciliation/cancel 경로 테스트가 통과했다.
 
 Remaining risk:
 
-- 현재 저장소에는 실제 포지션 청산 caller가 구현돼 있지 않아 “기존 포지션 청산 E2E”는 실행 검증할 경로가 없다.
-- reconciliation은 기존 주문 상태를 조회할 뿐 자동 재주문하지 않으므로 side를 재구성하지 않는다. 향후 sell retry/청산 기능을 추가할 때 side를 ledger/reconciliation identity에 포함할지 별도 설계가 필요하다.
+- credential rotation은 기존 객체를 자동 갱신하지 않고 새 broker 생성을 요구한다. 문서화된 의도와 일치한다.
 
-### [CODEX-018]
+### [CODEX-020]
 
 Status: **PARTIALLY_RESOLVED**
 
 Evidence:
 
-- account, positions, recent orders, assets, client-order-id 조회, order POST, cancel DELETE가 모두 단일 `_request()`를 사용한다.
-- `_request()`는 captured `self.config`와 현재 환경의 mode/endpoint를 HTTP 직전에 검사한다.
-- safe Paper 생성 후 unsafe Live 환경 변경 시 GET·POST·DELETE는 모두 HTTP delta 0이었다.
-- config 교체, invalid mode 및 endpoint 변조를 차단하는 테스트가 존재한다.
-- 그러나 `_validate_runtime_safety()`는 binary `is_trading_halted()`, 다단계 `is_entry_allowed()/is_liquidation_allowed()`, 승인 레코드를 검사하지 않는다.
-- 현재 credentials도 다시 검증하지 않는다. `self.config.validate_for_request()`는 생성 시점에 캡처된 key만 검사하고 `validate_order_allowed_now()`는 credentials를 검사하지 않는다.
+- public `AlpacaBroker.submit_order()`는 binary halt와 4-state Kill Switch를 network boundary에서 재검사한다.
+- ENTRY_DISABLED는 buy를 차단하고 sell liquidation을 허용한다.
+- ALL_TRADING_DISABLED/MANUAL_REVIEW 및 손상 state는 buy/sell 모두 차단한다.
+- account, positions, reconciliation 및 cancel은 명시된 read/cancel 정책에 따라 계속 허용된다.
+- 그러나 `_request()`의 `order_side`는 필수 인자일 뿐 POST path와 의미적으로 결합되지 않는다. 명시적 `None`은 `_check_kill_switch()`에서 즉시 반환한다.
 
 Direct reproduction:
 
-- `KILL_SWITCH_STATE=ENTRY_DISABLED`에서 direct `AlpacaBroker.submit_order(side="buy")` → session request 1회.
-- binary `KILL_SWITCH` 파일 활성 상태에서 direct broker submit → session request 1회.
-- broker 생성 후 현재 환경에서 `ALPACA_API_KEY`/`ALPACA_SECRET_KEY` 삭제 → stale captured credentials로 session request 1회.
-- unsafe Live 전환 후 POST, reconciliation GET, DELETE는 각각 session 호출 0회로 정상 차단됐다.
+- ENTRY_DISABLED에서 public buy → HTTP 0회, public sell → HTTP 1회(정책과 일치).
+- binary halt에서 public buy → HTTP 0회.
+- ENTRY_DISABLED에서 `_request("POST", "/v2/orders", order_side=None, ...)` → HTTP 1회.
+- binary halt에서 같은 explicit-None direct POST → HTTP 1회.
 
 Remaining risk:
 
-- wrapper를 우회하는 direct broker 주문 경로가 운영 정지 상태를 무시한다. 안전 제어는 최하위 네트워크 경계에서도 강제돼야 한다.
-- current credential 제거·회전도 장수명 broker 객체에 즉시 반영되지 않는다.
-- 승인 파일은 runtime broker gate에 연결되지 않았지만 현재 live mode 자체가 항상 차단되므로 이번 커밋만으로 live가 활성화되지는 않는다.
+- private 공통 network boundary를 직접 호출하거나 향후 order method가 실수로 `order_side=None`을 넘기면 모든 주문 정지 정책을 우회한다.
 
 ## Regression findings
+
+### [CODEX-016]
+
+Status: **RESOLVED**
+
+Evidence: strict buy/sell 전달과 payload 보존 테스트가 통과했고 이번 변경에 회귀가 없다.
 
 ### [CODEX-017]
 
 Status: **RESOLVED**
 
-Evidence:
-
-- 운영 Slack wrapper가 notification health tracker를 실제로 경유한다.
-- 성공·실패 기록, 연속 실패 escalation, ENTRY_DISABLED 이후 wrapper buy 차단 테스트가 통과했다.
-- 관련 집중 회귀 테스트에 회귀가 없었다.
+Evidence: notification health 기록·escalation·주문 차단 경로가 집중 회귀에서 통과했다.
 
 ### [CODEX-019]
 
 Status: **RESOLVED**
 
-Evidence:
-
-- kill-switch와 notification state read-modify-write는 `fcntl.flock` 보호를 유지한다.
-- multiprocessing lost-update, lock timeout 원본 보존, 손상 파일 안전 테스트가 통과했다.
+Evidence: 상태 저장소 multiprocessing lost-update 및 lock timeout 테스트가 통과했다.
 
 ## New findings
 
-### [CODEX-020] HIGH — direct broker network boundary가 Kill Switch를 우회함
+### [CODEX-021] HIGH — order-shaped `_request()`가 explicit `order_side=None`으로 Kill Switch를 우회함
 
 Status: **UNRESOLVED**
 
 Evidence:
 
-- `broker/alpaca_client.py`는 kill-switch 모듈을 import하거나 검사하지 않는다.
-- `paper_strategy_order.submit_order()`에는 binary/4-state gate가 있지만 `AlpacaBroker.submit_order()`를 직접 호출하면 이 계층을 우회한다.
-- binary halt와 `ENTRY_DISABLED` 각각에서 fake session request 1회를 직접 재현했다.
+- `_request()`는 `order_side` 누락만 Python TypeError로 막는다.
+- `_check_kill_switch(None)`은 HTTP method/path/body를 확인하지 않고 반환한다.
+- 구현 및 테스트에 보고서가 주장한 method+path 주문 감지 백스톱이 없다.
+- ENTRY_DISABLED와 binary halt에서 직접 POST session 호출을 각각 재현했다.
 
 Required behavior:
 
-- 모든 주문 POST 직전 broker network boundary에서 binary halt와 side별 4-state 정책을 재검사해야 한다.
-- buy는 `is_entry_allowed()`, sell은 `is_liquidation_allowed()`를 사용하고 손상 상태는 HTTP 호출 전에 fail-closed 처리해야 한다.
-- account/reconciliation 같은 read-only 조회를 허용할지 정책을 명시적으로 분리해야 한다.
-- direct broker 호출 및 wrapper 호출 모두에서 HTTP call count 0 회귀 테스트가 필요하다.
+- POST `/v2/orders` 등 주문 생성 endpoint에서는 `order_side=None`을 HTTP 이전에 거부해야 한다.
+- request payload의 `side`와 `order_side`가 정확히 일치하는지 검증해야 한다.
+- method/path 기반 분류는 query/trailing slash 등 정상 변형에도 결정적이어야 한다.
+- 내부 public method뿐 아니라 공통 network boundary 직접 호출 테스트에서 session 호출 0회를 보장해야 한다.
 
 ## Executed tests
 
-- 집중 안전 테스트 → **188 passed, 1 warning**
-- CODEX-017/019 회귀 집중 → **50 passed, 1 warning**
-- 저장소 루트 `venv/bin/pytest -q` → **443 passed, 2 warnings**
-- 저장소 루트 `venv/bin/python -m pytest -q` → **443 passed, 2 warnings**
-- 저장소 상위 `venv/bin/pytest us-stock-trading -q` → **443 passed, 2 warnings**
-- 저장소 상위 `venv/bin/python -m pytest us-stock-trading -q` → **443 passed, 2 warnings**
-- side 및 runtime gate 수동 격리 재현
+- 신규 안전 집중 4개 파일 → **81 passed, 1 warning**
+- 저장소 루트 `venv/bin/pytest -q` → **489 passed, 2 warnings**
+- 저장소 루트 `venv/bin/python -m pytest -q` → **489 passed, 2 warnings**
+- 저장소 상위 `venv/bin/pytest us-stock-trading -q` → **489 passed, 2 warnings**
+- 저장소 상위 `venv/bin/python -m pytest us-stock-trading -q` → **489 passed, 2 warnings**
+- public/private Kill Switch 및 credential 격리 재현
 
 Warnings:
 
-- urllib3 `NotOpenSSLWarning`: macOS LibreSSL 환경 경고이며 이번 Finding 원인이 아니다.
+- urllib3 `NotOpenSSLWarning`: macOS LibreSSL 환경 경고다.
 - scanner unknown-field `RuntimeWarning`: 의도된 기존 테스트 경고다.
 - 신규 안전 관련 warning은 없다.
 
-## Order-side verification
+## Kill-switch policy verification
 
-- wrapper → broker kwargs → POST payload에서 buy/sell이 정확히 유지된다.
-- strict side validation은 HTTP 이전에 수행된다.
-- 테스트 fake broker도 side를 필수로 받아 기본값으로 오류를 숨기지 않는다.
-- 실제 청산 workflow는 아직 구현돼 있지 않아 unverified area로 남겼다.
+- ACTIVE: public buy/sell 허용.
+- ENTRY_DISABLED: public buy 차단, public sell 허용.
+- ALL_TRADING_DISABLED/MANUAL_REVIEW: public buy/sell 차단.
+- binary halt: public buy/sell 차단.
+- read-only 조회와 cancel은 Kill Switch와 무관하게 허용하는 문서 정책과 일치한다.
+- explicit-None private POST만 정책을 우회한다.
 
-## Runtime HTTP safety verification
+## Credential verification
 
-- Alpaca 관련 session 호출은 `broker/alpaca_client.py::_request()` 한 곳에만 존재한다.
-- GET·POST·DELETE가 공통 mode/endpoint runtime gate를 사용한다.
-- unsafe Live 및 config/endpoint 변조는 session 호출 전에 차단된다.
-- Kill Switch와 현재 credential 상태는 공통 gate에 포함되지 않아 FAIL 판정 원인이 됐다.
-
-## Approval and kill-switch verification
-
-- `LIVE_APPROVAL_RECORD.md`는 `approved: false`, `live_enabled: false`, 상태 `BLOCKED`로 불변이다.
-- live mode는 현재 `BrokerConfig.validate_order_allowed()`에서 항상 차단된다.
-- 검증 중 Kill Switch 파일을 저장소에 생성하거나 해제하지 않았다.
-- 임시 경로의 손상·활성 state는 wrapper에는 fail-closed지만 direct broker에는 적용되지 않는다.
+- 누락·공백·교체·환경 조회 실패는 모든 GET/POST/DELETE 전에 차단된다.
+- stale captured credential은 현재 환경과 다르면 사용되지 않는다.
+- secret 값은 오류 메시지에 노출되지 않는다.
 
 ## Network safety
 
@@ -156,27 +142,26 @@ Warnings:
 - `order_history.csv`: SHA-256 `153feb31c2539c19cd60f63e3f90d0d0f734ba7a209ed1800af7c0070a0a91c7`, 31 bytes, mtime `1784558966` 불변.
 - `universe.csv`: SHA-256 `9fdaf3ac0ba7d94e24b6276fc603709a0c79c6842cf8143b8a242acdd16188b3`, 833518 bytes, mtime `1784558966` 불변.
 - `order_reconciliation.csv`, `scalping_watchlist.csv`, Kill Switch/notification runtime 파일은 검증 전후 모두 존재하지 않았다.
-- `LIVE_APPROVAL_RECORD.md`: SHA-256 `27e640537c41334859eb8ad89eb3d013b17b0c95b8abf7b5385e2b76adbd5bfe`, 2704 bytes, mtime `1784815607` 불변.
-- 기존 전체 테스트가 `strategy_performance.csv` mtime만 갱신했으나 내용·크기는 불변이었고 검증 전 mtime으로 복원했다.
+- `LIVE_APPROVAL_RECORD.md`: SHA-256 `27e640537c41334859eb8ad89eb3d013b17b0c95b8abf7b5385e2b76adbd5bfe`, `approved: false`, `live_enabled: false`, 상태 `BLOCKED`로 불변.
+- 전체 테스트가 `strategy_performance.csv` mtime만 갱신했으나 내용·크기는 불변이었고 이번 검증 기준 mtime으로 복원했다.
 
 ## Document consistency
 
-- 검증 패키지 SHA-256은 보고값과 정확히 일치하며 이전 패키지와 다른 새 패키지다.
-- 188 focused 및 443 전체 테스트 수는 실제 결과와 일치한다.
+- 새 validation package SHA-256은 보고값과 일치하고 이전 `27a36e62...` 패키지와 다르다.
+- 489 passed 및 2 warnings 주장은 실제 결과와 일치한다.
+- CODEX-018 credential 재검증 완료 주장은 실제 코드와 일치한다.
+- “method+path가 주문 관련이면 order_side 생략 시 차단” 주장은 실제 코드·테스트와 불일치한다.
 - `READY_FOR_CODEX_REVALIDATION`, limited review `BLOCKED`, `approved: false`, `live_enabled: false`는 정확하다.
-- 패키지의 “모든 HTTP runtime gate” 주장은 mode/endpoint 범위에는 맞지만 Kill Switch와 current credentials까지 포함한다는 검증 요청 기준에는 불완전하다.
 
 ## Unverified areas
 
-- 실제 Alpaca Paper/Live, Slack, Yahoo E2E
-- 실제 포지션 청산 및 sell retry/reconciliation side identity
-- 승인 레코드의 runtime machine-readable enforcement
-- API credential rotation/removal의 장수명 프로세스 동작
+- 실제 Alpaca/Slack/Yahoo E2E
+- 실제 포지션 청산 및 broker reconciliation
+- 승인 레코드의 machine-readable runtime enforcement
 - Ubuntu 운영 환경의 flock 및 실제 스케줄러
 
 ## Required next action
 
-1. CODEX-020을 해결해 direct broker POST가 binary/4-state Kill Switch를 반드시 준수하도록 한다.
-2. CODEX-018의 current credential 재검증 정책을 구현하고 누락·빈 값·회전 테스트를 추가한다.
-3. read-only broker 조회와 주문/취소의 Kill Switch 정책을 명시적으로 분리한다.
-4. 독립 재검증 전 limited live review는 `BLOCKED`, 실거래는 `DO_NOT_ENABLE`을 유지한다.
+1. CODEX-021을 해결해 order-shaped POST에서 `order_side=None`을 차단한다.
+2. payload `side`와 gate `order_side` 불일치도 HTTP 이전에 차단한다.
+3. 독립 재검증 전 limited live review는 `BLOCKED`, 실거래는 `DO_NOT_ENABLE`을 유지한다.
