@@ -18,20 +18,29 @@
 - `is_entry_allowed()` → `get_state() == ACTIVE`일 때만 `True` (`kill_switch_state.py:138-140`)
 - `is_liquidation_allowed()` → `get_state() in (ACTIVE, ENTRY_DISABLED)`일 때 `True` (`kill_switch_state.py:143-145`)
 
-### 1.1 강제 지점 — wrapper와 broker 양쪽 (2026-07-24 갱신, CODEX-020)
+### 1.1 강제 지점 — wrapper와 broker 양쪽 (2026-07-25 갱신, CODEX-021/CODEX-020 잔여분)
 
 이 판정 함수들은 두 곳에서 각각 독립적으로 재조회된다:
 
 1. `paper_strategy_order.submit_order()` — 신규 진입/청산 주문 wrapper.
-2. `broker/alpaca_client.py::AlpacaBroker._request()`의 `_check_kill_switch(order_side)` —
-   broker network boundary 자체. `submit_order()`는 `order_side="buy"`/`"sell"`을 전달하고,
-   `get_account`/`get_positions`/`get_recent_orders`/`get_assets`/
-   `get_order_by_client_order_id`/`cancel_order`는 `order_side=None`을 전달해 kill switch 판정
-   대상에서 명시적으로 제외된다(조회·취소는 어떤 kill switch 상태에서도 계속 동작).
+2. `broker/alpaca_client.py::AlpacaBroker._request()`의
+   `_check_kill_switch(purpose, order_side=None)` — broker network boundary 자체. `_request()`는
+   기본값 없는 keyword-only `purpose`(`RequestPurpose` enum: `READ_ONLY`/`ENTRY_ORDER`/
+   `EXIT_ORDER`/`CANCEL_ORDER`/`RECONCILIATION`)를 필수로 요구하며, kill switch는 `purpose`가
+   `ENTRY_ORDER`/`EXIT_ORDER`일 때만 재조회한다. `submit_order()`는 `purpose=ENTRY_ORDER`
+   (buy)/`EXIT_ORDER`(sell)를 전달하고, `get_account`/`get_positions`/`get_recent_orders`/
+   `get_assets`는 `READ_ONLY`, `get_order_by_client_order_id`는 `RECONCILIATION`,
+   `cancel_order`는 `CANCEL_ORDER`를 전달해 kill switch 판정 대상에서 명시적으로 제외된다
+   (조회·취소는 어떤 kill switch 상태에서도 계속 동작). `order_side`는 이제 payload의 `side`와
+   `purpose`가 실제로 일치하는지 확인하는 2차 방어선일 뿐, 단독으로는 kill switch 여부를
+   판단하지 않는다.
 
 Codex 재검증(`CODEX-020`, HIGH)이 wrapper만으로는 `AlpacaBroker.submit_order()`를
 `paper_strategy_order.py`를 거치지 않고 직접 호출하는 경로가 두 kill switch 메커니즘을 모두
-우회한다고 지적한 뒤(구현 커밋 `66eda8a`, Codex 독립 재검증 대기 중), 2번 지점이 추가됐다.
+우회한다고 지적해(구현 커밋 `66eda8a`) 2번 지점이 처음 추가됐으나, 후속 재검증에서
+`order_side=None`을 명시하면 여전히 우회 가능하다는 신규 CODEX-021(HIGH)이 제기됐다. `_request()`를
+`RequestPurpose` 기반으로 재설계해(구현 커밋 `c133e01`, Codex 독립 재검증 대기 중) `purpose`가
+기본값 없는 필수 인자이자 HTTP method와의 허용 조합까지 강제하는 유일한 1차 신호가 되도록 했다.
 운영자가 kill switch를 켜거나 끌 때 이 이중 강제 지점을 별도로 다룰 필요는 없다 — `activate()`/
 `release()`가 갱신하는 상태 파일은 두 지점 모두에서 공유되며, `_check_kill_switch()`는 매 요청마다
 `kill_switch_state.get_state()`를 다시 조회하므로 캐시된 값을 쓰지 않는다.

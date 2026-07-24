@@ -86,3 +86,30 @@
 - 승인 필요 여부: 아니오(CODEX Finding에 대한 직접 수정, 자율 진행 범위). Codex 독립 재검증
   (`PROCEED`/`FAIL` 여부) 전까지 Limited live review는 `BLOCKED`, Live trading은 `DO_NOT_ENABLE`을
   유지한다.
+
+### 2026-07-25 — CODEX-021(HIGH)을 `order_side` 보강이 아니라 `RequestPurpose` enum 기반 재설계로 해결, CODEX-020 잔여분도 동일 설계로 함께 종결
+- 상황: Codex 독립 재검증(`CODEX_REVIEW.md`, overall verdict `FAIL`)이 `_request()`의 `order_side`가
+  필수 인자이긴 하지만 POST 경로와 의미적으로 결합돼 있지 않아, 명시적 `order_side=None`이
+  `_check_kill_switch(None)`을 즉시 반환시켜 direct POST가 kill switch를 우회한다고 지적했다
+  (CODEX-021, HIGH). 이전 사이클이 검증 패키지에서 주장한 "method+path 백스톱"이 실제로는
+  구현되지 않았다는 지적이며, CODEX-020(PARTIALLY_RESOLVED)의 잔여 위험과 근본 원인이 동일했다.
+- 결정: `order_side`에 추가 방어 분기를 덧붙이는 방식(예: `order_side is None`이면 path를 검사)은
+  기각하고, `_request()`의 1차 판단 신호 자체를 `order_side`에서 명시적 `RequestPurpose` enum으로
+  교체했다. `order_side`는 payload와 purpose의 일치를 확인하는 2차 방어선으로 격하했다.
+- 근거: `order_side`에 분기를 덧붙이는 방식은 "값이 없으면 안전하지 않은 기본 동작"이라는 동일한
+  구조적 취약점을 다른 조건문으로 옮길 뿐이었다 — 지시서와 Codex 요구 모두 "method/path 기반
+  분류가 정상 변형에도 결정적이어야 한다"고 명시했는데, 이는 별도의 명시적 분류 축(purpose)이
+  필요하다는 의미로 해석했다. `purpose`를 기본값 없는 필수 인자로 만들고 `_METHOD_PURPOSES`
+  매트릭스로 HTTP method와 조합을 강제하면, 새로운 호출부가 추가되어도 의도를 명시하지 않고는
+  세션에 도달할 수 없다.
+- 구현: `RequestPurpose` enum(`READ_ONLY`/`ENTRY_ORDER`/`EXIT_ORDER`/`CANCEL_ORDER`/
+  `RECONCILIATION`), `_METHOD_PURPOSES` 매트릭스, `_check_kill_switch(purpose, order_side=None)`
+  재설계, `submit_order()`의 payload `side` ↔ `purpose` 파생값 일치 재검증. CODEX-016~019는
+  이번 사이클 범위 밖이므로 코드를 건드리지 않고 관련 회귀 테스트 재실행으로만 확인했다.
+- 대안: (a) `order_side is None and method == "POST"`이면 차단 — 문자열 method 비교에 의존하고
+  향후 `purpose` 없는 새 order-shaped 엔드포인트가 추가되면 다시 우회 가능해 기각. (b) `order_side`
+  자체의 허용값에서 `None`을 없애고 모든 non-order 호출에 별도 sentinel 문자열(`"NOT_AN_ORDER"`
+  등)을 쓰게 하는 방식 — 여전히 단일 문자열 인자에 의미를 과적재하는 구조적 문제가 남아 기각.
+- 승인 필요 여부: 아니오(CODEX Finding에 대한 직접 수정, 자율 진행 범위). Codex 독립 재검증
+  (`PROCEED`/`FAIL` 여부) 전까지 Limited live review는 `BLOCKED`, Live trading은 `DO_NOT_ENABLE`을
+  유지한다.

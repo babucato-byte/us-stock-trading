@@ -67,6 +67,24 @@ Codex 독립 재검증(`CODEX_REVIEW.md`, 대상 커밋 `47ee8d6`/`03962d3`/`cf4
 | 운영 데이터 파일 변경 여부 (`order_history.csv`, `universe.csv`) | 변경 없음 | SHA-256이 `CODEX_REVIEW.md` 기록값과 동일 |
 | `.env`, kill switch/notification 상태 파일 변경 여부 | 없음 | 이번 사이클에서 생성/수정하지 않음 |
 
+### 1.3 CODEX-021 해결 및 CODEX-020 잔여분 종결 후 재확인 (2026-07-25)
+
+Codex 독립 재검증(`CODEX_REVIEW.md`, 대상 커밋 `66eda8a`/`ed452da`/`cf5601d`/`edc5ad5`)이 overall
+verdict **FAIL**을 내렸다: CODEX-016/017/018/019는 RESOLVED로 재확인됐으나 CODEX-020(HIGH)이
+PARTIALLY_RESOLVED로 남았고 신규 CODEX-021(HIGH, `order_side=None` 명시로 kill switch 우회)이
+제기됐다. 이번 사이클(t1, 커밋 `c133e01`)에서 `AlpacaBroker._request()`를 `RequestPurpose` enum
+기반으로 재설계해 두 항목을 함께 닫았다. CODEX-016~019는 코드를 재작업하지 않고 관련 회귀
+테스트만 재실행해 확인했다.
+
+| 확인 항목 | 결과 | 근거 |
+|---|---|---|
+| `venv/bin/python -m pytest -q` 전체 실행 | exit code 0, **536 passed, 0 failed, 2 warnings** | CODEX-021 해결 및 CODEX-020 잔여분 종결 커밋 `c133e01` 기준 |
+| 집중 안전 테스트 | **255 passed, 1 warning** | `test_broker_kill_switch_gate.py` + `test_broker_request_purpose.py`(신규) + `test_alpaca_client_runtime_revalidation.py` + `test_broker_safety.py` + `test_universe_builder.py` + `test_paper_strategy_order_kill_switch_state.py` + `test_paper_order_execution.py` |
+| CODEX-016~019 회귀 전용 | **36 passed, 1 warning** | `test_paper_strategy_order_kill_switch_state.py` + `test_paper_strategy_order_notification_health.py` + `test_state_store_concurrency.py` — 코드 변경 없이 회귀만 확인 |
+| 신규 안전 관련 warning 여부 | 없음 | 2건 warning은 기존 urllib3 LibreSSL 경고와 의도된 scanner unknown-field 경고뿐 |
+| 운영 데이터 파일 변경 여부 (`order_history.csv`, `universe.csv`) | 변경 없음 | 이전 사이클 기록값과 동일 |
+| `.env`, kill switch/notification 상태 파일 변경 여부 | 없음 | 이번 사이클에서 생성/수정하지 않음 |
+
 ## 2. Broker 설정 (실측: `broker/broker_config.py`, `risk_config.py`)
 
 | 항목 | 값 | 근거 |
@@ -99,7 +117,7 @@ Codex 독립 재검증(`CODEX_REVIEW.md`, 대상 커밋 `47ee8d6`/`03962d3`/`cf4
 |---|---|---|
 | 바이너리 halt (`kill_switch.is_trading_halted()`) | `False` (정지 아님) | `TRADING_HALTED` 환경변수 미설정, `KILL_SWITCH` 센티널 파일 없음(`ls KILL_SWITCH` → No such file or directory) |
 | 다단계 상태 (`kill_switch_state.get_state()`) | `ACTIVE` | 상태 파일 `KILL_SWITCH_STATE.json` 없음 → `kill_switch_state.py:105-108`에 의해 기본값 `ACTIVE` |
-| 강제 지점(enforcement point) | `paper_strategy_order.submit_order()` wrapper + `broker/alpaca_client.py::AlpacaBroker._request()` 양쪽 | CODEX-020(2026-07-24, 커밋 `66eda8a`) 이후 `_request()`가 `order_side`별로 binary halt와 4-state 정책을 직접 재조회해, wrapper를 거치지 않은 direct broker 호출도 동일하게 차단한다. Codex 독립 재검증 대기 중 |
+| 강제 지점(enforcement point) | `paper_strategy_order.submit_order()` wrapper + `broker/alpaca_client.py::AlpacaBroker._request()` 양쪽 | CODEX-021(2026-07-25, 커밋 `c133e01`) 이후 `_request()`가 `RequestPurpose`(`ENTRY_ORDER`/`EXIT_ORDER`일 때만)별로 binary halt와 4-state 정책을 직접 재조회해, wrapper를 거치지 않은 direct broker 호출도 동일하게 차단한다. `order_side`는 이제 payload와 purpose 일치를 확인하는 2차 방어선일 뿐, 단독으로는 kill switch를 판단하지 않는다. Codex 독립 재검증 대기 중 |
 | 상세 절차 | [KILL_SWITCH_RUNBOOK.md](./KILL_SWITCH_RUNBOOK.md) 참조 | |
 
 ## 5. Slack / 알림 상태 (실측: `notification_health.py`)
@@ -132,8 +150,8 @@ Codex 독립 재검증(`CODEX_REVIEW.md`, 대상 커밋 `47ee8d6`/`03962d3`/`cf4
 
 **최종 상태: `BLOCKED`**
 
-근거: CODEX-020(HIGH)·CODEX-018 잔여분(MEDIUM) 수정(커밋 `66eda8a`/`ed452da`)은 전체 회귀
-(489 passed)를 통과했으나 Codex 독립 재검증 전이다. 문서 상태는
+근거: CODEX-021(HIGH) 해결 및 CODEX-020(HIGH) 잔여분 종결(커밋 `c133e01`, `RequestPurpose`
+재설계)은 전체 회귀(536 passed)를 통과했으나 Codex 독립 재검증 전이다. 문서 상태는
 **`READY_FOR_CODEX_REVALIDATION`**이며 `READY_FOR_LIMITED_LIVE_REVIEW`로 승격하지 않는다.
 또한 6~7절의 운영자 기입 항목이 남아 있으므로 limited live review 및 실거래 전환을
 재개하지 않는다. **Limited live review: BLOCKED**, **Live trading: DO_NOT_ENABLE**.

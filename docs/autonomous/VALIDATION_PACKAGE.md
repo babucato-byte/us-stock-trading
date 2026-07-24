@@ -4,7 +4,97 @@
 
 ---
 
-## 이번 패키지: CODEX-020·CODEX-018 잔여분 수정 (2026-07-24)
+## 이번 패키지: CODEX-021 해결 및 CODEX-020 잔여분 종결 (RequestPurpose 재설계, 2026-07-25)
+
+### 검증 대상
+
+- 독립 검증 기록: `CODEX_REVIEW.md`(대상 커밋 `66eda8a`/`ed452da`/`cf5601d`/`edc5ad5`, overall
+  verdict **FAIL**)
+- 구현 커밋: `c133e01`(t1, CODEX-021 해결 및 CODEX-020 잔여분 종결)
+- 상태: **`READY_FOR_CODEX_REVALIDATION`**
+- limited live review: **`BLOCKED` 유지**
+- live trading: **`DO_NOT_ENABLE` 유지**
+
+### 배경
+
+이전 재검증에서 CODEX-016/017/018/019는 RESOLVED로 재확인됐으나 CODEX-020(HIGH)이
+PARTIALLY_RESOLVED로 남았고, 신규 CODEX-021(HIGH)이 제기됐다: `_request()`의 `order_side`는
+필수 인자였지만 POST 경로와 결합돼 있지 않아 `order_side=None`을 명시하면
+`_check_kill_switch(None)`이 method/path를 확인하지 않고 즉시 반환해, direct
+`_request("POST", "/v2/orders", order_side=None, ...)` 호출이 binary halt와 4-state kill
+switch를 모두 우회했다. 두 Finding 모두 같은 근본 원인(주문 여부를 판단할 단일 신뢰 가능한 신호
+부재)이었다.
+
+### CODEX-021 해결 및 CODEX-020 잔여분 종결
+
+- `broker/alpaca_client.py`에 신규 `RequestPurpose` enum(`READ_ONLY`/`ENTRY_ORDER`/
+  `EXIT_ORDER`/`CANCEL_ORDER`/`RECONCILIATION`)을 도입했다.
+- `_request()`의 `purpose`를 기본값 없는 keyword-only 필수 인자로 만들고, `isinstance(purpose,
+  RequestPurpose)`를 요구해 `None`을 포함한 잘못된 값을 `ValueError`로 세션 접근 전에 차단한다.
+- 신규 `_METHOD_PURPOSES` 매트릭스가 HTTP method와 purpose의 허용 조합을 강제한다: GET은
+  `READ_ONLY`/`RECONCILIATION`만, POST는 `ENTRY_ORDER`/`EXIT_ORDER`만, DELETE는
+  `CANCEL_ORDER`만 허용, 불일치는 세션 호출 전 `ValueError`.
+- `_check_kill_switch(purpose, order_side=None)`는 `purpose`가 `ENTRY_ORDER`/`EXIT_ORDER`일
+  때만 binary halt와 4-state 정책을 재조회한다. `order_side`는 이제 payload의 `side`와
+  `purpose`가 실제로 일치하는지 확인하는 2차 방어선이며, 단독으로는 kill switch를 판단하지 않는다.
+- `submit_order()`는 `_SIDE_TO_PURPOSE`(`buy→ENTRY_ORDER`, `sell→EXIT_ORDER`)로 `purpose`를
+  파생하고, 세션 호출 직전 payload의 `order["side"]`가 이 `purpose`와 여전히 일치하는지
+  재검증해(불일치 시 `RuntimeError`) 향후 코드 변경이 `side`와 `purpose`를 갈라놓는 사고를
+  방지한다.
+- 조회·취소 경로(`get_account`/`get_positions`/`get_recent_orders`/`get_assets`/
+  `get_order_by_client_order_id`/`cancel_order`)는 각각 `RequestPurpose.READ_ONLY`/
+  `RECONCILIATION`/`CANCEL_ORDER`를 명시해 kill switch 정책과 무관하게 계속 동작한다.
+
+### CODEX-016~019 (재작업 아님, 회귀만 확인)
+
+이번 사이클에서 CODEX-016(다단계 kill switch 배선)·017(Slack health 배선)·018(주문 직전
+credential/환경 재검증)·019(상태 저장소 파일 잠금)는 코드를 변경하지 않았다. 관련 회귀 테스트
+(`tests/test_paper_strategy_order_kill_switch_state.py` 12건,
+`tests/test_paper_strategy_order_notification_health.py` 6건,
+`tests/test_state_store_concurrency.py` 6건, 도합 **36 passed, 1 warning**)만 재실행해 회귀가
+없음을 확인했다.
+
+### 추가·수정 테스트
+
+- `tests/test_broker_request_purpose.py`(신규): `purpose=None`/누락/잘못된 타입 명시적 거부,
+  method-purpose 불일치 거부(GET+ENTRY_ORDER, POST+READ_ONLY 등), order payload의 `side`와
+  `purpose` 불일치 거부, 조회·취소 경로가 kill switch와 무관하게 계속 동작함을 검증.
+- `tests/test_broker_kill_switch_gate.py`: 기존 호출부를 `purpose` 키워드로 갱신하고, `purpose`
+  누락 시 `TypeError`, `order_side`만 주어지고 `purpose`가 없을 때 `TypeError`, `purpose=None`
+  명시 시 `ValueError`를 검증하는 신규 테스트 3건 추가.
+- 실패 테스트 삭제, 완화, skip, xfail 없음.
+
+### 실행 결과
+
+```text
+venv/bin/python -m pytest -q:  536 passed, 0 failed, 2 warnings
+집중 안전 테스트:                255 passed, 1 warning
+CODEX-016~019 회귀 전용:         36 passed, 1 warning
+```
+
+두 warning은 기존 urllib3 LibreSSL 경고와 의도된 scanner unknown-field 경고다.
+
+### 안전 검증
+
+- 실제 Alpaca, Slack, Yahoo 호출 0회. HTTP 검증은 recording session/fake만 사용.
+- broker 내부 `session.get/post/delete` 직접 호출 없음, `session.request`는 공통 `_request()`
+  한 곳에만 존재(purpose 기반 kill switch 검사와 credential 재검증이 그 안에 포함됨).
+- `order_history.csv`, `universe.csv`는 이전 사이클 기록값과 동일(불변, 이번 사이클도 미변경).
+- `.env`, approval/live flag, kill-switch/notification 상태 파일을 변경하지 않았다.
+- `approved: false`, `live_enabled: false` 유지.
+- main 병합과 origin push 없음.
+
+### Codex 재검증 초점
+
+1. `purpose=None` 및 method-purpose 불일치가 세션 호출 전에 실제로 차단되는지(CODEX-021 재현
+   시나리오 포함).
+2. 조회·취소 경로가 kill switch 상태와 무관하게 계속 동작하는지.
+3. `submit_order()`의 payload `side` ↔ `purpose` 일치 재검증이 실제로 동작하는지.
+4. CODEX-016/017/018/019에 회귀가 없는지.
+
+---
+
+## 이전 패키지: CODEX-020·CODEX-018 잔여분 수정 (2026-07-24)
 
 ### 검증 대상
 

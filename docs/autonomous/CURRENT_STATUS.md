@@ -1,6 +1,6 @@
 # CURRENT_STATUS
 
-마지막 갱신: 2026-07-24
+마지막 갱신: 2026-07-25
 
 ## 현재 Phase
 Phase 2 — 초단타 관심종목 선별 엔진 (`IMPLEMENTED`, CODEX-010~015 수정 완료, Codex 재검증 대기)
@@ -9,7 +9,47 @@ Phase 1 최종 판정(유지): **Phase 1A(주문 진입 안전성) = VALIDATED**
 
 Phase 3(1분봉 감시/지표/주문 로직)은 이번 사이클에서 착수하지 않음 — 사용자 지시에 따라 범위 외.
 
-## 제한적 실거래 검토 사이클 — CODEX-020·CODEX-018 잔여분 수정 (2026-07-24)
+## 제한적 실거래 검토 사이클 — CODEX-021 해결 및 CODEX-020 잔여분 종결 (2026-07-25)
+Codex 독립 재검증(`CODEX_REVIEW.md`, 대상 커밋 `66eda8a`/`ed452da`/`cf5601d`/`edc5ad5`)의 판정은
+**Overall verdict: FAIL**이었다. CODEX-016/017/018/019는 RESOLVED로 재확인됐으나, CODEX-020(HIGH)이
+PARTIALLY_RESOLVED로 남았고 신규 **CODEX-021(HIGH)**이 제기됐다 — `_request()`의 `order_side`가
+필수 인자이긴 했지만 POST 경로와 의미적으로 결합되지 않아, `broker._request("POST", "/v2/orders",
+order_side=None, ...)`처럼 명시적으로 `None`을 전달하면 `_check_kill_switch(None)`이 method/path를
+전혀 확인하지 않고 즉시 반환해 kill switch를 우회할 수 있었다.
+
+이번 사이클(t1)에서 `AlpacaBroker._request()`를 `order_side` 단일 신호가 아니라 신규
+`RequestPurpose` enum(`READ_ONLY`/`ENTRY_ORDER`/`EXIT_ORDER`/`CANCEL_ORDER`/`RECONCILIATION`)
+기반으로 재설계했다(커밋 `c133e01`):
+- **CODEX-021 (HIGH)**: `_request()`에 기본값 없는 keyword-only `purpose` 인자를 추가하고,
+  `isinstance(purpose, RequestPurpose)`를 요구해 `None`을 포함한 잘못된 값은 `ValueError`로
+  세션 접근 전에 차단한다. `_METHOD_PURPOSES` 매트릭스가 HTTP method(GET/POST/DELETE)와
+  purpose의 허용 조합을 명시적으로 검사해, 예컨대 POST가 `READ_ONLY`를 주장하거나 GET이
+  `ENTRY_ORDER`를 주장하는 불일치를 세션 호출 전에 거부한다. `_check_kill_switch()`는 이제
+  `purpose`가 `ENTRY_ORDER`/`EXIT_ORDER`일 때만 kill switch를 검사하며, `order_side`는 payload의
+  `side`와 `purpose`가 일치하는지 확인하는 2차 방어선으로만 쓰인다(`submit_order()`가
+  `_SIDE_TO_PURPOSE`로 파생한 `purpose`와 payload의 `order["side"]`가 다르면 세션 호출 전에
+  `RuntimeError`).
+- **CODEX-020 잔여분 (HIGH)**: 위와 동일한 재설계로 함께 닫혔다 — method+path 기반 주문 감지
+  백스톱이 없다는 지적이 `_METHOD_PURPOSES` 매트릭스로 해결됐다. 조회·취소 경로
+  (`get_account`/`get_positions`/`get_recent_orders`/`get_assets`/
+  `get_order_by_client_order_id`/`cancel_order`)는 각각 `RequestPurpose.READ_ONLY`/
+  `RECONCILIATION`/`CANCEL_ORDER`를 명시해 kill switch 정책과 무관하게 계속 동작한다.
+
+CODEX-016~019(다단계 kill switch 배선, Slack health 배선, 주문 직전 credential/환경 재검증,
+상태 저장소 파일 잠금)는 이번 사이클에서 **재작업하지 않았다** — 관련 회귀 테스트
+(`tests/test_paper_strategy_order_kill_switch_state.py` 12건, `tests/test_paper_strategy_order_notification_health.py`
+6건, `tests/test_state_store_concurrency.py` 6건, 도합 36 passed)로 회귀 없음만 확인했다.
+
+전체 회귀는 저장소 루트 `venv/bin/python -m pytest -q` 기준 **536 passed, 0 failed, 2 warnings**다.
+집중 테스트(`tests/test_broker_kill_switch_gate.py` + `tests/test_broker_request_purpose.py`(신규) +
+`tests/test_alpaca_client_runtime_revalidation.py` + `tests/test_broker_safety.py` +
+`tests/test_universe_builder.py` + `tests/test_paper_strategy_order_kill_switch_state.py` +
+`tests/test_paper_order_execution.py`) **255 passed, 1 warning**. `order_history.csv`/`universe.csv`
+SHA-256은 이전 사이클 기록값과 동일(불변), `.env`·kill switch/notification 상태 파일 변경 없음.
+현재 상태는 **`READY_FOR_CODEX_REVALIDATION`**이며, 독립 재검증 전까지 **Limited live review:
+BLOCKED**, **Live trading: DO_NOT_ENABLE**을 유지한다.
+
+## 이전 사이클 — CODEX-020·CODEX-018 잔여분 수정 (2026-07-24, 역사적 기록)
 최신 Codex 독립 재검증(`CODEX_REVIEW.md`, 대상 커밋 `47ee8d6`/`03962d3`/`cf4ada9`)의 판정은
 **Overall verdict: FAIL**이었다. CODEX-016/017/019는 RESOLVED로 재확인됐으나, CODEX-018(MEDIUM)이
 PARTIALLY_RESOLVED로 남았고 신규 **CODEX-020(HIGH)**이 제기됐다 — direct
@@ -51,25 +91,28 @@ binary kill switch(`kill_switch.is_trading_halted()`)와 다단계 kill switch
 - 전체 회귀 267 passed(레포 루트 `pytest -q`/`python -m pytest -q` 동일), 실제 외부 API 호출 0회, `order_history.csv` 해시 불변, 운영 파일 변경 없음 확인.
 
 ## 현재 테스트 수
-489 passed, 0 failed, 2 warnings
+536 passed, 0 failed, 2 warnings
 
 ## 실패 테스트
 없음
 
 ## 현재 블로커
-CODEX-020·CODEX-018 잔여분 수정에 대한 Codex 독립 재검증 대기. `approved: false`,
-`live_enabled: false` 유지. **Limited live review: BLOCKED**, **Live trading: DO_NOT_ENABLE**.
+CODEX-021 해결 및 CODEX-020 잔여분 종결(RequestPurpose 재설계)에 대한 Codex 독립 재검증 대기.
+`approved: false`, `live_enabled: false` 유지. **Limited live review: BLOCKED**,
+**Live trading: DO_NOT_ENABLE**.
 
 ## 다음 작업
 1. `VALIDATION_PACKAGE.md`/`VALIDATION_REPORT.md`/`REMEDIATION_PLAN.md`/`DECISION_LOG.md`/
-   `docs/live_review/*.md`를 CODEX-020·CODEX-018 잔여분 기준으로 갱신(완료, 이번 커밋).
-2. Codex 재검증 요청. `PROCEED` 판정 시 CODEX-016~020 전체를 RESOLVED로 최종 확정하고 limited
+   `docs/live_review/*.md`를 CODEX-021 해결 및 CODEX-020 잔여분 종결 기준으로 갱신(완료, 이번 커밋).
+2. Codex 재검증 요청. `PROCEED` 판정 시 CODEX-016~021 전체를 RESOLVED로 최종 확정하고 limited
    live review 재개 여부 판단.
 3. `~/Projects/ai-orchestrator`를 통해 실거래 직전 준비 작업 진행 중 — 신규 항목은 오케스트레이터
    run으로 별도 추적.
 4. Phase 5 착수 전 사용자 결정이 필요한 SQLite 관련 항목(`DECISION_LOG.md`, `NEEDS_USER_DECISION`)은 여전히 대기 중 — Phase 2/3와는 무관.
 
 ## 최근 커밋
+- `c133e01` CODEX-021/CODEX-020 잔여분: `_request()`를 RequestPurpose 기반으로 재설계하고 회귀 테스트 추가
+- `47ae3ca` Codex 독립 재검증 기록: FAIL, CODEX-020 partial, CODEX-021 신규
 - `ed452da` CODEX-018 잔여분: 공통 gate 에서 현재 credentials 재검증
 - `66eda8a` CODEX-020: broker `_request` 공통 경로에 kill switch 게이트 추가
 - `4f1f89d` Correct volume and premarket calculations (CODEX-015)
@@ -80,6 +123,6 @@ CODEX-020·CODEX-018 잔여분 수정에 대한 Codex 독립 재검증 대기. `
 - `a7736d5` Reject non-finite scalping candidate inputs (CODEX-010)
 
 ## 미반영 검증 지적사항
-없음. Phase 1의 CODEX-001~009, Phase 2의 CODEX-010~015, 제한적 실거래 검토의 CODEX-016~020 전부
-Claude 측 수정/테스트 완료. Codex 최종 재검증 대기 중(Phase 2 `PROCEED` 여부, CODEX-020·018 잔여분
-`RESOLVED` 여부 모두 미확정).
+없음. Phase 1의 CODEX-001~009, Phase 2의 CODEX-010~015, 제한적 실거래 검토의 CODEX-016~021 전부
+Claude 측 수정/테스트 완료. Codex 최종 재검증 대기 중(Phase 2 `PROCEED` 여부, CODEX-021 해결 및
+CODEX-020 잔여분 종결의 `RESOLVED` 여부 모두 미확정).

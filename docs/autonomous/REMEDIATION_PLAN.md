@@ -387,3 +387,82 @@ PARTIALLY_RESOLVED로 남았고, 신규 **CODEX-020(HIGH)**이 제기됐다.
 - main 병합, origin push, 운영 배포, 실거래 활성화 없음.
 - 상태는 **`READY_FOR_CODEX_REVALIDATION`**이며, 독립 재검증 전까지 **Limited live review:
   BLOCKED**, **Live trading: DO_NOT_ENABLE**을 유지한다.
+
+---
+
+## CODEX-021 해결 및 CODEX-020 잔여분 종결 사이클 (2026-07-25)
+
+검증 기준: `docs/autonomous/CODEX_REVIEW.md`(대상 커밋 `66eda8a`/`ed452da`/`cf5601d`/`edc5ad5`,
+overall verdict **FAIL**). CODEX-016/017/018/019는 RESOLVED로 재확인되어 이번 사이클에서 코드를
+변경하지 않았다. CODEX-020(HIGH)이 PARTIALLY_RESOLVED로 남았고, 신규 **CODEX-021(HIGH)**이
+제기됐다.
+
+### CODEX-021 — order-shaped `_request()`가 explicit `order_side=None`으로 Kill Switch를 우회함 (HIGH)
+
+- 재현: `_request("POST", "/v2/orders", order_side=None, ...)`를 ENTRY_DISABLED와 binary halt
+  각각에서 직접 호출하면 `_check_kill_switch(None)`이 HTTP method/path를 확인하지 않고 즉시
+  반환해, fake session request가 1회씩 실제로 나가는 것을 격리 재현으로 확인했다.
+- 원인: `_request()`는 `order_side` 누락만 Python `TypeError`로 막았고, `_check_kill_switch()`는
+  `order_side is None`이면 무조건 반환했다. 이 `None`이 "주문 아님"과 "주문인데 명시를 생략함"
+  두 의미를 동시에 가리켜, 후자로 호출해도 전자로 취급됐다. 이전 사이클 검증 패키지가 주장한
+  method+path 백스톱은 실제로 구현되지 않았다.
+- 수정: `broker/alpaca_client.py`에 신규 `RequestPurpose` enum(`READ_ONLY`/`ENTRY_ORDER`/
+  `EXIT_ORDER`/`CANCEL_ORDER`/`RECONCILIATION`)을 도입했다. `_request()`의 `purpose`를 기본값
+  없는 keyword-only 필수 인자로 만들고 `isinstance(purpose, RequestPurpose)`를 요구해 `None`을
+  포함한 잘못된 값은 `ValueError`로 세션 접근 전에 차단한다. 신규 `_METHOD_PURPOSES` 매트릭스가
+  HTTP method(GET/POST/DELETE)와 purpose의 허용 조합을 강제해, 불일치(예: POST가
+  `READ_ONLY`를 주장, GET이 `ENTRY_ORDER`를 주장)는 세션 호출 전 `ValueError`. 신규
+  `_check_kill_switch(purpose, order_side=None)`는 `purpose`가 `ENTRY_ORDER`/`EXIT_ORDER`일
+  때만 binary halt/4-state 정책을 재조회하며, `order_side`는 이제 payload의 `side`와 `purpose`가
+  일치하는지 확인하는 2차 방어선일 뿐 단독으로 kill switch를 판단하지 않는다.
+- 수정 파일: `broker/alpaca_client.py`
+- 테스트: `tests/test_broker_request_purpose.py`(신규, `purpose=None`/누락/잘못된 타입 거부,
+  method-purpose 불일치 거부, order payload `side`-`purpose` 불일치 거부, 조회·취소 경로가
+  kill switch와 무관하게 계속 동작함을 검증) + `tests/test_broker_kill_switch_gate.py`(기존
+  호출부를 `purpose` 키워드로 갱신, `purpose` 누락 시 `TypeError`/`order_side`만 있고 `purpose`가
+  없을 때 `TypeError`/`purpose=None` 명시 시 `ValueError` 신규 3건 추가).
+- 처리 상태: RESOLVED
+- 구현 커밋: `c133e01`
+
+### CODEX-020 잔여분 — method+path 기반 주문 감지 백스톱 부재 (HIGH)
+
+- 재현: CODEX-021과 동일한 재현(위 참고). Codex가 이전 사이클 검증 패키지의 method+path 백스톱
+  주장을 재현으로 반증했다.
+- 원인: CODEX-021과 동일 — `order_side`만으로는 주문 여부를 신뢰성 있게 판단할 수 없었다.
+- 수정: CODEX-021과 동일한 `RequestPurpose`/`_METHOD_PURPOSES` 재설계로 함께 해결됐다(별도
+  구현 없음). 조회·취소 경로(`get_account`/`get_positions`/`get_recent_orders`/`get_assets`/
+  `get_order_by_client_order_id`/`cancel_order`)는 각각 `RequestPurpose.READ_ONLY`/
+  `RECONCILIATION`/`CANCEL_ORDER`를 명시해 kill switch 정책과 무관하게 계속 동작하도록 재확인됐다.
+- 수정 파일: `broker/alpaca_client.py`(CODEX-021과 동일 변경)
+- 테스트: CODEX-021과 동일(위 참고).
+- 처리 상태: RESOLVED
+- 구현 커밋: `c133e01`
+
+### CODEX-016~019 — 재작업 아님, 회귀만 확인
+
+이번 사이클은 CODEX-016(다단계 kill switch 배선)·017(Slack health 배선)·018(주문 직전
+credential/환경 재검증)·019(상태 저장소 파일 잠금)의 코드를 변경하지 않았다. Codex가 네 항목
+모두 RESOLVED로 재확인했으므로, 관련 회귀 테스트만 재실행해 회귀가 없음을 확인했다:
+`tests/test_paper_strategy_order_kill_switch_state.py`(12건),
+`tests/test_paper_strategy_order_notification_health.py`(6건),
+`tests/test_state_store_concurrency.py`(6건), `tests/test_alpaca_client_runtime_revalidation.py`
+(44건, `purpose` 키워드 시그니처 변경만 반영, 로직 변경 없음) — 도합 회귀 없음.
+
+### 검증 결과
+
+- 집중 안전 테스트(`test_broker_kill_switch_gate.py` + `test_broker_request_purpose.py`(신규) +
+  `test_alpaca_client_runtime_revalidation.py` + `test_broker_safety.py` +
+  `test_universe_builder.py` + `test_paper_strategy_order_kill_switch_state.py` +
+  `test_paper_order_execution.py`): **255 passed, 1 warning**
+- CODEX-016~019 회귀 전용(`test_paper_strategy_order_kill_switch_state.py` +
+  `test_paper_strategy_order_notification_health.py` + `test_state_store_concurrency.py`):
+  **36 passed, 1 warning**
+- 전체: `venv/bin/python -m pytest -q` **536 passed, 0 failed, 2 warnings**(신규 안전 관련
+  warning 없음, 기존 urllib3/scanner 경고만).
+- broker 내부 직접 session 호출은 `_request()` 한 곳만 유지, purpose 기반 kill switch 검사와
+  credential 재검증 모두 이 경로 안에 포함됐다.
+- 실제 Alpaca/Slack/Yahoo 호출 0회, `order_history.csv`/`universe.csv`는 이전 사이클 기록값과
+  동일(불변), `.env`·kill switch/notification 상태 파일 변경 없음.
+- main 병합, origin push, 운영 배포, 실거래 활성화 없음.
+- 상태는 **`READY_FOR_CODEX_REVALIDATION`**이며, 독립 재검증 전까지 **Limited live review:
+  BLOCKED**, **Live trading: DO_NOT_ENABLE**을 유지한다.
