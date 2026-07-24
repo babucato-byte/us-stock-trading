@@ -113,3 +113,38 @@
 - 승인 필요 여부: 아니오(CODEX Finding에 대한 직접 수정, 자율 진행 범위). Codex 독립 재검증
   (`PROCEED`/`FAIL` 여부) 전까지 Limited live review는 `BLOCKED`, Live trading은 `DO_NOT_ENABLE`을
   유지한다.
+
+### 2026-07-25 — CODEX-022(HIGH)를 `_request()` 단일 중앙 집중식 3자 일치 검증으로 해결, CODEX-021 잔여 위험도 동일 지점에서 종결
+- 상황: Codex 독립 재검증(`CODEX_REVIEW.md`, 대상 커밋 `47ae3ca`/`c133e01`/`cc740a5`, overall
+  verdict `FAIL`)이 `RequestPurpose` 재설계(CODEX-021/CODEX-020 잔여분 대응, 커밋 `c133e01`) 이후에도
+  `_request()`가 주문 POST의 payload `side`와 `order_side`, `purpose`를 서로 대조하지 않는다고
+  지적했다(CODEX-022, HIGH) — `purpose=EXIT_ORDER`를 선언한 채 매수 payload(`json={"side": "buy"}`)를
+  보내면 `ENTRY_DISABLED` 상태에서도 HTTP가 나갔다. CODEX-021도 이 잔여 위험 때문에
+  `PARTIALLY_RESOLVED`로 남았다. 검증 패키지가 검증 대상으로 제시한 신규 테스트
+  `test_post_allows_entry_and_exit_purpose` 자체도 두 purpose 모두 동일한 buy payload를 사용해
+  이 불일치를 실제로 검증하지 않았다는 지적도 포함됐다.
+- 결정: `order_side`나 `purpose`에 추가 특수 케이스를 덧붙이는 방식이 아니라, `purpose` ×
+  `order_side` × payload `side`의 3자 일치를 한 곳에서 강제하는 신규 `validate_order_intent()`
+  함수를 만들어 `_request()`가 `self.session.request()`에 도달하기 전, 그리고 `_check_kill_switch()`
+  보다도 먼저 호출하도록 배선했다.
+- 근거: Codex가 지적한 근본 원인은 "주문의 실제 의미는 HTTP method가 아니라 payload side로
+  결정되는데 현재 매트릭스는 POST의 ENTRY/EXIT 선언만 신뢰한다"는 것이었다 — 즉 신뢰할 단일
+  진실 공급원이 세 값(purpose 선언, order_side, 실제 payload) 중 어느 하나가 아니라 세 값의 일치
+  자체여야 한다는 의미로 해석했다. 검증 로직을 `_check_kill_switch()` 내부에 흩어 넣지 않고 별도
+  함수로 분리한 이유는, 이 비교가 kill switch 정책 조회와 무관한 순수 무결성 검사이며 향후 재사용
+  ·단위 테스트가 쉬워야 하기 때문이다.
+- 구현: `broker/alpaca_client.py`에 `_PURPOSE_REQUIRED_SIDE`(`ENTRY_ORDER→"buy"`,
+  `EXIT_ORDER→"sell"`) 매핑과 `validate_order_intent(purpose, order_side, payload)`를 추가했다.
+  `ENTRY_ORDER`/`EXIT_ORDER`는 `order_side`와 payload의 `side`가 모두 존재하고, 정확히 요구되는
+  문자열과 대소문자/공백/타입까지 일치해야 한다(`isinstance(..., str)`이 `bool`/`int`도 함께
+  거부). `READ_ONLY`/`RECONCILIATION`/`CANCEL_ORDER`는 반대로 `order_side`와 payload의 `side`가
+  둘 다 부재해야 한다. `_request()`는 다른 어떤 안전장치(런타임 재검증, kill switch 조회)보다도
+  먼저 이 함수를 호출해, 불일치 시 세션 호출이 0회임을 보장한다.
+- 대안: (a) `_check_kill_switch()` 내부에서 검사 — kill switch 정책과 무결성 검증을 한 함수에
+  섞으면 향후 두 관심사가 서로 다른 속도로 바뀔 때(예: kill switch 상태 종류 추가) 무결성 검사가
+  실수로 함께 손상될 위험이 있어 기각. (b) `submit_order()`의 기존 defense-in-depth 재검증을
+  강화하는 방식 — CODEX-022 원문이 지적한 것과 동일하게 wrapper를 거치지 않는 direct `_request()`
+  호출은 여전히 무방비로 남으므로 기각.
+- 승인 필요 여부: 아니오(CODEX Finding에 대한 직접 수정, 자율 진행 범위). 이번 run 최종 상태는
+  `READY_FOR_CODEX_REVALIDATION`이며, Codex 독립 재검증(`PROCEED`/`FAIL` 여부) 전까지
+  **Limited live review: BLOCKED**, **Live trading: DO_NOT_ENABLE**을 유지한다.

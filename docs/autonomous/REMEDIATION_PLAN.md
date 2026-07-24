@@ -385,8 +385,8 @@ PARTIALLY_RESOLVED로 남았고, 신규 **CODEX-020(HIGH)**이 제기됐다.
 - 실제 Alpaca/Slack/Yahoo 호출 0회, `order_history.csv`/`universe.csv` SHA-256 불변, `.env`·kill
   switch/notification 상태 파일 변경 없음.
 - main 병합, origin push, 운영 배포, 실거래 활성화 없음.
-- 상태는 **`READY_FOR_CODEX_REVALIDATION`**이며, 독립 재검증 전까지 **Limited live review:
-  BLOCKED**, **Live trading: DO_NOT_ENABLE**을 유지한다.
+- 상태는 **`READY_FOR_CODEX_REVALIDATION`**이며, 독립 재검증 전까지 **Limited live review: BLOCKED**,
+  **Live trading: DO_NOT_ENABLE**을 유지한다.
 
 ---
 
@@ -464,5 +464,84 @@ credential/환경 재검증)·019(상태 저장소 파일 잠금)의 코드를 �
 - 실제 Alpaca/Slack/Yahoo 호출 0회, `order_history.csv`/`universe.csv`는 이전 사이클 기록값과
   동일(불변), `.env`·kill switch/notification 상태 파일 변경 없음.
 - main 병합, origin push, 운영 배포, 실거래 활성화 없음.
-- 상태는 **`READY_FOR_CODEX_REVALIDATION`**이며, 독립 재검증 전까지 **Limited live review:
-  BLOCKED**, **Live trading: DO_NOT_ENABLE**을 유지한다.
+- 상태는 **`READY_FOR_CODEX_REVALIDATION`**이며, 독립 재검증 전까지 **Limited live review: BLOCKED**,
+  **Live trading: DO_NOT_ENABLE**을 유지한다.
+
+---
+
+## CODEX-022 해결 및 CODEX-021 잔여분 종결 사이클 (2026-07-25)
+
+검증 기준: `docs/autonomous/CODEX_REVIEW.md`(대상 커밋 `47ae3ca`/`c133e01`/`cc740a5`, overall
+verdict **FAIL**). CODEX-016/017/018/019는 RESOLVED로 재확인되어 이번 사이클에서 코드를 변경하지
+않았다. CODEX-021(HIGH)이 PARTIALLY_RESOLVED로 남았고, 신규 **CODEX-022(HIGH)**가 제기됐다.
+
+### CODEX-022 — `_request()`가 purpose/order_side/payload side 3자를 서로 대조하지 않음 (HIGH)
+
+- 재현: `ENTRY_DISABLED` 상태에서 `purpose=EXIT_ORDER`, `order_side="sell"`, JSON `side="buy"`
+  (및 `order_side=None`, `order_side="buy"` 변형)로 `_request("POST", "/v2/orders", ...)`를 직접
+  호출하면 매번 fake session에 buy payload가 실제로 1회 전달되는 것을 격리 재현으로 확인했다.
+- 원인: `RequestPurpose` 재설계(CODEX-021, 커밋 `c133e01`)는 `purpose`를 HTTP method와만
+  결합했을 뿐, POST의 실제 의미(주문이 매수인지 매도인지)는 payload의 `side` 필드로 결정되는데
+  `_check_kill_switch()`는 `purpose`만 보고 `order_side`와 payload `side`를 서로 대조하지
+  않았다. 검증 패키지가 제시한 신규 테스트(`test_post_allows_entry_and_exit_purpose`)조차 두
+  purpose 모두 동일한 buy payload를 사용해 이 불일치를 가려버렸다.
+- 수정: `broker/alpaca_client.py`에 `_PURPOSE_REQUIRED_SIDE`(`ENTRY_ORDER→"buy"`,
+  `EXIT_ORDER→"sell"`) 매핑과 신규 `validate_order_intent(purpose, order_side, payload)`를
+  추가했다. `ENTRY_ORDER`/`EXIT_ORDER`는 `order_side`와 `payload["side"]`가 모두 존재하고 정확히
+  요구되는 문자열과 완전히 일치해야 한다(`isinstance(..., str)` 검사로 `bool`/`int` 및 대소문자
+  ·공백 변형까지 거부). `READ_ONLY`/`RECONCILIATION`/`CANCEL_ORDER`는 반대로 `order_side`와
+  payload의 `side`가 둘 다 없어야 한다. `_request()`는 `_validate_runtime_safety()`와
+  `_check_kill_switch()`보다도 먼저 이 함수를 호출해, 세 값 중 하나라도 불일치하면 세션 호출이
+  0회임을 보장한다. 이로써 CODEX-021의 잔여 위험(2차 방어선인 `order_side`가 payload와
+  실제로 대조되지 않던 문제)도 동일 지점에서 함께 닫혔다.
+- 수정 파일: `broker/alpaca_client.py`
+- 테스트: `tests/test_broker_order_intent_gate.py`(신규, 17건) — CODEX-022가 지적한 3가지 직접
+  재현 시나리오(purpose/order_side/payload side 불일치 각 조합) 전부가 세션 호출 0회로
+  차단됨을 확인, payload 누락/비-dict/알 수 없는 side 값(대소문자·공백·`True`/`1` 포함)도
+  전부 차단, `submit_order()`를 경유한 정상 buy/sell은 세션 호출 1회로 정상 진행됨을 확인.
+  `tests/test_broker_request_purpose.py`의 기존 `test_post_allows_entry_and_exit_purpose`를
+  ENTRY_ORDER/EXIT_ORDER 각각 실제로 다른(buy/sell) `order_side`+payload를 사용하도록 갱신해
+  이전에 두 purpose가 같은 payload로 가려지던 결함을 테스트 자체에서도 제거했다.
+- 처리 상태: RESOLVED
+- 구현 커밋: `5aac75b`
+
+### CODEX-021 잔여분 — `order_side`가 payload와 대조되지 않던 2차 방어선 공백 (HIGH)
+
+- 재현: CODEX-022와 동일한 재현(위 참고). Codex가 CODEX-021을 PARTIALLY_RESOLVED로 유지한
+  근거가 CODEX-022와 동일한 근본 원인이었다.
+- 원인: CODEX-022와 동일 — `order_side`는 필수 인자였지만 payload `side`와 비교되지 않아
+  "2차 방어선"으로서 실질적인 방어력이 없었다.
+- 수정: CODEX-022와 동일한 `validate_order_intent()`로 함께 해결됐다(별도 구현 없음).
+- 수정 파일: `broker/alpaca_client.py`(CODEX-022와 동일 변경)
+- 테스트: CODEX-022와 동일(위 참고).
+- 처리 상태: RESOLVED
+- 구현 커밋: `5aac75b`
+
+### CODEX-016~021(CODEX-022 제외분) — 재작업 아님, 회귀만 확인
+
+이번 사이클은 CODEX-016(다단계 kill switch 배선)·017(Slack health 배선)·018(주문 직전
+credential/환경 재검증)·019(상태 저장소 파일 잠금)의 코드를 변경하지 않았다. Codex가 네 항목
+모두 RESOLVED로 재확인했으므로, 관련 회귀 테스트만 재실행해 회귀가 없음을 확인했다:
+`tests/test_paper_strategy_order_kill_switch_state.py`(12건),
+`tests/test_paper_strategy_order_notification_health.py`(6건),
+`tests/test_state_store_concurrency.py`(6건) — 도합 **36 passed, 1 warning**, 회귀 없음.
+
+### 검증 결과
+
+- 집중 안전 테스트(`test_broker_kill_switch_gate.py` + `test_broker_request_purpose.py` +
+  `test_broker_order_intent_gate.py`(신규) + `test_alpaca_client_runtime_revalidation.py` +
+  `test_broker_safety.py` + `test_universe_builder.py` +
+  `test_paper_strategy_order_kill_switch_state.py` + `test_paper_order_execution.py`):
+  **289 passed, 1 warning**
+- CODEX-016~019 회귀 전용(`test_paper_strategy_order_kill_switch_state.py` +
+  `test_paper_strategy_order_notification_health.py` + `test_state_store_concurrency.py`):
+  **36 passed, 1 warning**
+- 전체: `venv/bin/python -m pytest -q` **570 passed, 0 failed, 2 warnings**(신규 안전 관련
+  warning 없음, 기존 urllib3/scanner 경고만).
+- broker 내부 직접 session 호출은 `_request()` 한 곳만 유지, `validate_order_intent()`가
+  `_check_kill_switch()`보다 먼저 실행되도록 배선됐다.
+- 실제 Alpaca/Slack/Yahoo 호출 0회, `order_history.csv`/`universe.csv`는 이전 사이클 기록값과
+  동일(불변, SHA-256 재확인), `.env`·kill switch/notification 상태 파일 변경 없음.
+- main 병합, origin push, 운영 배포, 실거래 활성화 없음.
+- 상태는 **`READY_FOR_CODEX_REVALIDATION`**이며, 독립 재검증 전까지 **Limited live review: BLOCKED**,
+  **Live trading: DO_NOT_ENABLE**을 유지한다.

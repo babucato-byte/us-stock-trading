@@ -4,7 +4,99 @@
 
 ---
 
-## 이번 패키지: CODEX-021 해결 및 CODEX-020 잔여분 종결 (RequestPurpose 재설계, 2026-07-25)
+## 이번 패키지: CODEX-022 해결 및 CODEX-021 잔여분 종결 (validate_order_intent 3자 일치 검증, 2026-07-25)
+
+### 검증 대상
+
+- 독립 검증 기록: `CODEX_REVIEW.md`(대상 커밋 `47ae3ca`/`c133e01`/`cc740a5`, overall verdict
+  **FAIL**)
+- 구현 커밋: `5aac75b`(t1, CODEX-022 해결 및 CODEX-021 잔여분 종결)
+- 상태: **`READY_FOR_CODEX_REVALIDATION`**
+- limited live review: **`BLOCKED` 유지**
+- live trading: **`DO_NOT_ENABLE` 유지**
+
+### 배경
+
+이전 재검증에서 CODEX-016/017/018/019는 RESOLVED로 재확인됐으나 CODEX-021(HIGH)이
+PARTIALLY_RESOLVED로 남았고, 신규 CODEX-022(HIGH)가 제기됐다: `RequestPurpose` 재설계(커밋
+`c133e01`)는 `purpose`를 HTTP method와 결합하는 데는 성공했지만, POST의 실제 의미(매수인지
+매도인지)를 결정하는 payload의 `side` 필드는 `purpose`/`order_side`와 대조하지 않았다.
+`purpose=EXIT_ORDER`, `order_side="sell"`을 선언한 채 JSON payload에 `side="buy"`를 담아
+전송하면(혹은 그 반대 조합) `ENTRY_DISABLED` 상태에서도 세션 호출이 그대로 나갔다.
+
+### CODEX-022 해결 및 CODEX-021 잔여분 종결
+
+- `broker/alpaca_client.py`에 `_PURPOSE_REQUIRED_SIDE`(`ENTRY_ORDER→"buy"`,
+  `EXIT_ORDER→"sell"`) 매핑을 추가했다.
+- 신규 `validate_order_intent(purpose, order_side, payload)`가 `purpose` × `order_side` ×
+  `payload["side"]`의 3자 일치를 단일 지점에서 강제한다: `ENTRY_ORDER`/`EXIT_ORDER`는
+  `order_side`와 payload `side`가 모두 존재하고, 정확히 요구되는 문자열과 완전히 일치해야 한다
+  (`isinstance(..., str)` 검사가 `bool`/`int`뿐 아니라 `"BUY"`/`" buy"`/`"sell "` 같은 대소문자
+  ·공백 변형도 거부). `READ_ONLY`/`RECONCILIATION`/`CANCEL_ORDER`는 반대로 `order_side`와
+  payload `side`가 둘 다 없어야 한다.
+- `_request()`는 `_validate_runtime_safety()`/`_check_kill_switch()` 등 다른 어떤 안전장치보다도
+  먼저 `validate_order_intent()`를 호출해, 세 값 중 하나라도 불일치하면
+  `self.session.request()`에 도달하기 전에 `ValueError`로 차단한다.
+- CODEX-021의 잔여 위험(`order_side`가 payload와 실제로 대조되지 않아 2차 방어선으로서 실질적
+  방어력이 없던 문제)도 동일한 함수로 함께 닫혔다 — 별도 구현 없음.
+
+### CODEX-016~019 (재작업 아님, 회귀만 확인)
+
+이번 사이클에서 CODEX-016(다단계 kill switch 배선)·017(Slack health 배선)·018(주문 직전
+credential/환경 재검증)·019(상태 저장소 파일 잠금)는 코드를 변경하지 않았다. 관련 회귀 테스트
+(`tests/test_paper_strategy_order_kill_switch_state.py` 12건,
+`tests/test_paper_strategy_order_notification_health.py` 6건,
+`tests/test_state_store_concurrency.py` 6건, 도합 **36 passed, 1 warning**)만 재실행해 회귀가
+없음을 확인했다.
+
+### 추가·수정 테스트
+
+- `tests/test_broker_order_intent_gate.py`(신규, 17건): CODEX-022가 직접 재현한 3가지 시나리오
+  (`purpose=EXIT_ORDER`+`order_side="sell"`+`side="buy"`, `order_side=None`+`side="buy"`,
+  `order_side="buy"`+`side="buy"`, 모두 `EXIT_ORDER` 선언 하에서) 전부 세션 호출 0회로 차단됨을
+  확인. payload 누락/`side` 키 부재/비-dict body/대소문자·공백 변형/`True`·`1` 같은 타입 오류도
+  전부 차단. `submit_order()`를 경유한 정상 buy/sell은 세션 호출 1회로 정상 진행됨을 확인해
+  이번 수정이 정상 경로를 깨지 않았음을 검증.
+- `tests/test_broker_request_purpose.py`: 기존 `test_post_allows_entry_and_exit_purpose`가
+  ENTRY_ORDER/EXIT_ORDER 양쪽에 동일한 buy payload를 사용해 CODEX-022가 지적한 불일치를 가리고
+  있던 결함을 수정 — 이제 각 purpose에 맞는 실제 `order_side`+payload(`buy`/`sell`)를 사용한다.
+- 실패 테스트 삭제, 완화, skip, xfail 없음.
+
+### 실행 결과
+
+```text
+venv/bin/python -m pytest -q:  570 passed, 0 failed, 2 warnings
+집중 안전 테스트:                289 passed, 1 warning
+CODEX-016~019 회귀 전용:         36 passed, 1 warning
+```
+
+두 warning은 기존 urllib3 LibreSSL 경고와 의도된 scanner unknown-field 경고다.
+
+### 안전 검증
+
+- 실제 Alpaca, Slack, Yahoo 호출 0회. HTTP 검증은 recording session/fake만 사용.
+- broker 내부 `session.get/post/delete` 직접 호출 없음, `session.request`는 공통 `_request()`
+  한 곳에만 존재(`validate_order_intent()`가 kill switch 검사보다 먼저 실행되도록 배선됐다).
+- `order_history.csv`, `universe.csv`는 이전 사이클 기록값과 동일(불변, SHA-256 재확인, 이번
+  사이클도 미변경).
+- `.env`, approval/live flag, kill-switch/notification 상태 파일을 변경하지 않았다.
+- `approved: false`, `live_enabled: false` 유지.
+- main 병합과 origin push 없음.
+- 상태는 **`READY_FOR_CODEX_REVALIDATION`**이며, 독립 재검증 전까지 **Limited live review: BLOCKED**,
+  **Live trading: DO_NOT_ENABLE**을 유지한다.
+
+### Codex 재검증 초점
+
+1. `purpose`/`order_side`/payload `side` 3자 불일치의 모든 조합(CODEX-022 재현 시나리오 포함)이
+   세션 호출 전에 실제로 차단되는지.
+2. payload 누락, 비-dict body, 대소문자·공백·타입 변형(`True`/`1` 등)도 모두 차단되는지.
+3. 조회·취소 경로가 이번 변경 이후에도 kill switch 상태와 무관하게 계속 동작하는지.
+4. `submit_order()`의 정상 buy/sell 경로가 회귀 없이 동작하는지.
+5. CODEX-016/017/018/019에 회귀가 없는지.
+
+---
+
+## 이전 패키지: CODEX-021 해결 및 CODEX-020 잔여분 종결 (RequestPurpose 재설계, 2026-07-25)
 
 ### 검증 대상
 
