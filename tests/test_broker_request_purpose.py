@@ -149,12 +149,19 @@ def test_binary_halt_direct_post_with_invalid_purpose_never_reaches_http(monkeyp
 # (e) Method x purpose matrix.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("purpose", [RequestPurpose.ENTRY_ORDER, RequestPurpose.EXIT_ORDER])
-def test_post_allows_entry_and_exit_purpose(monkeypatch, tmp_path, purpose):
+@pytest.mark.parametrize(
+    "purpose, side",
+    [(RequestPurpose.ENTRY_ORDER, "buy"), (RequestPurpose.EXIT_ORDER, "sell")],
+)
+def test_post_allows_entry_and_exit_purpose(monkeypatch, tmp_path, purpose, side):
     _isolate_binary_halt(monkeypatch, tmp_path)
     broker = _make_broker()
 
-    broker._request("POST", "/v2/orders", purpose=purpose, json={"side": "buy"})
+    # CODEX-022: order_side and json["side"] must both agree with purpose --
+    # see test_broker_order_intent_gate.py for the exhaustive 3-way matrix.
+    broker._request(
+        "POST", "/v2/orders", purpose=purpose, order_side=side, json={"side": side}
+    )
 
     assert len(broker.session.posts) == 1
 

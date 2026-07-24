@@ -47,6 +47,71 @@ _SIDE_TO_PURPOSE = {
     "sell": RequestPurpose.EXIT_ORDER,
 }
 
+# The side each order-shaped purpose is required to carry, both as
+# order_side and as the outgoing json payload's "side" field. Used
+# exclusively by validate_order_intent() below.
+_PURPOSE_REQUIRED_SIDE = {
+    RequestPurpose.ENTRY_ORDER: "buy",
+    RequestPurpose.EXIT_ORDER: "sell",
+}
+
+
+def validate_order_intent(purpose, order_side, payload):
+    """The single centralized 3-way consistency gate: purpose x order_side x
+    payload["side"] (CODEX-022, closing the CODEX-021 remainder).
+
+    Every other gate in _request() validates purpose against the HTTP
+    method, and order_side against {"buy", "sell", None}, each in
+    isolation -- but nothing compared them against each other or against
+    the outgoing JSON body itself. Before this function existed, a caller
+    could pass purpose=EXIT_ORDER, order_side="sell" while the JSON payload
+    still said {"side": "buy"} (or omitted "side" entirely, or spelled it
+    "BUY" / " buy" / "sell " / True / 1) and every prior gate would wave it
+    through to self.session.request() unexamined.
+
+    This is the only place in the codebase that performs this comparison;
+    no other call site -- including submit_order()'s own defense-in-depth
+    check -- should reimplement it. _request() calls this before
+    self.session.request() is ever reached, and before _check_kill_switch()
+    so a mismatch never has a side effect beyond raising.
+    """
+    required_side = _PURPOSE_REQUIRED_SIDE.get(purpose)
+
+    if required_side is not None:
+        # ENTRY_ORDER / EXIT_ORDER: order_side and the payload's "side" must
+        # both be present and must both equal the one side this purpose
+        # permits.
+        if order_side is None:
+            raise ValueError(f"order_side must not be None for purpose {purpose.name}")
+        if not isinstance(payload, dict):
+            raise ValueError(
+                f"purpose {purpose.name} requires a dict json payload, got {type(payload).__name__}"
+            )
+        if "side" not in payload:
+            raise ValueError(f"purpose {purpose.name} requires json payload to contain 'side'")
+
+        payload_side = payload["side"]
+        # isinstance(..., str) also rejects bool/int (True/1 are not str
+        # instances), and the exact-literal comparison rejects case or
+        # whitespace variants such as "BUY", " buy", "sell ".
+        if not isinstance(payload_side, str) or payload_side not in ("buy", "sell"):
+            raise ValueError(
+                f"json payload 'side' must be exactly 'buy' or 'sell', got {payload_side!r}"
+            )
+
+        if order_side != required_side or payload_side != required_side:
+            raise ValueError(
+                f"purpose/order_side/payload mismatch for {purpose.name}: "
+                f"order_side={order_side!r}, payload side={payload_side!r}, required={required_side!r}"
+            )
+    else:
+        # READ_ONLY / RECONCILIATION / CANCEL_ORDER: no order-side signal is
+        # permitted anywhere -- neither as order_side nor inside a json body.
+        if order_side is not None:
+            raise ValueError(f"order_side must be None for purpose {purpose.name}, got {order_side!r}")
+        if isinstance(payload, dict) and "side" in payload:
+            raise ValueError(f"json payload must not contain 'side' for purpose {purpose.name}")
+
 
 @dataclass
 class BrokerResponse:
@@ -198,6 +263,13 @@ class AlpacaBroker:
 
         if order_side is not None and order_side not in {"buy", "sell"}:
             raise ValueError(f"order_side must be 'buy', 'sell', or None, got {order_side!r}")
+
+        # CODEX-022: the centralized 3-way check must run before any other
+        # safety gate that could have a side effect (kill switch state
+        # reads, credential revalidation), and always before
+        # self.session.request() -- a mismatch means zero session calls,
+        # regardless of what the kill switch state would otherwise allow.
+        validate_order_intent(purpose, order_side, kwargs.get("json"))
 
         self._validate_runtime_safety()
         self._check_kill_switch(purpose, order_side)
