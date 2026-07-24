@@ -1,12 +1,12 @@
 # CODEX_REVIEW
 
-Review target: CODEX-018 잔여분 및 CODEX-020 수정 독립 재검증
+Review target: CODEX-021 및 CODEX-020 잔여분 최종 수정 독립 재검증
 
-Commits: `66eda8a`, `ed452da`, `cf5601d`, `edc5ad5`
+Commits: `47ae3ca`, `c133e01`, `cc740a5`
 
-Validation package SHA-256: `173338b830c0b99b329ac7f430480c411f517d7e16e63abb11d7eb77a2154736`
+Validation package SHA-256: `4eb064d74ac0471788d63a0f9990e6bb81250c052c6890928fee5cda90c5f63d`
 
-Date: 2026-07-24
+Date: 2026-07-25
 
 Overall verdict: **FAIL**
 
@@ -14,29 +14,32 @@ Limited live review: **BLOCKED**
 
 Live trading: **DO_NOT_ENABLE**
 
-public broker 주문의 binary/4-state Kill Switch 적용과 현재 credential 재검증은 해결됐다. 그러나 검증 패키지가 해결했다고 주장한 method+path 백스톱은 구현되지 않았다. `_request("POST", "/v2/orders", order_side=None, ...)`처럼 `None`을 명시하면 Kill Switch 검사를 건너뛰고 ENTRY_DISABLED와 binary halt 상태에서 각각 HTTP가 1회 호출된다. 신규 HIGH Finding이므로 limited live review로 진행할 수 없다.
+`RequestPurpose` 도입으로 `purpose` 누락·`None`·잘못된 method 조합은 HTTP 전에 차단되고 public `submit_order()`도 안전하다. 그러나 공통 HTTP 경계 `_request()`는 주문 payload의 `side`, `order_side`, `purpose`가 서로 일치하는지 검증하지 않는다. 따라서 `ENTRY_DISABLED` 상태에서 `purpose=EXIT_ORDER`와 매수 payload를 전달하면 HTTP가 호출된다. 이전 HIGH 우회가 다른 인자 조합으로 여전히 가능하므로 최종 승인 조건을 충족하지 못한다.
 
-## Previous findings
+## Previous findings verification
 
-### [CODEX-018]
+### [CODEX-021]
 
-Status: **RESOLVED**
+Status: **PARTIALLY_RESOLVED**
 
 Evidence:
 
-- `_validate_runtime_safety()`가 매 요청 직전 `BrokerConfig.from_env()`로 현재 credentials를 다시 읽는다.
-- 현재 API key/secret의 누락, 공백, 교체 및 환경 조회 예외를 fail-closed 처리한다.
-- captured credentials와 현재 값은 `hmac.compare_digest()`로 비교하며 예외 메시지에 secret 원문을 포함하지 않는다.
-- GET, POST, DELETE 모두 공통 `_request()`를 사용한다.
+- `_request()`의 `purpose`는 기본값 없는 keyword-only 필수 인자다.
+- `purpose=None` 및 enum이 아닌 값은 runtime `isinstance` 검사에서 `ValueError`가 발생하며 session 호출은 0회다.
+- 옛 `order_side`만 전달하고 `purpose`를 생략하면 `TypeError`, 잘못된 method-purpose 조합은 `ValueError`이며 모두 session 호출 전이다.
+- public `submit_order(side="buy")`는 `ENTRY_ORDER`, sell은 `EXIT_ORDER`를 선택하고 local payload도 재검증한다.
+- 하지만 `_request()`는 POST 주문 payload의 `side`와 `purpose`를 결합하지 않는다. `order_side`도 선택 인자이며 payload와 일치 검사가 없다.
 
-Direct reproduction:
+Direct reproduction under `ENTRY_DISABLED`:
 
-- broker 생성 후 API key 삭제 상태에서 GET·POST·DELETE 총 session 호출 0회.
-- unsafe mode/endpoint 변경 차단 테스트와 기존 reconciliation/cancel 경로 테스트가 통과했다.
+- `purpose=EXIT_ORDER`, `order_side="sell"`, JSON `side="buy"` → HTTP 1회.
+- `purpose=EXIT_ORDER`, `order_side=None`, JSON `side="buy"` → HTTP 1회.
+- `purpose=EXIT_ORDER`, `order_side="buy"`, JSON `side="buy"` → HTTP 1회.
+- 세 호출 모두 recording fake session에 매수 payload가 전달됐다.
 
 Remaining risk:
 
-- credential rotation은 기존 객체를 자동 갱신하지 않고 새 broker 생성을 요구한다. 문서화된 의도와 일치한다.
+- private 메서드라도 모든 broker HTTP가 통과하는 공통 network boundary다. 향후 주문 경로가 잘못된 purpose를 지정하거나 내부 호출이 추가되면 ENTRY_DISABLED를 우회해 매수 주문을 전송할 수 있다.
 
 ### [CODEX-020]
 
@@ -44,77 +47,62 @@ Status: **PARTIALLY_RESOLVED**
 
 Evidence:
 
-- public `AlpacaBroker.submit_order()`는 binary halt와 4-state Kill Switch를 network boundary에서 재검사한다.
-- ENTRY_DISABLED는 buy를 차단하고 sell liquidation을 허용한다.
-- ALL_TRADING_DISABLED/MANUAL_REVIEW 및 손상 state는 buy/sell 모두 차단한다.
-- account, positions, reconciliation 및 cancel은 명시된 read/cancel 정책에 따라 계속 허용된다.
-- 그러나 `_request()`의 `order_side`는 필수 인자일 뿐 POST path와 의미적으로 결합되지 않는다. 명시적 `None`은 `_check_kill_switch()`에서 즉시 반환한다.
-
-Direct reproduction:
-
-- ENTRY_DISABLED에서 public buy → HTTP 0회, public sell → HTTP 1회(정책과 일치).
-- binary halt에서 public buy → HTTP 0회.
-- ENTRY_DISABLED에서 `_request("POST", "/v2/orders", order_side=None, ...)` → HTTP 1회.
-- binary halt에서 같은 explicit-None direct POST → HTTP 1회.
+- public buy/sell, binary halt, 4-state Kill Switch 정책과 read/reconciliation/cancel 예외는 집중 회귀에서 통과했다.
+- `RequestPurpose`의 method 매트릭스는 GET/POST/DELETE 용도 오분류를 차단한다.
+- 그러나 주문의 실제 의미는 HTTP method가 아니라 payload side로 결정되며, 현재 매트릭스는 POST의 ENTRY/EXIT 선언만 신뢰한다.
 
 Remaining risk:
 
-- private 공통 network boundary를 직접 호출하거나 향후 order method가 실수로 `order_side=None`을 넘기면 모든 주문 정지 정책을 우회한다.
+- 선언된 `EXIT_ORDER`와 실제 buy payload 불일치가 network boundary에서 허용된다.
 
-## Regression findings
-
-### [CODEX-016]
+### [CODEX-018]
 
 Status: **RESOLVED**
 
-Evidence: strict buy/sell 전달과 payload 보존 테스트가 통과했고 이번 변경에 회귀가 없다.
+Evidence: 모든 요청 직전 현재 credential 및 mode/endpoint를 재검증하는 기존 회귀가 통과했다.
 
-### [CODEX-017]
-
-Status: **RESOLVED**
-
-Evidence: notification health 기록·escalation·주문 차단 경로가 집중 회귀에서 통과했다.
-
-### [CODEX-019]
+### [CODEX-016], [CODEX-017], [CODEX-019]
 
 Status: **RESOLVED**
 
-Evidence: 상태 저장소 multiprocessing lost-update 및 lock timeout 테스트가 통과했다.
+Evidence: 주문 side/payload 보존, notification health/escalation, multiprocessing state-store 회귀가 집중 테스트에서 통과했다.
 
 ## New findings
 
-### [CODEX-021] HIGH — order-shaped `_request()`가 explicit `order_side=None`으로 Kill Switch를 우회함
+### [CODEX-022] HIGH — EXIT_ORDER 선언으로 ENTRY_DISABLED 매수 payload를 전송할 수 있음
 
 Status: **UNRESOLVED**
 
 Evidence:
 
-- `_request()`는 `order_side` 누락만 Python TypeError로 막는다.
-- `_check_kill_switch(None)`은 HTTP method/path/body를 확인하지 않고 반환한다.
-- 구현 및 테스트에 보고서가 주장한 method+path 주문 감지 백스톱이 없다.
-- ENTRY_DISABLED와 binary halt에서 직접 POST session 호출을 각각 재현했다.
+- `_METHOD_PURPOSES["POST"]`는 ENTRY_ORDER와 EXIT_ORDER를 모두 허용하지만 body를 검사하지 않는다.
+- `_check_kill_switch()`는 `purpose`만 사용하고 `order_side` 및 JSON payload를 목적과 대조하지 않는다.
+- 신규 테스트 `test_post_allows_entry_and_exit_purpose`도 두 purpose 모두에 동일한 buy payload를 사용하여 불일치를 허용한다.
+- 위 세 가지 직접 재현에서 session 호출과 buy payload 전달을 확인했다.
 
 Required behavior:
 
-- POST `/v2/orders` 등 주문 생성 endpoint에서는 `order_side=None`을 HTTP 이전에 거부해야 한다.
-- request payload의 `side`와 `order_side`가 정확히 일치하는지 검증해야 한다.
-- method/path 기반 분류는 query/trailing slash 등 정상 변형에도 결정적이어야 한다.
-- 내부 public method뿐 아니라 공통 network boundary 직접 호출 테스트에서 session 호출 0회를 보장해야 한다.
+- 주문 POST의 공통 session 경계에서 `order_side`와 JSON `side`를 필수로 요구한다.
+- `ENTRY_ORDER ↔ buy`, `EXIT_ORDER ↔ sell`, `order_side ↔ payload side`를 모두 정확히 일치시킨다.
+- 누락, `None`, 비-dict body, 알 수 없는 side 및 모든 불일치는 session 접근 전에 fail-closed 처리한다.
+- mismatch 각각에 대해 session 호출 0회를 보장하는 회귀 테스트를 추가한다.
 
 ## Executed tests
 
-- 신규 안전 집중 4개 파일 → **81 passed, 1 warning**
-- 저장소 루트 `venv/bin/pytest -q` → **489 passed, 2 warnings**
-- 저장소 루트 `venv/bin/python -m pytest -q` → **489 passed, 2 warnings**
-- 저장소 상위 `venv/bin/pytest us-stock-trading -q` → **489 passed, 2 warnings**
-- 저장소 상위 `venv/bin/python -m pytest us-stock-trading -q` → **489 passed, 2 warnings**
-- public/private Kill Switch 및 credential 격리 재현
+- 주문·Kill Switch·runtime credential·notification·state-store 집중 6개 파일 → **152 passed, 1 warning**
+- 저장소 루트 `venv/bin/pytest -q` → **536 passed, 2 warnings**
+- 저장소 루트 `venv/bin/python -m pytest -q` → **536 passed, 2 warnings**
+- 저장소 상위 `venv/bin/python -m pytest us-stock-trading -q` → **536 passed, 2 warnings**
+- CODEX-021 기존 exploit 3종 → 모두 session 호출 0회.
+- CODEX-022 purpose/side/payload mismatch 3종 → 모두 session 호출 1회.
 
-Warnings:
+전체 테스트는 통과하지만 CODEX-022의 음성 테스트가 없으므로 안전성 해결의 근거가 되지 않는다.
 
-- urllib3 `NotOpenSSLWarning`: macOS LibreSSL 환경 경고다.
-- scanner unknown-field `RuntimeWarning`: 의도된 기존 테스트 경고다.
-- 신규 안전 관련 warning은 없다.
+## Warnings review
+
+- urllib3 `NotOpenSSLWarning`: macOS LibreSSL 환경 호환성 경고다.
+- scanner unknown-field `RuntimeWarning`: 미지원 필드를 의도적으로 건너뛰는 기존 테스트 경고다.
+- 두 경고 모두 이번 주문 우회와 직접 관련되지 않는다.
 
 ## Kill-switch policy verification
 
@@ -122,46 +110,47 @@ Warnings:
 - ENTRY_DISABLED: public buy 차단, public sell 허용.
 - ALL_TRADING_DISABLED/MANUAL_REVIEW: public buy/sell 차단.
 - binary halt: public buy/sell 차단.
-- read-only 조회와 cancel은 Kill Switch와 무관하게 허용하는 문서 정책과 일치한다.
-- explicit-None private POST만 정책을 우회한다.
-
-## Credential verification
-
-- 누락·공백·교체·환경 조회 실패는 모든 GET/POST/DELETE 전에 차단된다.
-- stale captured credential은 현재 환경과 다르면 사용되지 않는다.
-- secret 값은 오류 메시지에 노출되지 않는다.
+- READ_ONLY/RECONCILIATION/CANCEL_ORDER는 문서 정책대로 허용.
+- 단, ENTRY_DISABLED + direct EXIT_ORDER/buy-payload 조합은 차단되지 않는다.
 
 ## Network safety
 
 - 실제 Alpaca, Slack, Yahoo 호출은 수행하지 않았다.
-- 모든 HTTP 검증은 recording fake session을 사용했다.
-- 공식 테스트에서 실제 외부 socket 연결 증거는 없었다.
+- 직접 재현은 recording fake session만 사용했다.
+- 테스트 중 실제 외부 호출 증거는 없었다.
 
 ## Operational file safety
 
 - `order_history.csv`: SHA-256 `153feb31c2539c19cd60f63e3f90d0d0f734ba7a209ed1800af7c0070a0a91c7`, 31 bytes, mtime `1784558966` 불변.
 - `universe.csv`: SHA-256 `9fdaf3ac0ba7d94e24b6276fc603709a0c79c6842cf8143b8a242acdd16188b3`, 833518 bytes, mtime `1784558966` 불변.
-- `order_reconciliation.csv`, `scalping_watchlist.csv`, Kill Switch/notification runtime 파일은 검증 전후 모두 존재하지 않았다.
-- `LIVE_APPROVAL_RECORD.md`: SHA-256 `27e640537c41334859eb8ad89eb3d013b17b0c95b8abf7b5385e2b76adbd5bfe`, `approved: false`, `live_enabled: false`, 상태 `BLOCKED`로 불변.
-- 전체 테스트가 `strategy_performance.csv` mtime만 갱신했으나 내용·크기는 불변이었고 이번 검증 기준 mtime으로 복원했다.
+- `order_reconciliation.csv`, `scalping_watchlist.csv`는 검증 전후 모두 존재하지 않았다.
+- `docs/live_review/LIVE_APPROVAL_RECORD.md`: SHA-256 `27e640537c41334859eb8ad89eb3d013b17b0c95b8abf7b5385e2b76adbd5bfe`, `approved: false`, `live_enabled: false`, 상태 `BLOCKED`로 불변.
+- 테스트가 `strategy_performance.csv` mtime만 갱신했으며 내용 SHA-256 `ca012439cb2ba6a8f285b3f95493f9b17d22abb5b01a924ef2bd4cfe96f66da8`와 크기는 불변이었다. 검증 기준 mtime `1784906741`로 복원했다.
 
 ## Document consistency
 
-- 새 validation package SHA-256은 보고값과 일치하고 이전 `27a36e62...` 패키지와 다르다.
-- 489 passed 및 2 warnings 주장은 실제 결과와 일치한다.
-- CODEX-018 credential 재검증 완료 주장은 실제 코드와 일치한다.
-- “method+path가 주문 관련이면 order_side 생략 시 차단” 주장은 실제 코드·테스트와 불일치한다.
-- `READY_FOR_CODEX_REVALIDATION`, limited review `BLOCKED`, `approved: false`, `live_enabled: false`는 정확하다.
+- validation package SHA-256은 보고값과 일치하며 이전 패키지와 다르다.
+- `536 passed, 0 failed, 2 warnings` 주장은 재현됐다.
+- `purpose=None`, 옛 인자-only 및 public buy 우회 차단 주장은 재현됐다.
+- “payload의 side와 purpose가 일치하는지도 세션 호출 직전 재검증” 주장은 public `submit_order()`에만 해당하며 공통 `_request()`에는 적용되지 않아 문서가 해결 범위를 과장한다.
+- `approved: false`, `live_enabled: false`, `BLOCKED`는 정확하다.
 
 ## Unverified areas
 
 - 실제 Alpaca/Slack/Yahoo E2E
 - 실제 포지션 청산 및 broker reconciliation
-- 승인 레코드의 machine-readable runtime enforcement
 - Ubuntu 운영 환경의 flock 및 실제 스케줄러
+
+## Phase decision
+
+- CODEX-021: **PARTIALLY_RESOLVED**
+- CODEX-022 HIGH: **UNRESOLVED**
+- Overall: **FAIL**
+- Limited live review: **BLOCKED**
+- Live trading: **DO_NOT_ENABLE**
 
 ## Required next action
 
-1. CODEX-021을 해결해 order-shaped POST에서 `order_side=None`을 차단한다.
-2. payload `side`와 gate `order_side` 불일치도 HTTP 이전에 차단한다.
-3. 독립 재검증 전 limited live review는 `BLOCKED`, 실거래는 `DO_NOT_ENABLE`을 유지한다.
+1. `_request()`의 주문 POST 경계에서 purpose, `order_side`, payload `side`의 완전한 일치를 강제한다.
+2. 누락·None·불일치·비정상 payload 각각의 HTTP 0회 회귀 테스트를 추가한다.
+3. 독립 재검증 전 병합·push·limited live review·실거래 활성화를 진행하지 않는다.
