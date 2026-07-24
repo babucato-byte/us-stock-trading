@@ -24,6 +24,7 @@ import kill_switch
 import kill_switch_state as kss
 import paper_strategy_order as pso
 from broker import AlpacaBroker, BrokerConfig
+from broker.alpaca_client import RequestPurpose
 
 
 class RecordingSession:
@@ -299,21 +300,53 @@ def test_request_rejects_unknown_order_side_value(monkeypatch, tmp_path):
     broker = _make_broker()
 
     with pytest.raises(ValueError):
-        broker._request("POST", "/v2/orders", order_side="hold", json={})
+        broker._request(
+            "POST", "/v2/orders", purpose=RequestPurpose.ENTRY_ORDER, order_side="hold", json={}
+        )
 
     assert broker.session.posts == []
 
 
-def test_request_requires_order_side_even_when_bypassing_submit_order(monkeypatch, tmp_path):
+def test_request_requires_purpose_even_when_bypassing_submit_order(monkeypatch, tmp_path):
     """Reproduces the independent-review gap: calling the common _request()
-    path directly for an order-shaped POST, without naming order_side at
-    all, must not silently default to "no gate" -- it must fail before the
+    path directly for an order-shaped POST, without naming purpose at all,
+    must not silently default to "no gate" -- it must fail before the
     session is ever touched, in every kill switch state (including ACTIVE,
-    where submit_order() itself would have been allowed through)."""
+    where submit_order() itself would have been allowed through). purpose
+    has no default on purpose (CODEX-021): order_side alone, which does have
+    a default of None, is no longer sufficient to reach the session."""
     _isolate_binary_halt(monkeypatch, tmp_path)
     broker = _make_broker()
 
     with pytest.raises(TypeError):
         broker._request("POST", "/v2/orders", json={"symbol": "AAPL", "side": "buy"})
+
+    assert broker.session.posts == []
+
+
+def test_request_requires_purpose_even_when_order_side_given(monkeypatch, tmp_path):
+    """CODEX-021: order_side alone (even a valid one) must never be enough to
+    reach the session -- purpose is the mandatory, no-default gate. A caller
+    that names order_side but omits purpose entirely must fail with a
+    TypeError before self.session.request() is ever touched."""
+    _isolate_binary_halt(monkeypatch, tmp_path)
+    broker = _make_broker()
+
+    with pytest.raises(TypeError):
+        broker._request("POST", "/v2/orders", order_side="buy", json={"symbol": "AAPL", "side": "buy"})
+
+    assert broker.session.posts == []
+
+
+def test_request_rejects_none_purpose_explicitly(monkeypatch, tmp_path):
+    """purpose=None must be rejected explicitly (not just "missing"), since a
+    caller could construct one dynamically and pass None instead of omitting
+    the keyword -- e.g. order_side=None was the exact shape of the original
+    CODEX-021 bypass, and purpose must not have an equivalent hole."""
+    _isolate_binary_halt(monkeypatch, tmp_path)
+    broker = _make_broker()
+
+    with pytest.raises(ValueError):
+        broker._request("POST", "/v2/orders", purpose=None, order_side="buy", json={"symbol": "AAPL", "side": "buy"})
 
     assert broker.session.posts == []

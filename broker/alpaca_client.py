@@ -1,3 +1,4 @@
+import enum
 import hmac
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -8,6 +9,43 @@ import kill_switch
 import kill_switch_state
 
 from .broker_config import BrokerConfig, validate_order_allowed_now
+
+
+class RequestPurpose(enum.Enum):
+    """Explicit intent classification for every AlpacaBroker._request() call.
+
+    CODEX-021: order_side alone was not a sufficient gate -- a caller could
+    reach _request() with order_side=None (the value every non-order
+    endpoint legitimately uses) while still POSTing to /v2/orders, which
+    would skip the kill switch check entirely. purpose is now the primary
+    signal _request() gates on; order_side may still be passed alongside it
+    for a secondary sanity check, but it never stands alone.
+    """
+
+    READ_ONLY = "read_only"
+    ENTRY_ORDER = "entry_order"
+    EXIT_ORDER = "exit_order"
+    CANCEL_ORDER = "cancel_order"
+    RECONCILIATION = "reconciliation"
+
+
+# Which purposes each HTTP method is allowed to carry. Checked before every
+# session.request() call so a mismatched (method, purpose) pair -- e.g. a
+# GET claiming ENTRY_ORDER, or a POST claiming READ_ONLY -- is rejected
+# instead of silently reaching the network.
+_METHOD_PURPOSES = {
+    "GET": frozenset({RequestPurpose.READ_ONLY, RequestPurpose.RECONCILIATION}),
+    "POST": frozenset({RequestPurpose.ENTRY_ORDER, RequestPurpose.EXIT_ORDER}),
+    "DELETE": frozenset({RequestPurpose.CANCEL_ORDER}),
+}
+
+# Long-only v1.0: buy always opens a new position (entry), sell always
+# closes/reduces one (exit). There is no short-selling path, so this mapping
+# is exhaustive for the two sides submit_order() accepts.
+_SIDE_TO_PURPOSE = {
+    "buy": RequestPurpose.ENTRY_ORDER,
+    "sell": RequestPurpose.EXIT_ORDER,
+}
 
 
 @dataclass
@@ -94,20 +132,19 @@ class AlpacaBroker:
                 "BrokerConfig/AlpacaBroker instead of rotating credentials under an existing instance."
             )
 
-    def _check_kill_switch(self, order_side):
+    def _check_kill_switch(self, purpose, order_side=None):
         """Gate order-affecting requests on both kill switch mechanisms,
         re-read fresh on every call (never cached on self).
 
-        order_side is None for every non-order endpoint (get_account,
-        get_positions, get_recent_orders, get_assets,
-        get_order_by_client_order_id, cancel_order) and is skipped entirely
-        for them -- those must keep working regardless of kill switch state.
-        Only submit_order() passes "buy" or "sell", since only it initiates
-        a new entry or liquidation.
+        Only ENTRY_ORDER/EXIT_ORDER purposes are checked here -- READ_ONLY,
+        RECONCILIATION, and CANCEL_ORDER keep working regardless of kill
+        switch state (queries and cancellation stay unlimited by design).
+        order_side, if given, is a secondary sanity check only; the binding
+        decision is always purpose, never order_side alone.
         """
-        if order_side is None:
+        if purpose not in (RequestPurpose.ENTRY_ORDER, RequestPurpose.EXIT_ORDER):
             return
-        if order_side not in {"buy", "sell"}:
+        if order_side is not None and order_side not in {"buy", "sell"}:
             raise ValueError(f"order_side must be 'buy', 'sell', or None, got {order_side!r}")
 
         if kill_switch.is_trading_halted():
@@ -115,15 +152,25 @@ class AlpacaBroker:
 
         state_allows = (
             kill_switch_state.is_entry_allowed()
-            if order_side == "buy"
+            if purpose == RequestPurpose.ENTRY_ORDER
             else kill_switch_state.is_liquidation_allowed()
         )
         if not state_allows:
             raise RuntimeError(
-                f"Kill switch state engaged: {order_side} orders not permitted, order not submitted."
+                f"Kill switch state engaged: {purpose.name} not permitted, order not submitted."
             )
 
-    def _request(self, method, path, *, order_side, return_response=False, not_found_is_none=False, **kwargs):
+    def _request(
+        self,
+        method,
+        path,
+        *,
+        purpose,
+        order_side=None,
+        return_response=False,
+        not_found_is_none=False,
+        **kwargs,
+    ):
         # Safety gates must run before any network access, not just before
         # order submission: without this, a misconfigured Paper mode whose
         # ALPACA_PAPER_BASE_URL was overwritten with the Live URL could still
@@ -132,14 +179,28 @@ class AlpacaBroker:
         # calling AlpacaBroker.submit_order() directly instead of through the
         # paper_strategy_order.submit_order() wrapper.
         #
-        # order_side has no default on purpose: every call site (inside this
-        # class or a direct caller bypassing it) must state its intent
-        # explicitly. A caller reaching this method without naming
-        # order_side -- e.g. broker._request("POST", "/v2/orders", json=...)
-        # -- gets a TypeError before the session is ever touched, instead of
-        # silently skipping the kill switch check.
+        # purpose has no default on purpose (pun intended): every call site
+        # (inside this class or a direct caller bypassing it) must state its
+        # intent explicitly. CODEX-021: order_side=None alone used to be
+        # indistinguishable from a legitimate read-only call, which let a
+        # direct POST to /v2/orders skip the kill switch entirely by simply
+        # omitting order_side or passing None. purpose is checked here,
+        # before self.session.request() is ever reached, and a caller that
+        # omits it gets a TypeError before this line even runs.
+        if purpose is None or not isinstance(purpose, RequestPurpose):
+            raise ValueError(f"purpose must be a RequestPurpose member, got {purpose!r}")
+
+        allowed_purposes = _METHOD_PURPOSES.get(method)
+        if not allowed_purposes or purpose not in allowed_purposes:
+            raise ValueError(
+                f"HTTP method {method!r} is not permitted for purpose {purpose.name}"
+            )
+
+        if order_side is not None and order_side not in {"buy", "sell"}:
+            raise ValueError(f"order_side must be 'buy', 'sell', or None, got {order_side!r}")
+
         self._validate_runtime_safety()
-        self._check_kill_switch(order_side)
+        self._check_kill_switch(purpose, order_side)
         url = f"{self.config.base_url}{path}"
         response = self.session.request(method, url, headers=self.headers, timeout=30, **kwargs)
         if not_found_is_none and response.status_code == 404:
@@ -148,13 +209,15 @@ class AlpacaBroker:
         return response if return_response else response.json()
 
     def get_account(self):
-        return self._request("GET", "/v2/account", order_side=None)
+        return self._request("GET", "/v2/account", purpose=RequestPurpose.READ_ONLY)
 
     def get_positions(self):
-        return self._request("GET", "/v2/positions", order_side=None)
+        return self._request("GET", "/v2/positions", purpose=RequestPurpose.READ_ONLY)
 
     def get_recent_orders(self, limit=10):
-        return self._request("GET", f"/v2/orders?status=all&limit={limit}", order_side=None)
+        return self._request(
+            "GET", f"/v2/orders?status=all&limit={limit}", purpose=RequestPurpose.READ_ONLY
+        )
 
     def get_assets(self):
         """List tradable assets (used to build the trading universe).
@@ -164,7 +227,7 @@ class AlpacaBroker:
         own URL from ALPACA_BASE_URL/ALPACA_PAPER_BASE_URL directly and
         called requests.get() without any endpoint validation.
         """
-        return self._request("GET", "/v2/assets", order_side=None)
+        return self._request("GET", "/v2/assets", purpose=RequestPurpose.READ_ONLY)
 
     def get_order_by_client_order_id(self, client_order_id):
         """Look up a submitted order by the id we generated at reservation time.
@@ -177,14 +240,18 @@ class AlpacaBroker:
         return self._request(
             "GET",
             "/v2/orders:by_client_order_id",
-            order_side=None,
+            purpose=RequestPurpose.RECONCILIATION,
             params={"client_order_id": client_order_id},
             not_found_is_none=True,
         )
 
     def submit_order(self, symbol, qty=1, *, side, order_type="market", time_in_force="day", client_order_id=None):
+        # Long-only v1.0: buy is always an entry, sell is always an exit --
+        # see _SIDE_TO_PURPOSE. There is no short-selling path in this
+        # version, so this if/else is the complete mapping.
         if side not in {"buy", "sell"}:
             raise ValueError("side must be exactly 'buy' or 'sell'")
+        purpose = _SIDE_TO_PURPOSE[side]
 
         order = {
             "symbol": symbol,
@@ -204,7 +271,19 @@ class AlpacaBroker:
                 dry_run=True,
             )
 
-        response = self._request("POST", "/v2/orders", order_side=side, json=order, return_response=True)
+        # CODEX-021 defense-in-depth: verify the outgoing payload's side
+        # still matches the purpose derived from it before ever reaching
+        # HTTP, so a future edit that mutates `order["side"]` after `purpose`
+        # was computed fails loudly instead of silently submitting a
+        # mismatched order under the wrong kill-switch gate.
+        if _SIDE_TO_PURPOSE.get(order["side"]) is not purpose:
+            raise RuntimeError(
+                "Order payload side does not match the submission purpose; refusing to submit."
+            )
+
+        response = self._request(
+            "POST", "/v2/orders", purpose=purpose, order_side=side, json=order, return_response=True
+        )
         return BrokerResponse(
             status_code=response.status_code,
             text=response.text,
@@ -216,7 +295,9 @@ class AlpacaBroker:
         """Cancel an order through the same runtime safety gate."""
         if not order_id or not isinstance(order_id, str):
             raise ValueError("order_id must be a non-empty string")
-        return self._request("DELETE", f"/v2/orders/{order_id}", order_side=None)
+        return self._request(
+            "DELETE", f"/v2/orders/{order_id}", purpose=RequestPurpose.CANCEL_ORDER
+        )
 
 
 def _safe_json(response):
