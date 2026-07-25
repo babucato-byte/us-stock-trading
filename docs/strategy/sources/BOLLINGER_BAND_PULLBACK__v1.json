@@ -1,0 +1,28 @@
+{
+  "source_id": "BOLLINGER_BAND_PULLBACK",
+  "source_type": "YOUTUBE",
+  "title": "볼린저 밴드 눌림목(pullback) 진입",
+  "reference": "TBD_OPERATOR: 실제 사용자 차트 분석 자료 또는 YouTube 영상 링크/타임스탬프 미지정. 아래 claims는 해당 개념에 대한 공개적으로 알려진 일반 서술이며, 특정 소스를 인용한 것이 아님.",
+  "collected_at": "2026-07-25T00:00:00+00:00",
+  "version": 1,
+  "validation_status": "COLLECTED",
+  "claims": [
+    {
+      "category": "ENTRY",
+      "statement": "가격이 볼린저 밴드 상단을 돌파한 뒤 중심선(20일 이동평균)까지 눌림 후 재상승 시 진입한다",
+      "origin": "ASSUMPTION",
+      "source_excerpt": null,
+      "confidence": 0.5
+    },
+    {
+      "category": "STOP",
+      "statement": "손절은 볼린저 밴드 하단 이탈 시로 설정한다",
+      "origin": "ASSUMPTION",
+      "source_excerpt": null,
+      "confidence": 0.4
+    }
+  ],
+  "derived_strategy_id": null,
+  "similar_to": [],
+  "notes": "VWAP 대신 이동평균 기반 밴드를 사용 — VWAP_MICRO_PULLBACK_MOMENTUM_V1과 유사한 구조(눌림목 재돌파) 후보로 similarity 분석 대상."
+}

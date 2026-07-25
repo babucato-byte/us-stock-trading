@@ -1,0 +1,28 @@
+{
+  "source_id": "VWAP_MOMENTUM_ENTRY",
+  "source_type": "USER_CHART_ANALYSIS",
+  "title": "VWAP·EMA·거래량 기반 모멘텀 진입",
+  "reference": "docs/autonomous/PROJECT_CONSTITUTION.md",
+  "collected_at": "2026-07-25T00:00:00+00:00",
+  "version": 1,
+  "validation_status": "REVIEWED",
+  "claims": [
+    {
+      "category": "ENTRY",
+      "statement": "VWAP, EMA, 거래량 기반으로 진입한다",
+      "origin": "SOURCE",
+      "source_excerpt": "VWAP·EMA·거래량 기반 진입 → Alpaca Paper 주문",
+      "confidence": 1.0
+    },
+    {
+      "category": "FILTER",
+      "statement": "사용 지표는 원칙적으로 VWAP, EMA9, EMA21, 거래량/상대거래량, 가격 구조, ATR로 제한한다",
+      "origin": "SOURCE",
+      "source_excerpt": "사용 지표는 원칙적으로 VWAP, EMA9, EMA21, 거래량/상대거래량, 가격 구조, ATR로 제한한다.",
+      "confidence": 1.0
+    }
+  ],
+  "derived_strategy_id": "VWAP_MICRO_PULLBACK_MOMENTUM_V1",
+  "similar_to": [],
+  "notes": "strategy/plugins/vwap_micro_pullback_v1.py로 이미 구현·테스트됨 (Stage 3)."
+}
