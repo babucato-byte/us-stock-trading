@@ -3,15 +3,62 @@
 마지막 갱신: 2026-07-25
 
 ## 현재 Phase
-Phase 4 — VWAP 마이크로 풀백 전략 엔진 (Stage 3, `IMPLEMENTED`, Claude 자체 테스트 통과, Codex
-검증 전). Phase 2 — 초단타 관심종목 선별 엔진 (`IMPLEMENTED`, CODEX-010~015 수정 완료, Codex 재검증
-대기, 변경 없음).
+Phase 5 — 포지션 생명주기 및 자동 청산 (Stage 4, `IMPLEMENTED`, Claude 자체 테스트 통과, Codex
+검증 전 — 사용자 지시에 따라 Stage 3~10을 Codex 중간 검증 없이 연속 구현 중). Phase 4 — VWAP
+마이크로 풀백 전략 엔진 (Stage 3, `IMPLEMENTED`, 변경 없음). Phase 2 — 초단타 관심종목 선별 엔진
+(`IMPLEMENTED`, CODEX-010~015 수정 완료, Codex 재검증 대기, 변경 없음).
 
-Phase 1 최종 판정(유지): **Phase 1A(주문 진입 안전성) = VALIDATED**, **Phase 1B(부분체결·포지션 생명주기) = DEFERRED_TO_PHASE_5**.
+Phase 1 최종 판정(유지): **Phase 1A(주문 진입 안전성) = VALIDATED**, **Phase 1B(부분체결·포지션
+생명주기) = Phase 5로 이관 완료, Phase 5 자체는 `IMPLEMENTED`**.
 
-Phase 3(1분봉 실시간 수집/폴링 인프라)은 이번 사이클에서도 착수하지 않음 — Stage 3는 전략 플러그인
-인터페이스/레지스트리/`VWAP_MICRO_PULLBACK_MOMENTUM_V1` 로직 자체만 구현했고, 구성된 pandas
-DataFrame을 입력으로 받아 테스트한다. 라이브 1분봉 폴링은 여전히 범위 외.
+Phase 3(1분봉 실시간 수집/폴링 인프라)은 이번 사이클에서도 착수하지 않음 — Stage 3/4는 전략
+플러그인·포지션 생명주기 로직 자체만 구현했고, 구성된 pandas DataFrame과 fake broker를 입력으로
+받아 테스트한다. 라이브 1분봉 폴링/실브로커 연동은 여전히 범위 외.
+
+## Stage 4 — 포지션 생명주기(`positions/`) 구현 완료 (2026-07-25)
+사용자의 "Stage 3~10 연속 구현, Codex 중간 검증 없이 진행" 지시에 따라 착수. `docs/autonomous/
+SCALPING_V1_ROADMAP.md` Phase 5 대응. 신규 패키지 `positions/`(`states.py`, `store.py`,
+`lifecycle.py`)를 추가했다.
+
+- `positions/states.py`: 13개 생명주기 상태(`SETUP_DETECTED`~`CLOSED`) + 6개 예외 상태
+  (`REJECTED/CANCELLED/EXPIRED/UNKNOWN/MANUAL_REVIEW/RECOVERY_REQUIRED`), 명시적 `TRANSITIONS`
+  인접 테이블로 임의 상태 전이를 구조적으로 차단, `FAIL_CLOSED_STATE = RECOVERY_REQUIRED`
+  (`kill_switch_state.py`의 fail-closed 컨벤션 재사용, 한 단계 더 보수적).
+- `positions/store.py`: 포지션별 JSON 원자적 저장소(`order_intent_ledger.py`/`kill_switch_state.py`
+  와 동일한 `fcntl.flock`+tempfile+fsync+os.replace 패턴), 레코드별 fail-closed 검증(손상 JSON/
+  필드 누락/미인식 상태 → 다른 레코드는 영향 없이 해당 레코드만 `RECOVERY_REQUIRED`), `locked_position()`
+  컨텍스트 매니저로 "읽기→판단→브로커 호출→쓰기" 전체 구간을 단일 락으로 보호(중복 청산 방지의
+  핵심 메커니즘 — 최초 설계는 저장 시점만 잠갔는데, 두 동시 호출이 모두 브로커를 호출한 뒤 마지막
+  쓰기만 순서가 보장되는 경쟁 조건이 있어 재설계함, 스레딩 테스트로 검증).
+- `positions/lifecycle.py`: `enter_position()`(전략 `require_active()` 검증 → `generate_entry()` →
+  `try_reserve_order()` → `submit_order(side="buy")`, ledger commit/abort), `record_fill()`(부분/
+  완전 체결, `FILLED`→`STOP_ACTIVE` 자동 전이), `check_and_manage()`(우선순위: EOD 강제청산 >
+  시간손절 > 손절 > 1R 50% 분할익절 > 2R 전량청산, 분할 익절 후 손절가를 손익분기로 이동하는
+  최소 트레일링 정책), `check_invalidation()`(전략 무효화 신호 시 전량청산, 신선한 봉 데이터가
+  필요해 `check_and_manage()`와 분리), `recover_on_restart()`(브로커 재조회 실패/불확실/broker
+  미제공 시 `RECOVERY_REQUIRED`로 fail-closed, 이미 `RECOVERY_REQUIRED`인 레코드는 절대 추측으로
+  복구하지 않음). 모든 청산 주문은 `paper_strategy_order.submit_order(side="sell")`을 직접
+  호출 — `try_reserve_order()`/`is_duplicate_order()`는 "심볼당 하루 1건" 진입 전용 중복 방지
+  구조라 청산에 재사용할 수 없다고 판단(청산은 kill switch/자격증명/`RequestPurpose` 게이트는
+  그대로 통과, 진입 전용 일일 중복 방지 로직만 우회). 근거: `DECISION_LOG.md` Stage 4 섹션.
+- 신규 테스트: `tests/test_position_states.py` 31건(상태 전이 커버리지), `tests/test_position_store.py`
+  15건(원자적 저장/락 경쟁/fail-closed/`locked_position` 동시성), `tests/test_position_lifecycle.py`
+  23건(진입 성공/무신호/비활성전략/kill-switch차단/브로커거부, 부분·완전체결, 1R분할익절·2R전량청산·
+  손절, 시간손절, EOD강제청산, 전략무효화, 동시 손절 요청의 중복 청산 방지, 실현/미실현 PnL, 재시작
+  복구 4가지 시나리오) — 총 69건 신규.
+- 전체 회귀: 저장소 루트 `venv/bin/python -m pytest -q` 기준 **683 passed, 0 failed**(기존 613 →
+  Stage 3 이후 660(부분 구현) → 683). 실제 Alpaca/Slack/네트워크 호출 0회(FakeBroker/모킹만 사용),
+  `order_history.csv`/`universe.csv`/`strategy_performance.csv` MD5 불변, `broker/`·`order_safety.py`·
+  `config/scanner_presets.json`·`.env`·kill switch 상태 파일 변경 없음.
+- 커밋: `a78ab1b`(states+테스트), `2058614`(store+테스트), `f9a2d1f`(`locked_position()`+VWAP
+  `invalidate()` 실구현+config), `b3d8cf4`(lifecycle+테스트).
+- 잔여 위험: 상태 영속화가 여전히 파일(JSON) 기반이며 `order_history.csv`와 별개 파일이라 두 파일에
+  걸친 단일 트랜잭션은 없음(Phase 1B에서 이미 문서화된 동일 위험, 안전 크리티컬 판단 자체는
+  `order_history.csv`/kill switch 상태에만 의존하므로 실거래 안전성에는 영향 없음) — Stage 5(SQLite
+  전환 검토)에서 재평가 예정. 트레일링 정책은 "1R 50% 분할 후 손절을 손익분기로 이동"이라는 최소
+  규칙으로, 정교한 트레일링 알고리즘이 아님(의도된 초기 정책). 실시간 브로커 reconciliation
+  (`recover_on_restart()`가 실제 Alpaca 응답을 어떻게 파싱할지)은 Phase 3(1분봉 실시간 인프라) 착수
+  후 실제 broker 클라이언트로 통합 테스트 필요 — 현재는 fail-closed 동작만 검증됨.
 
 ## Stage 3 — 전략 플랫폼(`strategy/`) 구현 완료 (2026-07-25)
 `docs/autonomous/SCALPING_V1_ROADMAP.md` Phase 4 대응. 신규 패키지 `strategy/`(`interface.py`,
@@ -180,26 +227,31 @@ binary kill switch(`kill_switch.is_trading_halted()`)와 다단계 kill switch
 - 전체 회귀 267 passed(레포 루트 `pytest -q`/`python -m pytest -q` 동일), 실제 외부 API 호출 0회, `order_history.csv` 해시 불변, 운영 파일 변경 없음 확인.
 
 ## 현재 테스트 수
-613 passed, 0 failed, 2 warnings (Stage 3 전략 플랫폼 신규 43건 포함)
+683 passed, 0 failed (Stage 4 포지션 생명주기 신규 69건 포함: states 31 + store 15 + lifecycle 23)
 
 ## 실패 테스트
 없음
 
 ## 현재 블로커
-CODEX-022 해결 및 CODEX-021 잔여분 종결(`validate_order_intent()` 3자 일치 검증)에 대한 Codex
-독립 재검증 대기. `approved: false`, `live_enabled: false` 유지. **Limited live review: BLOCKED**,
-**Live trading: DO_NOT_ENABLE**.
+없음 (코드 수준). CODEX-016~022는 이전 사이클에서 Codex 최종 독립 재검증까지 `PASS_WITH_CONDITIONS`로
+종결됨(위 "Codex 최종 독립 재검증" 섹션 참고). 사용자 지시에 따라 Stage 3~10은 Codex 중간 검증 없이
+연속 구현 중이며, 전체 완료 후 `FINAL_VALIDATION_PACKAGE.md` 작성과 함께 Codex 통합 검증을 1회
+요청할 예정. `approved: false`, `live_enabled: false` 유지. **Limited live review: BLOCKED**(신규
+Stage 코드가 아직 Codex 검증을 거치지 않았으므로), **Live trading: DO_NOT_ENABLE**.
 
 ## 다음 작업
-1. `VALIDATION_PACKAGE.md`/`VALIDATION_REPORT.md`/`REMEDIATION_PLAN.md`/`DECISION_LOG.md`/
-   `docs/live_review/*.md`를 CODEX-022 해결 및 CODEX-021 잔여분 종결 기준으로 갱신(완료, 이번 커밋).
-2. Codex 재검증 요청. `PROCEED` 판정 시 CODEX-016~022 전체를 RESOLVED로 최종 확정하고 limited
-   live review 재개 여부 판단.
-3. `~/Projects/ai-orchestrator`를 통해 실거래 직전 준비 작업 진행 중 — 신규 항목은 오케스트레이터
-   run으로 별도 추적.
-4. Phase 5 착수 전 사용자 결정이 필요한 SQLite 관련 항목(`DECISION_LOG.md`, `NEEDS_USER_DECISION`)은 여전히 대기 중 — Phase 2/3와는 무관.
+1. Stage 5(거래 상태 저장소) 착수 — CSV로 원자적 다중 파일 트랜잭션(주문/체결/포지션)을 안전하게
+   처리할 수 없다는 기존 판단(Phase 1B/Phase 5 잔여 위험 참고)을 근거로 SQLite 전환을 구체화한다.
+2. Stage 6~10을 사용자 지시서의 순서대로 계속 진행(각 Stage마다 자체 테스트 → 전체 회귀 → 로컬 커밋
+   → 문서 갱신, Codex 검증 없이).
+3. Stage 10 완료 후 `docs/autonomous/FINAL_VALIDATION_PACKAGE.md` 작성, 상태를
+   `READY_FOR_FINAL_CODEX_VALIDATION`으로 종료.
 
 ## 최근 커밋
+- `b3d8cf4` Add position lifecycle and automated exits (Stage 4 part 4/N)
+- `f9a2d1f` Add locked_position() and real strategy invalidation (Stage 4 part 3/N)
+- `2058614` Add atomic position record store (Stage 4 part 2/N)
+- `a78ab1b` Add position lifecycle state machine (Stage 4 part 1/N)
 - `5aac75b` CODEX-022 해결 + CODEX-021 잔여분 종결: `_request()`에 중앙 집중식 3자 일치(purpose/order_side/payload side) 검증 추가 및 회귀 테스트
 - `a31290b` Codex 독립 재검증 기록: FAIL, CODEX-021 partial, CODEX-022 신규
 - `c133e01` CODEX-021/CODEX-020 잔여분: `_request()`를 RequestPurpose 기반으로 재설계하고 회귀 테스트 추가

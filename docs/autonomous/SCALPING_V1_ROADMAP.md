@@ -140,14 +140,18 @@ Phase 1은 두 부분으로 나뉜다:
 
 ## Phase 5 — 포지션 생명주기 및 자동 청산
 
-**상태: NOT_STARTED**
+**상태: IMPLEMENTED**
 
-- 목적: `DETECTED→ARMED→ENTRY_SUBMITTED→PARTIALLY_FILLED→FILLED→PARTIAL_EXIT_SUBMITTED→PARTIAL_EXITED→TRAILING→EXIT_SUBMITTED→CLOSED` 상태 머신 구현, 부분체결/분할익절/시간손절/강제청산 처리.
-- 완료 조건: Phase 1에서 이관된 "부분 체결 처리" 포함, 재시작 후 상태 복구, 중복 청산 방지 테스트 통과.
-- 관련 파일(예정): `scalping/position_lifecycle.py`
-- 테스트 결과: 미착수
-- 커밋 해시: 없음
-- 잔여 위험: 상태 영속화 방식(파일 vs 경량 DB) 결정 필요.
+- 목적: `SETUP_DETECTED→ARMED→ENTRY_RESERVED→ENTRY_SUBMITTED→PARTIALLY_FILLED→FILLED→STOP_ACTIVE→TARGET_1_ACTIVE→PARTIAL_EXIT_SUBMITTED→PARTIAL_EXITED→TRAILING→EXIT_SUBMITTED→CLOSED` 상태 머신 구현, 부분체결/분할익절/시간손절/강제청산 처리.
+- 구현 내용:
+  - `positions/states.py`: 13개 생명주기 상태 + 6개 예외 상태(REJECTED/CANCELLED/EXPIRED/UNKNOWN/MANUAL_REVIEW/RECOVERY_REQUIRED), 명시적 `TRANSITIONS` 인접 테이블(임의 상태 전이 차단), `FAIL_CLOSED_STATE = RECOVERY_REQUIRED`.
+  - `positions/store.py`: 포지션별 JSON 원자적 저장소(`fcntl.flock`, tempfile+fsync+os.replace 패턴 재사용), 레코드별 fail-closed 검증(손상/필드누락/미인식 상태 → RECOVERY_REQUIRED), `locked_position()` 컨텍스트 매니저로 "읽기-판단-브로커 호출-쓰기" 전체 구간을 단일 락으로 보호(중복 청산 방지의 핵심 메커니즘, 스레딩 테스트로 검증).
+  - `positions/lifecycle.py`: `enter_position()`(전략 ACTIVE 검증→`try_reserve_order`→`submit_order(side="buy")`, ledger commit/abort), `record_fill()`(부분/완전 체결, FILLED→STOP_ACTIVE 자동 전이), `check_and_manage()`(우선순위: EOD 강제청산 > 시간손절 > 손절 > 1R 50% 분할익절 > 2R 전량청산, 손익분기 트레일링), `check_invalidation()`(전략 무효화 신호 시 전량청산), `recover_on_restart()`(브로커 재조회 실패/불확실 시 RECOVERY_REQUIRED로 fail-closed). 모든 청산 주문은 `paper_strategy_order.submit_order(side="sell")`을 직접 호출(진입 전용 일일 중복 방지 로직을 우회하되 kill switch/자격증명/RequestPurpose 게이트는 그대로 통과) — 근거는 `DECISION_LOG.md` Stage 4 섹션 참고.
+- 완료 조건: 상태 전이 테스트(23건, `tests/test_position_lifecycle.py` + 31건 `tests/test_position_states.py`), 부분체결 테스트, 손절·익절 테스트, 시간손절·EOD강제청산 테스트, 재시작 복구 테스트(불확실/확인됨/이미RECOVERY_REQUIRED/종결상태 스킵), 동시성 기반 중복 청산 방지 테스트, 청산 주문 side="sell" 보증, Kill Switch 정책 유지(모두 통과) — **모두 충족**.
+- 관련 파일: `positions/states.py`, `positions/store.py`, `positions/lifecycle.py`, `tests/test_position_states.py`, `tests/test_position_store.py`, `tests/test_position_lifecycle.py`
+- 테스트 결과: 전체 스위트 683 passed, 0 failed (Phase 5 관련 신규 69건 포함). 실제 Alpaca/Slack/네트워크 호출 0회, 운영 CSV 변경 0건.
+- 커밋 해시: `a78ab1b`(states), `2058614`(store), `f9a2d1f`(locked_position + invalidate), `b3d8cf4`(lifecycle)
+- 잔여 위험: 상태 영속화가 여전히 파일(JSON) 기반 — Phase 5 자체는 완료되었으나, `order_history.csv`/`positions` 저장소가 별개 파일로 분리되어 있어 두 파일에 걸친 단일 트랜잭션은 없음(Phase 1B에서 이미 문서화된 동일 잔여 위험). Stage 5(거래 상태 저장소 SQLite 전환 검토)에서 재평가 예정. 트레일링 정책은 "1R 50% 분할 후 손절을 손익분기로 이동"이라는 최소 규칙으로, 정교한 트레일링 알고리즘이 아님(의도된 초기 정책, `DECISION_LOG.md` 참고).
 
 ---
 
