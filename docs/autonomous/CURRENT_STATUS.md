@@ -3,11 +3,56 @@
 마지막 갱신: 2026-07-25
 
 ## 현재 Phase
-Phase 2 — 초단타 관심종목 선별 엔진 (`IMPLEMENTED`, CODEX-010~015 수정 완료, Codex 재검증 대기)
+Phase 4 — VWAP 마이크로 풀백 전략 엔진 (Stage 3, `IMPLEMENTED`, Claude 자체 테스트 통과, Codex
+검증 전). Phase 2 — 초단타 관심종목 선별 엔진 (`IMPLEMENTED`, CODEX-010~015 수정 완료, Codex 재검증
+대기, 변경 없음).
 
 Phase 1 최종 판정(유지): **Phase 1A(주문 진입 안전성) = VALIDATED**, **Phase 1B(부분체결·포지션 생명주기) = DEFERRED_TO_PHASE_5**.
 
-Phase 3(1분봉 감시/지표/주문 로직)은 이번 사이클에서 착수하지 않음 — 사용자 지시에 따라 범위 외.
+Phase 3(1분봉 실시간 수집/폴링 인프라)은 이번 사이클에서도 착수하지 않음 — Stage 3는 전략 플러그인
+인터페이스/레지스트리/`VWAP_MICRO_PULLBACK_MOMENTUM_V1` 로직 자체만 구현했고, 구성된 pandas
+DataFrame을 입력으로 받아 테스트한다. 라이브 1분봉 폴링은 여전히 범위 외.
+
+## Stage 3 — 전략 플랫폼(`strategy/`) 구현 완료 (2026-07-25)
+`docs/autonomous/SCALPING_V1_ROADMAP.md` Phase 4 대응. 신규 패키지 `strategy/`(`interface.py`,
+`status.py`, `registry.py`, `plugins/vwap_micro_pullback_v1.py`, `plugins/__init__.py`,
+`plugins/_example_orb_stub.py`)와 `config/scalping_strategy_v1_config.py`를 추가했다.
+
+- `TradingStrategy` ABC(`strategy/interface.py`): `strategy_id`/`version`/`status`를 생성 시점에
+  fail-closed 검증. `evaluate_setup`/`generate_entry`/`calculate_stop`/`calculate_targets`는 Stage 3
+  실 구현. `manage_position`/`invalidate`는 `NotImplementedError` 스텁(Stage 4/Phase 5 포지션
+  생명주기 선행 필요, 코드 주석에 이유 명시).
+- 전략 상태(`strategy/status.py`): `COLLECTED/STRUCTURED/REVIEWED/BACKTESTED/PAPER_APPROVED/
+  LIMITED_LIVE_APPROVED/ACTIVE/PAUSED/REJECTED` 9종, `ORDER_GENERATING_STATUSES={ACTIVE}`로 주문
+  생성 가능 여부를 단일 지점에서 정의.
+- `StrategyRegistry`(`strategy/registry.py`): 등록 시점에 strategy_id/version/status 검증(fail-closed),
+  ACTIVE 최대 1개를 구조적으로 강제(두 번째 ACTIVE 등록/활성화 시도는 `StrategyRegistrationError`로
+  거부, 첫 번째를 암묵적으로 비활성화하지 않음 — 결정 근거 `DECISION_LOG.md`), `get_active_strategy()`
+  (없으면 `None`), `require_active()`/`select_strategy_for_order()`(ACTIVE가 아니면
+  `StrategyNotActiveError`, PAPER_APPROVED/LIMITED_LIVE_APPROVED도 차단).
+- `VWAP_MICRO_PULLBACK_MOMENTUM_V1`(`strategy/plugins/vwap_micro_pullback_v1.py`): VWAP/EMA9/EMA21을
+  pandas로 직접 계산(`indicators.py`는 일봉 HMA 계열 전용이라 재사용 대상 아님을 확인 후 판단).
+  price>VWAP·EMA9>EMA21 → 초기 rally → 얕은 pullback(거래량 감소) → 재돌파(거래량 재확대) 순으로
+  판정, 손절은 micro-pullback low + ATR 기반 최소 버퍼, 목표는 1R에서 50% 분할 익절(문서에 명시된
+  값) + target_2 2R(ASSUMPTION, 근거 `DECISION_LOG.md`).
+- 주문 경로 연결: `paper_strategy_order.submit_order()`에는 현재 `strategy_id` 개념 자체가 없어
+  (하드코딩된 단일 스코어링만 존재) 가짜 연결점을 만들지 않았다 — `require_active()`/
+  `select_strategy_for_order()`를 `strategy/registry.py`의 독립 함수로 구현하고
+  `tests/test_strategy_platform.py`에서 직접 검증. Stage 4가 실제 주문 트리거 경로에서 호출할
+  예정(코드 주석에 명시).
+- 확장 패턴: `strategy/plugins/__init__.py` 모듈 docstring + `strategy/plugins/_example_orb_stub.py`
+  (미구현 스텁, ORB류 신규 전략 추가 시 따라야 할 최소 형태 예시).
+- 신규 테스트: `tests/test_strategy_platform.py` 43건(레지스트리 검증/ACTIVE 1개 강제/가드/플러그인
+  entry-present·VWAP-EMA 실패·pullback 없음·stop/target 정합성·Stage4 스텁 등).
+- 전체 회귀: 저장소 루트 `venv/bin/python -m pytest -q` 기준 **613 passed, 0 failed, 2 warnings**
+  (기존 570 + 신규 43). 실제 네트워크 호출 0회(모두 구성된 pandas DataFrame 사용), `order_history.csv`
+  /`universe.csv`/`strategy_performance.csv` MD5 불변 확인, `broker/`·`order_safety.py`·
+  `config/scanner_presets.json`·`.env`·kill switch 상태 파일 변경 없음.
+- 잔여 위험: Stage 4(Phase 5, 포지션 생명주기)가 `manage_position`/`invalidate`를 실제 구현하고
+  `require_active()`를 실제 주문 트리거 경로에 배선해야 함. 임계값(눌림 깊이 %, rally 최소 %,
+  target_2 R-배수 등)은 Phase 6 백테스트 이전까지 잠정값(`DECISION_LOG.md`). 신호 중복 방지/추격진입
+  방지/실시간 스프레드·유동성 차단/stale 데이터 차단은 Phase 3(1분봉 실시간 수집, 여전히
+  `NOT_STARTED`) 착수 후 별도 구현 필요.
 
 ## Codex 최종 독립 재검증: PASS_WITH_CONDITIONS (2026-07-25, 커밋 `a31290b`/`5aac75b`/`8803252` 대상)
 Overall verdict **`PASS_WITH_CONDITIONS`**. CODEX-016~022 전부 **RESOLVED**로 최종 확정, 신규
@@ -135,7 +180,7 @@ binary kill switch(`kill_switch.is_trading_halted()`)와 다단계 kill switch
 - 전체 회귀 267 passed(레포 루트 `pytest -q`/`python -m pytest -q` 동일), 실제 외부 API 호출 0회, `order_history.csv` 해시 불변, 운영 파일 변경 없음 확인.
 
 ## 현재 테스트 수
-570 passed, 0 failed, 2 warnings
+613 passed, 0 failed, 2 warnings (Stage 3 전략 플랫폼 신규 43건 포함)
 
 ## 실패 테스트
 없음

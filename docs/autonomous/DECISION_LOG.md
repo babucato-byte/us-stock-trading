@@ -148,3 +148,43 @@
 - 승인 필요 여부: 아니오(CODEX Finding에 대한 직접 수정, 자율 진행 범위). 이번 run 최종 상태는
   `READY_FOR_CODEX_REVALIDATION`이며, Codex 독립 재검증(`PROCEED`/`FAIL` 여부) 전까지
   **Limited live review: BLOCKED**, **Live trading: DO_NOT_ENABLE**을 유지한다.
+
+### 2026-07-25 — Stage 3: 전략 플랫폼(`strategy/`) 인터페이스·레지스트리·`VWAP_MICRO_PULLBACK_MOMENTUM_V1` 초기 설정값 근거
+- 상황: SCALPING_V1_ROADMAP.md Phase 4("VWAP 마이크로 풀백 전략 엔진")와 "유튜브 전략 정보 연결"
+  트랙의 `COLLECTED→...→ACTIVE` 상태 저장 구조를 구현. `strategy/interface.py`(TradingStrategy
+  ABC), `strategy/status.py`(상태 상수), `strategy/registry.py`(StrategyRegistry),
+  `strategy/plugins/vwap_micro_pullback_v1.py`(1차 전략 구현) 신규 작성.
+- 결정 1 — ACTIVE는 최대 1개, 두 번째 ACTIVE 시도는 명시적으로 거부(자동 비활성화 없음): 지시서가
+  "명시적, 결정적 정책 하나를 선택해 테스트하라"고 요구했다. `register()`/`activate()` 모두, 이미
+  다른 strategy_id가 ACTIVE인 상태에서 두 번째를 ACTIVE로 만들려는 시도를 `StrategyRegistrationError`로
+  거부하고 첫 번째는 그대로 둔다. 대안(암묵적으로 첫 번째를 PAUSED로 내리고 두 번째를 승격)은
+  `kill_switch_state.py`의 activate()/release() 분리 원칙(안전 영향이 있는 전이는 항상 명시적 별도
+  호출이어야 한다)과 배치되어 기각.
+- 결정 2 — `require_active()`/`select_strategy_for_order()`는 PAPER_APPROVED/LIMITED_LIVE_APPROVED도
+  차단: 로드맵 원문 "ACTIVE 이전 전략은 주문 엔진에 연결하지 않는다"를 문자 그대로 적용했다. "거의
+  다 됐다"는 인상을 주는 상태라도 주문 생성 가능 여부는 정확히 ACTIVE 하나로만 판정한다
+  (`strategy/status.py`의 `ORDER_GENERATING_STATUSES = {ACTIVE}`).
+- 결정 3 — `paper_strategy_order.py`에 가짜 연결점을 만들지 않음: 현재 `submit_order()`에는
+  `strategy_id` 개념 자체가 없다(단일 하드코딩된 `analyze_stock` 스코어링만 존재). "전략이 주문을
+  생성하기로 결정하는" 실제 지점은 Stage 4(Phase 5, 포지션 생명주기)가 만든다. 지시서가 명시적으로
+  "실제 연결점이 없으면 가짜 연결점을 만들지 말라"고 요구했으므로, `require_active()`/
+  `select_strategy_for_order()`는 `strategy/registry.py`의 독립 함수로만 구현하고 직접 테스트했다
+  (`tests/test_strategy_platform.py::test_only_active_registered_vwap_strategy_may_produce_an_order`).
+  Stage 4가 실제 주문 트리거 경로에서 이 함수를 호출할 것.
+- 결정 4(ASSUMPTION, `config/scalping_strategy_v1_config.py`) — PROJECT_CONSTITUTION.md/로드맵
+  원문에 정확한 수치가 없는 임계값들을 다음과 같이 초기값으로 고정하고 코드에 `# ASSUMPTION` 주석을
+  남겼다(전부 Phase 6 백테스트 이전까지 잠정값):
+  - `RALLY_MIN_PERCENT=0.5`(초기 rally의 최소 크기 — 노이즈와 구분하기 위한 최소값).
+  - `MIN_PULLBACK_DEPTH_PERCENT=0.1` / `MAX_PULLBACK_DEPTH_PERCENT=3.0`("얕은 pullback"의 범위 —
+    상한을 두지 않으면 "micro" pullback이라는 표현과 모순되는 깊은 조정까지 통과시키게 됨).
+  - `TARGET_2_R_MULTIPLE=2.0` — 문서에 명시된 것은 "1R 도달 시 50% 분할 익절"(`TARGET_1_R_MULTIPLE=1.0`,
+    `PARTIAL_EXIT_FRACTION_AT_TARGET_1=0.5`)뿐이고, 분할 익절 후 잔여 포지션의 목표(target_2)
+    R-배수는 어디에도 명시되어 있지 않다. 검증되지 않은 값을 임의로 지어내는 대신, 일반적으로
+    쓰이는 보수적인 러너 목표값 2R을 잠정값으로 사용했다.
+  - `generate_entry()`의 진입가 규칙(ASSUMPTION, 코드 주석) — 진입가는 돌파 레벨+오프셋이 아니라
+    돌파 봉의 실제 종가를 사용한다. 실제 체결되지 않은 가격을 지어내지 않기 위함.
+- 대안: 위 값들을 아예 `NOT_EVALUATED`로 두고 신호를 절대 발생시키지 않는 방식도 고려했으나,
+  Stage 3의 목적 자체가 "테스트 가능한 실제 로직"을 요구했고(지시서), 값이 잠정적이라는 사실 자체를
+  숨기지 않고 명시(코드 주석 + 본 항목)하는 편이 "값이 없어 아무것도 못 만든다"보다 낫다고 판단.
+- 승인 필요 여부: 아니오(코드 분석·테스트 추가·최소 리팩터링·mock/fixture 작성 범위, 지시서의 "변경
+  승인 기준"에 해당하지 않음). 백테스트(Phase 6) 전까지 실거래 판정 근거로 사용하지 않는다.

@@ -104,14 +104,37 @@ Phase 1은 두 부분으로 나뉜다:
 
 ## Phase 4 — VWAP 마이크로 풀백 전략 엔진
 
-**상태: NOT_STARTED**
+**상태: IMPLEMENTED** (Stage 3, Claude 자체 테스트 통과 — Codex 검증 전까지 `VALIDATED`로 승격하지 않음)
 
 - 목적: `VWAP_MICRO_PULLBACK_MOMENTUM_V1`을 독립 모듈로 구현, 구조화된 결과(`strategy_id, symbol, evaluated_at, state, signal, entry_reason, rejection_reasons, entry_price, stop_price, target_1, target_2, risk_per_share, confidence_score, input_snapshot`) 반환.
-- 완료 조건: VWAP/EMA 조건, 눌림 깊이/거래량 감소, 재돌파 거래량 증가, 손절 위치·최소손익비 계산, 신호 중복 방지, 추격진입 방지, 스프레드/유동성 저하 차단, stale 데이터 차단 — 각각 단위 테스트.
-- 관련 파일(예정): `scalping/strategies/vwap_micro_pullback_v1.py`, `config/scalping_strategy_v1.json`
-- 테스트 결과: 미착수
-- 커밋 해시: 없음
-- 잔여 위험: 임계값(눌림 깊이 %, 손익비 등)의 실증 근거 확보 필요 — Phase 6 백테스트 이전에는 잠정값으로 명시하고 `UNKNOWN`/가정으로 표시.
+- Stage 3 구현 범위: 전략 플러그인 인터페이스(`strategy/interface.py`의 `TradingStrategy` ABC +
+  `EvaluationResult`), 전략 상태 상수(`strategy/status.py`, `COLLECTED`~`REJECTED` 9종), 전략
+  레지스트리(`strategy/registry.py`, ACTIVE 최대 1개 구조적 강제 + `require_active()`/
+  `select_strategy_for_order()` 주문 생성 가드), 1차 전략 플러그인
+  (`strategy/plugins/vwap_micro_pullback_v1.py`) — VWAP/EMA9/EMA21은 pandas로 직접 계산(기존
+  `indicators.py`는 일봉 HMA/MACD/SQZMOM 전용이라 재사용 대상 아님, 확인 후 판단),
+  price>VWAP·EMA9>EMA21·초기 rally·얕은 pullback(거래량 감소 동반)·재돌파(거래량 재확대) 순으로
+  `evaluate_setup()`이 판정, `generate_entry()`가 진입가(돌파 봉 종가)·손절(micro-pullback low, ATR
+  기반 최소 버퍼)·목표(1R에서 50% 분할, ASSUMPTION인 2R 잔여 목표)를 계산. 확장 패턴 예시는
+  `strategy/plugins/__init__.py`와 `strategy/plugins/_example_orb_stub.py`.
+- Stage 3 범위 밖(의도적 미구현, Stage 4로 이관): `manage_position()`/`invalidate()`는
+  `NotImplementedError` 스텁(포지션 생명주기 상태 머신이 Phase 5 선행 필요). 신호 중복 방지,
+  추격진입 방지, 실시간 스프레드/유동성 저하 차단, stale 데이터 차단은 1분봉 실시간 수집(Phase 3,
+  `NOT_STARTED`)이 존재해야 의미가 있는 항목이라 Stage 3에서는 구현하지 않음 — Phase 3 착수 후
+  재검토.
+- 완료 조건 충족 현황(Stage 3 한정): VWAP/EMA 조건 ✅, 눌림 깊이/거래량 감소 ✅, 재돌파 거래량 증가
+  ✅, 손절 위치·최소손익비 계산 ✅(단위 테스트로 stop<entry, target>entry, 1R 수식 검증), 각 조건별
+  단위 테스트 ✅. 신호 중복 방지/추격진입 방지/스프레드·유동성 차단/stale 데이터 차단은 위 사유로
+  Stage 3 범위 밖.
+- 관련 파일: `strategy/interface.py`, `strategy/status.py`, `strategy/registry.py`,
+  `strategy/plugins/vwap_micro_pullback_v1.py`, `strategy/plugins/__init__.py`,
+  `strategy/plugins/_example_orb_stub.py`, `config/scalping_strategy_v1_config.py`(신규, 임계값 근거는
+  `DECISION_LOG.md`), `tests/test_strategy_platform.py`(신규, 43건).
+- 테스트 결과: 신규 43 passed, 전체 회귀 613 passed(기존 570 + 신규 43), 저장소 루트 기준.
+- 커밋 해시: 본 커밋(CURRENT_STATUS.md에 최신값 기록).
+- 잔여 위험: 임계값(눌림 깊이 %, rally 최소 %, target_2 R-배수 등)의 실증 근거 확보 필요 — Phase 6
+  백테스트 이전에는 잠정값으로 명시(코드 `# ASSUMPTION` 주석 + `DECISION_LOG.md`). 실시간 1분봉
+  피드가 없어 stale 데이터/추격진입/신호 중복 방지는 Phase 3 착수 후 별도 구현 필요.
 
 ---
 
