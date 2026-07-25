@@ -3,9 +3,10 @@
 마지막 갱신: 2026-07-25
 
 ## 현재 Phase
-Phase 5 — 포지션 생명주기 및 자동 청산 (Stage 4, `IMPLEMENTED`, Claude 자체 테스트 통과, Codex
-검증 전 — 사용자 지시에 따라 Stage 3~10을 Codex 중간 검증 없이 연속 구현 중). Phase 4 — VWAP
-마이크로 풀백 전략 엔진 (Stage 3, `IMPLEMENTED`, 변경 없음). Phase 2 — 초단타 관심종목 선별 엔진
+Stage 5 — 거래 상태 저장소(`state_store/`, SQLite 병행 인프라) `IMPLEMENTED`, Claude 자체 테스트
+통과, Codex 검증 전 — 사용자 지시에 따라 Stage 3~10을 Codex 중간 검증 없이 연속 구현 중. Phase 5 —
+포지션 생명주기 및 자동 청산 (Stage 4, `IMPLEMENTED`, 변경 없음). Phase 4 — VWAP 마이크로 풀백
+전략 엔진 (Stage 3, `IMPLEMENTED`, 변경 없음). Phase 2 — 초단타 관심종목 선별 엔진
 (`IMPLEMENTED`, CODEX-010~015 수정 완료, Codex 재검증 대기, 변경 없음).
 
 Phase 1 최종 판정(유지): **Phase 1A(주문 진입 안전성) = VALIDATED**, **Phase 1B(부분체결·포지션
@@ -14,6 +15,37 @@ Phase 1 최종 판정(유지): **Phase 1A(주문 진입 안전성) = VALIDATED**
 Phase 3(1분봉 실시간 수집/폴링 인프라)은 이번 사이클에서도 착수하지 않음 — Stage 3/4는 전략
 플러그인·포지션 생명주기 로직 자체만 구현했고, 구성된 pandas DataFrame과 fake broker를 입력으로
 받아 테스트한다. 라이브 1분봉 폴링/실브로커 연동은 여전히 범위 외.
+
+## Stage 5 — 거래 상태 저장소(`state_store/`) 구현 완료 (2026-07-25)
+`docs/autonomous/DECISION_LOG.md` "Stage 5" 섹션에 CSV vs SQLite 평가를 먼저 기록한 뒤 착수.
+결론: `order_history.csv`/`order_reconciliation.csv`/`POSITION_STORE.json`은 각자 원자적이지만
+세 파일에 걸친 단일 트랜잭션이 없어 Phase 1B/Phase 5가 이미 문서화한 잔여 위험(부분 체결의
+포지션 상태 완전 반영)의 근본 원인이 됨 — SQLite로 **병행** 인프라를 구축하되, **실제 운영 경로는
+전환하지 않음**(지시서의 절대 제약).
+
+- `state_store/schema.py`+`migrations.py`: `orders`/`fills`/`positions`/`position_events`/
+  `strategy_runs`/`risk_events`/`kill_switch_events` 7개 테이블 + `schema_migrations` 버전 추적.
+  `fills.client_order_id`는 `orders`로의 FK를 걸지 않음(`order_history.csv` 자체가
+  `client_order_id`를 항상 갖지 않아 — 그 값은 `order_intent_ledger.csv`에만 존재 — 강제 FK가
+  정상 레거시 가져오기를 실패시키므로 기존 CSV들과 동일한 느슨한 자연 키 상관관계 유지).
+- `state_store/db.py`: `connect()`(WAL 모드, FK 강제, busy_timeout), `init_db()`(멱등적 마이그레이션
+  실행기, 마이그레이션별 독립 트랜잭션).
+- `state_store/csv_import.py`: `order_history.csv`/`order_reconciliation.csv`용 **읽기 전용**
+  가져오기(원본 CSV는 `pandas.read_csv()`만, 절대 쓰거나 삭제하지 않음 — 바이트 불변 테스트로 확인).
+  구버전 2컬럼 형식과 현재 5컬럼 형식(`REQUIRED_HISTORY_COLUMNS`) 모두 관용적으로 처리, 자연 키
+  기반 멱등성(재실행 시 중복 삽입 없음).
+- `state_store/export.py`: `export_table()`/`export_all()`(SQLite→CSV, 대상 경로는 항상 호출자
+  지정), `reset_schema()`(SQLite 파일 자체만 초기화, 가져오기 원본 CSV는 건드리지 않음).
+- 신규 테스트: `tests/test_state_store.py` 20건(스키마/마이그레이션 멱등성, 트랜잭션 무결성,
+  UNIQUE/FK 제약, 레거시·신규 CSV 가져오기, 가져오기 멱등성, 파일 누락 처리, 내보내기 왕복,
+  `reset_schema` 데이터 초기화, 실제 `TRADING_STATE.db` 미생성 확인).
+- 전체 회귀: **703 passed, 0 failed**(기존 683 + 신규 20). 실제 네트워크 호출 0회, 운영 CSV 변경
+  0건(가져오기 전후 바이트 동일 확인), `broker/`·`order_safety.py`·`config/scanner_presets.json`·
+  `.env`·kill switch 상태 파일 변경 없음. `.gitignore`에 `TRADING_STATE.db(-wal/-shm)` 추가.
+- 커밋: `bf05098`.
+- 잔여 위험/미해결: SQLite 저장소를 실제 주문/포지션 경로에 배선하는 것은 이번 단계에 포함되지
+  않음 — `DECISION_LOG.md`에 `NEEDS_USER_DECISION`으로 명시. 배선 전까지는 CSV/JSON이 유일한 실제
+  판단 근거로 계속 사용됨(안전성에 영향 없음, 감사/롤백용 병행 사본일 뿐).
 
 ## Stage 4 — 포지션 생명주기(`positions/`) 구현 완료 (2026-07-25)
 사용자의 "Stage 3~10 연속 구현, Codex 중간 검증 없이 진행" 지시에 따라 착수. `docs/autonomous/
@@ -227,7 +259,8 @@ binary kill switch(`kill_switch.is_trading_halted()`)와 다단계 kill switch
 - 전체 회귀 267 passed(레포 루트 `pytest -q`/`python -m pytest -q` 동일), 실제 외부 API 호출 0회, `order_history.csv` 해시 불변, 운영 파일 변경 없음 확인.
 
 ## 현재 테스트 수
-683 passed, 0 failed (Stage 4 포지션 생명주기 신규 69건 포함: states 31 + store 15 + lifecycle 23)
+703 passed, 0 failed (Stage 5 거래 상태 저장소 신규 20건 포함, Stage 4 포지션 생명주기 신규 69건:
+states 31 + store 15 + lifecycle 23)
 
 ## 실패 테스트
 없음
@@ -240,14 +273,16 @@ binary kill switch(`kill_switch.is_trading_halted()`)와 다단계 kill switch
 Stage 코드가 아직 Codex 검증을 거치지 않았으므로), **Live trading: DO_NOT_ENABLE**.
 
 ## 다음 작업
-1. Stage 5(거래 상태 저장소) 착수 — CSV로 원자적 다중 파일 트랜잭션(주문/체결/포지션)을 안전하게
-   처리할 수 없다는 기존 판단(Phase 1B/Phase 5 잔여 위험 참고)을 근거로 SQLite 전환을 구체화한다.
-2. Stage 6~10을 사용자 지시서의 순서대로 계속 진행(각 Stage마다 자체 테스트 → 전체 회귀 → 로컬 커밋
+1. Stage 6(사용자/YouTube 전략 자료 구조화) 착수 — VWAP, 1:2 R:R, 50% 분할 익절, Turtle, 멀티
+   타임프레임 RSI, Bollinger 눌림, CCI·RSI·ADX, Ross Cameron micro pullback 등 알려진 소스 자료를
+   source/assumption/unknown 분리 스키마로 구조화하고, 절대 자동으로 ACTIVE 전환하지 않는다.
+2. Stage 7~10을 사용자 지시서의 순서대로 계속 진행(각 Stage마다 자체 테스트 → 전체 회귀 → 로컬 커밋
    → 문서 갱신, Codex 검증 없이).
 3. Stage 10 완료 후 `docs/autonomous/FINAL_VALIDATION_PACKAGE.md` 작성, 상태를
    `READY_FOR_FINAL_CODEX_VALIDATION`으로 종료.
 
 ## 최근 커밋
+- `bf05098` Add local SQLite trading state store (Stage 5)
 - `b3d8cf4` Add position lifecycle and automated exits (Stage 4 part 4/N)
 - `f9a2d1f` Add locked_position() and real strategy invalidation (Stage 4 part 3/N)
 - `2058614` Add atomic position record store (Stage 4 part 2/N)

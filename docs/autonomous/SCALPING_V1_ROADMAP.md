@@ -151,7 +151,8 @@ Phase 1은 두 부분으로 나뉜다:
 - 관련 파일: `positions/states.py`, `positions/store.py`, `positions/lifecycle.py`, `tests/test_position_states.py`, `tests/test_position_store.py`, `tests/test_position_lifecycle.py`
 - 테스트 결과: 전체 스위트 683 passed, 0 failed (Phase 5 관련 신규 69건 포함). 실제 Alpaca/Slack/네트워크 호출 0회, 운영 CSV 변경 0건.
 - 커밋 해시: `a78ab1b`(states), `2058614`(store), `f9a2d1f`(locked_position + invalidate), `b3d8cf4`(lifecycle)
-- 잔여 위험: 상태 영속화가 여전히 파일(JSON) 기반 — Phase 5 자체는 완료되었으나, `order_history.csv`/`positions` 저장소가 별개 파일로 분리되어 있어 두 파일에 걸친 단일 트랜잭션은 없음(Phase 1B에서 이미 문서화된 동일 잔여 위험). Stage 5(거래 상태 저장소 SQLite 전환 검토)에서 재평가 예정. 트레일링 정책은 "1R 50% 분할 후 손절을 손익분기로 이동"이라는 최소 규칙으로, 정교한 트레일링 알고리즘이 아님(의도된 초기 정책, `DECISION_LOG.md` 참고).
+- 잔여 위험: 상태 영속화가 여전히 파일(JSON) 기반 — Phase 5 자체는 완료되었으나, `order_history.csv`/`positions` 저장소가 별개 파일로 분리되어 있어 두 파일에 걸친 단일 트랜잭션은 없음(Phase 1B에서 이미 문서화된 동일 잔여 위험). 트레일링 정책은 "1R 50% 분할 후 손절을 손익분기로 이동"이라는 최소 규칙으로, 정교한 트레일링 알고리즘이 아님(의도된 초기 정책, `DECISION_LOG.md` 참고).
+- **Stage 5 부속 갱신(2026-07-25)**: 위 잔여 위험(다중 파일 트랜잭션 부재)을 해결하기 위해 `state_store/`(SQLite 기반 orders/fills/positions/position_events/strategy_runs/risk_events/kill_switch_events 스키마, 마이그레이션, 읽기 전용 CSV 가져오기, 내보내기/롤백)를 병행 인프라로 구축했다. **실제 운영 경로는 전환하지 않았다** — `paper_strategy_order.py`/`positions/lifecycle.py`는 여전히 CSV/JSON을 유일한 판단 근거로 사용한다. 전환 여부는 `DECISION_LOG.md` Stage 5 섹션에 `NEEDS_USER_DECISION`으로 기록. 신규 테스트 20건, 전체 회귀 703 passed. 커밋 `bf05098`.
 
 ---
 
