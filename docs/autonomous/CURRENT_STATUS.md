@@ -3,9 +3,11 @@
 마지막 갱신: 2026-07-25
 
 ## 현재 Phase
-Stage 9 — 운영 관제(Dashboard/CLI, `ops_dashboard/`) `IMPLEMENTED`, Claude 자체 테스트 통과, Codex
-검증 전 — 사용자 지시에 따라 Stage 3~10을 Codex 중간 검증 없이 연속 구현 중. Stage 8 — 전략 선택
-엔진(`strategy_selection/`) `IMPLEMENTED`, 변경 없음. Stage 7 — 전략 평가 엔진(백테스트/리플레이,
+Stage 10 — 30,000원 제한 실거래 준비(`live_readiness/` + 플레이북 문서) 문서화·계산 모듈 완료
+(실거래 준비 완료 아님), Claude 자체 테스트 통과, Codex 검증 전. **Stage 3~10 사용자 지시서 범위
+전체 완료** — 다음 작업은 `FINAL_VALIDATION_PACKAGE.md` 작성 및 Codex 통합 검증 요청. Stage 9 —
+운영 관제(Dashboard/CLI, `ops_dashboard/`) `IMPLEMENTED`, 변경 없음. Stage 8 — 전략 선택 엔진
+(`strategy_selection/`) `IMPLEMENTED`, 변경 없음. Stage 7 — 전략 평가 엔진(백테스트/리플레이,
 `backtest/`) `IMPLEMENTED`, 변경 없음. Stage 6 — 사용자/YouTube 전략 자료 구조화
 (`strategy_sources/`) `IMPLEMENTED`, 변경 없음. Stage 5 — 거래 상태 저장소(`state_store/`, SQLite
 병행 인프라) `IMPLEMENTED`, 변경 없음. Phase 5 — 포지션 생명주기 및 자동 청산 (Stage 4,
@@ -19,6 +21,31 @@ Phase 1 최종 판정(유지): **Phase 1A(주문 진입 안전성) = VALIDATED**
 Phase 3(1분봉 실시간 수집/폴링 인프라)은 이번 사이클에서도 착수하지 않음 — Stage 3/4는 전략
 플러그인·포지션 생명주기 로직 자체만 구현했고, 구성된 pandas DataFrame과 fake broker를 입력으로
 받아 테스트한다. 라이브 1분봉 폴링/실브로커 연동은 여전히 범위 외.
+
+## Stage 10 — 30,000원 제한 실거래 준비 (2026-07-26)
+`live_readiness/`(`sizing.py`/`allowlist.py`) + `docs/live_review/LIMITED_LIVE_30K_KRW_PLAYBOOK.md`.
+
+- 구현: 마이크로 주문 수량 계산(`calculate_micro_order_quantity` — 소수점 주식 기본 비활성 확인,
+  최소 주문 금액 확인, 자금 부족/최소금액 미달을 별도 상태로 명시, 잘못된 입력은 예외), 종목
+  allow-list fail-closed 검사(`is_symbol_allowed` — 빈 목록은 아무것도 허용하지 않음,
+  `TBD_REVIEW_RECOMMENDATIONS.md` #4가 지적한 "코드 미강제" 갭을 채움).
+- **의도적으로 실제 주문 경로에 배선하지 않음**: `paper_strategy_order.py`/`positions/lifecycle.py`는
+  이미 Codex `PASS_WITH_CONDITIONS` 검증을 거친 안전 크리티컬 경계라, Stage 3~10 연속 구현 중
+  재검증 없이 다시 수정하지 않기로 결정(플레이북 §6). 배선 여부는 `NEEDS_USER_DECISION`으로 남김.
+- 첫 오류 시 `ENTRY_DISABLED`: 기존 `kill_switch_state.py`가 이미 지원하는 상태를 활용한 **수동
+  운영 절차**로 문서화(자동화는 별도 결정).
+- 일일 1~2건/동시 1포지션/오버나이트 금지: 기존 코드 강제 여부를 표로 정리(`order_safety.
+  MAX_TRADES_PER_DAY`/`MAX_OPEN_POSITIONS`는 존재하나 파일럿 규모 값으로 하향 조정 필요, EOD 강제
+  청산은 이미 `positions/lifecycle.py`로 구조적 강제).
+- 롤백 계획(기존 `ROLLBACK_PLAN.md`에 파일럿 특화 추가), 일일 운영 플레이북, 최종 체크리스트.
+- TBD_OPERATOR(추정 없이 명시적으로 미확정 유지): 실계좌, 실환율, Live API Key, 실 주문 금액
+  한도, 실 승인자, 배포 시각, 롤백 담당자, 실제 Alpaca 최소 주문 금액, 실제 allow-list 내용.
+- 신규 테스트: `tests/test_live_readiness.py` 12건. 전체 회귀 **820 passed, 0 failed**(기존 808 +
+  신규 12). 실제 네트워크 호출 0회, 운영 CSV 변경 0건, `approved`/`live_enabled` 미변경.
+- 커밋: `986d655`.
+- **본 문서 작성 시점: 사용자 지시서의 Stage 3~10 범위가 전부 완료됨.** 다음 작업은
+  `docs/autonomous/FINAL_VALIDATION_PACKAGE.md` 작성 후 `READY_FOR_FINAL_CODEX_VALIDATION`으로
+  종료하는 것.
 
 ## Stage 9 — 운영 관제(`ops_dashboard/`, Dashboard/CLI) 구현 완료 (2026-07-26)
 `snapshot.py`(`build_snapshot()`), `cli.py`(`render_text()`/`main()`, `python -m ops_dashboard.cli`).
@@ -397,9 +424,10 @@ binary kill switch(`kill_switch.is_trading_halted()`)와 다단계 kill switch
 - 전체 회귀 267 passed(레포 루트 `pytest -q`/`python -m pytest -q` 동일), 실제 외부 API 호출 0회, `order_history.csv` 해시 불변, 운영 파일 변경 없음 확인.
 
 ## 현재 테스트 수
-808 passed, 0 failed (Stage 9 운영 관제 신규 16건 포함, Stage 8 전략 선택 엔진 신규 27건, Stage 7
-백테스트 엔진 신규 29건, Stage 6 전략 자료 구조화 신규 33건, Stage 5 거래 상태 저장소 신규 20건,
-Stage 4 포지션 생명주기 신규 69건: states 31 + store 15 + lifecycle 23)
+820 passed, 0 failed (Stage 10 실거래 준비 신규 12건 포함, Stage 9 운영 관제 신규 16건, Stage 8
+전략 선택 엔진 신규 27건, Stage 7 백테스트 엔진 신규 29건, Stage 6 전략 자료 구조화 신규 33건,
+Stage 5 거래 상태 저장소 신규 20건, Stage 4 포지션 생명주기 신규 69건: states 31 + store 15 +
+lifecycle 23)
 
 ## 실패 테스트
 없음
@@ -412,17 +440,20 @@ Stage 4 포지션 생명주기 신규 69건: states 31 + store 15 + lifecycle 23
 Stage 코드가 아직 Codex 검증을 거치지 않았으므로), **Live trading: DO_NOT_ENABLE**.
 
 ## 다음 작업
-1. Stage 10(30,000원 제한 실거래 준비 문서화) 착수 — 마이크로 주문 수량 계산, 소수점 주식 확인,
-   최소 주문 금액 확인, 종목 허용목록, 일일 1~2건, 동시 1포지션, 오버나이트 금지, 첫 오류 시
-   ENTRY_DISABLED, 롤백 계획, 일일/사고 대응 플레이북, 최종 체크리스트를 작성한다. 실제 계좌/환율/
-   Live API Key/실 주문 금액/실 승인자/배포 시각/롤백 담당자는 `TBD_OPERATOR`로 남긴다.
-2. Stage 10 완료 후 `docs/autonomous/FINAL_VALIDATION_PACKAGE.md` 작성 — 전체 커밋/Stage별 변경
-   파일·테스트 결과/아키텍처/Kill Switch/30,000원 제한 실거래 준비/남은 TBD_OPERATOR 항목/알려진
-   위험/검증 중점 영역/SHA-256을 포함, 상태를 `READY_FOR_FINAL_CODEX_VALIDATION`으로 종료(이
-   문서를 쓰기 전까지는 `READY_FOR_30K_KRW_LIMITED_LIVE_REVIEW`/`LIVE_READY`/`LIVE_APPROVED`/
-   `PRODUCTION_READY` 등을 사용하지 않는다).
+1. **`docs/autonomous/FINAL_VALIDATION_PACKAGE.md` 작성** — Stage 3~10 전 범위가 완료됨에 따라
+   유일하게 남은 작업. 전체 커밋 목록/Stage별 변경 파일·테스트 결과/아키텍처/전략 인터페이스/활성
+   전략/포지션 생명주기/SQLite 저장소 구조/사용자·YouTube 전략 구조/전략 평가·선택 방식/Kill
+   Switch/운영 관제/30,000원 제한 실거래 준비/외부 API 호출 현황/운영 파일 변경 현황/main·origin
+   현황/`approved`·`live_enabled` 현황/남은 TBD_OPERATOR 항목/알려진 위험/검증 중점 영역/SHA-256을
+   포함해야 한다. 최종 상태는 `READY_FOR_FINAL_CODEX_VALIDATION`으로 종료하며,
+   `READY_FOR_30K_KRW_LIMITED_LIVE_REVIEW`/`LIVE_READY`/`LIVE_APPROVED`/`PRODUCTION_READY` 등은
+   Codex의 최종 검증 전까지 사용하지 않는다.
+2. 이후에는 Codex 통합 검증 1회를 요청하고, 결과(`PASS`/`PASS_WITH_CONDITIONS`/`FAIL`)에 따라
+   후속 조치(추가 수정 또는 제한적 실거래 검토 재개 여부 판단)를 진행한다 — 사용자 승인 없이는
+   main/origin/실거래를 건드리지 않는다.
 
 ## 최근 커밋
+- `986d655` Prepare 30000 KRW limited live review (Stage 10)
 - `f2e1a24` Add trading operations monitoring dashboard (Stage 9)
 - `2094adf` Add deterministic strategy selection engine (Stage 8)
 - `59958cf` Add intraday strategy backtest/replay engine (Stage 7)

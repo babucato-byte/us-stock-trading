@@ -234,6 +234,21 @@ import하지 않으며 `ACTIVE` 승격을 전혀 호출하지 않음 — 선택�
   일일 손실(`daily_loss`)은 실제 broker 계좌 스냅샷(`account` dict)을 호출자가 명시적으로 주입해야
   계산됨 — 라이브 API 호출 없이는 `NOT_AVAILABLE`.
 
+## Stage 10 — 30,000원 제한 실거래 준비 (부속, 2026-07-26 완료)
+
+**상태: 문서화·계산 모듈 완료 (실거래 준비 완료 아님)**
+
+`live_readiness/`(`sizing.py`/`allowlist.py`) 신규 순수 계산 모듈 + `docs/live_review/
+LIMITED_LIVE_30K_KRW_PLAYBOOK.md`. 마이크로 주문 수량 계산(소수점 확인·최소 주문 금액 확인
+포함)과 종목 allow-list fail-closed 검사를 실제 코드로 구현·테스트했으나, **실제 주문 제출
+경로(`paper_strategy_order.py`/`positions/lifecycle.py`)에는 배선하지 않았다** — 그 경로는 이미
+Codex `PASS_WITH_CONDITIONS` 검증을 거친 안전 크리티컬 경계이며, 이번 Stage 3~10 연속 구현
+사이클에서 재검증 없이 다시 건드리지 않기로 결정(근거는 플레이북 §6/§7 `NEEDS_USER_DECISION`).
+첫 오류 시 `ENTRY_DISABLED` 전환은 기존 `kill_switch_state.py` 상태를 활용한 **수동 운영 절차**로
+문서화(자동 배선 여부는 별도 결정 사항). 신규 테스트 12건, 전체 회귀 820 passed. 커밋 `986d655`.
+TBD_OPERATOR: 실계좌/실환율/Live API Key/실 주문 금액 한도/실 승인자/배포 시각/롤백 담당자/실제
+Alpaca 최소 주문 금액/실제 allow-list 내용 — 전부 미확정 상태로 명시적으로 남김.
+
 ## Phase 8 — Paper 검증 게이트
 
 **상태: NOT_STARTED**
