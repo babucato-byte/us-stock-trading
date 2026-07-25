@@ -262,3 +262,46 @@
 - 커밋: `bf05098`
 - 승인 필요 여부: 아니오(로컬 SQLite 신규 구축·CSV 읽기 전용 가져오기·테스트 범위, 운영 경로 전환은
   포함하지 않음. 운영 경로 전환 자체는 향후 별도 사용자 승인 필요 항목으로 기록).
+
+## Stage 7 — 전략 평가 엔진(백테스트/리플레이) 설계 근거 (2026-07-26)
+
+사용자가 Stage 7 착수 직전 명시적으로 제시한 10개 제약을 그대로 구현했다. 이 결정 로그는 그 중
+수치/정책 ASSUMPTION만 기록한다 — **백테스트 결과를 보고 나서 조정한 값은 하나도 없다**(제약 1).
+
+- 결정 1 — 비용 가정(`backtest/config.py::BacktestConfig`): `spread_bps=5.0`,
+  `slippage_bps=5.0`, `fee_per_share=0.0`(Alpaca 무수수료), `entry_delay_bars=1`,
+  `max_fill_fraction_of_bar_volume=0.10`, `nominal_qty=100`. 전부 어떤 전략의 백테스트도 실행하기
+  **전에** 고정한 값이며, Phase 6 결과를 이유로 사후 조정하지 않는다. 실제 측정된 스프레드/슬리피지
+  수치가 확보되면 이 값을 갱신하되 반드시 새 `DECISION_LOG.md` 항목과 근거(출처)를 남긴다.
+- 결정 2 — 동일봉 손절/목표 충돌 정책(제약 2): `SAME_BAR_COLLISION_STOP_FIRST`만 지원. 1분봉
+  OHLCV만으로는 봉 내부에서 손절과 목표 중 무엇이 먼저 닿았는지 알 수 없으므로, 항상 손절이 먼저
+  닿은 것으로 가정한다 — 전략의 edge를 과대평가할 수 없는 방향으로만 편향된 보수적 선택.
+- 결정 3 — 비용 분리 표시(제약 3): `CostBreakdown`(spread_cost/slippage_cost/fee_cost/
+  entry_delay_cost) 4개 필드를 거래마다 별도 기록. spread/slippage/entry_delay는 이미 체결가에
+  반영된 정보성 수치(체결가 자체가 spread+slippage만큼 불리하게 조정됨)이고, fee만 realized_pnl에서
+  실제로 차감된다 — 이 구분을 `models.py`의 `CostBreakdown` 문서화 주석에 명시.
+- 결정 4 — 프리마켓/정규장 분리(제약 5): 진입은 `market_hours.get_us_market_session(bar_time) ==
+  "regular"`일 때만 허용(`paper_strategy_order.py`의 실제 운영 게이트 `market_session == "regular"`와
+  동일 조건 재사용). 프리마켓 봉은 지표 워밍업(VWAP/EMA/ATR)에는 계속 사용되지만 신호→체결의 트리거
+  봉이 될 수 없다.
+- 결정 5 — 부분체결·거래량 제약(제약 6): 모든 체결(진입·청산)이
+  `min(desired_qty, bar_Volume * max_fill_fraction_of_bar_volume)`로 캡핑됨. 한 봉에서 다 체결하지
+  못한 잔량은 다음 봉으로 이월되어 동일 조건(손절/목표)이 재평가된다 — 강제로 체결을 지어내지 않음.
+  `nominal_qty=100`(ASSUMPTION, 결정 1)으로 1R 50% 분할 익절이 실제 두 개의 구분되는 체결(50주 +
+  50주)로 시뮬레이션되도록 함(1주 단위였다면 50% 분할이 항상 전량 청산으로 붕괴되어 목표가 2R 러너
+  청산을 검증할 수 없었음).
+- 결정 6 — 최대 수익 거래 제거 결과(제약 7): `metrics.compute_metrics_with_best_trade_removed()`가
+  `all_trades`와 `best_trade_removed`를 **함께** 반환 — 후자가 전자를 대체하지 않음.
+- 결정 7 — 데이터 부족 처리(제약 8): `bars` 개수가 `min_bars_required`(기본 500) 미만이면
+  `BacktestResult.status = INSUFFICIENT_DATA`, `trades=[]`를 반환하고 어떤 지표도 계산하지 않음.
+  `compare.py`도 이 상태를 그대로 통과시켜 `metrics` 필드 자체를 행에서 생략(플레이스홀더 점수로
+  치환하지 않음).
+- 결정 8 — YouTube 후보는 비교 대상일 뿐(제약 9): `backtest/compare.py`는
+  `strategy.registry`를 import하지 않으며 `activate()`/`register(status=ACTIVE)` 호출이 전혀 없음
+  (`tests/test_backtest_engine.py::test_compare_module_never_imports_strategy_registry`로 AST 기반
+  검증). 비교 테이블 생성과 전략 활성화는 구조적으로 분리되어 있으며, 활성화는 전적으로 Stage 8의
+  책임으로 남겨둔다.
+- 결정 9 — Look-ahead 방지(제약 4): `engine.py`의 모든 전략 호출은 `bars.iloc[:i+1]`만 전달 —
+  미래 봉을 구조적으로 참조할 수 없음. 데이터가 소진되어 포지션이 청산되지 못한 신호는 거래로
+  기록하지 않는다(결과를 지어내지 않음, `_try_enter`의 `fill_index >= n` 처리).
+- 승인 필요 여부: 아니오(백테스트 인프라·비용 가정 문서화·테스트 범위, 실거래/승인/main/push와 무관).
