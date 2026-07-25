@@ -207,10 +207,32 @@ Phase 1은 두 부분으로 나뉜다:
 import하지 않으며 `ACTIVE` 승격을 전혀 호출하지 않음 — 선택은 추천일 뿐, 실제 활성화는 별도
 운영자 승인 절차. 신규 테스트 27건, 전체 회귀 792 passed. 커밋 `2094adf`.
 
-## Phase 7 — Paper Trading 운영 관제
+## Phase 7 — Paper Trading 운영 관제 (Stage 9, 2026-07-26 완료)
 
-**상태: NOT_STARTED**
-목적/완료조건: 지시서 원문 7번 섹션 그대로 적용(기존 Slack 채널 재사용, 중복/과다 알림 방지). 착수 시 세부 작업 목록을 본 절에 추가.
+**상태: IMPLEMENTED**
+
+- 목적: 지시서 원문 7번 섹션(기존 Slack 채널 재사용, 중복/과다 알림 방지) 중 알림 중복/에스컬레이션
+  부분은 이미 이전 사이클의 `notification_health.py`(CODEX-016~019 계열)로 구현되어 있었다. 이번
+  Stage 9는 사용자 지시서의 별도 항목 "운영 관제 Dashboard/CLI"를 신규 구현: 현재 모드/활성
+  전략/시장상태/관심종목/신호/주문/포지션/손절·목표가/실현·미실현 PnL/일일 주문 수/일일 손실/
+  Kill Switch/Slack 상태/broker 상태/reconciliation/마지막 성공 실행 시각을 로컬에서 확인 가능하게
+  했다.
+- 구현: `ops_dashboard/`(`snapshot.py`, `cli.py`). 모든 섹션이 로컬 파일/env 기반 config에서만
+  조립되며, 실제 Alpaca/Slack API를 전혀 호출하지 않는다 — "Slack이 다운돼도 로컬에서 계속 확인
+  가능"이 폴백 경로가 아니라 애초에 어떤 섹션도 Slack 가용성에 의존하지 않는 구조로 보장됨(Slack
+  섹션은 webhook 환경변수 존재 여부만 확인, broker 섹션은 `BrokerConfig`의 env 파생 값만 읽음).
+  각 섹션은 개별적으로 장애 허용적(`SectionResult.ok=False`) — 데이터 소스 하나가 깨져도 나머지
+  대시보드는 정상 렌더링.
+- 신규 테스트: `tests/test_ops_dashboard.py` 16건. 작성 중 실제 크로스 파일 테스트 격리 버그를
+  발견·수정(`test_ai_analysis.py`가 `sys.modules.pop("paper_strategy_order", ...)`를 실행하는
+  것과 상호작용해 모듈 레벨 import가 stale해지는 문제 — 커밋 메시지 참고).
+- 전체 회귀: **808 passed, 0 failed**(기존 792 + 신규 16). 실제 네트워크 호출 0회, 운영 CSV 변경
+  0건.
+- 커밋 해시: `f2e1a24`.
+- 잔여 위험: "마지막 성공 실행 시각"은 전용 마커 파일이 없어 `order_history.csv`/
+  `order_reconciliation.csv`의 mtime을 근사치로 사용(ASSUMPTION, 정확한 실행 완료 시각이 아님).
+  일일 손실(`daily_loss`)은 실제 broker 계좌 스냅샷(`account` dict)을 호출자가 명시적으로 주입해야
+  계산됨 — 라이브 API 호출 없이는 `NOT_AVAILABLE`.
 
 ## Phase 8 — Paper 검증 게이트
 

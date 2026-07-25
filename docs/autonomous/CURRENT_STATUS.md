@@ -3,11 +3,12 @@
 마지막 갱신: 2026-07-25
 
 ## 현재 Phase
-Stage 8 — 전략 선택 엔진(`strategy_selection/`) `IMPLEMENTED`, Claude 자체 테스트 통과, Codex
-검증 전 — 사용자 지시에 따라 Stage 3~10을 Codex 중간 검증 없이 연속 구현 중. Stage 7 — 전략 평가
-엔진(백테스트/리플레이, `backtest/`) `IMPLEMENTED`, 변경 없음. Stage 6 — 사용자/YouTube 전략 자료
-구조화(`strategy_sources/`) `IMPLEMENTED`, 변경 없음. Stage 5 — 거래 상태 저장소(`state_store/`,
-SQLite 병행 인프라) `IMPLEMENTED`, 변경 없음. Phase 5 — 포지션 생명주기 및 자동 청산 (Stage 4,
+Stage 9 — 운영 관제(Dashboard/CLI, `ops_dashboard/`) `IMPLEMENTED`, Claude 자체 테스트 통과, Codex
+검증 전 — 사용자 지시에 따라 Stage 3~10을 Codex 중간 검증 없이 연속 구현 중. Stage 8 — 전략 선택
+엔진(`strategy_selection/`) `IMPLEMENTED`, 변경 없음. Stage 7 — 전략 평가 엔진(백테스트/리플레이,
+`backtest/`) `IMPLEMENTED`, 변경 없음. Stage 6 — 사용자/YouTube 전략 자료 구조화
+(`strategy_sources/`) `IMPLEMENTED`, 변경 없음. Stage 5 — 거래 상태 저장소(`state_store/`, SQLite
+병행 인프라) `IMPLEMENTED`, 변경 없음. Phase 5 — 포지션 생명주기 및 자동 청산 (Stage 4,
 `IMPLEMENTED`, 변경 없음). Phase 4 — VWAP 마이크로 풀백 전략 엔진 (Stage 3, `IMPLEMENTED`, 변경
 없음). Phase 2 — 초단타 관심종목 선별 엔진 (`IMPLEMENTED`, CODEX-010~015 수정 완료, Codex 재검증
 대기, 변경 없음).
@@ -18,6 +19,33 @@ Phase 1 최종 판정(유지): **Phase 1A(주문 진입 안전성) = VALIDATED**
 Phase 3(1분봉 실시간 수집/폴링 인프라)은 이번 사이클에서도 착수하지 않음 — Stage 3/4는 전략
 플러그인·포지션 생명주기 로직 자체만 구현했고, 구성된 pandas DataFrame과 fake broker를 입력으로
 받아 테스트한다. 라이브 1분봉 폴링/실브로커 연동은 여전히 범위 외.
+
+## Stage 9 — 운영 관제(`ops_dashboard/`, Dashboard/CLI) 구현 완료 (2026-07-26)
+`snapshot.py`(`build_snapshot()`), `cli.py`(`render_text()`/`main()`, `python -m ops_dashboard.cli`).
+
+- 구현: 현재 모드/활성 전략/시장상태/관심종목/일일 주문/포지션(손절·목표가·실현·미실현 PnL 포함)/
+  Kill Switch(binary+4-state)/Slack 설정 여부/broker config/reconciliation 집계/마지막 성공 실행
+  시각(근사치)까지 로컬 파일과 env 파생 config만으로 조립. 실제 Alpaca/Slack API를 전혀 호출하지
+  않음 — "Slack 다운 시에도 로컬 확인 가능"이 별도 폴백이 아니라 애초에 어떤 섹션도 Slack 가용성에
+  의존하지 않는 구조로 보장(Slack 섹션은 webhook 환경변수 존재 여부만, broker 섹션은 `BrokerConfig`
+  env 파생 값만 확인, 소스에 `requests.post/get` 미참조를 테스트로 검증).
+- 각 섹션(`SectionResult`)이 개별적으로 장애 허용적 — 데이터 소스 하나가 깨져도(예: 아직
+  `order_history.csv`가 초기화되지 않은 상태) 나머지 섹션은 정상 렌더링.
+- 신규 테스트: `tests/test_ops_dashboard.py` 16건. 작성 중 실제 크로스 파일 테스트 격리 버그
+  발견·수정: `test_ai_analysis.py::test_ai_analysis_is_independent_from_order_modules`가
+  `sys.modules.pop("paper_strategy_order", ...)`를 실행하는 것과 상호작용해, 파일 상단에서
+  수집 시점에 바인딩한 `import paper_strategy_order as pso`가 이후 stale해지고
+  `ops_dashboard/snapshot.py`의 내부 지역 import는 새로 재임포트된(패치되지 않은) 모듈 객체를
+  가져오면서 3개 테스트가 실행 순서에 따라 간헐적으로 실제 저장소 루트의 `order_history.csv`/
+  `order_reconciliation.csv`를 읽는 문제가 있었다. 픽스처가 fixture 실행 시점에 fresh하게
+  import하고 그 모듈 객체를 `pso`라는 이름으로 명시적으로 요청 가능한 fixture 반환값으로 노출하는
+  방식으로 수정(테스트 본문은 더 이상 파일 최상단의 stale한 바인딩에 의존하지 않음).
+- 전체 회귀: **808 passed, 0 failed**(기존 792 + 신규 16). 실제 네트워크 호출 0회, 운영 CSV 변경
+  0건.
+- 커밋: `f2e1a24`.
+- 잔여 위험: "마지막 성공 실행 시각"은 전용 마커 파일이 없어 CSV mtime을 근사치로 사용
+  (ASSUMPTION). 일일 손실(`daily_loss`)은 `account` dict를 호출자가 명시적으로 주입해야 계산되며,
+  라이브 broker 호출 없이는 `NOT_AVAILABLE`.
 
 ## Stage 8 — 전략 선택 엔진(`strategy_selection/`) 구현 완료 (2026-07-26)
 `models.py`(`SelectionState`/`SelectionInput`/`SelectionFactors`/`SelectionResult`),
@@ -369,9 +397,9 @@ binary kill switch(`kill_switch.is_trading_halted()`)와 다단계 kill switch
 - 전체 회귀 267 passed(레포 루트 `pytest -q`/`python -m pytest -q` 동일), 실제 외부 API 호출 0회, `order_history.csv` 해시 불변, 운영 파일 변경 없음 확인.
 
 ## 현재 테스트 수
-792 passed, 0 failed (Stage 8 전략 선택 엔진 신규 27건 포함, Stage 7 백테스트 엔진 신규 29건,
-Stage 6 전략 자료 구조화 신규 33건, Stage 5 거래 상태 저장소 신규 20건, Stage 4 포지션 생명주기
-신규 69건: states 31 + store 15 + lifecycle 23)
+808 passed, 0 failed (Stage 9 운영 관제 신규 16건 포함, Stage 8 전략 선택 엔진 신규 27건, Stage 7
+백테스트 엔진 신규 29건, Stage 6 전략 자료 구조화 신규 33건, Stage 5 거래 상태 저장소 신규 20건,
+Stage 4 포지션 생명주기 신규 69건: states 31 + store 15 + lifecycle 23)
 
 ## 실패 테스트
 없음
@@ -384,16 +412,18 @@ Stage 6 전략 자료 구조화 신규 33건, Stage 5 거래 상태 저장소 �
 Stage 코드가 아직 Codex 검증을 거치지 않았으므로), **Live trading: DO_NOT_ENABLE**.
 
 ## 다음 작업
-1. Stage 9(운영 관제 Dashboard/CLI) 착수 — 현재 모드/활성 전략/시장상태/관심종목/신호/주문/
-   포지션/손절·목표가/실현·미실현 PnL/일일 주문 수/일일 손실/Kill Switch/Slack 상태/broker 상태/
-   reconciliation/마지막 성공 실행 시각을 로컬에서 확인 가능하게 하고, Slack이 다운되어도 계속
-   확인 가능해야 한다.
-2. Stage 10을 사용자 지시서의 순서대로 계속 진행(자체 테스트 → 전체 회귀 → 로컬 커밋 → 문서 갱신,
-   Codex 검증 없이).
-3. Stage 10 완료 후 `docs/autonomous/FINAL_VALIDATION_PACKAGE.md` 작성, 상태를
-   `READY_FOR_FINAL_CODEX_VALIDATION`으로 종료.
+1. Stage 10(30,000원 제한 실거래 준비 문서화) 착수 — 마이크로 주문 수량 계산, 소수점 주식 확인,
+   최소 주문 금액 확인, 종목 허용목록, 일일 1~2건, 동시 1포지션, 오버나이트 금지, 첫 오류 시
+   ENTRY_DISABLED, 롤백 계획, 일일/사고 대응 플레이북, 최종 체크리스트를 작성한다. 실제 계좌/환율/
+   Live API Key/실 주문 금액/실 승인자/배포 시각/롤백 담당자는 `TBD_OPERATOR`로 남긴다.
+2. Stage 10 완료 후 `docs/autonomous/FINAL_VALIDATION_PACKAGE.md` 작성 — 전체 커밋/Stage별 변경
+   파일·테스트 결과/아키텍처/Kill Switch/30,000원 제한 실거래 준비/남은 TBD_OPERATOR 항목/알려진
+   위험/검증 중점 영역/SHA-256을 포함, 상태를 `READY_FOR_FINAL_CODEX_VALIDATION`으로 종료(이
+   문서를 쓰기 전까지는 `READY_FOR_30K_KRW_LIMITED_LIVE_REVIEW`/`LIVE_READY`/`LIVE_APPROVED`/
+   `PRODUCTION_READY` 등을 사용하지 않는다).
 
 ## 최근 커밋
+- `f2e1a24` Add trading operations monitoring dashboard (Stage 9)
 - `2094adf` Add deterministic strategy selection engine (Stage 8)
 - `59958cf` Add intraday strategy backtest/replay engine (Stage 7)
 - `9814114` Normalize .gitignore to LF and remove duplicate/dead lines
