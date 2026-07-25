@@ -226,3 +226,39 @@
   약화한 것이 아니라 Stage 3가 "아직 미구현"이라고 표시했던 스텁이 실제로 구현되며 자연히 깨질
   수밖에 없었던 가정을 갱신한 것).
 - 승인 필요 여부: 아니오(코드 구현·테스트 추가·문서화 범위, 실거래/승인/main/push와 무관).
+
+## Stage 5 — 거래 상태 저장소: CSV vs SQLite 평가 및 전환 (2026-07-25)
+
+- 평가: `order_history.csv` + `order_reconciliation.csv` + `POSITION_STORE.json`은 각자 원자적
+  쓰기(fsync+os.replace)와 `fcntl.flock` 락을 갖췄지만, 세 파일에 걸친 단일 트랜잭션은 없다.
+  주문/체결/포지션을 함께 갱신해야 하는 경우(예: 청산 주문 제출과 포지션 상태 전이) 파일 하나가
+  성공하고 다른 파일이 실패하면 불일치가 발생할 수 있다 — 이는 Phase 1B에서 이미 "부분 체결의
+  포지션 상태 완전 반영은 Phase 5 선행 필요"로 문서화된 것과 같은 근본 원인이다. 결론: **CSV는
+  다중 파일 트랜잭션·재시작 복구·체결 이력 정규화 요구를 구조적으로 만족할 수 없다** → SQLite로
+  전환 검토를 진행한다(사용자 지시서의 Stage 5 평가 조건과 일치).
+- 결정 1 — 전환 범위: 이번 단계는 **로컬 SQLite 저장소를 신규 병행 인프라로만 구축**한다.
+  `paper_strategy_order.py`/`positions/lifecycle.py`의 실제 운영 경로는 전혀 변경하지 않는다
+  (지시서의 "실제 운영 경로 전환 금지" 절대 제약). `order_history.csv`/`order_reconciliation.csv`/
+  `POSITION_STORE.json`은 계속 유일한 실제 판단 근거로 남는다. SQLite 저장소를 실제 경로에
+  배선하는 것은 **별도의 명시적 사용자 결정**이 필요한 항목으로 남겨둔다(`NEEDS_USER_DECISION`).
+- 결정 2 — 스키마: `orders`/`fills`/`positions`/`position_events`/`strategy_runs`/`risk_events`/
+  `kill_switch_events` 7개 테이블 + `schema_migrations`(버전 추적). `fills.client_order_id`에는
+  `orders`로의 FOREIGN KEY를 걸지 않았다 — `order_history.csv`가 애초에 `client_order_id`를
+  저장하지 않는 레코드도 있어(그 값은 `order_intent_ledger.csv`에만 존재), 강제 FK를 걸면 정상적인
+  레거시 CSV 가져오기가 실패한다. 기존 CSV들이 이미 (symbol, order_date) 같은 자연 키로만 상관되어
+  있는 것과 동일한 느슨한 상관관계를 그대로 유지했다.
+- 결정 3 — CSV 가져오기는 **읽기 전용**: `state_store/csv_import.py`는 `pandas.read_csv()`만
+  호출하고 원본 CSV를 절대 쓰거나 삭제하지 않는다(테스트로 원본 바이트 불변 확인). 레거시
+  `order_history.csv`(구버전 `symbol,order_date` 2컬럼 형식)와 현재
+  `REQUIRED_HISTORY_COLUMNS`(5컬럼) 형식을 모두 허용 — 없는 컬럼은 NULL로 채우고 실패시키지
+  않는다(감사용 read-only 복사본 생성이 목적이라 fail-closed보다 관용적 처리가 적절).
+- 결정 4 — 롤백/내보내기: `state_store/export.py`의 `export_table()`/`export_all()`은 SQLite →
+  CSV로만 쓰며, 대상 경로는 항상 호출자가 명시(현재 어떤 호출부도 실제 운영 CSV 경로를 대상으로
+  지정하지 않음). `reset_schema()`는 SQLite 데이터베이스 파일 자체만 초기화하며 가져오기 원본 CSV는
+  건드리지 않는다(테스트로 확인).
+- 신규 테스트: `tests/test_state_store.py` 20건(스키마/마이그레이션 멱등성/트랜잭션/FK/레거시·
+  신규 CSV 가져오기/가져오기 멱등성/내보내기 왕복/reset_schema/실제 DB 파일 미생성 확인).
+- 전체 회귀: 703 passed, 0 failed(기존 683 + 신규 20). 실제 네트워크 호출 0회, 운영 CSV 변경 0건.
+- 커밋: `<이 결정과 함께 커밋됨>`
+- 승인 필요 여부: 아니오(로컬 SQLite 신규 구축·CSV 읽기 전용 가져오기·테스트 범위, 운영 경로 전환은
+  포함하지 않음. 운영 경로 전환 자체는 향후 별도 사용자 승인 필요 항목으로 기록).
