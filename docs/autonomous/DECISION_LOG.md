@@ -305,3 +305,41 @@
   미래 봉을 구조적으로 참조할 수 없음. 데이터가 소진되어 포지션이 청산되지 못한 신호는 거래로
   기록하지 않는다(결과를 지어내지 않음, `_try_enter`의 `fill_index >= n` 처리).
 - 승인 필요 여부: 아니오(백테스트 인프라·비용 가정 문서화·테스트 범위, 실거래/승인/main/push와 무관).
+
+## Stage 8 — 전략 선택 엔진 설계 근거 (2026-07-26)
+
+- 결정 1 — "ACTIVE 전략만 평가"의 해석: 지시서 원문이 요구한 "ACTIVE 전략만 평가"를 문자 그대로
+  `strategy/status.py`의 `ACTIVE`(등록 시점 최대 1개만 허용되는 레지스트리 상태)로 해석하면
+  선택 엔진이 "이미 선택된 전략 단 하나"만 볼 수 있어 애초에 "선택"이라는 개념이 성립하지 않는다.
+  대신 **평가 대상 자격**을 `strategy/status.py` 상태 기준으로 다음과 같이 재해석했다: `REJECTED`/
+  `PAUSED` → `DISABLED`(운영자가 이미 끔), `COLLECTED`/`STRUCTURED`(아직 검토·백테스트 전) →
+  `INSUFFICIENT_DATA`, 그 외(`REVIEWED` 이상 — `BACKTESTED`/`PAPER_APPROVED`/
+  `LIMITED_LIVE_APPROVED`/`ACTIVE`)는 실제 점수 계산 대상. 이 해석 근거: 선택 엔진의 목적 자체가
+  "여러 후보 중 하나를 뽑는 것"이므로 후보 풀이 복수여야 하고, 상태 진행 단계상 `REVIEWED` 미만은
+  백테스트 데이터 자체가 없어 어차피 점수를 매길 수 없다(자연스럽게 `INSUFFICIENT_DATA`로 귀결).
+- 결정 2 — 점수 계산 임계값(전부 ASSUMPTION, `strategy_selection/scoring.py`에 상수로 고정,
+  실제 백테스트/Paper 결과를 보고 조정하지 않음):
+  `MIN_TRADES_FOR_SAMPLE_SIZE_SCORE=30`(표본 충분 기준), `MDD_REFERENCE_DOLLARS=100`(백테스트
+  `nominal_qty=100`과 동일 기준), `AVG_R_REFERENCE=2.0`, `PROFIT_FACTOR_REFERENCE=3.0`(각각 이
+  값 이상이면 해당 하위 점수 만점). `MIN_TRADES_FOR_SCORING=10`(백테스트 거래 10건 미만이면 아예
+  점수 계산 자체를 하지 않고 `INSUFFICIENT_DATA`로 처리 — 향후 실거래 승인 게이트인 "최소 100회
+  체결"보다는 낮은, 순수 선택 엔진용 최소 표본 기준).
+- 결정 3 — 합성 점수 가중치(`COMPOSITE_WEIGHTS`, 합=1.0): `backtest_performance`/
+  `paper_performance` 각 0.20(직접 성과 지표라 가장 큰 비중), `sample_size`/`mdd` 각 0.15,
+  `market_state_fit`/`symbol_condition_fit`/`slippage_sensitivity` 각 0.10. 특정 전략의 결과를
+  보고 맞춘 값이 아니라 착수 전 고정. 결측 요소는 0으로 취급하지 않고 나머지 요소로 재정규화
+  (`compute_composite_score`) — 일부 데이터가 없다고 해서 부당하게 낮은 점수를 받지 않도록 함.
+- 결정 4 — 시장상태 적합도 게이트(`PREFERRED_MARKET_STATES`): `TradingStrategy`에 선호 세션
+  메타데이터가 없어, 별도의 명시적 테이블로 관리. 현재 `VWAP_MICRO_PULLBACK_MOMENTUM_V1`만
+  `{"regular"}`로 등록(`PROJECT_CONSTITUTION.md`의 정규장 전용 정책과 일치). 테이블에 없는
+  `strategy_id`는 시장상태 불일치 게이트를 적용하지 않음(신규 전략 추가 시 이 테이블에 문서화된
+  값을 채워야 함을 코드 주석에 명시).
+- 결정 5 — 동점 처리: 합성 점수가 동일하면 입력 목록에서 먼저 나온 후보가 `SELECTED`(결정론적,
+  무작위 아님).
+- 결정 6 — 활성화와의 경계: `strategy_selection/engine.py`는 `strategy.registry`를 import하지
+  않고 `activate()`/`ACTIVE` 등록을 전혀 호출하지 않음 — Stage 7의 `backtest/compare.py`와 동일한
+  경계 원칙. `SELECTED` 판정은 추천일 뿐, 실제로 전략을 `ACTIVE`로 전환하는 것은 여전히 운영자의
+  명시적 승인 절차(전략 상태 전이)를 통해서만 이루어진다.
+- 신규 테스트: `tests/test_strategy_selection.py` 27건. 전체 회귀 792 passed, 0 failed.
+- 승인 필요 여부: 아니오(선택 엔진 인프라·가중치 문서화·테스트 범위, 실거래/승인/main/push와 무관.
+  단, 선택 결과를 실제 `ACTIVE` 전환에 사용하려면 별도 운영자 승인 절차가 필요함을 결정 6에 명시).
