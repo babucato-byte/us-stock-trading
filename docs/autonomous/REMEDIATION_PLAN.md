@@ -543,5 +543,13 @@ credential/환경 재검증)·019(상태 저장소 파일 잠금)의 코드를 �
 - 실제 Alpaca/Slack/Yahoo 호출 0회, `order_history.csv`/`universe.csv`는 이전 사이클 기록값과
   동일(불변, SHA-256 재확인), `.env`·kill switch/notification 상태 파일 변경 없음.
 - main 병합, origin push, 운영 배포, 실거래 활성화 없음.
-- 상태는 **`READY_FOR_CODEX_REVALIDATION`**이며, 독립 재검증 전까지 **Limited live review: BLOCKED**,
-  **Live trading: DO_NOT_ENABLE**을 유지한다.
+
+## Codex 최종 독립 재검증 결과 (2026-07-25, 커밋 `a31290b`/`5aac75b`/`8803252` 대상)
+
+Overall verdict **`PASS_WITH_CONDITIONS`**. CODEX-016~022 전부 **RESOLVED**로 최종 확정. 신규
+CRITICAL/HIGH/MEDIUM Finding 없음. Limited live review 권고: **`READY_FOR_LIMITED_LIVE_REVIEW`**
+(단, **Live trading: DO_NOT_ENABLE`** 유지 — 실거래 활성화를 의미하지 않음). 남은 조건은 코드
+Finding이 아니라 운영자 `TBD` 항목(실제 계좌/credential, 현재 포지션·미체결 주문·reconciliation,
+허용 종목·거래시간·주문당 절대 한도, 승인자·검토 시각·롤백 담당자)이며,
+`docs/live_review/TBD_REVIEW_RECOMMENDATIONS.md`에 각 항목의 권장값 초안이 정리되어 있다.
+상세는 `docs/autonomous/CODEX_REVIEW.md`(커밋 `d38cb95`에서 그대로 기록) 참고.

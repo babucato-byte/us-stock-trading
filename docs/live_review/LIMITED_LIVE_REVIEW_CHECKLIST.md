@@ -167,10 +167,14 @@ side 3자를 서로 대조하지 않아 `EXIT_ORDER` 선언 하에 매수 payloa
 
 이 문서의 최종 상태는 아래 두 값 중 하나로만 표기한다: `READY_FOR_LIMITED_LIVE_REVIEW` 또는 `BLOCKED`.
 
-**최종 상태: `BLOCKED`**
+**최종 상태: `READY_FOR_LIMITED_LIVE_REVIEW`**
 
-근거: CODEX-022(HIGH) 해결 및 CODEX-021(HIGH) 잔여분 종결(커밋 `5aac75b`,
-`validate_order_intent()` 3자 일치 검증)은 전체 회귀(570 passed)를 통과했으나 Codex 독립 재검증
-전이다. 문서 상태는 **`READY_FOR_CODEX_REVALIDATION`**이며 `READY_FOR_LIMITED_LIVE_REVIEW`로
-승격하지 않는다. 또한 6~7절의 운영자 기입 항목이 남아 있으므로 limited live review 및 실거래
-전환을 재개하지 않는다. **Limited live review: BLOCKED**, **Live trading: DO_NOT_ENABLE**.
+근거: Codex 독립 재검증(`CODEX_REVIEW.md`, 2026-07-25, 대상 커밋 `a31290b`/`5aac75b`/`8803252`)이
+**`PASS_WITH_CONDITIONS`**을 내리고 CODEX-016~022 전부 **RESOLVED**로 최종 확정했으며, 신규
+CRITICAL/HIGH/MEDIUM Finding이 없다. 이에 따라 이 문서의 최종 상태를 `READY_FOR_LIMITED_LIVE_REVIEW`로
+승격한다 — **단 이 값은 사람 검토 단계 진입 준비가 됐다는 의미일 뿐, 실거래 활성화가 아니다.**
+6~7절의 운영자 기입 항목(실제 계좌, 현재 포지션·미체결 주문·reconciliation, 허용 종목·거래시간·
+주문당 절대 한도, 승인자·검토 시각·롤백 담당자)이 전부 채워지고 운영자가 명시적으로 승인하기
+전까지는 실거래를 개시하지 않는다. **Live trading: DO_NOT_ENABLE**을 계속 유지하며,
+`approved: false`/`live_enabled: false`는 변경하지 않았다. 각 TBD 항목의 권장값 초안은
+[TBD_REVIEW_RECOMMENDATIONS.md](./TBD_REVIEW_RECOMMENDATIONS.md) 참조.
