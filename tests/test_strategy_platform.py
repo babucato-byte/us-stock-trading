@@ -356,12 +356,32 @@ def test_vwap_plugin_calculate_targets_rejects_stop_above_entry():
         strategy.calculate_targets(entry_price=100.0, stop_price=100.0)
 
 
-def test_vwap_plugin_manage_position_and_invalidate_are_stage4_stubs():
+def test_vwap_plugin_manage_position_is_still_a_stage4_stub():
+    # manage_position() is not overridden by the VWAP plugin -- position
+    # management is positions/lifecycle.py's job (Stage 4), driven by the
+    # already-computed stop/target prices captured at entry time, not by
+    # a per-strategy manage_position() dispatch.
     strategy = VWAPMicroPullbackV1()
     with pytest.raises(NotImplementedError):
         strategy.manage_position(position_state={}, latest_bar={})
-    with pytest.raises(NotImplementedError):
-        strategy.invalidate(evaluation=None, reason="test")
+
+
+def test_vwap_plugin_invalidate_is_implemented_in_stage4():
+    # invalidate() IS overridden (Stage 4, roadmap Phase 5): a position's
+    # entry thesis (price above VWAP) is invalidated once the latest bar
+    # closes back below VWAP. Note the real signature -- (bars, *, symbol)
+    # -- intentionally differs from the base class's NotImplementedError
+    # placeholder signature (evaluation, reason); see the docstring on
+    # VWAPMicroPullbackV1.invalidate() for why.
+    strategy = VWAPMicroPullbackV1()
+
+    # A steady climb: the latest close stays above VWAP -- not invalidated.
+    healthy = pd.DataFrame([_bar(c, volume=50_000) for c in [100, 101, 102, 103, 104]])
+    assert strategy.invalidate(healthy, symbol="AAPL") is False
+
+    # A sharp drop that closes the latest bar below VWAP: invalidated.
+    broken = pd.DataFrame([_bar(c, volume=50_000) for c in [100, 101, 102, 103, 90]])
+    assert strategy.invalidate(broken, symbol="AAPL") is True
 
 
 # ---------------------------------------------------------------------------

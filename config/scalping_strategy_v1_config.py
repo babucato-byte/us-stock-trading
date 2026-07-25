@@ -86,3 +86,19 @@ TARGET_2_R_MULTIPLE = _env_float("SCALPING_STRATEGY_TARGET_2_R_MULTIPLE", 2.0)
 PARTIAL_EXIT_FRACTION_AT_TARGET_1 = _env_float(
     "SCALPING_STRATEGY_PARTIAL_EXIT_FRACTION_AT_TARGET_1", 0.5
 )
+
+# Stage 4 (roadmap Phase 5): a position open longer than this is force-exited
+# (exit_reason="TIME_STOP") regardless of where price is. ASSUMPTION: the
+# constitution requires a time stop but does not specify a duration; a
+# scalping strategy with "보유 시간: 수분에서 당일" (minutes to same-day) makes
+# 60 minutes a conservative default pending Phase 6 backtest validation.
+# Recorded in DECISION_LOG.md.
+MAX_POSITION_HOLD_MINUTES = _env_int("SCALPING_STRATEGY_MAX_POSITION_HOLD_MINUTES", 60)
+
+# Stage 4: how many minutes before the regular session close a still-open
+# position is force-liquidated (exit_reason="EOD_FORCED_CLOSE"). Must be
+# large enough that the forced-exit order itself can be submitted and
+# reasonably expected to fill before 16:00 ET.
+EOD_FORCE_CLOSE_MINUTES_BEFORE_CLOSE = _env_int(
+    "SCALPING_STRATEGY_EOD_FORCE_CLOSE_MINUTES_BEFORE_CLOSE", 5
+)

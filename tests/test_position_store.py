@@ -117,6 +117,72 @@ def test_lock_file_left_by_dead_process_does_not_block_next_writer(tmp_path, mon
     assert store.load_position(record["position_id"]) is not None
 
 
+def test_locked_position_persists_mutation_on_clean_exit():
+    record = store.create_position("S", "1.0", "AAPL", "coid-1", 10)
+    with store.locked_position(record["position_id"]) as locked:
+        assert locked["state"] == states.SETUP_DETECTED
+        states.validate_transition(locked["state"], states.ARMED)
+        locked["state"] = states.ARMED
+        locked["state_history"].append({"state": states.ARMED, "at": "t", "reason": "test"})
+
+    reloaded = store.load_position(record["position_id"])
+    assert reloaded["state"] == states.ARMED
+
+
+def test_locked_position_does_not_persist_on_exception():
+    record = store.create_position("S", "1.0", "AAPL", "coid-1", 10)
+    with pytest.raises(RuntimeError):
+        with store.locked_position(record["position_id"]) as locked:
+            locked["state"] = states.ARMED
+            raise RuntimeError("simulated broker failure mid-transition")
+
+    reloaded = store.load_position(record["position_id"])
+    assert reloaded["state"] == states.SETUP_DETECTED  # unchanged
+
+
+def test_locked_position_unknown_id_raises():
+    with pytest.raises(store.PositionStoreError):
+        with store.locked_position("not-a-real-id"):
+            pass
+
+
+def test_locked_position_serializes_concurrent_callers(tmp_path, monkeypatch):
+    import threading
+    import time as time_module
+
+    monkeypatch.setenv("POSITION_STORE_FILE", str(tmp_path / "POSITION_STORE.json"))
+    record = store.create_position("S", "1.0", "AAPL", "coid-1", 10)
+    position_id = record["position_id"]
+
+    order = []
+    barrier = threading.Barrier(2)
+
+    def holder():
+        with store.locked_position(position_id) as locked:
+            barrier.wait(timeout=2)
+            order.append("holder-acquired")
+            time_module.sleep(0.2)  # hold the lock long enough for the second thread to block
+            locked["state"] = states.ARMED
+            locked["state_history"].append({"state": states.ARMED, "at": "t", "reason": "holder"})
+            order.append("holder-released")
+
+    def waiter():
+        barrier.wait(timeout=2)
+        time_module.sleep(0.05)  # ensure holder has the lock first
+        with store.locked_position(position_id) as locked:
+            order.append("waiter-acquired")
+            assert locked["state"] == states.ARMED  # sees holder's committed change
+
+    t1 = threading.Thread(target=holder)
+    t2 = threading.Thread(target=waiter)
+    t1.start()
+    t2.start()
+    t1.join(timeout=3)
+    t2.join(timeout=3)
+
+    assert order == ["holder-acquired", "holder-released", "waiter-acquired"]
+
+
 def test_store_file_never_created_at_real_repo_root():
     # The autouse fixture points POSITION_STORE_FILE at tmp_path for every
     # test in this module; assert the real repo-root default path was

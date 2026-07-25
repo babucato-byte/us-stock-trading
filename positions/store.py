@@ -272,3 +272,62 @@ def save_position(record, lock_timeout=LOCK_TIMEOUT_SECONDS):
         payload["positions"][position_id] = record
         _atomic_write(_resolve_store_path(), payload)
     return record
+
+
+class PositionAlreadyHandled(Exception):
+    """Raised by locked_position() callers (by convention, not by the
+    context manager itself -- see below) when the position's freshly-read
+    state is no longer one they're willing to act on, e.g. an exit was
+    already submitted by another caller that won the lock first."""
+
+
+@contextmanager
+def locked_position(position_id, lock_timeout=LOCK_TIMEOUT_SECONDS):
+    """Hold the position store's lock across an entire read-decide-act-write
+    span and yield the freshly-read, validated record as a mutable dict.
+
+    This is the one true fix for duplicate-exit prevention: a naive
+    "read state, decide, call the broker, then save" sequence is racy if
+    the lock is only held during the final save -- two near-simultaneous
+    callers could both read the same pre-exit state, both decide to
+    submit, and both actually call the broker before either gets to
+    record the outcome. Here, the lock is acquired *before* the state is
+    even read, and is not released until the `with` block exits, so a
+    second concurrent caller for the same position_id blocks (up to
+    lock_timeout) until the first caller's entire decide-act-write
+    sequence (including any broker call the caller makes inside the
+    `with` block) has completed and been persisted -- by the time the
+    second caller gets the lock, it sees the *already-updated* state and
+    can correctly decide there is nothing left to do.
+
+    The caller is responsible for: checking record["state"] is one they
+    expect to act on (raising/no-op otherwise), doing whatever broker
+    call or other side effect is needed, mutating `record` in place
+    (including calling `positions.states.validate_transition(old, new)`
+    itself before setting record["state"] = new -- this context manager
+    does not validate the transition for you, since not every use is a
+    state change), and appending to record["state_history"] if it does
+    change state. On successful exit (no exception raised inside the
+    `with` block), the mutated record is written back to disk atomically
+    while the lock is still held. On exception, nothing is written --
+    the store is left exactly as it was before the `with` block, so a
+    broker call that raised partway through never gets silently recorded
+    as if it had happened.
+
+    Raises PositionStoreError if the store file is corrupted or
+    position_id is unknown to it.
+    """
+    with _store_lock(lock_timeout):
+        payload = _read_raw()
+        if payload.get("_file_corrupted"):
+            raise PositionStoreError(
+                "Refusing to lock: the position store file is corrupted and must be "
+                "manually recovered first."
+            )
+        raw = payload["positions"].get(position_id)
+        if raw is None:
+            raise PositionStoreError(f"Cannot lock unknown position_id {position_id!r}")
+        record = _validate_or_fail_closed(position_id, raw)
+        yield record
+        payload["positions"][position_id] = record
+        _atomic_write(_resolve_store_path(), payload)

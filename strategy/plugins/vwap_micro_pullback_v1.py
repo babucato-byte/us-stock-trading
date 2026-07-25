@@ -355,3 +355,36 @@ class VWAPMicroPullbackV1(TradingStrategy):
             # and is recorded separately in config/scalping_strategy_v1_config.py.
             "partial_exit_fraction_at_target_1": cfg.PARTIAL_EXIT_FRACTION_AT_TARGET_1,
         }
+
+    def invalidate(self, bars: pd.DataFrame, *, symbol: str) -> bool:
+        """Stage 4: setup-invalidation check for a position already held.
+
+        ASSUMPTION (DECISION_LOG.md): the constitution's exit-flow
+        description lists "2R 목표 또는 VWAP/EMA9 이탈" for remaining-quantity
+        management, but does not define exactly what "이탈" (breach) means
+        numerically. This implements the simplest defensible reading: the
+        position's original entry thesis (price above VWAP) is invalidated
+        the moment the latest bar closes back below VWAP -- not on an
+        intra-bar touch, and not requiring EMA9 to also cross (EMA9/EMA21
+        are an entry-momentum filter, not restated here as a second
+        exit trigger, to avoid inventing a compound rule the source docs
+        never specified). Returns True (invalidated) / False, never raises
+        for a well-formed DataFrame -- this is called on live position bars,
+        where an exception would leave a position unmanaged.
+
+        Overrides TradingStrategy.invalidate()'s NotImplementedError stub;
+        this is the "Stage 4 wires the real position-lifecycle callbacks"
+        case the Stage 3 docstring anticipated. Signature intentionally
+        differs from the base class's NotImplementedError placeholder
+        (which took an EvaluationResult) because the real, useful signal
+        for this rule is fresh bar data, not the original entry evaluation.
+        """
+        close = _column(bars, "Close")
+        if close.empty:
+            return False
+        vwap = compute_vwap(bars)
+        latest_close = close.iloc[-1]
+        latest_vwap = vwap.iloc[-1]
+        if pd.isna(latest_close) or pd.isna(latest_vwap):
+            return False
+        return bool(latest_close < latest_vwap)

@@ -188,3 +188,41 @@
   숨기지 않고 명시(코드 주석 + 본 항목)하는 편이 "값이 없어 아무것도 못 만든다"보다 낫다고 판단.
 - 승인 필요 여부: 아니오(코드 분석·테스트 추가·최소 리팩터링·mock/fixture 작성 범위, 지시서의 "변경
   승인 기준"에 해당하지 않음). 백테스트(Phase 6) 전까지 실거래 판정 근거로 사용하지 않는다.
+
+## Stage 4(로드맵 Phase 5) — 포지션 생명주기 초기 정책 (2026-07-25)
+
+- 결정 1 — 청산 주문은 `try_reserve_order()`를 거치지 않는다: `try_reserve_order()`/
+  `is_duplicate_order()`는 "(symbol, order_date)당 최대 1행"을 강제하는 **진입** 전용 안전장치다
+  (동일 종목 당일 중복 매수 방지가 목적). 청산(부분/전체/시간손절/EOD/무효화)을 이 경로로 보내면
+  이미 그날 진입 주문이 기록된 종목의 매도 주문이 "중복 주문"으로 오판되어 차단된다. 따라서 진입만
+  `try_reserve_order()` + `submit_order(side="buy")`를 그대로 사용하고, 청산은
+  `paper_strategy_order.submit_order(side="sell")`를 직접 호출한다(kill switch/credential/
+  RequestPurpose 게이트는 동일하게 전부 통과 — 우회하는 것은 order_history.csv의 진입 전용 중복
+  방지 로직뿐). 중복 **청산** 방지는 `positions/store.py`의 `locked_position()`(포지션 레코드
+  잠금)과 `positions/states.py`의 상태 전이 검증이 대신 맡는다.
+- 결정 2 — `positions/store.py`에 `locked_position()` 컨텍스트 매니저 추가: 최초 설계였던
+  "락은 저장 시점에만 잡고, 브로커 호출은 락 밖에서 한다" 방식은 두 동시 호출이 모두 같은
+  사전-청산 상태를 읽고 둘 다 브로커에 매도 주문을 낼 수 있는 경쟁 조건이 있었다(락은 "누가 먼저
+  기록했는지"만 보호하고 "누가 먼저 브로커를 호출했는지"는 보호하지 못함). `locked_position()`은
+  읽기→판단→브로커 호출→쓰기 전체 구간 동안 락을 유지해, 두 번째 동시 호출은 첫 번째가 완전히
+  끝날 때까지 블록되고 락을 얻은 시점엔 이미 갱신된 상태를 보게 되어 "더 할 일 없음"을 정확히
+  판단한다(`tests/test_position_store.py::test_locked_position_serializes_concurrent_callers`로
+  스레드 기반 재현).
+- 결정 3(ASSUMPTION) — `MAX_POSITION_HOLD_MINUTES=60`: 지시서는 시간 손절을 요구하지만 정확한
+  분(分) 값을 명시하지 않는다. PROJECT_CONSTITUTION.md의 "보유 시간: 수분에서 당일"이라는 표현에
+  맞춰 60분을 보수적 초기값으로 사용(Phase 6 백테스트 전까지 잠정값).
+- 결정 4(ASSUMPTION) — 잔여 수량 청산의 "전략 무효화(invalidate)" 규칙:
+  `VWAPMicroPullbackV1.invalidate()`를 "최근 봉 종가가 VWAP 아래로 마감"으로 구현했다. 지시서는
+  "2R 목표 또는 VWAP/EMA9 이탈"이라고만 서술하고 정확한 조건(봉중 터치 vs 종가 마감, EMA9도 함께
+  요구하는지)은 명시하지 않는다. 진입 조건의 momentum 필터(EMA9>EMA21)를 청산 조건으로 그대로
+  재사용하면 문서에 없는 복합 규칙을 지어내는 것이 되므로, VWAP 이탈(종가 기준, 봉중 터치 아님)
+  하나만 사용한다.
+- 결정 5 — `TradingStrategy.invalidate()`의 실제 시그니처가 Stage 3 스텁 시그니처
+  (`evaluation, reason`)와 다르다(`bars, *, symbol`): Stage 3가 만든 자리표시자 시그니처는
+  "무엇을 인자로 받을지" 확정 짓지 않은 채 `NotImplementedError`만 던지는 스텁이었고, 실제로
+  청산 판단에 필요한 신호는 (진입 시점에 이미 계산된) `EvaluationResult`가 아니라 **최신 봉
+  데이터**였다. 시그니처를 억지로 맞추기보다 실제로 필요한 인자로 재정의했다(코드 주석에 명시,
+  `tests/test_strategy_platform.py`의 관련 테스트도 이 시그니처 변경을 반영해 갱신 — 기존 테스트를
+  약화한 것이 아니라 Stage 3가 "아직 미구현"이라고 표시했던 스텁이 실제로 구현되며 자연히 깨질
+  수밖에 없었던 가정을 갱신한 것).
+- 승인 필요 여부: 아니오(코드 구현·테스트 추가·문서화 범위, 실거래/승인/main/push와 무관).
