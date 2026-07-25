@@ -3,11 +3,12 @@
 마지막 갱신: 2026-07-25
 
 ## 현재 Phase
-Stage 5 — 거래 상태 저장소(`state_store/`, SQLite 병행 인프라) `IMPLEMENTED`, Claude 자체 테스트
-통과, Codex 검증 전 — 사용자 지시에 따라 Stage 3~10을 Codex 중간 검증 없이 연속 구현 중. Phase 5 —
-포지션 생명주기 및 자동 청산 (Stage 4, `IMPLEMENTED`, 변경 없음). Phase 4 — VWAP 마이크로 풀백
-전략 엔진 (Stage 3, `IMPLEMENTED`, 변경 없음). Phase 2 — 초단타 관심종목 선별 엔진
-(`IMPLEMENTED`, CODEX-010~015 수정 완료, Codex 재검증 대기, 변경 없음).
+Stage 6 — 사용자/YouTube 전략 자료 구조화(`strategy_sources/`) `IMPLEMENTED`, Claude 자체 테스트
+통과, Codex 검증 전 — 사용자 지시에 따라 Stage 3~10을 Codex 중간 검증 없이 연속 구현 중. Stage 5 —
+거래 상태 저장소(`state_store/`, SQLite 병행 인프라) `IMPLEMENTED`, 변경 없음. Phase 5 — 포지션
+생명주기 및 자동 청산 (Stage 4, `IMPLEMENTED`, 변경 없음). Phase 4 — VWAP 마이크로 풀백 전략 엔진
+(Stage 3, `IMPLEMENTED`, 변경 없음). Phase 2 — 초단타 관심종목 선별 엔진 (`IMPLEMENTED`,
+CODEX-010~015 수정 완료, Codex 재검증 대기, 변경 없음).
 
 Phase 1 최종 판정(유지): **Phase 1A(주문 진입 안전성) = VALIDATED**, **Phase 1B(부분체결·포지션
 생명주기) = Phase 5로 이관 완료, Phase 5 자체는 `IMPLEMENTED`**.
@@ -15,6 +16,49 @@ Phase 1 최종 판정(유지): **Phase 1A(주문 진입 안전성) = VALIDATED**
 Phase 3(1분봉 실시간 수집/폴링 인프라)은 이번 사이클에서도 착수하지 않음 — Stage 3/4는 전략
 플러그인·포지션 생명주기 로직 자체만 구현했고, 구성된 pandas DataFrame과 fake broker를 입력으로
 받아 테스트한다. 라이브 1분봉 폴링/실브로커 연동은 여전히 범위 외.
+
+## Stage 6 — 사용자/YouTube 전략 자료 구조화(`strategy_sources/`) 구현 완료 (2026-07-25)
+신규 패키지 `strategy_sources/`(`models.py`, `repository.py`, `similarity.py`, `known_sources.py`).
+
+- `models.py`: `StrategyClaim`(category/statement/origin/source_excerpt/confidence)과
+  `StrategySource`(source_id/type/title/reference/version/validation_status/claims/
+  derived_strategy_id/similar_to). `origin`이 소스가 명시적으로 말한 것(`SOURCE`, `source_excerpt`
+  필수)과 수집자의 추론(`ASSUMPTION`), 소스가 다루지 않은 공백(`UNKNOWN`)을 구조적으로 분리 —
+  Stage 3에서 `VWAPMicroPullbackV1.invalidate()`가 명시되지 않은 가정을 그대로 물려받을 뻔했던
+  것(`DECISION_LOG.md` Stage 3 결정 4)과 같은 문제를 방지. `validation_status`는
+  `strategy/status.py`의 앞 4개 상태(`COLLECTED`/`STRUCTURED`/`REVIEWED`/`REJECTED`)로만 제한 —
+  `ACTIVE`는 단지 "아직 도달 못함"이 아니라 **구조적으로 도달 불가능**(다른 상태로 생성 시도 시
+  `InvalidStrategySourceError`).
+- `repository.py`: 버전 관리되는 append-only JSON 저장소(기본 `docs/strategy/sources/`,
+  테스트용 `STRATEGY_SOURCES_DIR` 환경변수 오버라이드). `save_source()`는 버전이 정확히
+  (현재 최대 버전+1)이 아니면 거부하고, 이미 존재하는 버전 파일은 절대 덮어쓰지 않음 — 소스 자료의
+  변경 이력이 보존됨. `positions/store.py`와 동일한 `fcntl.flock` 락 패턴으로 동시 저장 시 버전
+  번호 경쟁 방지.
+- `similarity.py`: 두 소스 간 카테고리별 Jaccard 단어 중복도 기반 **결정론적 규칙 기반**
+  유사도 채점 — LLM 판단이 아님(Stage 8의 전략 선택 설명가능성 요구사항과 동일한 원칙을 한 단계
+  앞서 적용).
+- `known_sources.py`: 지시서에 명시된 8개 소스(VWAP 진입, 1:2 손익비, 1R 50% 분할 익절, Ross
+  Cameron 스타일 마이크로 눌림목은 `PROJECT_CONSTITUTION.md`에 실제로 명시되어 있고
+  `vwap_micro_pullback_v1.py`로 이미 구현됨 — 실제 인용문으로 `origin=SOURCE` 처리, `REVIEWED`.
+  Turtle·멀티 타임프레임 RSI·볼린저 눌림목·CCI/RSI/ADX는 실제 지정된 소스 문서/영상이 없어 모든
+  claim을 `origin=ASSUMPTION`, `reference`를 `TBD_OPERATOR` 명시 마커로 처리 — 근거 없는 인용을
+  지어내지 않음(`PROJECT_CONSTITUTION.md` 절대 금지사항 13 "유튜브에서 추출한 전략을 검증 없이
+  주문 엔진에 연결하지 않는다"와 같은 원칙을 한 단계 앞서 적용), `validation_status=COLLECTED`
+  유지, `derived_strategy_id` 없음). `seed_known_sources()`는 멱등적이며 실제
+  `docs/strategy/sources/*.json` 8개 파일로 이미 시딩 완료.
+- 신규 테스트: `tests/test_strategy_sources.py` 33건(claim/source 검증 — `ACTIVE` 구조적 차단
+  포함, 왕복 직렬화, 저장소 버전 관리 — 저장/로드/잘못된 버전 번호 거부/버전 건너뛰기 거부/다중
+  버전 이력 보존, 유사도 채점 — 동일/무관/부분 카테고리 중복 claim, 임계값 필터링, 자기 자신 제외,
+  8개 알려진 소스 카탈로그 — 정확히 8개 고유 항목, `REVIEWED` 이상 없음, 미검증 4개 항목에
+  조작된 `SOURCE` claim 없음, 시딩 멱등성 및 재로드 검증).
+- 전체 회귀: **736 passed, 0 failed**(기존 703 + 신규 33). 실제 네트워크 호출 0회, 운영 CSV
+  변경 0건.
+- 커밋: `639af97`(구현+테스트+시딩된 카탈로그), `8915c44`+`9814114`(`.gitignore` 락 파일 패턴
+  버그 수정 및 실수로 커밋된 빈 락 파일 제거 — 부수적 정리).
+- 잔여 위험: 8개 중 4개(Turtle/멀티 RSI/볼린저/CCI-RSI-ADX)는 실제 사용자 자료·영상이 아직
+  제공되지 않은 자리표시자 카탈로그 — 실제 자료 제공 시 `save_source()`로 버전 2를 추가해 갱신
+  필요. `similarity.py`는 매우 단순한 단어 중복 기반이라 유사 전략 탐지의 정밀도는 낮음(의도된
+  최소 구현, Stage 7/8에서 필요 시 고도화 검토).
 
 ## Stage 5 — 거래 상태 저장소(`state_store/`) 구현 완료 (2026-07-25)
 `docs/autonomous/DECISION_LOG.md` "Stage 5" 섹션에 CSV vs SQLite 평가를 먼저 기록한 뒤 착수.
@@ -259,8 +303,8 @@ binary kill switch(`kill_switch.is_trading_halted()`)와 다단계 kill switch
 - 전체 회귀 267 passed(레포 루트 `pytest -q`/`python -m pytest -q` 동일), 실제 외부 API 호출 0회, `order_history.csv` 해시 불변, 운영 파일 변경 없음 확인.
 
 ## 현재 테스트 수
-703 passed, 0 failed (Stage 5 거래 상태 저장소 신규 20건 포함, Stage 4 포지션 생명주기 신규 69건:
-states 31 + store 15 + lifecycle 23)
+736 passed, 0 failed (Stage 6 전략 자료 구조화 신규 33건 포함, Stage 5 거래 상태 저장소 신규 20건,
+Stage 4 포지션 생명주기 신규 69건: states 31 + store 15 + lifecycle 23)
 
 ## 실패 테스트
 없음
@@ -273,15 +317,19 @@ states 31 + store 15 + lifecycle 23)
 Stage 코드가 아직 Codex 검증을 거치지 않았으므로), **Live trading: DO_NOT_ENABLE**.
 
 ## 다음 작업
-1. Stage 6(사용자/YouTube 전략 자료 구조화) 착수 — VWAP, 1:2 R:R, 50% 분할 익절, Turtle, 멀티
-   타임프레임 RSI, Bollinger 눌림, CCI·RSI·ADX, Ross Cameron micro pullback 등 알려진 소스 자료를
-   source/assumption/unknown 분리 스키마로 구조화하고, 절대 자동으로 ACTIVE 전환하지 않는다.
-2. Stage 7~10을 사용자 지시서의 순서대로 계속 진행(각 Stage마다 자체 테스트 → 전체 회귀 → 로컬 커밋
+1. Stage 7(전략 평가 엔진: 백테스트/리플레이) 착수 — 1분봉 리플레이에 수수료/스프레드/슬리피지/
+   진입 지연/부분체결/손절-목표 동일봉 충돌 정책/장 마감 강제청산/look-ahead 방지를 반영하고,
+   거래수/승률/평균R/Profit Factor/Expectancy/MDD/연속손실/시간대·가격대·유동성·슬리피지 민감도
+   분해/최고거래 제거 결과를 산출한다.
+2. Stage 8~10을 사용자 지시서의 순서대로 계속 진행(각 Stage마다 자체 테스트 → 전체 회귀 → 로컬 커밋
    → 문서 갱신, Codex 검증 없이).
 3. Stage 10 완료 후 `docs/autonomous/FINAL_VALIDATION_PACKAGE.md` 작성, 상태를
    `READY_FOR_FINAL_CODEX_VALIDATION`으로 종료.
 
 ## 최근 커밋
+- `9814114` Normalize .gitignore to LF and remove duplicate/dead lines
+- `8915c44` Fix .gitignore lock-file pattern and remove stray lock file
+- `639af97` Structure user and YouTube strategy sources (Stage 6)
 - `bf05098` Add local SQLite trading state store (Stage 5)
 - `b3d8cf4` Add position lifecycle and automated exits (Stage 4 part 4/N)
 - `f9a2d1f` Add locked_position() and real strategy invalidation (Stage 4 part 3/N)

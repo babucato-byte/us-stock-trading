@@ -156,6 +156,20 @@ Phase 1은 두 부분으로 나뉜다:
 
 ---
 
+## Stage 6 — 사용자/YouTube 전략 자료 구조화 (부속, 2026-07-25 완료)
+
+**상태: IMPLEMENTED**
+
+이 항목은 원래 Phase 1~8 로드맵에 별도 번호가 없던 신규 범위(사용자 지시서 Stage 6)라 여기 부속
+섹션으로 기록한다. `strategy_sources/`(`models.py`/`repository.py`/`similarity.py`/
+`known_sources.py`) 신규 구현: 사용자 차트 분석·YouTube 전략 자료를 source/assumption/unknown로
+분리한 스키마, 버전 관리되는 append-only JSON 저장소, 결정론적(비-LLM) 유사도 채점. 지시서에
+명시된 8개 소스(VWAP 진입/1:2 R:R/50% 분할 익절/Ross Cameron 마이크로 눌림목은
+`PROJECT_CONSTITUTION.md` 실제 인용 + `REVIEWED`; Turtle/멀티 RSI/볼린저 눌림목/CCI·RSI·ADX는
+실제 소스 미지정이라 전부 `ASSUMPTION`+`TBD_OPERATOR`)를 `docs/strategy/sources/*.json`에 시딩.
+`validation_status`는 절대 `ACTIVE`에 도달할 수 없도록 구조적으로 제한(`strategy/status.py`
+상태 재사용, 앞 4단계만 허용). 신규 테스트 33건, 전체 회귀 736 passed. 커밋 `639af97`.
+
 ## Phase 6 — 초단타 백테스트 및 리플레이
 
 **상태: NOT_STARTED**
