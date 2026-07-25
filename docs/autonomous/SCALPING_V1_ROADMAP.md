@@ -170,10 +170,28 @@ Phase 1은 두 부분으로 나뉜다:
 `validation_status`는 절대 `ACTIVE`에 도달할 수 없도록 구조적으로 제한(`strategy/status.py`
 상태 재사용, 앞 4단계만 허용). 신규 테스트 33건, 전체 회귀 736 passed. 커밋 `639af97`.
 
-## Phase 6 — 초단타 백테스트 및 리플레이
+## Phase 6 — 초단타 백테스트 및 리플레이 (Stage 7, 2026-07-26 완료)
 
-**상태: NOT_STARTED**
-목적/완료조건: 지시서 원문 6번 섹션 그대로 적용(수수료/스프레드/슬리피지/부분체결 가정 반영, look-ahead bias 방지, 단일 수익 거래 제거 결과 별도 산출). 착수 시 세부 작업 목록을 본 절에 추가.
+**상태: IMPLEMENTED**
+
+- 목적: 1분봉 리플레이로 전략의 `generate_entry()`/`invalidate()`를 과거 데이터에 통과시켜 Phase 5
+  실거래 청산 정책(1R 50% 분할, 2R/손절 전량 청산, 시간 손절, 장 마감 강제 청산)을 동일하게
+  시뮬레이션. 수수료/스프레드/슬리피지/부분체결 가정 반영, look-ahead 방지, 단일 최대 수익 거래
+  제거 결과 별도 산출 — 착수 직전 사용자가 명시한 10개 제약(비용 미조정, 동일봉 충돌 보수적 처리,
+  비용 항목 분리 표시, look-ahead 금지, 프리마켓/정규장 분리, 부분체결·거래량 제약, 최대수익거래
+  제거 결과 별도 출력, 데이터부족 시 INSUFFICIENT_DATA, YouTube 후보 비-자동활성화, 자체+회귀
+  테스트 통과 후 다음 Stage) 그대로 구현.
+- 관련 파일: `backtest/config.py`(비용·정책 가정, 전부 결과를 보기 전에 고정), `backtest/models.py`
+  (Trade/CostBreakdown/BacktestResult), `backtest/engine.py`(리플레이 루프, look-ahead 구조적 차단),
+  `backtest/metrics.py`(승률/평균R/PF/기대값/MDD/연속손실/최대수익거래제거/시간대·가격대·유동성·
+  슬리피지 민감도 분해), `backtest/compare.py`(비교 테이블 전용, `strategy.registry` 미참조 —
+  AST 기반 테스트로 검증).
+- 테스트 결과: `tests/test_backtest_engine.py` 29건. 전체 회귀 **765 passed, 0 failed**(기존 736 +
+  신규 29). 실제 네트워크 호출 0회, 운영 CSV 변경 0건.
+- 커밋 해시: `59958cf`.
+- 잔여 위험: `nominal_qty=100`/`spread_bps=5.0`/`slippage_bps=5.0` 등은 전부 ASSUMPTION(근거
+  `DECISION_LOG.md` Stage 7 섹션) — 실제 측정치 확보 전까지 잠정값. 동일봉 충돌 정책은
+  `STOP_FIRST` 한 가지만 지원(보수적 선택, 다른 정책 필요 시 별도 결정 필요).
 
 ## Phase 7 — Paper Trading 운영 관제
 

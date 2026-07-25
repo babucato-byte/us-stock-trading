@@ -3,12 +3,13 @@
 마지막 갱신: 2026-07-25
 
 ## 현재 Phase
-Stage 6 — 사용자/YouTube 전략 자료 구조화(`strategy_sources/`) `IMPLEMENTED`, Claude 자체 테스트
-통과, Codex 검증 전 — 사용자 지시에 따라 Stage 3~10을 Codex 중간 검증 없이 연속 구현 중. Stage 5 —
-거래 상태 저장소(`state_store/`, SQLite 병행 인프라) `IMPLEMENTED`, 변경 없음. Phase 5 — 포지션
-생명주기 및 자동 청산 (Stage 4, `IMPLEMENTED`, 변경 없음). Phase 4 — VWAP 마이크로 풀백 전략 엔진
-(Stage 3, `IMPLEMENTED`, 변경 없음). Phase 2 — 초단타 관심종목 선별 엔진 (`IMPLEMENTED`,
-CODEX-010~015 수정 완료, Codex 재검증 대기, 변경 없음).
+Stage 7 — 전략 평가 엔진(백테스트/리플레이, `backtest/`) `IMPLEMENTED`, Claude 자체 테스트 통과,
+Codex 검증 전 — 사용자 지시에 따라 Stage 3~10을 Codex 중간 검증 없이 연속 구현 중. Stage 6 —
+사용자/YouTube 전략 자료 구조화(`strategy_sources/`) `IMPLEMENTED`, 변경 없음. Stage 5 — 거래 상태
+저장소(`state_store/`, SQLite 병행 인프라) `IMPLEMENTED`, 변경 없음. Phase 5 — 포지션 생명주기 및
+자동 청산 (Stage 4, `IMPLEMENTED`, 변경 없음). Phase 4 — VWAP 마이크로 풀백 전략 엔진 (Stage 3,
+`IMPLEMENTED`, 변경 없음). Phase 2 — 초단타 관심종목 선별 엔진 (`IMPLEMENTED`, CODEX-010~015 수정
+완료, Codex 재검증 대기, 변경 없음).
 
 Phase 1 최종 판정(유지): **Phase 1A(주문 진입 안전성) = VALIDATED**, **Phase 1B(부분체결·포지션
 생명주기) = Phase 5로 이관 완료, Phase 5 자체는 `IMPLEMENTED`**.
@@ -16,6 +17,39 @@ Phase 1 최종 판정(유지): **Phase 1A(주문 진입 안전성) = VALIDATED**
 Phase 3(1분봉 실시간 수집/폴링 인프라)은 이번 사이클에서도 착수하지 않음 — Stage 3/4는 전략
 플러그인·포지션 생명주기 로직 자체만 구현했고, 구성된 pandas DataFrame과 fake broker를 입력으로
 받아 테스트한다. 라이브 1분봉 폴링/실브로커 연동은 여전히 범위 외.
+
+## Stage 7 — 전략 평가 엔진(`backtest/`, 백테스트/리플레이) 구현 완료 (2026-07-26)
+착수 직전 사용자가 명시한 10개 제약을 그대로 구현: (1) 결과를 보고 임계값을 조정하지 않음 —
+`backtest/config.py`의 모든 비용/정책 가정은 어떤 전략도 백테스트하기 전에 고정, 근거는
+`DECISION_LOG.md` Stage 7 섹션. (2) 동일봉 손절/목표 충돌은 `STOP_FIRST`(보수적)만 지원. (3)
+spread/slippage/수수료/진입지연 4개 비용을 `CostBreakdown`으로 거래마다 분리 기록. (4) look-ahead
+금지 — `engine.py`는 항상 `bars.iloc[:i+1]`만 전략에 전달, 데이터가 소진돼 체결을 시뮬레이션할 수
+없는 신호는 거래로 기록하지 않음. (5) 프리마켓/정규장 분리 — 진입은
+`get_us_market_session(bar_time)=="regular"`일 때만(`paper_strategy_order.py`의 실제 운영 게이트와
+동일 조건), 프리마켓 봉은 지표 워밍업에만 사용. (6) 모든 체결이 봉 거래량의
+`max_fill_fraction_of_bar_volume`으로 캡핑, 미체결 잔량은 다음 봉으로 이월(체결을 지어내지 않음).
+(7) `compute_metrics_with_best_trade_removed()`가 `all_trades`/`best_trade_removed`를 함께 반환 —
+후자가 전자를 대체하지 않음. (8) `bars` < `min_bars_required`(기본 500)면
+`status=INSUFFICIENT_DATA`, 지표 계산 자체를 하지 않음, `compare.py`도 이를 플레이스홀더 점수 없이
+그대로 통과. (9) `backtest/compare.py`는 `strategy.registry`를 import하지 않고
+`activate()`/`ACTIVE` 등록을 전혀 호출하지 않음(AST 기반 테스트로 검증) — YouTube 후보 비교는
+비교일 뿐 자동 승격 없음, 승격은 전적으로 Stage 8 책임. (10) 자체 테스트 29건 + 전체 회귀 통과 후
+본 문서 갱신.
+
+- 관련 파일: `backtest/config.py`(`BacktestConfig`), `backtest/models.py`(`Trade`/`ExitEvent`/
+  `CostBreakdown`/`BacktestResult`), `backtest/engine.py`(리플레이 루프 — `_try_enter`/`_manage_bar`/
+  `_apply_exit`/`_finalize_trade`), `backtest/metrics.py`(승률/평균R/PF/기대값/MDD/최대연속손실/
+  최대수익거래제거/시간대·가격대·유동성·슬리피지민감도 분해), `backtest/compare.py`.
+- 신규 테스트: `tests/test_backtest_engine.py` 29건(INSUFFICIENT_DATA 처리, look-ahead 안전 체결
+  타이밍, 프리마켓 차단/정규장 허용, 동일봉 충돌 해소, 비용 분리 정확성, 거래량 캡핑+이월, 1R
+  부분익절→2R 전량청산 2건 체결 이벤트, 시간손절, 장마감 강제청산, 전략 무효화, 봉 데이터 검증,
+  전체 지표/비교 함수).
+- 전체 회귀: **765 passed, 0 failed**(기존 736 + 신규 29). 실제 네트워크 호출 0회, 운영 CSV 변경
+  0건.
+- 커밋: `59958cf`(구현+테스트), `DECISION_LOG.md` Stage 7 섹션 병행 커밋.
+- 잔여 위험: `nominal_qty=100`/`spread_bps=5.0`/`slippage_bps=5.0` 등 비용 가정은 실측치가 아닌
+  ASSUMPTION — 실제 측정 데이터 확보 시 갱신 필요(근거와 함께 `DECISION_LOG.md`에 기록). 동일봉
+  충돌 정책은 `STOP_FIRST` 한 가지만 지원.
 
 ## Stage 6 — 사용자/YouTube 전략 자료 구조화(`strategy_sources/`) 구현 완료 (2026-07-25)
 신규 패키지 `strategy_sources/`(`models.py`, `repository.py`, `similarity.py`, `known_sources.py`).
@@ -303,8 +337,9 @@ binary kill switch(`kill_switch.is_trading_halted()`)와 다단계 kill switch
 - 전체 회귀 267 passed(레포 루트 `pytest -q`/`python -m pytest -q` 동일), 실제 외부 API 호출 0회, `order_history.csv` 해시 불변, 운영 파일 변경 없음 확인.
 
 ## 현재 테스트 수
-736 passed, 0 failed (Stage 6 전략 자료 구조화 신규 33건 포함, Stage 5 거래 상태 저장소 신규 20건,
-Stage 4 포지션 생명주기 신규 69건: states 31 + store 15 + lifecycle 23)
+765 passed, 0 failed (Stage 7 백테스트 엔진 신규 29건 포함, Stage 6 전략 자료 구조화 신규 33건,
+Stage 5 거래 상태 저장소 신규 20건, Stage 4 포지션 생명주기 신규 69건: states 31 + store 15 +
+lifecycle 23)
 
 ## 실패 테스트
 없음
@@ -317,16 +352,17 @@ Stage 4 포지션 생명주기 신규 69건: states 31 + store 15 + lifecycle 23
 Stage 코드가 아직 Codex 검증을 거치지 않았으므로), **Live trading: DO_NOT_ENABLE**.
 
 ## 다음 작업
-1. Stage 7(전략 평가 엔진: 백테스트/리플레이) 착수 — 1분봉 리플레이에 수수료/스프레드/슬리피지/
-   진입 지연/부분체결/손절-목표 동일봉 충돌 정책/장 마감 강제청산/look-ahead 방지를 반영하고,
-   거래수/승률/평균R/Profit Factor/Expectancy/MDD/연속손실/시간대·가격대·유동성·슬리피지 민감도
-   분해/최고거래 제거 결과를 산출한다.
-2. Stage 8~10을 사용자 지시서의 순서대로 계속 진행(각 Stage마다 자체 테스트 → 전체 회귀 → 로컬 커밋
+1. Stage 8(전략 선택 엔진) 착수 — ACTIVE 후보만 평가 대상으로 하고, LLM 자유 판단이 아닌
+   설명가능한 점수/규칙 기반으로 선택한다(시장상태 적합도/종목상태 적합도/백테스트 성과/Paper
+   성과/표본크기/MDD/슬리피지 민감도/데이터 품질/전략 상태). 초기에는 한 번에 전략 하나만 선택,
+   선택 상태는 SELECTED/NOT_SELECTED/DISABLED/INSUFFICIENT_DATA/MARKET_MISMATCH.
+2. Stage 9~10을 사용자 지시서의 순서대로 계속 진행(각 Stage마다 자체 테스트 → 전체 회귀 → 로컬 커밋
    → 문서 갱신, Codex 검증 없이).
 3. Stage 10 완료 후 `docs/autonomous/FINAL_VALIDATION_PACKAGE.md` 작성, 상태를
    `READY_FOR_FINAL_CODEX_VALIDATION`으로 종료.
 
 ## 최근 커밋
+- `59958cf` Add intraday strategy backtest/replay engine (Stage 7)
 - `9814114` Normalize .gitignore to LF and remove duplicate/dead lines
 - `8915c44` Fix .gitignore lock-file pattern and remove stray lock file
 - `639af97` Structure user and YouTube strategy sources (Stage 6)
