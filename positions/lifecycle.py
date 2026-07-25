@@ -27,7 +27,9 @@ full reasoning):
     then sees the updated state and has nothing left to do.
 """
 
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from typing import List, Optional
 
 import paper_strategy_order
 from config import scalping_strategy_v1_config as cfg
@@ -429,6 +431,45 @@ def _force_full_exit(position_id, symbol, order_date, broker, reason, lock_timeo
 # Restart recovery
 # ---------------------------------------------------------------------------
 
+RECOVERY_STATUS_OK = "OK"
+RECOVERY_STATUS_STORE_UNAVAILABLE = "STORE_UNAVAILABLE"
+
+
+@dataclass
+class RestartRecoveryResult:
+    """CODEX-025: recover_on_restart()'s return type. Deliberately not a
+    bare list -- a bare `[]` is structurally identical whether it means
+    "no open positions" or "the store is corrupted and we can't tell,"
+    which is exactly the fail-open bug this type exists to make
+    impossible to reintroduce by accident at any call site."""
+    status: str
+    positions: List[dict] = field(default_factory=list)
+    reason: Optional[str] = None
+    broker_positions: Optional[list] = None
+
+
+def _escalate_kill_switch_for_store_failure(reason):
+    """Best-effort escalation to MANUAL_REVIEW when the position store
+    itself is unavailable -- a corrupted store might be hiding a live,
+    unmanaged position, so entries must stop until a human has reconciled
+    against the broker's own full position list. If the kill switch
+    escalation call itself fails (e.g. its own lock times out), that
+    failure is swallowed here rather than raised -- the caller's
+    RESTART_STATUS_STORE_UNAVAILABLE result is what actually blocks new
+    entries (via store.create_position() already refusing to write into a
+    corrupted file), so a failed escalation must not prevent
+    recover_on_restart() from at least reporting the store failure."""
+    try:
+        import kill_switch_state
+        kill_switch_state.activate(
+            kill_switch_state.MANUAL_REVIEW,
+            reason=f"position store unavailable on restart: {reason}",
+            activated_by="system:recover_on_restart",
+        )
+    except Exception:
+        pass
+
+
 def recover_on_restart(*, broker=None, lock_timeout=store.LOCK_TIMEOUT_SECONDS):
     """Scan every non-terminal position and reconcile it against the
     broker before anything else touches it. A position already in
@@ -437,9 +478,38 @@ def recover_on_restart(*, broker=None, lock_timeout=store.LOCK_TIMEOUT_SECONDS):
     guessing. Reconciliation failure/inconsistency (broker lookup raises,
     or returns nothing usable) also lands in RECOVERY_REQUIRED, never
     silently resumed as if the process had never restarted.
+
+    CODEX-025: if the *entire* store is unreadable/corrupted
+    (store.PositionStoreCorruptedError), this returns
+    RestartRecoveryResult(status=STORE_UNAVAILABLE, positions=[]) -- never
+    a bare empty result indistinguishable from "no positions ever
+    existed" -- and escalates the kill switch to MANUAL_REVIEW so new
+    entries stop until an operator has reconciled the broker's actual
+    position list by hand. The corrupted file itself is never touched
+    (no auto-reinitialization) so it remains available for manual
+    recovery/forensics.
     """
+    try:
+        non_terminal = store.load_non_terminal()
+    except store.PositionStoreCorruptedError as exc:
+        _escalate_kill_switch_for_store_failure(str(exc))
+        # Best-effort: pull the broker's own full position list so an
+        # operator has something concrete to reconcile the corrupted local
+        # store against. A failure here must not hide the store failure
+        # itself -- broker_positions simply stays None.
+        broker_positions = None
+        if broker is not None:
+            try:
+                broker_positions = broker.get_positions()
+            except Exception:
+                broker_positions = None
+        return RestartRecoveryResult(
+            status=RECOVERY_STATUS_STORE_UNAVAILABLE, positions=[], reason=str(exc),
+            broker_positions=broker_positions,
+        )
+
     results = []
-    for position_id, record in store.load_non_terminal().items():
+    for position_id, record in non_terminal.items():
         if record["state"] == states.RECOVERY_REQUIRED:
             results.append(record)
             continue
@@ -469,4 +539,4 @@ def recover_on_restart(*, broker=None, lock_timeout=store.LOCK_TIMEOUT_SECONDS):
                      "reason": "restart recovery: broker reconciliation confirmed current state"}
                 )
             results.append(dict(locked))
-    return results
+    return RestartRecoveryResult(status=RECOVERY_STATUS_OK, positions=results, reason=None)

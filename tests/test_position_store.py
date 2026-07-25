@@ -78,6 +78,114 @@ def test_corrupted_json_file_fails_closed_not_silently_empty(tmp_path, monkeypat
         store.create_position("S", "1.0", "AAPL", "coid-x", 1)
 
 
+# ---------------------------------------------------------------------------
+# CODEX-025: load_all()/load_non_terminal() fail closed on whole-file
+# corruption instead of silently returning {} (was indistinguishable from
+# a legitimately empty/fresh store).
+# ---------------------------------------------------------------------------
+
+def test_load_all_raises_on_corrupted_file_not_silently_empty(tmp_path, monkeypatch):
+    store_path = tmp_path / "POSITION_STORE.json"
+    monkeypatch.setenv("POSITION_STORE_FILE", str(store_path))
+    store_path.write_text("{not valid json")
+
+    with pytest.raises(store.PositionStoreCorruptedError):
+        store.load_all()
+
+
+def test_load_non_terminal_raises_on_corrupted_file(tmp_path, monkeypatch):
+    store_path = tmp_path / "POSITION_STORE.json"
+    monkeypatch.setenv("POSITION_STORE_FILE", str(store_path))
+    store_path.write_text("{not valid json")
+
+    with pytest.raises(store.PositionStoreCorruptedError):
+        store.load_non_terminal()
+
+
+def test_load_all_raises_on_schema_mismatch(tmp_path, monkeypatch):
+    store_path = tmp_path / "POSITION_STORE.json"
+    monkeypatch.setenv("POSITION_STORE_FILE", str(store_path))
+    store_path.write_text(json.dumps({"not_positions": []}))
+
+    with pytest.raises(store.PositionStoreCorruptedError):
+        store.load_all()
+
+
+def test_load_all_succeeds_on_legitimately_empty_store(tmp_path, monkeypatch):
+    store_path = tmp_path / "POSITION_STORE.json"
+    monkeypatch.setenv("POSITION_STORE_FILE", str(store_path))
+    # No file at all -- a fresh install, must not be conflated with corruption.
+    assert store.load_all() == {}
+    assert store.load_non_terminal() == {}
+
+
+# ---------------------------------------------------------------------------
+# CODEX-025: check_store_health() diagnostic classification
+# ---------------------------------------------------------------------------
+
+def test_check_store_health_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv("POSITION_STORE_FILE", str(tmp_path / "POSITION_STORE.json"))
+    health = store.check_store_health()
+    assert health["status"] == store.STORE_STATUS_MISSING
+
+
+def test_check_store_health_valid_empty(tmp_path, monkeypatch):
+    store_path = tmp_path / "POSITION_STORE.json"
+    monkeypatch.setenv("POSITION_STORE_FILE", str(store_path))
+    store.create_position("S", "1.0", "AAPL", "coid-1", 1)
+    # remove the one position to leave a legitimately empty-but-valid file
+    payload = store._read_raw()
+    payload["positions"] = {}
+    store._atomic_write(store._resolve_store_path(), payload)
+    health = store.check_store_health()
+    assert health["status"] == store.STORE_STATUS_VALID_EMPTY
+
+
+def test_check_store_health_valid_with_positions(tmp_path, monkeypatch):
+    monkeypatch.setenv("POSITION_STORE_FILE", str(tmp_path / "POSITION_STORE.json"))
+    store.create_position("S", "1.0", "AAPL", "coid-1", 1)
+    health = store.check_store_health()
+    assert health["status"] == store.STORE_STATUS_VALID_WITH_POSITIONS
+
+
+def test_check_store_health_corrupted(tmp_path, monkeypatch):
+    store_path = tmp_path / "POSITION_STORE.json"
+    monkeypatch.setenv("POSITION_STORE_FILE", str(store_path))
+    store_path.write_text("{not valid json")
+    health = store.check_store_health()
+    assert health["status"] == store.STORE_STATUS_CORRUPTED
+
+
+def test_check_store_health_schema_mismatch(tmp_path, monkeypatch):
+    store_path = tmp_path / "POSITION_STORE.json"
+    monkeypatch.setenv("POSITION_STORE_FILE", str(store_path))
+    store_path.write_text(json.dumps([1, 2, 3]))
+    health = store.check_store_health()
+    assert health["status"] == store.STORE_STATUS_SCHEMA_MISMATCH
+
+
+def test_check_store_health_permission_error(tmp_path, monkeypatch):
+    store_path = tmp_path / "POSITION_STORE.json"
+    monkeypatch.setenv("POSITION_STORE_FILE", str(store_path))
+    store.create_position("S", "1.0", "AAPL", "coid-1", 1)
+    store_path.chmod(0o000)
+    try:
+        health = store.check_store_health()
+        assert health["status"] in (store.STORE_STATUS_READ_FAILURE, store.STORE_STATUS_CORRUPTED)
+    finally:
+        store_path.chmod(0o644)  # restore so tmp_path cleanup can remove it
+
+
+def test_check_store_health_partial_truncated_file(tmp_path, monkeypatch):
+    store_path = tmp_path / "POSITION_STORE.json"
+    monkeypatch.setenv("POSITION_STORE_FILE", str(store_path))
+    store.create_position("S", "1.0", "AAPL", "coid-1", 1)
+    full_content = store_path.read_text()
+    store_path.write_text(full_content[: len(full_content) // 2])  # truncate mid-write
+    health = store.check_store_health()
+    assert health["status"] == store.STORE_STATUS_CORRUPTED
+
+
 def test_record_missing_required_field_fails_closed(tmp_path, monkeypatch):
     store_path = tmp_path / "POSITION_STORE.json"
     monkeypatch.setenv("POSITION_STORE_FILE", str(store_path))

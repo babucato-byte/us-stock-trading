@@ -54,6 +54,58 @@ class PositionStoreError(Exception):
     """Raised for lock/IO failures against the position store."""
 
 
+class PositionStoreCorruptedError(PositionStoreError):
+    """CODEX-025: raised by load_all()/load_non_terminal() when the entire
+    store file is unreadable/corrupted, instead of silently returning {}.
+
+    A whole-file corruption (truncated write, permission error, invalid
+    JSON, or a payload that isn't the expected {"positions": {...}} shape)
+    means every position that may have been recorded in it is now of
+    unknown truth -- there could be a live, unmanaged open position sitting
+    in a file we can no longer read. Returning an empty dict from that
+    state is indistinguishable from "this account has genuinely never
+    traded," which is a fail-open outcome dressed up as fail-closed
+    (load_position() for a single known id already does the right thing by
+    surfacing RECOVERY_REQUIRED; load_all() previously did not carry that
+    guarantee forward because it has no id to key a fail-closed record on).
+    Callers (positions/lifecycle.py::recover_on_restart()) must treat this
+    exception as "the whole store is unavailable," not attempt to catch it
+    and proceed as if positions were simply absent.
+    """
+
+
+# Store-health classification (CODEX-025). Purely diagnostic/reporting --
+# load_all()/load_non_terminal() only ever draw the coarser
+# healthy-vs-PositionStoreCorruptedError distinction for control flow, but
+# check_store_health() exposes the finer-grained reason for logs/dashboards.
+STORE_STATUS_MISSING = "MISSING_STORE"
+STORE_STATUS_VALID_EMPTY = "VALID_EMPTY"
+STORE_STATUS_VALID_WITH_POSITIONS = "VALID_WITH_POSITIONS"
+STORE_STATUS_CORRUPTED = "CORRUPTED_STORE"
+STORE_STATUS_SCHEMA_MISMATCH = "SCHEMA_MISMATCH"
+STORE_STATUS_READ_FAILURE = "READ_FAILURE"
+
+
+def check_store_health():
+    """Read-only diagnostic classification of the store file's current
+    state. Never raises; always returns {"status": ..., "reason": ...}."""
+    path = _resolve_store_path()
+    if not path.exists():
+        return {"status": STORE_STATUS_MISSING, "reason": "no store file yet (never traded, or fresh install)"}
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+    except PermissionError as exc:
+        return {"status": STORE_STATUS_READ_FAILURE, "reason": f"permission error: {exc}"}
+    except Exception as exc:
+        return {"status": STORE_STATUS_CORRUPTED, "reason": f"parse failure: {exc}"}
+    if not isinstance(payload, dict) or not isinstance(payload.get("positions"), dict):
+        return {"status": STORE_STATUS_SCHEMA_MISMATCH, "reason": "payload is not the expected {'positions': {...}} shape"}
+    if not payload["positions"]:
+        return {"status": STORE_STATUS_VALID_EMPTY, "reason": None}
+    return {"status": STORE_STATUS_VALID_WITH_POSITIONS, "reason": None}
+
+
 def _resolve_store_path():
     override = os.environ.get("POSITION_STORE_FILE")
     return Path(override) if override else STORE_FILE
@@ -195,11 +247,22 @@ def load_position(position_id):
 
 def load_all():
     """Return {position_id: record} for every position in the store, each
-    individually validated/fail-closed. One corrupted record never hides or
-    invalidates the others."""
+    individually validated/fail-closed. One corrupted *record* never hides
+    or invalidates the others (see _validate_or_fail_closed).
+
+    A corrupted *store file* (CODEX-025) is a different failure mode and
+    must not be conflated with "no positions": raises
+    PositionStoreCorruptedError rather than returning {}, since an empty
+    dict here is indistinguishable from a legitimately fresh install and
+    would cause restart recovery to skip broker reconciliation for
+    positions that may actually still be open.
+    """
     payload = _read_raw()
     if payload.get("_file_corrupted"):
-        return {}
+        raise PositionStoreCorruptedError(
+            "Position store file is corrupted or unreadable; refusing to report positions "
+            "as empty. Manual recovery required before resuming trading."
+        )
     return {
         position_id: _validate_or_fail_closed(position_id, raw)
         for position_id, raw in payload["positions"].items()

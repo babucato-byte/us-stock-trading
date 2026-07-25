@@ -456,18 +456,19 @@ def test_compute_unrealized_pnl_zero_when_no_remaining_qty():
 def test_recover_on_restart_marks_unreconcilable_position_recovery_required():
     record, broker = _filled_position(qty=10)
     # No broker passed => reconciliation is inconclusive by construction.
-    results = lifecycle.recover_on_restart(broker=None)
-    assert len(results) == 1
-    assert results[0]["state"] == states.RECOVERY_REQUIRED
+    result = lifecycle.recover_on_restart(broker=None)
+    assert result.status == lifecycle.RECOVERY_STATUS_OK
+    assert len(result.positions) == 1
+    assert result.positions[0]["state"] == states.RECOVERY_REQUIRED
 
 
 def test_recover_on_restart_confirms_when_broker_lookup_succeeds():
     record, broker = _filled_position(qty=10)
     broker._orders_by_client_id[record["client_order_id"]] = {"status": "filled"}
 
-    results = lifecycle.recover_on_restart(broker=broker)
-    assert len(results) == 1
-    assert results[0]["state"] == states.STOP_ACTIVE  # unchanged, confirmed
+    result = lifecycle.recover_on_restart(broker=broker)
+    assert len(result.positions) == 1
+    assert result.positions[0]["state"] == states.STOP_ACTIVE  # unchanged, confirmed
 
 
 def test_recover_on_restart_leaves_already_recovery_required_untouched():
@@ -477,13 +478,74 @@ def test_recover_on_restart_leaves_already_recovery_required_untouched():
         locked["state"] = states.RECOVERY_REQUIRED
         locked["state_history"].append({"state": states.RECOVERY_REQUIRED, "at": "t", "reason": "prior crash"})
 
-    results = lifecycle.recover_on_restart(broker=broker)
-    assert results[0]["state"] == states.RECOVERY_REQUIRED
+    result = lifecycle.recover_on_restart(broker=broker)
+    assert result.positions[0]["state"] == states.RECOVERY_REQUIRED
 
 
 def test_recover_on_restart_skips_terminal_positions():
     record, broker = _filled_position(qty=10)
     lifecycle.check_and_manage(record["position_id"], current_price=94.0, broker=broker)  # closes it
 
-    results = lifecycle.recover_on_restart(broker=broker)
-    assert results == []
+    result = lifecycle.recover_on_restart(broker=broker)
+    assert result.positions == []
+    assert result.status == lifecycle.RECOVERY_STATUS_OK
+
+
+# ---------------------------------------------------------------------------
+# CODEX-025: corrupted store fails closed on restart, not silently empty
+# ---------------------------------------------------------------------------
+
+def test_recover_on_restart_store_unavailable_on_corrupted_file(tmp_path, monkeypatch):
+    store_path = tmp_path / "POSITION_STORE.json"
+    monkeypatch.setenv("POSITION_STORE_FILE", str(store_path))
+    store_path.write_text("{not valid json")
+
+    result = lifecycle.recover_on_restart(broker=None)
+    assert result.status == lifecycle.RECOVERY_STATUS_STORE_UNAVAILABLE
+    assert result.positions == []
+    assert result.reason is not None
+
+
+def test_recover_on_restart_store_unavailable_escalates_kill_switch(tmp_path, monkeypatch):
+    import kill_switch_state
+    store_path = tmp_path / "POSITION_STORE.json"
+    monkeypatch.setenv("POSITION_STORE_FILE", str(store_path))
+    store_path.write_text("{not valid json")
+
+    lifecycle.recover_on_restart(broker=None)
+    assert kill_switch_state.get_state() == kill_switch_state.MANUAL_REVIEW
+
+
+def test_recover_on_restart_store_unavailable_fetches_broker_positions_best_effort():
+    strategy = FakeStrategy()
+    registry = _active_registry(strategy)
+    broker = FakeBroker()
+    broker._positions = [{"symbol": "AAPL", "qty": 5}]
+    bars = pd.DataFrame([{"Close": 100.0}])
+    lifecycle.enter_position(strategy, "AAPL", bars, qty=10, order_date=TODAY, broker=broker, registry=registry)
+
+    import positions.store as store_module
+    store_path = store_module._resolve_store_path()
+    store_path.write_text("{not valid json")
+
+    def _get_positions():
+        return [{"symbol": "AAPL", "qty": 5}]
+    broker.get_positions = _get_positions
+
+    result = lifecycle.recover_on_restart(broker=broker)
+    assert result.status == lifecycle.RECOVERY_STATUS_STORE_UNAVAILABLE
+    assert result.broker_positions == [{"symbol": "AAPL", "qty": 5}]
+
+
+def test_new_entry_refused_when_store_corrupted(tmp_path, monkeypatch):
+    store_path = tmp_path / "POSITION_STORE.json"
+    monkeypatch.setenv("POSITION_STORE_FILE", str(store_path))
+    store_path.write_text("{not valid json")
+
+    strategy = FakeStrategy()
+    registry = _active_registry(strategy)
+    broker = FakeBroker()
+    bars = pd.DataFrame([{"Close": 100.0}])
+    with pytest.raises(store.PositionStoreError):
+        lifecycle.enter_position(strategy, "AAPL", bars, qty=10, order_date=TODAY, broker=broker, registry=registry)
+    assert broker.submit_calls == []
