@@ -1,11 +1,14 @@
 # CURRENT_STATUS
 
-마지막 갱신: 2026-07-25
+마지막 갱신: 2026-07-26
 
 ## 현재 Phase
-Stage 10 — 30,000원 제한 실거래 준비(`live_readiness/` + 플레이북 문서) 문서화·계산 모듈 완료
-(실거래 준비 완료 아님), Claude 자체 테스트 통과, Codex 검증 전. **Stage 3~10 사용자 지시서 범위
-전체 완료** — 다음 작업은 `FINAL_VALIDATION_PACKAGE.md` 작성 및 Codex 통합 검증 요청. Stage 9 —
+**`docs/autonomous/FINAL_VALIDATION_PACKAGE.md` 작성 완료(커밋 `530f888`) — 상태
+`READY_FOR_FINAL_CODEX_VALIDATION`.** Stage 3~10 사용자 지시서 범위 전체가 자체 테스트·전체
+회귀(820 passed, 0 failed)를 통과한 상태로 완료되었으며, 남은 것은 Codex 통합 검증 요청뿐이다.
+`approved: false`, `live_enabled: false` 유지, **Live trading: DO_NOT_ENABLE**. Stage 10 —
+30,000원 제한 실거래 준비(`live_readiness/` + 플레이북 문서) `IMPLEMENTED`(문서화·계산 모듈,
+실거래 준비 완료 아님), 변경 없음. Stage 9 —
 운영 관제(Dashboard/CLI, `ops_dashboard/`) `IMPLEMENTED`, 변경 없음. Stage 8 — 전략 선택 엔진
 (`strategy_selection/`) `IMPLEMENTED`, 변경 없음. Stage 7 — 전략 평가 엔진(백테스트/리플레이,
 `backtest/`) `IMPLEMENTED`, 변경 없음. Stage 6 — 사용자/YouTube 전략 자료 구조화
@@ -434,25 +437,23 @@ lifecycle 23)
 
 ## 현재 블로커
 없음 (코드 수준). CODEX-016~022는 이전 사이클에서 Codex 최종 독립 재검증까지 `PASS_WITH_CONDITIONS`로
-종결됨(위 "Codex 최종 독립 재검증" 섹션 참고). 사용자 지시에 따라 Stage 3~10은 Codex 중간 검증 없이
-연속 구현 중이며, 전체 완료 후 `FINAL_VALIDATION_PACKAGE.md` 작성과 함께 Codex 통합 검증을 1회
-요청할 예정. `approved: false`, `live_enabled: false` 유지. **Limited live review: BLOCKED**(신규
-Stage 코드가 아직 Codex 검증을 거치지 않았으므로), **Live trading: DO_NOT_ENABLE**.
+종결됨(위 "Codex 최종 독립 재검증" 섹션 참고). Stage 3~10은 자체 테스트·전체 회귀를 모두 통과한
+상태로 완료되었고 `FINAL_VALIDATION_PACKAGE.md`도 작성 완료됨 — **유일한 블로커는 아직 Codex
+통합 검증을 요청/수행하지 않았다는 것뿐**. `approved: false`, `live_enabled: false` 유지.
+**Limited live review: BLOCKED**(신규 Stage 코드가 아직 Codex 검증을 거치지 않았으므로),
+**Live trading: DO_NOT_ENABLE**.
 
 ## 다음 작업
-1. **`docs/autonomous/FINAL_VALIDATION_PACKAGE.md` 작성** — Stage 3~10 전 범위가 완료됨에 따라
-   유일하게 남은 작업. 전체 커밋 목록/Stage별 변경 파일·테스트 결과/아키텍처/전략 인터페이스/활성
-   전략/포지션 생명주기/SQLite 저장소 구조/사용자·YouTube 전략 구조/전략 평가·선택 방식/Kill
-   Switch/운영 관제/30,000원 제한 실거래 준비/외부 API 호출 현황/운영 파일 변경 현황/main·origin
-   현황/`approved`·`live_enabled` 현황/남은 TBD_OPERATOR 항목/알려진 위험/검증 중점 영역/SHA-256을
-   포함해야 한다. 최종 상태는 `READY_FOR_FINAL_CODEX_VALIDATION`으로 종료하며,
-   `READY_FOR_30K_KRW_LIMITED_LIVE_REVIEW`/`LIVE_READY`/`LIVE_APPROVED`/`PRODUCTION_READY` 등은
-   Codex의 최종 검증 전까지 사용하지 않는다.
-2. 이후에는 Codex 통합 검증 1회를 요청하고, 결과(`PASS`/`PASS_WITH_CONDITIONS`/`FAIL`)에 따라
-   후속 조치(추가 수정 또는 제한적 실거래 검토 재개 여부 판단)를 진행한다 — 사용자 승인 없이는
-   main/origin/실거래를 건드리지 않는다.
+1. **Codex 통합 검증 요청** — `docs/autonomous/FINAL_VALIDATION_PACKAGE.md`(커밋 `530f888`)를
+   근거로 1회 요청. 결과(`PASS`/`PASS_WITH_CONDITIONS`/`FAIL`)에 따라 후속 조치를 진행한다:
+   - `PASS`/`PASS_WITH_CONDITIONS`: `CODEX_REVIEW.md`에 기록하고, §10에 정리된 잔여 위험(특히
+     SQLite/`ENTRY_DISABLED`/allow-list 미배선 3건)에 대한 후속 조치 여부를 사용자와 논의.
+   - `FAIL`: 지적된 CRITICAL/HIGH를 기존 CODEX-XXX 사이클과 동일한 패턴으로 수정 후 재검증.
+2. 어떤 결과든 `approved`/`live_enabled`/`main`/`origin`/실거래 활성화는 사용자의 명시적 승인
+   없이는 건드리지 않는다.
 
 ## 최근 커밋
+- `530f888` Add FINAL_VALIDATION_PACKAGE.md for Stage 3-10, ready for Codex validation
 - `986d655` Prepare 30000 KRW limited live review (Stage 10)
 - `f2e1a24` Add trading operations monitoring dashboard (Stage 9)
 - `2094adf` Add deterministic strategy selection engine (Stage 8)
