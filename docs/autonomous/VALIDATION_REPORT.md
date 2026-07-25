@@ -1,5 +1,72 @@
 # VALIDATION_REPORT
 
+## 2026-07-26 — Stage 3~10 통합 수정 사이클: CODEX-023~027 해결
+
+Codex 독립 검증(`CODEX_REVIEW.md`, 대상 범위 `415c129`~`64a5551`, overall verdict **FAIL**,
+Stage 3~10 판정 **KEEP_IN_PROGRESS**)이 신규 HIGH 4건(CODEX-023~026) + MEDIUM 1건(CODEX-027)을
+제기했다. 상세 재현·수정 내용은 `REMEDIATION_PLAN.md`의 동일 날짜 섹션 참고. 이 문서는 최종
+검증 결과만 요약한다.
+
+- **CODEX-023**(HIGH, accepted를 체결로 오판): `positions/order_status.py` 신설, 청산 경로가
+  broker의 실제 주문 상태(accepted/new/... vs partially_filled/filled)를 구분하도록 재작성.
+- **CODEX-024**(HIGH, timeout 후 중복 sell 가능): `state_store/exit_intent_ledger.py` 신설,
+  broker 호출 전에 durable exit intent를 SQLite에 원자적으로 예약하는 3단계 청산 흐름으로 재설계.
+- **CODEX-025**(HIGH, 손상 store가 빈 결과로 보임): `positions/store.py::load_all()`이 전체 파일
+  손상 시 예외를 발생시키도록 변경, `recover_on_restart()`가 구조적으로 구분되는
+  `RestartRecoveryResult`를 반환.
+- **CODEX-026**(HIGH, 30,000원/allow-list 미배선): `live_readiness/order_gateway.py` 신설,
+  `paper_strategy_order.submit_order()`의 live-mode 진입 경로에 배선(Paper 거래·청산은 미적용).
+- **CODEX-027**(MEDIUM, 비정상 fill 허용): `positions/fill_validation.py` 신설,
+  `record_fill()`이 mutation 전에 검증하도록 변경.
+
+### 실행 명령 및 결과
+```
+./venv/bin/python -m pytest -q
+```
+```
+923 passed, 0 failed, 2 warnings
+```
+- CODEX-023~027 착수 전 기준선(820 passed, 이전 Stage 3~10 완료 시점) 대비 신규 103건 추가.
+- 실제 Alpaca/Slack/Yahoo 네트워크 호출 0회 (`FakeBroker`/`SequencedBroker`/실제 `AlpacaBroker`
+  + 세션 호출 시 예외를 던지는 더블만 사용).
+- 실제 운영 CSV(`order_history.csv`/`universe.csv`/`strategy_performance.csv`) 변경 0건(md5
+  재확인). 실제 저장소 루트 `TRADING_STATE.db`가 테스트 중 생성되지 않음을 전용 테스트로 확인
+  (청산 경로의 신규 SQLite 의존성이 격리되지 않았던 실제 버그를 발견·수정한 뒤).
+
+### 코드 변경 검증
+- 청산 경로 재작성이 기존 duplicate-exit 방지(포지션 락 기반)를 대체한 것이 아니라, 그 위에
+  크래시/timeout 생존 가능한 durable intent 계층을 추가한 것임을 동시성 테스트로 재확인
+  (`positions/store.py::locked_position()`은 변경하지 않음).
+- CODEX-026의 live-mode 게이트가 `broker.config.is_live_mode`로 정확히 분기해 Paper 거래 경로를
+  전혀 건드리지 않음을, 기존 수백 건의 Paper 경로 테스트가 전부 그대로 통과하는 것으로 확인.
+- `getattr(broker.config, ...)`이 `.config` 없는 테스트 더블에서 `AttributeError`를 유발하던
+  실제 버그를 발견·수정하고 전용 회귀 테스트를 추가.
+
+### 테스트하지 못한 영역
+- 실제 Alpaca 계정에서의 accepted→filled 실제 이벤트 순서/타이밍(이번 사이클은 시뮬레이션된
+  broker 응답으로만 검증).
+- 실제 SQLite 파일을 여러 프로세스(스레드가 아닌)가 동시에 사용하는 시나리오 — 스레딩 동시성은
+  테스트했으나 멀티프로세스 재현은 이번 사이클 범위 밖.
+- 실제 FX 데이터 제공자 연동 — `live_readiness/order_gateway.py`는 FX rate를 호출자가 주입하는
+  구조이며, 실제 제공자 연결은 아직 존재하지 않음(§7 TBD_OPERATOR, `LIMITED_LIVE_30K_KRW_
+  PLAYBOOK.md`).
+
+### 안전 관련 변경
+- 전부 기존 동작을 더 보수적으로 만드는 방향(청산을 더 신중하게 확인, 손상 store를 더 명확히
+  차단, 실거래 진입에 새 게이트 추가, 비정상 fill 차단) — 기존 리스크 한도를 완화한 곳 없음.
+
+### 운영 영향
+- 없음. 운영 서버 미접속, systemd/cron/nginx 미변경, `.env` 실값 미변경, `main`/`origin` 미변경.
+
+### 남은 위험
+- `paper_strategy_order.submit_order()`를 우회해 `broker.submit_order()`를 직접 호출하는 경로는
+  CODEX-026 게이트의 적용을 받지 않음(현재 이 저장소 내 어떤 진입 경로도 그렇게 하지 않음을 확인했으나,
+  향후 신규 코드가 이 경로를 우회하지 않도록 유지 관리 필요).
+- 첫 오류 시 `ENTRY_DISABLED` 자동 배선은 여전히 미구현(Stage 10에서 `NEEDS_USER_DECISION`으로
+  기록, 이번 사이클도 변경하지 않음).
+
+---
+
 ## 2026-07-25 — CODEX-022 해결 및 CODEX-021 잔여분 종결 (validate_order_intent 3자 일치 검증)
 
 Codex 독립 재검증(`CODEX_REVIEW.md`, 대상 커밋 `47ae3ca`/`c133e01`/`cc740a5`, overall verdict

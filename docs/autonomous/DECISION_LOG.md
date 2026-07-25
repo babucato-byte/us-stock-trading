@@ -343,3 +343,46 @@
 - 신규 테스트: `tests/test_strategy_selection.py` 27건. 전체 회귀 792 passed, 0 failed.
 - 승인 필요 여부: 아니오(선택 엔진 인프라·가중치 문서화·테스트 범위, 실거래/승인/main/push와 무관.
   단, 선택 결과를 실제 `ACTIVE` 전환에 사용하려면 별도 운영자 승인 절차가 필요함을 결정 6에 명시).
+
+## Stage 3~10 통합 수정 사이클 — CODEX-023~027 (2026-07-26)
+
+- 결정 1(CODEX-023/024, 아키텍처) — 청산 durable intent를 Stage 5의 SQLite(`state_store/`)에
+  신규 `exit_intents` 테이블(migration 2)로 추가하고, 포지션 자체(JSON, `positions/store.py`)는
+  마이그레이션하지 않았다. 근거: 포지션 저장소 전체를 SQLite로 옮기는 것은 기존에 광범위하게
+  테스트된 JSON 기반 API(`create_position`/`load_position`/`locked_position` 등)를 건드리는
+  대규모 변경이며, CODEX-024가 실제로 요구하는 것은 "broker 호출 전 durable 기록"이라는 신규
+  기능이지 기존 포지션 저장소의 재작성이 아니다. exit intent만 SQLite로 분리하면 두 저장소 간
+  진짜 단일 트랜잭션은 없지만(Phase 1B/Phase 5의 기존 잔여 위험과 동일한 성격), CODEX-024가
+  요구한 "broker 호출 전 원자적 영속화"는 `positions.store.locked_position()` 블록이 broker
+  호출 **전에** 끝나도록 3단계로 나눈 것으로 실질적으로 충족된다(Phase A가 디스크에 커밋된 뒤에만
+  Phase B가 실행됨).
+- 결정 2(CODEX-023, 정책) — 청산 시 broker가 반환한 `filled_avg_price`가 없으면(`None`) 손절가
+  또는 target_1가로 대체(fallback)한다(기존 Stage 4 정책 유지). 실제 체결가를 모르는 상태에서
+  PnL을 아예 계산하지 않는 대안도 검토했으나, 그 경우 CLOSED 포지션의 realized_pnl이 영구히
+  `None`으로 남아 운영 대시보드·최종 정산에 사용할 수 없게 되므로, 트리거 가격을 보수적 근사치로
+  사용하는 기존 정책을 그대로 유지하기로 했다(ASSUMPTION, 실제 체결가가 나중에 reconciliation으로
+  확인되면 후속 개선 과제로 남김).
+- 결정 3(CODEX-026, 범위) — 30,000원/allow-list 게이트는 `paper_strategy_order.submit_order()`의
+  `side="buy" AND broker.config.is_live_mode` 조합에서만 활성화하고, Paper 거래·청산 주문에는
+  전혀 적용하지 않는다. 근거: (a) 이 예산·allow-list 개념 자체가 "실거래 파일럿"에만 의미가 있고
+  Paper 거래에는 적용할 논리적 근거가 없다(가짜 자금에 KRW 예산을 강제하는 것은 무의미), (b) 기존
+  Paper 경로는 이미 수백 건의 테스트로 검증된 안전 크리티컬 경로이며, 이번 사이클에서 그 경로의
+  동작을 하나라도 바꾸면 회귀 위험이 이번 수정 자체의 목적(안전성 강화)과 상충한다, (c) 청산은
+  `kill_switch_state`의 `ENTRY_DISABLED`(신규 진입만 차단, 청산은 허용)와 동일한 기존 비대칭
+  원칙을 그대로 따른다 — 이미 보유한 포지션은 예산 상태와 무관하게 항상 청산 가능해야 한다.
+- 결정 4(CODEX-026, 잔여 범위) — `paper_strategy_order.submit_order()`를 우회해
+  `broker.submit_order()`를 직접 호출하는 경로는 이번 게이트의 보호를 받지 못한다. 이 저장소
+  전체를 검색해 그런 직접 호출 경로가 현재 존재하지 않음을 확인했으나(모든 진입 경로가 이미
+  `submit_order()`를 경유), 이를 원천적으로 막는 것(예: `broker/alpaca_client.py::_request()`
+  레벨에 배선)은 이미 CODEX-016~022로 검증 완료된 안전 크리티컬 네트워크 경계를 다시 건드리는
+  것이라 이번 사이클 범위에서 제외했다. `docs/live_review/LIMITED_LIVE_30K_KRW_PLAYBOOK.md`
+  §4의 `NEEDS_USER_DECISION`과 함께, 향후 실제 제한적 실거래 검토 시점에 재평가할 항목으로
+  기록한다.
+- 결정 5(CODEX-025, 복구 정책) — 손상된 store 감지 시 Kill Switch를 `ENTRY_DISABLED`가 아니라
+  `MANUAL_REVIEW`로 전환한다. 근거: `ENTRY_DISABLED`는 "신규 진입만 막고 기존 포지션 청산은
+  허용"하는 상태인데, 손상된 store는 청산해야 할 포지션이 있는지조차 알 수 없는 상태이므로,
+  청산이 계속 허용되는 `ENTRY_DISABLED`보다 사람의 개입을 명시적으로 요구하는 `MANUAL_REVIEW`가
+  더 보수적이고 정확하다(`kill_switch_state.py`의 기존 상태 의미론과 일치).
+- 승인 필요 여부: 아니오(코드 구현·테스트 추가·문서화 범위, 실거래/승인/main/push와 무관). 결정
+  3·4에 기록된 "Live 모드 게이트가 direct broker 호출을 막지 못한다"는 잔여 범위는 실제 제한적
+  실거래 검토 시점에 사용자 재확인이 필요한 `NEEDS_USER_DECISION`으로 별도 기록.

@@ -137,6 +137,65 @@ wrapper뿐 아니라 `broker/alpaca_client.py::AlpacaBroker._request()` 자체�
   4. 재시작 후 새 credential로 정상 조회(`get_account`)가 되는지 확인.
   5. 확인 완료 후 해제 체크리스트를 거쳐 `release()`.
 
+## 10. 청산 주문이 EXIT_SUBMITTED에 머물러 있음 (accepted 상태에서 진행 없음)
+
+- **감지**(2026-07-26, CODEX-023 수정 이후): `positions/lifecycle.py`가 broker 응답의
+  accepted/new/pending_* 상태를 더 이상 체결로 오판하지 않으므로, 이런 포지션은
+  `EXIT_SUBMITTED`/`PARTIAL_EXIT_SUBMITTED`에 정상적으로 머무른다 — 이는 버그가 아니라 "아직
+  실제 체결이 확인되지 않았다"는 정확한 상태다. 다만 이 상태가 비정상적으로 오래(예: 정규장
+  마감이 임박했는데도) 지속되면 조사가 필요하다.
+- **권장 상태**: 즉시 Kill Switch를 활성화할 필요는 없음 — 먼저
+  `positions.lifecycle.reconcile_pending_exit(position_id, broker=broker)`를 호출해 broker의
+  실제 주문 상태를 재조회한다(재주문하지 않음, 순수 조회).
+- **절차**:
+  1. `ops_dashboard.cli`로 해당 포지션의 `client_order_id`와 상태 확인.
+  2. `reconcile_pending_exit()` 호출 — broker가 `filled`/`partially_filled`를 반환하면 포지션이
+     정상적으로 갱신된다.
+  3. broker가 해당 주문을 전혀 모른다고 응답하거나(주문 없음) 조회 자체가 실패하면 exit intent가
+     `RECONCILIATION_REQUIRED`로 남는다 — 이 경우 자동 재주문하지 않으며, 사람이 broker
+     대시보드에서 직접 주문 상태를 확인한 뒤 수동으로 처리 방향을 결정해야 한다.
+  4. 장 마감이 임박했는데도 미해소 상태면 `kss.activate(kss.MANUAL_REVIEW, reason="청산 미확인 상태로 장마감 임박", activated_by=...)`.
+
+## 11. Position store 손상 감지 (2026-07-26, CODEX-025 수정 이후 자동 대응)
+
+- **감지**: `positions/store.py::load_all()`이 `PositionStoreCorruptedError`를 발생시키면,
+  `positions.lifecycle.recover_on_restart()`가 이를 감지해 **자동으로**
+  `kss.activate(kss.MANUAL_REVIEW, reason="position store unavailable on restart: ...", activated_by="system:recover_on_restart")`
+  를 호출한다 — 운영자가 수동으로 활성화하지 않아도 이미 `MANUAL_REVIEW` 상태일 수 있다.
+- **권장 상태**: `MANUAL_REVIEW`(이미 자동 전환되어 있을 가능성 높음) — `ENTRY_DISABLED`가 아닌
+  이유: 손상된 store는 청산해야 할 포지션이 있는지조차 알 수 없으므로, 청산까지 허용하는
+  `ENTRY_DISABLED`보다 전면적인 사람 개입이 필요.
+- **절차**:
+  1. `kill_switch_state.get_current_record()`로 자동 전환 여부와 사유 확인.
+  2. **손상된 `POSITION_STORE.json` 파일을 절대 삭제하거나 자동 초기화하지 않는다** — 코드도
+     이를 자동으로 하지 않으므로(원본 보존 확인, `positions/store.py::create_position()`도
+     이미 손상 파일에 쓰기를 거부), 사람이 파일 내용을 직접 검사(백업이 있다면 비교)해 실제 손상
+     범위를 파악한다.
+  3. `broker.get_positions()`(또는 broker 대시보드)로 실제 계좌의 미결제 포지션 전체를 조회해
+     로컬 기록과 대조한다.
+  4. 손상 원인(디스크 오류, 동시 쓰기 충돌, 수동 편집 실수 등) 파악 후, 필요 시 파일을 수동으로
+     복구(가장 최근 정상 백업 복원 등)하고 `recover_on_restart()`를 다시 실행해 정상 복구되는지
+     확인.
+  5. 확인 완료 후 해제 체크리스트를 거쳐 `release()`.
+
+## 12. Live 진입이 CODEX-026 게이트에 의해 반복적으로 차단됨
+
+- **감지**(2026-07-26, CODEX-026 수정 이후): `broker.config.is_live_mode`가 `True`인 상태에서
+  `paper_strategy_order.submit_order(side="buy", ...)`가 423 응답과
+  `response.data["blocked_reason"]`(예: `"symbol ... is not on the allow-list"`,
+  `"no FX rate available"`, `"max daily entries reached"` 등)을 반복적으로 반환.
+- **권장 상태**: Kill Switch 활성화 불필요 — 이 게이트 자체가 이미 해당 진입을 안전하게 차단하고
+  있음(broker에 세션 호출이 전혀 가지 않음). 다만 "왜 계속 차단되는가"는 조사가 필요.
+- **절차**:
+  1. `blocked_reason` 문자열로 어떤 검사에서 막혔는지 확인(`live_readiness/order_gateway.py`의
+     `LiveOrderBlockedError` 메시지와 1:1 대응).
+  2. allow-list/FX rate/예산 등 `LiveEntryContext`를 조립하는 호출부의 설정값을 점검 — 이 게이트
+     자체를 우회하거나 완화하는 코드 변경은 하지 않는다(기존 리스크 한도 완화 금지 원칙).
+  3. 실제로 설정이 잘못됐다면(예: allow-list에 거래하려는 심볼이 누락) 운영자가 명시적으로 값을
+     수정 — 코드가 자동으로 "일단 통과시키는" 방향으로 완화되어서는 안 됨.
+  4. 이 프로젝트는 현재 `ENABLE_REAL_TRADING=False`/`live_dry_run`이 기본값이므로, 이 시나리오는
+     실제 실거래 파일럿 준비/검토 단계에서만 실질적으로 발생한다.
+
 ## 공통 유의사항
 
 - 모든 활성화/해제는 `kill_switch_state.py`의 감사 이력(`get_history()`)에 남으므로,

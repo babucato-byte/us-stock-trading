@@ -3,10 +3,14 @@
 마지막 갱신: 2026-07-26
 
 ## 현재 Phase
-**`docs/autonomous/FINAL_VALIDATION_PACKAGE.md` 작성 완료(커밋 `530f888`) — 상태
-`READY_FOR_FINAL_CODEX_VALIDATION`.** Stage 3~10 사용자 지시서 범위 전체가 자체 테스트·전체
-회귀(820 passed, 0 failed)를 통과한 상태로 완료되었으며, 남은 것은 Codex 통합 검증 요청뿐이다.
-`approved: false`, `live_enabled: false` 유지, **Live trading: DO_NOT_ENABLE**. Stage 10 —
+**Stage 3~10 통합 수정 사이클 — CODEX-023~027 전부 RESOLVED (2026-07-26).** Codex 독립 검증
+(대상 범위 `415c129`~`64a5551`, overall verdict `FAIL`, Stage 3~10 판정 `KEEP_IN_PROGRESS`)이
+제기한 HIGH 4건(CODEX-023 accepted≠filled, CODEX-024 durable exit intent, CODEX-025 fail-closed
+store 복구, CODEX-026 30,000원/allow-list 실배선) + MEDIUM 1건(CODEX-027 fill 검증)을 전부
+로컬 브랜치에서 수정·테스트했다(커밋 `0f60ec9`/`c5c56c4`/`ee6dae2`/`f482e90`). 전체 회귀
+**923 passed, 0 failed**(착수 전 820에서 103건 신규). `approved: false`, `live_enabled: false`
+유지, **Live trading: DO_NOT_ENABLE**. 다음 작업은 새 `FINAL_VALIDATION_PACKAGE.md`(새 SHA-256
+포함) 작성 후 상태를 `READY_FOR_FINAL_CODEX_REVALIDATION`으로 종료하는 것. Stage 10 —
 30,000원 제한 실거래 준비(`live_readiness/` + 플레이북 문서) `IMPLEMENTED`(문서화·계산 모듈,
 실거래 준비 완료 아님), 변경 없음. Stage 9 —
 운영 관제(Dashboard/CLI, `ops_dashboard/`) `IMPLEMENTED`, 변경 없음. Stage 8 — 전략 선택 엔진
@@ -24,6 +28,41 @@ Phase 1 최종 판정(유지): **Phase 1A(주문 진입 안전성) = VALIDATED**
 Phase 3(1분봉 실시간 수집/폴링 인프라)은 이번 사이클에서도 착수하지 않음 — Stage 3/4는 전략
 플러그인·포지션 생명주기 로직 자체만 구현했고, 구성된 pandas DataFrame과 fake broker를 입력으로
 받아 테스트한다. 라이브 1분봉 폴링/실브로커 연동은 여전히 범위 외.
+
+## Stage 3~10 통합 수정 사이클 — CODEX-023~027 (2026-07-26)
+Codex 독립 검증(`CODEX_REVIEW.md`, 대상 범위 `415c129`~`64a5551`, overall verdict `FAIL`)이
+제기한 5건을 전부 로컬 브랜치에서 수정. 상세는 `docs/autonomous/REMEDIATION_PLAN.md`/
+`VALIDATION_REPORT.md`의 동일 날짜 섹션, ASSUMPTION·범위 결정은 `DECISION_LOG.md` 참고.
+
+- **CODEX-023**(HIGH): `positions/order_status.py` 신설 — broker의 accepted/new/... 상태를
+  체결로 오판하지 않도록 청산 경로 재작성. 청산 접수 즉시 `EXIT_SUBMITTED`로 전환되며, 실제
+  `filled`/`partially_filled` 확인 전까지 remaining_qty·PnL 불변.
+- **CODEX-024**(HIGH): `state_store/exit_intent_ledger.py` 신설(SQLite migration 2) — broker
+  호출 **전에** durable exit intent 예약. `positions/lifecycle.py::_execute_exit()`가 3단계
+  (예약+상태전환 → broker 호출 → 결과반영)로 재설계되어 timeout/크래시 후 재시도해도 sell이
+  중복 제출되지 않음. `reconcile_pending_exit()`가 재시작/재시도 시 공통 해소 경로.
+- **CODEX-025**(HIGH): `positions/store.py::load_all()`이 전체 파일 손상 시
+  `PositionStoreCorruptedError`를 발생(빈 dict 반환 대신). `recover_on_restart()`가
+  `RestartRecoveryResult`(status/positions/reason)를 반환해 "손상됨"과 "포지션 0개"가 구조적으로
+  구분됨. 손상 감지 시 Kill Switch를 `MANUAL_REVIEW`로 자동 전환.
+- **CODEX-026**(HIGH): `live_readiness/order_gateway.py` 신설 — allow-list/예산/FX rate/최대
+  포지션/일일 진입 횟수/손절 위험금액을 전부 fail-closed 검증. `paper_strategy_order.
+  submit_order()`의 `side="buy" AND is_live_mode` 경로에만 배선(Paper 거래·청산은 미적용,
+  설계 근거는 `DECISION_LOG.md`).
+- **CODEX-027**(MEDIUM): `positions/fill_validation.py` 신설 — `record_fill()`이 mutation 전에
+  검증(음수/NaN/상한초과/퇴행 전부 차단, 동일 관측 반복은 멱등적 no-op).
+
+전체 회귀: **923 passed, 0 failed**(착수 전 820에서 103건 신규). 실제 네트워크 호출 0회, 운영
+CSV 변경 0건, 실제 저장소 루트 `TRADING_STATE.db`가 테스트 중 생성되지 않음(청산 경로의 신규
+SQLite 의존성이 격리되지 않았던 실제 버그를 발견·수정한 뒤 확인). `approved`/`live_enabled`/
+`main`/`origin` 변경 없음. 기존 리스크 한도 완화 없음 — 전부 신규 fail-closed 검증 추가.
+
+커밋: `0f60ec9`(CODEX-027), `c5c56c4`(CODEX-025), `ee6dae2`(CODEX-023/024 통합),
+`f482e90`(CODEX-026).
+
+잔여 범위: `paper_strategy_order.submit_order()`를 우회한 direct broker 호출은 CODEX-026 게이트의
+보호를 받지 않음(현재 이 저장소에 그런 경로 없음을 확인, 향후 유지보수 시 재확인 필요). 첫 오류
+시 `ENTRY_DISABLED` 자동 배선은 여전히 미구현(Stage 10에서 이미 `NEEDS_USER_DECISION`으로 기록).
 
 ## Stage 10 — 30,000원 제한 실거래 준비 (2026-07-26)
 `live_readiness/`(`sizing.py`/`allowlist.py`) + `docs/live_review/LIMITED_LIVE_30K_KRW_PLAYBOOK.md`.
@@ -427,32 +466,37 @@ binary kill switch(`kill_switch.is_trading_halted()`)와 다단계 kill switch
 - 전체 회귀 267 passed(레포 루트 `pytest -q`/`python -m pytest -q` 동일), 실제 외부 API 호출 0회, `order_history.csv` 해시 불변, 운영 파일 변경 없음 확인.
 
 ## 현재 테스트 수
-820 passed, 0 failed (Stage 10 실거래 준비 신규 12건 포함, Stage 9 운영 관제 신규 16건, Stage 8
-전략 선택 엔진 신규 27건, Stage 7 백테스트 엔진 신규 29건, Stage 6 전략 자료 구조화 신규 33건,
-Stage 5 거래 상태 저장소 신규 20건, Stage 4 포지션 생명주기 신규 69건: states 31 + store 15 +
-lifecycle 23)
+923 passed, 0 failed (CODEX-023~027 수정 사이클 신규 103건 포함: CODEX-027 fill_validation 18건 +
+position_lifecycle 6건, CODEX-025 position_store 14건 + position_lifecycle 4건, CODEX-023/024
+exit_reconciliation 20건 + exit_intent_ledger 13건 + state_store 3건, CODEX-026
+live_order_gateway 25건. Stage 3~10 자체는 820 passed 기준 완료)
 
 ## 실패 테스트
 없음
 
 ## 현재 블로커
 없음 (코드 수준). CODEX-016~022는 이전 사이클에서 Codex 최종 독립 재검증까지 `PASS_WITH_CONDITIONS`로
-종결됨(위 "Codex 최종 독립 재검증" 섹션 참고). Stage 3~10은 자체 테스트·전체 회귀를 모두 통과한
-상태로 완료되었고 `FINAL_VALIDATION_PACKAGE.md`도 작성 완료됨 — **유일한 블로커는 아직 Codex
-통합 검증을 요청/수행하지 않았다는 것뿐**. `approved: false`, `live_enabled: false` 유지.
-**Limited live review: BLOCKED**(신규 Stage 코드가 아직 Codex 검증을 거치지 않았으므로),
-**Live trading: DO_NOT_ENABLE**.
+종결됨. CODEX-023~027도 이번 사이클에서 전부 RESOLVED로 로컬 수정·테스트 완료됨 — **유일한
+블로커는 아직 이번 수정에 대한 Codex 통합 재검증을 요청/수행하지 않았다는 것뿐**.
+`approved: false`, `live_enabled: false` 유지. **Limited live review: BLOCKED**(신규 수정이
+아직 Codex 검증을 거치지 않았으므로), **Live trading: DO_NOT_ENABLE**.
 
 ## 다음 작업
-1. **Codex 통합 검증 요청** — `docs/autonomous/FINAL_VALIDATION_PACKAGE.md`(커밋 `530f888`)를
-   근거로 1회 요청. 결과(`PASS`/`PASS_WITH_CONDITIONS`/`FAIL`)에 따라 후속 조치를 진행한다:
-   - `PASS`/`PASS_WITH_CONDITIONS`: `CODEX_REVIEW.md`에 기록하고, §10에 정리된 잔여 위험(특히
-     SQLite/`ENTRY_DISABLED`/allow-list 미배선 3건)에 대한 후속 조치 여부를 사용자와 논의.
-   - `FAIL`: 지적된 CRITICAL/HIGH를 기존 CODEX-XXX 사이클과 동일한 패턴으로 수정 후 재검증.
-2. 어떤 결과든 `approved`/`live_enabled`/`main`/`origin`/실거래 활성화는 사용자의 명시적 승인
+1. **새 `FINAL_VALIDATION_PACKAGE.md` 작성**(새 SHA-256 포함) 후 상태를
+   `READY_FOR_FINAL_CODEX_REVALIDATION`으로 종료.
+2. **Codex 통합 재검증 요청** — 결과(`PASS`/`PASS_WITH_CONDITIONS`/`FAIL`)에 따라 후속 조치:
+   - `PASS`/`PASS_WITH_CONDITIONS`: `CODEX_REVIEW.md`에 기록하고, 남은 잔여 범위(direct broker
+     호출 우회 미차단, `ENTRY_DISABLED` 자동 배선 미구현)에 대한 후속 조치 여부를 사용자와 논의.
+   - `FAIL`: 지적된 CRITICAL/HIGH를 동일한 패턴으로 수정 후 재검증.
+3. 어떤 결과든 `approved`/`live_enabled`/`main`/`origin`/실거래 활성화는 사용자의 명시적 승인
    없이는 건드리지 않는다.
 
 ## 최근 커밋
+- `f482e90` Enforce 30000 KRW budget and allow-list at the order boundary (CODEX-026)
+- `ee6dae2` Separate order acceptance from fills and add durable exit intents (CODEX-023/024)
+- `c5c56c4` Fail closed on corrupted position store (CODEX-025)
+- `0f60ec9` Validate fill quantities and prices (CODEX-027)
+- `f2afb4e` Record Codex independent review: FAIL, CODEX-023~026 HIGH, CODEX-027 MEDIUM
 - `530f888` Add FINAL_VALIDATION_PACKAGE.md for Stage 3-10, ready for Codex validation
 - `986d655` Prepare 30000 KRW limited live review (Stage 10)
 - `f2e1a24` Add trading operations monitoring dashboard (Stage 9)

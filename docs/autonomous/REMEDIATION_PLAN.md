@@ -553,3 +553,107 @@ Finding이 아니라 운영자 `TBD` 항목(실제 계좌/credential, 현재 포
 허용 종목·거래시간·주문당 절대 한도, 승인자·검토 시각·롤백 담당자)이며,
 `docs/live_review/TBD_REVIEW_RECOMMENDATIONS.md`에 각 항목의 권장값 초안이 정리되어 있다.
 상세는 `docs/autonomous/CODEX_REVIEW.md`(커밋 `d38cb95`에서 그대로 기록) 참고.
+
+## Stage 3~10 통합 수정 사이클 — CODEX-023~027 (2026-07-26)
+
+검증 기준: `CODEX_REVIEW.md`(2026-07-26, 대상 범위 `415c129`~`64a5551`; overall verdict **FAIL**,
+Stage 3~10 판정 **KEEP_IN_PROGRESS**). 신규 Finding: CODEX-023(HIGH), CODEX-024(HIGH),
+CODEX-025(HIGH), CODEX-026(HIGH), CODEX-027(MEDIUM). 처리 순서: CODEX-027 → 025 → 023/024(통합,
+같은 재작성 대상이므로) → 026.
+
+### CODEX-027 — record_fill이 비정상·퇴행 fill을 허용함 (MEDIUM) — RESOLVED
+- 재현 여부: 재현됨 — `filled_qty=-3`, `filled_qty=NaN`, `average_fill_price=-5`가 모두 저장 허용,
+  더 작은 cumulative quantity 전달 시 기존 fill을 감소시킴.
+- 수정: `positions/fill_validation.py` 신설 — `validate_cumulative_fill()`(finite/양수/상한/비퇴행
+  강제, bool·문자열 명시 거부), `validate_exit_qty()`/`validate_fill_price()`(청산 경로용).
+  `positions/lifecycle.py::record_fill()`이 mutation 전에 검증 호출, 실패 시 레코드 완전 불변.
+  동일 cumulative 값 반복 관측은 예외가 아니라 멱등적 no-op으로 처리.
+- 테스트: `tests/test_fill_validation.py` 18건 + `tests/test_position_lifecycle.py` 6건.
+- 처리 상태: RESOLVED
+- 구현 커밋: `0f60ec9`
+
+### CODEX-025 — 손상된 position store가 restart recovery에서 "포지션 없음"으로 보임 (HIGH) — RESOLVED
+- 재현 여부: 재현됨 — 손상 JSON에서 `load_position()`은 `RECOVERY_REQUIRED`였지만
+  `load_all()`/`load_non_terminal()`/`recover_on_restart()`는 빈 결과를 반환(fail-open 결과).
+- 수정: `positions/store.py::load_all()`/`load_non_terminal()`이 전체 파일 손상 시
+  `PositionStoreCorruptedError`를 발생시켜(빈 dict 반환 대신) 손상과 "포지션 없음"을 구조적으로
+  구분. 신규 `check_store_health()`(MISSING/VALID_EMPTY/VALID_WITH_POSITIONS/CORRUPTED/
+  SCHEMA_MISMATCH/READ_FAILURE 분류). `positions/lifecycle.py::recover_on_restart()`가
+  `RestartRecoveryResult`(status/positions/reason/broker_positions)를 반환 — bare list와 구조적으로
+  구분되어 "STORE_UNAVAILABLE, 결과 없음"이 "정상, 포지션 0개"와 절대 혼동될 수 없음. 손상 감지 시
+  Kill Switch를 `MANUAL_REVIEW`로 자동 전환(best-effort), broker 전체 포지션 조회 시도(best-effort),
+  손상 파일 자동 초기화 없음(원본 보존). `store.create_position()`은 이미 손상 파일에 쓰기를
+  거부하고 있었음을 재확인(신규 진입 차단은 기존에 이미 보장되어 있었음).
+- 테스트: `tests/test_position_store.py` 14건(손상/스키마불일치/정상빈파일/권한오류/truncated 파일
+  분류 포함) + `tests/test_position_lifecycle.py` 4건(STORE_UNAVAILABLE 결과, kill switch 에스컬레이션,
+  broker 포지션 best-effort 조회, 손상 store에서 신규 진입 거부 재확인).
+- 처리 상태: RESOLVED
+- 구현 커밋: `c5c56c4`
+
+### CODEX-023 — accepted 주문을 체결로 오판하여 조기 CLOSED 처리 (HIGH) — RESOLVED
+### CODEX-024 — 청산 timeout 후 durable intent 부재로 중복 sell 가능 (HIGH) — RESOLVED
+같은 `positions/lifecycle.py` 청산 경로 재작성으로 함께 처리(분리 시 중간 상태가 서로를 깨뜨림).
+
+- 재현 여부: 둘 다 재현됨 — accepted-but-unfilled 청산이 로컬에서 즉시 `CLOSED`/remaining=0으로
+  기록됨. timeout 이후 재실행 시 동일 수량 sell이 중복 제출되고 상태는 `STOP_ACTIVE`로 되돌아감.
+- 수정(CODEX-023): `positions/order_status.py` 신설 —
+  `classify_broker_order_status()`가 accepted/new/pending_new/pending_replace/pending_cancel/
+  calculated/held/suspended를 `NOT_FILLED`로, partially_filled/filled만 실제 체결로 분류(그 외는
+  `UNKNOWN`, fail-closed). 청산은 이제 접수 즉시 `EXIT_SUBMITTED`/`PARTIAL_EXIT_SUBMITTED`로
+  전환되고 머무르며, 실제 filled/partially_filled 확인 시에만 수량·PnL이 변경된다. 반복 관측은
+  CODEX-027과 동일한 단조성 규율로 중복 반영을 차단.
+- 수정(CODEX-024): `state_store/exit_intent_ledger.py` 신설(migration 2, `exit_intents` 테이블) —
+  broker 호출 **전에** durable exit intent를 SQLite에 원자적으로 예약. `positions/lifecycle.py`의
+  `_execute_exit()`가 3단계(예약+상태전환 → broker 호출 → 결과 반영)로 재설계되어, 예약과 상태전환은
+  broker 호출 전에 디스크에 커밋됨 — 이전 설계(단일 락 블록 안에서 broker 호출까지 수행)는 예외 발생
+  시 예약 자체가 롤백되어 재시도가 사실을 기억하지 못하는 근본 원인이었다. `reconcile_pending_exit()`
+  가 재시도/재시작 시의 공통 해소 경로 — 절대 재주문하지 않고 broker를 client_order_id로 조회.
+  broker 조회 실패/주문 미확인은 `RECONCILIATION_REQUIRED`로 flag, 자동 재주문 없음.
+  `recover_on_restart()`도 pending exit intent가 있는 포지션을 동일 경로로 재조정.
+- 테스트: `tests/test_exit_reconciliation.py` 20건(accepted/new/partial/filled 분리, 반복 이벤트
+  멱등성, timeout-후-재시도 sell 1회, 동시 청산 sell 1회, stop·target 동시 트리거 sell 1회,
+  intent 저장 실패 시 broker 호출 0회, 재시작 reconciliation, broker 미확인/조회실패 시 재주문 0회,
+  stale RESERVED intent 자동 재주문 금지 등) + `tests/test_exit_intent_ledger.py` 13건.
+  부수적으로 SQLite 첫 사용 동시성 경합(`state_store/db.py::init_db()`)과, 청산 경로의 신규 SQLite
+  의존성이 격리되지 않은 테스트 파일에서 실제 저장소 루트 `TRADING_STATE.db`를 생성하던 버그를
+  발견·수정(`tests/test_position_lifecycle.py`에 `STATE_STORE_DB_FILE` 격리 추가).
+- 처리 상태: RESOLVED (둘 다)
+- 구현 커밋: `ee6dae2`
+
+### CODEX-026 — 30,000원과 allow-list가 실제 주문을 제한하지 않음 (HIGH) — RESOLVED
+- 재현 여부: 재현됨 — `live_readiness.sizing`/`allowlist`가 `paper_strategy_order.py`/
+  `positions/lifecycle.py`/`broker/alpaca_client.py` 어디에서도 import/호출되지 않아 실제 주문
+  경계에 아무 효과가 없었음.
+- 수정: `live_readiness/order_gateway.py` 신설 — `validate_and_size_live_entry()`가 allow-list,
+  최대 동시 포지션, 일일 진입 횟수, 환율 존재·유효성·최신성(naive/stale/미래 타임스탬프 차단),
+  가용 현금, `max_order_notional_krw` 상한(사전에 예산을 캡핑해 sizing 결과가 구조적으로 상한을
+  넘을 수 없도록 함), 소수점 정책, 손절 기준 위험금액의 `max_daily_loss_krw` 상한을 전부
+  fail-closed로 검증. `paper_strategy_order.submit_order()`에 배선하되 **side="buy" AND
+  broker.config.is_live_mode일 때만** 활성화(Paper 거래는 전혀 영향받지 않음, 청산은 항상 게이트
+  없음 — 기존 kill_switch_state의 ACTIVE/ENTRY_DISABLED 비대칭과 동일한 설계 원칙). 이 범위 결정은
+  `DECISION_LOG.md`에 기록. `paper_strategy_order.submit_order()`를 우회해 `broker.submit_order()`를
+  직접 호출하는 경로는 이 Python 레벨 게이트의 적용을 받지 않음 — 이 저장소 내 어떤 진입 경로도
+  현재 그렇게 하지 않는다는 점과 함께 잔여 범위로 명시.
+- 부수 버그 발견·수정: `getattr(broker.config, "is_live_mode", False)`가 `broker.config`를 먼저
+  즉시 평가해, `.config` 속성이 아예 없는 테스트 더블(기존 테스트 전반의 FakeBroker 대다수)에서
+  `AttributeError`를 유발 — `getattr(broker, "config", None)`으로 먼저 broker 자체를 안전하게 조회
+  하도록 수정.
+- 테스트: `tests/test_live_order_gateway.py` 25건(모든 차단 사유 단위 테스트 + 실제 `AlpacaBroker`와
+  `.request()` 호출 시 예외를 던지는 세션 더블을 사용한 통합 테스트로 "차단된 live 진입은 실제
+  네트워크 호출 0회"를 증명, sell은 절대 게이트되지 않음 확인, Paper 모드는 기존 경로 그대로 도달함
+  확인, `.config` 없는 broker 더블 회귀 테스트 포함).
+- 처리 상태: RESOLVED
+- 구현 커밋: `f482e90`
+
+### 검증 결과 (CODEX-023~027 전체)
+
+- 전체 회귀: `venv/bin/python -m pytest -q` **923 passed, 0 failed, 2 warnings**(신규 안전 관련
+  warning 없음, 기존 urllib3/scanner 경고만). Stage 3~10 착수 전 기준선 613 passed 대비, 이번
+  Stage 3~10 + CODEX-023~027 전체로 310건 신규.
+- 실제 Alpaca/Slack/Yahoo 호출 0회. 실제 저장소 루트 `TRADING_STATE.db`가 테스트 중 생성되지 않음을
+  전용 테스트로 재확인(발견된 버그 수정 후).
+- `order_history.csv`/`universe.csv`/`strategy_performance.csv`는 이전 사이클 기록값과 동일(md5
+  재확인), `.env`·kill switch/notification 상태 파일 변경 없음.
+- main 병합, origin push, 운영 배포, 실거래 활성화, `approved`/`live_enabled` 변경 없음.
+- 기존 리스크 한도(`risk_config.py`, `order_safety.py`)를 완화한 곳 없음 — 이번 사이클은 오직
+  새로운 fail-closed 검증을 추가했을 뿐, 기존 한도값을 낮추거나 우회 경로를 넓힌 곳이 없다.
