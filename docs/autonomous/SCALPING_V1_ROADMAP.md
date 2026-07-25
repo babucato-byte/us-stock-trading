@@ -193,6 +193,20 @@ Phase 1은 두 부분으로 나뉜다:
   `DECISION_LOG.md` Stage 7 섹션) — 실제 측정치 확보 전까지 잠정값. 동일봉 충돌 정책은
   `STOP_FIRST` 한 가지만 지원(보수적 선택, 다른 정책 필요 시 별도 결정 필요).
 
+## Stage 8 — 전략 선택 엔진 (부속, 2026-07-26 완료)
+
+**상태: IMPLEMENTED**
+
+원 로드맵의 Phase 1~8 번호에 별도 슬롯이 없는 신규 범위(사용자 지시서 Stage 8)라 부속 섹션으로
+기록한다. `strategy_selection/`(`models.py`/`scoring.py`/`engine.py`) 신규 구현: 후보 전략 풀 중
+설명가능한 점수/규칙 기반(비-LLM)으로 최대 1개를 `SELECTED`로 결정. 자격 게이트 자체가 설명가능 —
+`REJECTED`/`PAUSED` → `DISABLED`, `COLLECTED`/`STRUCTURED`(검토 전) → `INSUFFICIENT_DATA`, 백테스트
+결과 없음/`INSUFFICIENT_DATA`/거래 10건 미만 → `INSUFFICIENT_DATA`, 선호 시장상태 불일치 →
+`MARKET_MISMATCH`. 나머지만 점수 계산(백테스트 성과/Paper 성과/표본크기/MDD/슬리피지 민감도/
+시장상태 적합도/종목상태 적합도, 전부 요소별 breakdown 노출). 엔진은 `strategy.registry`를
+import하지 않으며 `ACTIVE` 승격을 전혀 호출하지 않음 — 선택은 추천일 뿐, 실제 활성화는 별도
+운영자 승인 절차. 신규 테스트 27건, 전체 회귀 792 passed. 커밋 `2094adf`.
+
 ## Phase 7 — Paper Trading 운영 관제
 
 **상태: NOT_STARTED**

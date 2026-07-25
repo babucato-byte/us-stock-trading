@@ -3,13 +3,14 @@
 마지막 갱신: 2026-07-25
 
 ## 현재 Phase
-Stage 7 — 전략 평가 엔진(백테스트/리플레이, `backtest/`) `IMPLEMENTED`, Claude 자체 테스트 통과,
-Codex 검증 전 — 사용자 지시에 따라 Stage 3~10을 Codex 중간 검증 없이 연속 구현 중. Stage 6 —
-사용자/YouTube 전략 자료 구조화(`strategy_sources/`) `IMPLEMENTED`, 변경 없음. Stage 5 — 거래 상태
-저장소(`state_store/`, SQLite 병행 인프라) `IMPLEMENTED`, 변경 없음. Phase 5 — 포지션 생명주기 및
-자동 청산 (Stage 4, `IMPLEMENTED`, 변경 없음). Phase 4 — VWAP 마이크로 풀백 전략 엔진 (Stage 3,
-`IMPLEMENTED`, 변경 없음). Phase 2 — 초단타 관심종목 선별 엔진 (`IMPLEMENTED`, CODEX-010~015 수정
-완료, Codex 재검증 대기, 변경 없음).
+Stage 8 — 전략 선택 엔진(`strategy_selection/`) `IMPLEMENTED`, Claude 자체 테스트 통과, Codex
+검증 전 — 사용자 지시에 따라 Stage 3~10을 Codex 중간 검증 없이 연속 구현 중. Stage 7 — 전략 평가
+엔진(백테스트/리플레이, `backtest/`) `IMPLEMENTED`, 변경 없음. Stage 6 — 사용자/YouTube 전략 자료
+구조화(`strategy_sources/`) `IMPLEMENTED`, 변경 없음. Stage 5 — 거래 상태 저장소(`state_store/`,
+SQLite 병행 인프라) `IMPLEMENTED`, 변경 없음. Phase 5 — 포지션 생명주기 및 자동 청산 (Stage 4,
+`IMPLEMENTED`, 변경 없음). Phase 4 — VWAP 마이크로 풀백 전략 엔진 (Stage 3, `IMPLEMENTED`, 변경
+없음). Phase 2 — 초단타 관심종목 선별 엔진 (`IMPLEMENTED`, CODEX-010~015 수정 완료, Codex 재검증
+대기, 변경 없음).
 
 Phase 1 최종 판정(유지): **Phase 1A(주문 진입 안전성) = VALIDATED**, **Phase 1B(부분체결·포지션
 생명주기) = Phase 5로 이관 완료, Phase 5 자체는 `IMPLEMENTED`**.
@@ -17,6 +18,37 @@ Phase 1 최종 판정(유지): **Phase 1A(주문 진입 안전성) = VALIDATED**
 Phase 3(1분봉 실시간 수집/폴링 인프라)은 이번 사이클에서도 착수하지 않음 — Stage 3/4는 전략
 플러그인·포지션 생명주기 로직 자체만 구현했고, 구성된 pandas DataFrame과 fake broker를 입력으로
 받아 테스트한다. 라이브 1분봉 폴링/실브로커 연동은 여전히 범위 외.
+
+## Stage 8 — 전략 선택 엔진(`strategy_selection/`) 구현 완료 (2026-07-26)
+`models.py`(`SelectionState`/`SelectionInput`/`SelectionFactors`/`SelectionResult`),
+`scoring.py`(요소별 순수 함수 + `COMPOSITE_WEIGHTS`), `engine.py`(`select_strategy()`).
+
+- 해석 결정(`DECISION_LOG.md` 결정 1): 지시서의 "ACTIVE 전략만 평가"를 문자 그대로
+  `strategy.status==ACTIVE`로 해석하면 후보 풀이 항상 최대 1개(레지스트리의 ACTIVE 1개 제약)라
+  "선택"이 성립하지 않으므로, "검토 단계(`REVIEWED`) 이상으로 진행된 전략만 평가"로 재해석했다.
+  `REJECTED`/`PAUSED` → `DISABLED`, `COLLECTED`/`STRUCTURED`(백테스트 데이터 자체가 없음) →
+  `INSUFFICIENT_DATA`로 자연스럽게 귀결.
+- 자격 게이트: 백테스트 결과 없음/`INSUFFICIENT_DATA`/거래 10건 미만(`MIN_TRADES_FOR_SCORING`,
+  ASSUMPTION) → `INSUFFICIENT_DATA`. 선호 시장상태(`PREFERRED_MARKET_STATES` 테이블, 현재는
+  `VWAP_MICRO_PULLBACK_MOMENTUM_V1` → `{"regular"}`만 등록, `PROJECT_CONSTITUTION.md`와 일치)와
+  불일치 시 `MARKET_MISMATCH`.
+- 점수: `backtest_performance`/`paper_performance`(승률+평균R+PF 평균, `backtest.metrics.
+  compute_metrics()`와 동일 shape 재사용)/`sample_size`/`mdd`/`slippage_sensitivity`(
+  `backtest.metrics.slippage_sensitivity()` 결과에서 저-고 슬리피지 구간 기대값 유지율)/
+  `market_state_fit`/`symbol_condition_fit` 7개 요소, 결측 요소는 0이 아니라 제외 후 재정규화.
+  가중치·임계값 전부 결과를 보기 전에 고정(`DECISION_LOG.md` 결정 2/3, Stage 7과 동일한 원칙).
+  단 하나만 `SELECTED`, 동점은 입력 순서로 결정론적 처리.
+- 경계: `engine.py`는 `strategy.registry`를 import하지 않고 `ACTIVE` 등록을 호출하지 않음(Stage 7
+  `backtest/compare.py`와 동일 원칙) — `SELECTED`는 추천일 뿐 실제 활성화는 별도 운영자 승인 필요.
+- 신규 테스트: `tests/test_strategy_selection.py` 27건(자격 게이트 5종, 단일/다중 후보 선택,
+  비활성/데이터부족 후보 단독일 때도 미선택, 동점 결정론적 처리, 후보 0명 시 미선택, 요소별 순수
+  함수 단위 테스트, 가중치 합=1.0 불변식).
+- 전체 회귀: **792 passed, 0 failed**(기존 765 + 신규 27). 실제 네트워크 호출 0회, 운영 CSV 변경
+  0건.
+- 커밋: `2094adf`.
+- 잔여 위험: `PREFERRED_MARKET_STATES` 테이블에 신규 전략 추가 시 수동으로 채워야 함(비어있으면
+  시장상태 게이트가 적용되지 않음 — 자격이 아니라 "아직 미문서화"로 해석). 가중치·임계값은 전부
+  ASSUMPTION, 실제 Paper 성과 데이터 축적 후 재검토 필요.
 
 ## Stage 7 — 전략 평가 엔진(`backtest/`, 백테스트/리플레이) 구현 완료 (2026-07-26)
 착수 직전 사용자가 명시한 10개 제약을 그대로 구현: (1) 결과를 보고 임계값을 조정하지 않음 —
@@ -337,9 +369,9 @@ binary kill switch(`kill_switch.is_trading_halted()`)와 다단계 kill switch
 - 전체 회귀 267 passed(레포 루트 `pytest -q`/`python -m pytest -q` 동일), 실제 외부 API 호출 0회, `order_history.csv` 해시 불변, 운영 파일 변경 없음 확인.
 
 ## 현재 테스트 수
-765 passed, 0 failed (Stage 7 백테스트 엔진 신규 29건 포함, Stage 6 전략 자료 구조화 신규 33건,
-Stage 5 거래 상태 저장소 신규 20건, Stage 4 포지션 생명주기 신규 69건: states 31 + store 15 +
-lifecycle 23)
+792 passed, 0 failed (Stage 8 전략 선택 엔진 신규 27건 포함, Stage 7 백테스트 엔진 신규 29건,
+Stage 6 전략 자료 구조화 신규 33건, Stage 5 거래 상태 저장소 신규 20건, Stage 4 포지션 생명주기
+신규 69건: states 31 + store 15 + lifecycle 23)
 
 ## 실패 테스트
 없음
@@ -352,16 +384,17 @@ lifecycle 23)
 Stage 코드가 아직 Codex 검증을 거치지 않았으므로), **Live trading: DO_NOT_ENABLE**.
 
 ## 다음 작업
-1. Stage 8(전략 선택 엔진) 착수 — ACTIVE 후보만 평가 대상으로 하고, LLM 자유 판단이 아닌
-   설명가능한 점수/규칙 기반으로 선택한다(시장상태 적합도/종목상태 적합도/백테스트 성과/Paper
-   성과/표본크기/MDD/슬리피지 민감도/데이터 품질/전략 상태). 초기에는 한 번에 전략 하나만 선택,
-   선택 상태는 SELECTED/NOT_SELECTED/DISABLED/INSUFFICIENT_DATA/MARKET_MISMATCH.
-2. Stage 9~10을 사용자 지시서의 순서대로 계속 진행(각 Stage마다 자체 테스트 → 전체 회귀 → 로컬 커밋
-   → 문서 갱신, Codex 검증 없이).
+1. Stage 9(운영 관제 Dashboard/CLI) 착수 — 현재 모드/활성 전략/시장상태/관심종목/신호/주문/
+   포지션/손절·목표가/실현·미실현 PnL/일일 주문 수/일일 손실/Kill Switch/Slack 상태/broker 상태/
+   reconciliation/마지막 성공 실행 시각을 로컬에서 확인 가능하게 하고, Slack이 다운되어도 계속
+   확인 가능해야 한다.
+2. Stage 10을 사용자 지시서의 순서대로 계속 진행(자체 테스트 → 전체 회귀 → 로컬 커밋 → 문서 갱신,
+   Codex 검증 없이).
 3. Stage 10 완료 후 `docs/autonomous/FINAL_VALIDATION_PACKAGE.md` 작성, 상태를
    `READY_FOR_FINAL_CODEX_VALIDATION`으로 종료.
 
 ## 최근 커밋
+- `2094adf` Add deterministic strategy selection engine (Stage 8)
 - `59958cf` Add intraday strategy backtest/replay engine (Stage 7)
 - `9814114` Normalize .gitignore to LF and remove duplicate/dead lines
 - `8915c44` Fix .gitignore lock-file pattern and remove stray lock file
