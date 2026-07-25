@@ -169,7 +169,7 @@ def calculate_rsi(df, period=14):
     return 100 - (100 / (1 + rs))
 
 
-def submit_order(symbol, qty=1, broker=None, client_order_id=None, *, side):
+def submit_order(symbol, qty=1, broker=None, client_order_id=None, *, side, live_entry_context=None):
     """Submit one order, gated by two independent kill switches, both
     re-checked fresh on every call (never cached):
 
@@ -182,6 +182,16 @@ def submit_order(symbol, qty=1, broker=None, client_order_id=None, *, side):
 
     Both gates must pass for the broker to be called; either one blocking
     returns a 423 response without ever reaching `broker`.
+
+    CODEX-026: a THIRD gate applies only when side="buy" AND the broker is
+    configured for live trading (broker.config.is_live_mode) -- Paper
+    trading is entirely unaffected. live_entry_context must be a
+    live_readiness.order_gateway.LiveEntryContext describing the pilot's
+    allow-list/budget/FX-rate/position-count state; missing it, or it
+    failing any check (see live_readiness/order_gateway.py), blocks the
+    order with a 423 before the broker is ever called and re-sizes `qty`
+    to the gateway's fail-closed-computed quantity when all checks pass
+    (never trusts a caller-supplied qty for a live entry).
     """
     if is_trading_halted():
         print(f"Kill switch engaged: {symbol} order not submitted.")
@@ -206,6 +216,33 @@ def submit_order(symbol, qty=1, broker=None, client_order_id=None, *, side):
         )
 
     broker = broker or AlpacaBroker()
+
+    # getattr(broker, "config", None) first, not getattr(broker.config, ...):
+    # test doubles (FakeBroker in many existing tests) commonly have no
+    # .config attribute at all, and `broker.config` would raise
+    # AttributeError before getattr's default ever applies.
+    broker_config = getattr(broker, "config", None)
+    if side == "buy" and getattr(broker_config, "is_live_mode", False):
+        from live_readiness.order_gateway import LiveOrderBlockedError, validate_and_size_live_entry
+        if live_entry_context is None:
+            print(f"CODEX-026: live entry for {symbol} blocked -- no LiveEntryContext supplied.")
+            return BrokerResponse(
+                status_code=423,
+                text="Live entry blocked: no LiveEntryContext supplied, order not submitted.",
+                data={"blocked_reason": "MISSING_LIVE_ENTRY_CONTEXT"},
+                dry_run=False,
+            )
+        try:
+            qty = validate_and_size_live_entry(live_entry_context)
+        except LiveOrderBlockedError as exc:
+            print(f"CODEX-026: live entry for {symbol} blocked -- {exc}")
+            return BrokerResponse(
+                status_code=423,
+                text=f"Live entry blocked: {exc}",
+                data={"blocked_reason": str(exc)},
+                dry_run=False,
+            )
+
     response = broker.submit_order(
         symbol,
         qty=qty,
