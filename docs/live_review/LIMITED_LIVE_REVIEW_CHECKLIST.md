@@ -104,6 +104,28 @@ side 3자를 서로 대조하지 않아 `EXIT_ORDER` 선언 하에 매수 payloa
 | 운영 데이터 파일 변경 여부 (`order_history.csv`, `universe.csv`) | 변경 없음 | SHA-256이 이전 사이클 기록값과 동일 |
 | `.env`, kill switch/notification 상태 파일 변경 여부 | 없음 | 이번 사이클에서 생성/수정하지 않음 |
 
+### 1.5 Stage 3~10 + CODEX-023~027 통합 수정 사이클 후 재확인 (2026-07-26)
+
+Codex 독립 검증(`CODEX_REVIEW.md`, 대상 커밋 `415c129`..`e3b9e9f`, Stage 3~10)이 overall verdict
+**FAIL**을 내렸다: CODEX-023(HIGH, accepted 주문을 체결로 오판), CODEX-024(HIGH, 청산 timeout 후
+durable intent 부재로 중복 sell 가능), CODEX-025(HIGH, 손상된 position store가 빈 포지션으로
+처리됨), CODEX-026(HIGH, 30,000원 sizing/allow-list가 실제 주문 경계에 미배선),
+CODEX-027(MEDIUM, 비정상 fill 수량/체결가 허용). 이번 사이클(커밋 `0f60ec9`/`c5c56c4`/`ee6dae2`/
+`f482e90`)에서 5건 모두 수정: broker order status 분류(`positions/order_status.py`) +
+fill 검증(`positions/fill_validation.py`) + durable exit intent ledger(SQLite,
+`state_store/exit_intent_ledger.py`) + 3단계 청산 재설계(`positions/lifecycle.py`) + fail-closed
+store corruption 감지(`positions/store.py`) + live 진입 경계 게이트(`live_readiness/
+order_gateway.py`, `side="buy" AND is_live_mode`에만 적용).
+
+| 확인 항목 | 결과 | 근거 |
+|---|---|---|
+| `venv/bin/python -m pytest -q` 전체 실행 | exit code 0, **923 passed, 0 failed, 2 warnings** | CODEX-023~027 수정 완료 커밋 `4de0714` 기준 |
+| CODEX-023~027 집중 테스트 | **103 passed** | `test_fill_validation.py` 18 + `test_exit_intent_ledger.py` 13 + `test_exit_reconciliation.py` 20 + `test_live_order_gateway.py` 25 + `test_position_lifecycle.py`/`test_position_store.py`/`test_state_store.py` 신규분 27 |
+| 신규 안전 관련 warning 여부 | 없음 | 2건 warning은 기존 urllib3 LibreSSL 경고와 의도된 scanner unknown-field 경고뿐 |
+| 운영 데이터 파일 변경 여부 (`order_history.csv`, `universe.csv`, `strategy_performance.csv`) | 변경 없음 | md5가 이전 사이클 기록값과 동일 |
+| `.env`, kill switch/notification 상태 파일 변경 여부 | 없음 | 이번 사이클에서 생성/수정하지 않음(단, `recover_on_restart()`가 store 손상 시 Kill Switch를 `MANUAL_REVIEW`로 자동 전환하는 신규 코드 경로 자체는 추가됨 — 실제 상태 파일이 사전에 변경된 것은 아님) |
+| 상세 | [FINAL_VALIDATION_PACKAGE.md](../autonomous/FINAL_VALIDATION_PACKAGE.md) | Codex 재검증 대기 중, 상태 `READY_FOR_FINAL_CODEX_REVALIDATION` |
+
 ## 2. Broker 설정 (실측: `broker/broker_config.py`, `risk_config.py`)
 
 | 항목 | 값 | 근거 |
@@ -123,11 +145,11 @@ side 3자를 서로 대조하지 않아 `EXIT_ORDER` 선언 하에 매수 payloa
 | 일일 손실 한도 | `MAX_DAILY_LOSS_RATE = -0.02` (계좌 자본 대비 -2%) | `risk_config.py:2` |
 | 총 낙폭 한도 | `MAX_TOTAL_DRAWDOWN = -0.10` | `risk_config.py:3` |
 | 포지션당 최대 비중 | `MAX_POSITION_RATE = 0.10` (계좌 자본의 10%) | `risk_config.py:6` |
-| 주문당 최대 금액(절대 금액) | `TBD(운영자 기입)` | `risk_config.py`에 절대 금액(달러) 상한 설정 없음. 비중 기반 한도(`MAX_POSITION_RATE`)만 존재 |
+| 주문당 최대 금액(절대 금액) | `TBD(운영자 기입)` | `risk_config.py`에는 여전히 절대 금액 상한이 없으나, `live_readiness/order_gateway.py::validate_and_size_live_entry()`(CODEX-026, 2026-07-26, 커밋 `f482e90`)가 `max_order_notional_krw`를 live 진입 경계에서 실제로 강제한다. 남은 것은 이 값 자체의 실측 기입뿐 |
 | 최대 동시 포지션 수 | `MAX_OPEN_POSITIONS = 5` | `risk_config.py:11` |
 | 최대 일일 주문 수 | `MAX_TRADES_PER_DAY = 3` | `risk_config.py:10` |
 | 계좌 총 익스포저 상한 | `MAX_TOTAL_EXPOSURE_RATE = 0.5` (계좌 자본의 50%) | `risk_config.py:15` |
-| 허용 종목 범위(심볼 allow-list) | `TBD(운영자 기입)` | `risk_config.py`, `account_risk.py`에 종목 allow-list/블랙리스트 설정 없음 |
+| 허용 종목 범위(심볼 allow-list) | `TBD(운영자 기입)` | `risk_config.py`, `account_risk.py`에는 여전히 없으나, `live_readiness/allowlist.py::is_symbol_allowed()`(CODEX-026, 2026-07-26, 커밋 `f482e90`)가 live 진입 경계에서 fail-closed로 실제 강제한다(빈 목록은 전부 차단). 남은 것은 실제 종목 목록의 기입뿐 |
 | 허용 거래 시간대 | `TBD(운영자 기입)` | `risk_config.py`에 거래 시간 창(time window) 설정 없음 |
 
 ## 4. Kill Switch 상태 (실측)

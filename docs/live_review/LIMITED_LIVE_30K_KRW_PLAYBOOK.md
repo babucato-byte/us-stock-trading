@@ -4,8 +4,16 @@
 실거래 승인을 의미하지 않는다.** `approved: false`, `live_enabled: false`
 ([LIVE_APPROVAL_RECORD.md](./LIVE_APPROVAL_RECORD.md))는 변경하지 않았다. 이 문서 작성 과정에서
 코드(`broker/**`, `order_safety.py`, `risk_config.py`)와 환경변수(`.env`)는 전혀 변경하지 않았다 —
-신규 순수 계산 모듈(`live_readiness/`)만 추가했으며, 그 모듈은 아래 §6에서 설명하는 이유로 **실제
-주문 제출 경로(`paper_strategy_order.py`/`positions/lifecycle.py`)에 아직 배선되지 않았다.**
+신규 순수 계산 모듈(`live_readiness/sizing.py`, `live_readiness/allowlist.py`)을 추가했다.
+
+**갱신(2026-07-26, CODEX-026)**: 이 모듈들은 최초 작성 시점(Stage 10)에는 실제 주문 제출 경로에
+배선되지 않았으나, Codex 독립 검증(CODEX-026 HIGH)에서 이 배선 부재 자체가 결함으로 지적되어
+이번 사이클에 신규 `live_readiness/order_gateway.py::validate_and_size_live_entry()`가
+`paper_strategy_order.submit_order()`의 **`side="buy" AND broker.config.is_live_mode`인 경우에
+한해** 실제로 강제되도록 배선됐다(커밋 `f482e90`). Paper 거래와 모든 청산 주문은 이 게이트의
+영향을 받지 않는다 — 근거는 `docs/autonomous/DECISION_LOG.md`의 CODEX-023~027 섹션 결정 3.
+`paper_strategy_order.submit_order()`를 우회하는 direct broker 호출은 여전히 이 게이트의 보호를
+받지 못한다(같은 결정 로그의 결정 4, `NEEDS_USER_DECISION`으로 유지).
 
 ## 1. 마이크로 주문 수량 계산
 
@@ -35,8 +43,9 @@ allow-list(`[]`/`None`)는 아무 종목도 허용하지 않는다(빈 차단목
 내용은 운영자가 채워야 한다.
 
 `docs/live_review/TBD_REVIEW_RECOMMENDATIONS.md` 항목 #4가 이미 "코드에 이 하드캡을 강제하는
-로직이 아직 없다"고 지적한 갭을 이번 단계에서 계산 함수로 채웠다. 아래 §6에서 설명하듯 실제 주문
-경로에 배선하는 것은 별도 결정 사항으로 남겨둔다.
+로직이 아직 없다"고 지적한 갭을 이번 단계에서 계산 함수로 채웠다. **2026-07-26 갱신**: 이 함수는
+이제 `live_readiness/order_gateway.py`를 통해 live 진입 경계에 실제로 배선되어 있다(CODEX-026,
+커밋 `f482e90`) — 남은 것은 실제 파일럿 종목 목록의 기입뿐이다.
 
 ## 3. 일일/포지션 한도 (기존 정책과의 관계)
 
