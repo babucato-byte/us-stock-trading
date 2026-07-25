@@ -11,7 +11,7 @@ import pandas as pd
 import pytest
 
 import paper_strategy_order as pso
-from positions import lifecycle, states, store
+from positions import fill_validation, lifecycle, states, store
 from strategy.interface import (
     STATE_ENTRY_SIGNAL,
     STATE_NO_SETUP,
@@ -231,6 +231,54 @@ def test_record_fill_wrong_state_raises():
     lifecycle.record_fill(record["position_id"], filled_qty=10, average_fill_price=100.0)
     with pytest.raises(lifecycle.PositionLifecycleError):
         lifecycle.record_fill(record["position_id"], filled_qty=10, average_fill_price=100.0)
+
+
+# ---------------------------------------------------------------------------
+# CODEX-027: record_fill() rejects invalid/regressing fills
+# ---------------------------------------------------------------------------
+
+def test_record_fill_negative_qty_rejected_and_position_unchanged():
+    record, _ = _entered_position(qty=10)
+    with pytest.raises(fill_validation.InvalidFillError):
+        lifecycle.record_fill(record["position_id"], filled_qty=-3, average_fill_price=100.0)
+    unchanged = store.load_position(record["position_id"])
+    assert unchanged["state"] == states.ENTRY_SUBMITTED
+    assert unchanged["filled_qty"] == 0
+
+
+def test_record_fill_nan_qty_rejected():
+    record, _ = _entered_position(qty=10)
+    with pytest.raises(fill_validation.InvalidFillError):
+        lifecycle.record_fill(record["position_id"], filled_qty=float("nan"), average_fill_price=100.0)
+
+
+def test_record_fill_qty_exceeding_requested_rejected():
+    record, _ = _entered_position(qty=10)
+    with pytest.raises(fill_validation.InvalidFillError):
+        lifecycle.record_fill(record["position_id"], filled_qty=15, average_fill_price=100.0)
+
+
+def test_record_fill_negative_price_rejected():
+    record, _ = _entered_position(qty=10)
+    with pytest.raises(fill_validation.InvalidFillError):
+        lifecycle.record_fill(record["position_id"], filled_qty=5, average_fill_price=-1.0)
+
+
+def test_record_fill_regression_rejected():
+    record, _ = _entered_position(qty=10)
+    lifecycle.record_fill(record["position_id"], filled_qty=6, average_fill_price=100.0)
+    with pytest.raises(fill_validation.InvalidFillError):
+        lifecycle.record_fill(record["position_id"], filled_qty=3, average_fill_price=100.0)
+    unchanged = store.load_position(record["position_id"])
+    assert unchanged["filled_qty"] == 6  # the earlier valid fill was not clobbered
+
+
+def test_record_fill_duplicate_same_cumulative_event_is_idempotent_noop():
+    record, _ = _entered_position(qty=10)
+    first = lifecycle.record_fill(record["position_id"], filled_qty=6, average_fill_price=100.0)
+    second = lifecycle.record_fill(record["position_id"], filled_qty=6, average_fill_price=100.0)
+    assert first["state_history"] == second["state_history"]  # no new history entry appended
+    assert second["filled_qty"] == 6
 
 
 # ---------------------------------------------------------------------------

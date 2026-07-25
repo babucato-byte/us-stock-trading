@@ -32,7 +32,7 @@ from datetime import datetime, timedelta, timezone
 import paper_strategy_order
 from config import scalping_strategy_v1_config as cfg
 from market_hours import MARKET_REGULAR_END, combine_eastern, eastern_now
-from positions import states, store
+from positions import fill_validation, states, store
 from strategy import registry as strategy_registry
 
 
@@ -163,35 +163,56 @@ def record_fill(position_id, filled_qty, average_fill_price, *, lock_timeout=sto
     filled_qty reaches requested_qty, transitions FILLED -> STOP_ACTIVE
     automatically (the constitution's "자동 손절" -- a stop is considered
     active the instant the position is fully filled, not something a
-    separate call arms later)."""
+    separate call arms later).
+
+    `filled_qty` is the new *cumulative* filled quantity (CODEX-027):
+    validated via fill_validation.validate_cumulative_fill() before
+    anything is mutated -- negative/NaN/Infinity/non-numeric quantities
+    or prices, a quantity exceeding requested_qty, or a quantity that
+    regresses below the previously recorded cumulative fill all raise
+    InvalidFillError and leave the position record untouched. A repeat
+    observation of the exact same cumulative (filled_qty,
+    average_fill_price) already on record is a no-op (idempotent), not
+    an error -- the same broker fill event may be delivered more than
+    once.
+    """
     with store.locked_position(position_id, lock_timeout=lock_timeout) as locked:
         if locked["state"] not in (states.ENTRY_SUBMITTED, states.PARTIALLY_FILLED):
             raise PositionLifecycleError(
                 f"Cannot record a fill for position {position_id!r} in state "
                 f"{locked['state']!r} (expected ENTRY_SUBMITTED or PARTIALLY_FILLED)"
             )
-        locked["filled_qty"] = filled_qty
-        locked["remaining_qty"] = filled_qty
-        locked["average_fill_price"] = average_fill_price
-        locked["last_reconciled_at"] = _now_iso()
+        previous_filled_qty = locked["filled_qty"] or 0
+        is_duplicate_observation = (
+            filled_qty == previous_filled_qty and average_fill_price == locked["average_fill_price"]
+        )
+        if not is_duplicate_observation:
+            fill_validation.validate_cumulative_fill(
+                locked["requested_qty"], previous_filled_qty, filled_qty, average_fill_price
+            )
 
-        if filled_qty >= locked["requested_qty"]:
-            states.validate_transition(locked["state"], states.FILLED)
-            locked["state"] = states.FILLED
-            locked["state_history"].append(
-                {"state": states.FILLED, "at": _now_iso(), "reason": f"filled_qty={filled_qty}"}
-            )
-            states.validate_transition(locked["state"], states.STOP_ACTIVE)
-            locked["state"] = states.STOP_ACTIVE
-            locked["state_history"].append(
-                {"state": states.STOP_ACTIVE, "at": _now_iso(), "reason": "fully filled, stop armed"}
-            )
-        else:
-            states.validate_transition(locked["state"], states.PARTIALLY_FILLED)
-            locked["state"] = states.PARTIALLY_FILLED
-            locked["state_history"].append(
-                {"state": states.PARTIALLY_FILLED, "at": _now_iso(), "reason": f"filled_qty={filled_qty}"}
-            )
+            locked["filled_qty"] = filled_qty
+            locked["remaining_qty"] = filled_qty
+            locked["average_fill_price"] = average_fill_price
+            locked["last_reconciled_at"] = _now_iso()
+
+            if filled_qty >= locked["requested_qty"]:
+                states.validate_transition(locked["state"], states.FILLED)
+                locked["state"] = states.FILLED
+                locked["state_history"].append(
+                    {"state": states.FILLED, "at": _now_iso(), "reason": f"filled_qty={filled_qty}"}
+                )
+                states.validate_transition(locked["state"], states.STOP_ACTIVE)
+                locked["state"] = states.STOP_ACTIVE
+                locked["state_history"].append(
+                    {"state": states.STOP_ACTIVE, "at": _now_iso(), "reason": "fully filled, stop armed"}
+                )
+            else:
+                states.validate_transition(locked["state"], states.PARTIALLY_FILLED)
+                locked["state"] = states.PARTIALLY_FILLED
+                locked["state_history"].append(
+                    {"state": states.PARTIALLY_FILLED, "at": _now_iso(), "reason": f"filled_qty={filled_qty}"}
+                )
     return store.load_position(position_id)
 
 
