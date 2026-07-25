@@ -27,6 +27,7 @@ full reasoning):
     then sees the updated state and has nothing left to do.
 """
 
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
@@ -34,7 +35,9 @@ from typing import List, Optional
 import paper_strategy_order
 from config import scalping_strategy_v1_config as cfg
 from market_hours import MARKET_REGULAR_END, combine_eastern, eastern_now
-from positions import fill_validation, states, store
+from positions import fill_validation, order_status, states, store
+from state_store import db as state_db
+from state_store import exit_intent_ledger as eil
 from strategy import registry as strategy_registry
 
 
@@ -237,20 +240,270 @@ def compute_unrealized_pnl(record, current_price):
 
 
 # ---------------------------------------------------------------------------
-# Exit submission (shared by every exit path below)
+# Exit submission (shared by every exit path below) -- CODEX-023/024
+#
+# CODEX-023: broker order *acceptance* (HTTP 200/201, status="accepted"/
+# "new"/etc.) is never treated as a fill. Only a broker order status of
+# "filled"/"partially_filled" ever changes remaining_qty or realized PnL;
+# an accepted-but-unfilled exit leaves the position in a submitted state
+# (EXIT_SUBMITTED/PARTIAL_EXIT_SUBMITTED) until a later reconciliation
+# confirms an actual fill.
+#
+# CODEX-024: every exit reserves a durable SQLite exit_intents row (see
+# state_store/exit_intent_ledger.py) BEFORE the broker is ever called.
+# That reservation, together with the position's own state transition, is
+# committed to disk before Phase B's broker call -- so a crash mid-call
+# leaves a record a restart can reconcile, rather than silently reverting
+# to the pre-exit state and letting a naive retry submit a second sell.
 # ---------------------------------------------------------------------------
 
-def _submit_exit_order(symbol, qty, *, order_date, broker):
-    """Submit a real "sell" order through the same safety-gated path as
-    entries, WITHOUT going through try_reserve_order() (see module
-    docstring for why). client_order_id is exit-specific so it never
-    collides with the entry's own reservation."""
-    import uuid
-    client_order_id = f"exit-{symbol}-{order_date}-{uuid.uuid4().hex[:10]}"
-    response = paper_strategy_order.submit_order(
-        symbol, qty=qty, broker=broker, client_order_id=client_order_id, side="sell",
+def _open_exit_db():
+    return state_db.open_db()
+
+
+def _target_submitted_state(on_fully_filled_state):
+    return states.PARTIAL_EXIT_SUBMITTED if on_fully_filled_state == states.PARTIAL_EXITED else states.EXIT_SUBMITTED
+
+
+def _transition_to_submitted(locked, on_fully_filled_state, client_order_id, note):
+    """Move `locked` toward its submitted state, routing through
+    TARGET_1_ACTIVE first when required (STOP_ACTIVE has no direct edge
+    to PARTIAL_EXIT_SUBMITTED -- see positions/states.py's TRANSITIONS)."""
+    target_state = _target_submitted_state(on_fully_filled_state)
+    if target_state == states.PARTIAL_EXIT_SUBMITTED and locked["state"] == states.STOP_ACTIVE:
+        states.validate_transition(locked["state"], states.TARGET_1_ACTIVE)
+        locked["state"] = states.TARGET_1_ACTIVE
+        locked["state_history"].append(
+            {"state": states.TARGET_1_ACTIVE, "at": _now_iso(), "reason": "target_1 price reached"}
+        )
+    states.validate_transition(locked["state"], target_state)
+    locked["state"] = target_state
+    locked["client_order_id"] = client_order_id
+    locked["state_history"].append({"state": target_state, "at": _now_iso(), "reason": note})
+
+
+def _apply_exit_fill_progress(conn, locked, intent, fill_state, confirmed_qty, confirmed_price,
+                               *, reason, on_fully_filled_state):
+    """Phase C's core: apply whatever Phase B learned about the intent's
+    broker order to the locked position record, keyed off the
+    *cumulative* confirmed_filled_qty already recorded on the intent so a
+    repeated observation of the same broker event never double-applies
+    PnL (CODEX-023's "filled 이벤트 반복 → 중복 PnL 반영 없음" /
+    CODEX-027's monotonic-fill discipline, reused here for exits)."""
+    already_applied = intent["confirmed_filled_qty"] or 0
+    requested_qty = intent["requested_qty"]
+
+    if fill_state == order_status.FILL_STATE_FILLED:
+        target_cumulative = requested_qty
+    elif fill_state == order_status.FILL_STATE_PARTIALLY_FILLED:
+        target_cumulative = confirmed_qty if confirmed_qty is not None else already_applied
+    else:
+        target_cumulative = already_applied  # NOT_FILLED / UNKNOWN -- no quantity change
+
+    # CODEX-027 discipline applied to the exit path too: a cumulative fill
+    # observation must never regress below what's already been applied,
+    # and never exceed what this intent actually requested. Silently
+    # clamping either direction would be exactly the kind of quiet
+    # data-quality bug CODEX-027 exists to make impossible.
+    if target_cumulative < already_applied:
+        raise fill_validation.InvalidFillError(
+            f"exit fill regressed from {already_applied!r} to {target_cumulative!r} "
+            f"for intent {intent['intent_id']!r}"
+        )
+    if target_cumulative > requested_qty:
+        raise fill_validation.InvalidFillError(
+            f"exit fill {target_cumulative!r} exceeds intent's requested_qty {requested_qty!r} "
+            f"for intent {intent['intent_id']!r}"
+        )
+
+    delta = target_cumulative - already_applied
+    if delta > 0:
+        fill_validation.validate_exit_qty(locked["remaining_qty"], delta)
+        price = confirmed_price if confirmed_price is not None else (
+            locked.get("target_1_price") if on_fully_filled_state == states.PARTIAL_EXITED else locked["stop_price"]
+        )
+        fill_validation.validate_fill_price(price)
+        _add_realized_pnl(locked, delta, price)
+        locked["remaining_qty"] = max(0, locked["remaining_qty"] - delta)
+
+    if fill_state == order_status.FILL_STATE_FILLED:
+        eil.mark_confirmed(conn, intent["intent_id"], confirmed_filled_qty=target_cumulative)
+        states.validate_transition(locked["state"], on_fully_filled_state)
+        locked["state"] = on_fully_filled_state
+        if on_fully_filled_state == states.CLOSED:
+            locked["exit_reason"] = reason
+        locked["state_history"].append(
+            {"state": on_fully_filled_state, "at": _now_iso(), "reason": f"{reason}, fill confirmed"}
+        )
+    elif fill_state == order_status.FILL_STATE_PARTIALLY_FILLED:
+        if delta > 0:
+            eil.update_progress(conn, intent["intent_id"], confirmed_filled_qty=target_cumulative)
+    elif fill_state == order_status.FILL_STATE_NOT_FILLED:
+        pass  # accepted/new/etc. -- genuinely nothing to do yet
+    else:  # UNKNOWN -- an order status we don't recognize; fail closed
+        eil.mark_reconciliation_required(conn, intent["intent_id"])
+        states.validate_transition(locked["state"], states.MANUAL_REVIEW)
+        locked["state"] = states.MANUAL_REVIEW
+        locked["state_history"].append(
+            {"state": states.MANUAL_REVIEW, "at": _now_iso(),
+             "reason": f"{reason} exit: unrecognized broker order status {confirmed_price!r}"}
+        )
+
+
+def reconcile_pending_exit(position_id, *, broker=None, on_fully_filled_state=None,
+                            lock_timeout=store.LOCK_TIMEOUT_SECONDS, db_conn=None):
+    """Resolve an already-reserved (RESERVED/SUBMITTED/SUBMISSION_UNKNOWN/
+    RECONCILIATION_REQUIRED) exit intent for `position_id` against the
+    broker's current view of that order -- NEVER submits a new order.
+    Returns the (possibly unchanged) position record, or None if there is
+    no active exit intent to reconcile.
+
+    This is the function restart recovery and a retried check_and_manage()
+    call both end up funneling through for a position that already has a
+    pending exit -- see _execute_exit()'s RECONCILE branch, which is a
+    thin wrapper around this.
+    """
+    conn = db_conn or _open_exit_db()
+    intent = eil.get_active_intent(conn, position_id)
+    if intent is None:
+        return None
+    reason = intent["reason"]
+    fully_filled_state = on_fully_filled_state or (
+        states.PARTIAL_EXITED if reason == "PARTIAL_TARGET_1" else states.CLOSED
     )
-    return response, client_order_id
+
+    if broker is None:
+        return store.load_position(position_id)  # nothing to reconcile against
+
+    try:
+        broker_order = broker.get_order_by_client_order_id(intent["client_order_id"])
+    except Exception:
+        # CODEX-024: a broker lookup failure must never trigger a resubmission.
+        return store.load_position(position_id)
+
+    if broker_order is None:
+        # The broker has never heard of this client_order_id -- most
+        # likely a crash happened before the order was ever actually
+        # sent. Policy: flag for operator reconciliation, never
+        # auto-resubmit.
+        eil.mark_reconciliation_required(conn, intent["intent_id"])
+        return store.load_position(position_id)
+
+    order_info = order_status.extract_order_info(broker_order)
+    fill_state = order_status.classify_broker_order_status(order_info.get("status"))
+
+    with store.locked_position(position_id, lock_timeout=lock_timeout) as locked:
+        current_intent = eil.get_by_id(conn, intent["intent_id"])
+        if current_intent is None or current_intent["state"] in eil.TERMINAL_STATES:
+            return dict(locked)  # already resolved by a concurrent/prior call
+        if locked["state"] not in (states.EXIT_SUBMITTED, states.PARTIAL_EXIT_SUBMITTED):
+            _transition_to_submitted(
+                locked, fully_filled_state, intent["client_order_id"],
+                f"restart recovery: resuming pending exit intent {intent['intent_id']}",
+            )
+        _apply_exit_fill_progress(
+            conn, locked, current_intent, fill_state,
+            order_info.get("filled_qty"), order_info.get("filled_avg_price"),
+            reason=reason, on_fully_filled_state=fully_filled_state,
+        )
+    return store.load_position(position_id)
+
+
+def _execute_exit(position_id, symbol, order_date, broker, reason, qty_selector, lock_timeout,
+                   *, on_fully_filled_state, db_conn=None):
+    """Durable, duplicate-safe exit submission -- see module section
+    docstring above for the full three-phase design."""
+    conn = db_conn or _open_exit_db()
+
+    # ---- Phase A: find-or-reserve a durable intent, durably persisted
+    # before any broker call. ----
+    existing_intent = eil.get_active_intent(conn, position_id)
+    if existing_intent is not None:
+        # A prior attempt already reserved (and maybe submitted) an exit
+        # for this position -- crash/timeout recovery, not a fresh
+        # decision. Catch the position's own state up to reflect that if
+        # a crash happened before the first attempt's Phase A finished
+        # writing it, then resolve via the same path restart recovery uses.
+        with store.locked_position(position_id, lock_timeout=lock_timeout) as locked:
+            if locked["state"] not in (states.EXIT_SUBMITTED, states.PARTIAL_EXIT_SUBMITTED):
+                fully_filled_state = on_fully_filled_state or (
+                    states.PARTIAL_EXITED if existing_intent["reason"] == "PARTIAL_TARGET_1" else states.CLOSED
+                )
+                _transition_to_submitted(
+                    locked, fully_filled_state, existing_intent["client_order_id"],
+                    f"resuming pending exit intent {existing_intent['intent_id']} instead of resubmitting",
+                )
+        return reconcile_pending_exit(
+            position_id, broker=broker, on_fully_filled_state=on_fully_filled_state,
+            lock_timeout=lock_timeout, db_conn=conn,
+        )
+
+    intent_id = None
+    client_order_id = None
+    exit_qty = None
+    with store.locked_position(position_id, lock_timeout=lock_timeout) as locked:
+        if not _exit_states_reachable_from(locked["state"]):
+            return dict(locked)  # already handled by a concurrent/prior call
+        exit_qty = qty_selector(locked)
+        if exit_qty <= 0:
+            if on_fully_filled_state == states.CLOSED:
+                states.validate_transition(locked["state"], states.CLOSED)
+                locked["state"] = states.CLOSED
+                locked["exit_reason"] = reason
+                locked["state_history"].append(
+                    {"state": states.CLOSED, "at": _now_iso(), "reason": f"{reason} (nothing left to exit)"}
+                )
+            return dict(locked)
+        client_order_id = f"exit-{symbol}-{order_date}-{uuid.uuid4().hex[:10]}"
+        try:
+            intent_id = eil.reserve(conn, position_id, reason, exit_qty, client_order_id)
+        except Exception:
+            # Could not durably record the intent -- refuse to call the broker.
+            return dict(locked)
+        _transition_to_submitted(
+            locked, on_fully_filled_state, client_order_id,
+            f"{reason}, exit intent {intent_id} reserved, exiting {exit_qty}",
+        )
+
+    # (Phase A's write is now durable on disk -- position and exit intent both,
+    # BEFORE the broker is ever called.)
+
+    # ---- Phase B: the actual broker call. ----
+    try:
+        response = paper_strategy_order.submit_order(
+            symbol, qty=exit_qty, broker=broker, client_order_id=client_order_id, side="sell",
+        )
+    except Exception:
+        eil.mark_submission_unknown(conn, intent_id)
+        return store.load_position(position_id)
+
+    if response.status_code not in (200, 201):
+        # Broker explicitly rejected the order -- it never reached an
+        # in-flight state at all, so the intent is aborted outright, not
+        # left pending for reconciliation.
+        eil.mark_aborted(conn, intent_id)
+        with store.locked_position(position_id, lock_timeout=lock_timeout) as locked:
+            states.validate_transition(locked["state"], states.MANUAL_REVIEW)
+            locked["state"] = states.MANUAL_REVIEW
+            locked["state_history"].append(
+                {"state": states.MANUAL_REVIEW, "at": _now_iso(),
+                 "reason": f"{reason} exit broker rejection, status_code={response.status_code}"}
+            )
+        return store.load_position(position_id)
+
+    order_info = order_status.extract_order_info(response)
+    eil.mark_submitted(conn, intent_id, broker_order_id=order_info.get("order_id"))
+    fill_state = order_status.classify_broker_order_status(order_info.get("status"))
+
+    # ---- Phase C: apply whatever Phase B learned. ----
+    with store.locked_position(position_id, lock_timeout=lock_timeout) as locked:
+        current_intent = eil.get_by_id(conn, intent_id)
+        _apply_exit_fill_progress(
+            conn, locked, current_intent, fill_state,
+            order_info.get("filled_qty"), order_info.get("filled_avg_price"),
+            reason=reason, on_fully_filled_state=on_fully_filled_state,
+        )
+    return store.load_position(position_id)
 
 
 def _exit_states_reachable_from(current_state):
@@ -347,84 +600,24 @@ def check_invalidation(position_id, strategy, bars, *, order_date=None, broker=N
 
 
 def _partial_exit_at_target_1(position_id, symbol, order_date, broker, lock_timeout):
-    with store.locked_position(position_id, lock_timeout=lock_timeout) as locked:
-        if locked["state"] != states.STOP_ACTIVE:
-            return  # someone else already handled this (duplicate-exit prevention)
-        # STOP_ACTIVE -> TARGET_1_ACTIVE -> PARTIAL_EXIT_SUBMITTED, per TRANSITIONS
-        # (no direct STOP_ACTIVE -> PARTIAL_EXIT_SUBMITTED edge).
-        states.validate_transition(locked["state"], states.TARGET_1_ACTIVE)
-        locked["state"] = states.TARGET_1_ACTIVE
-        locked["state_history"].append(
-            {"state": states.TARGET_1_ACTIVE, "at": _now_iso(), "reason": "target_1 price reached"}
-        )
+    def _qty_selector(locked):
         fraction = cfg.PARTIAL_EXIT_FRACTION_AT_TARGET_1
-        exit_qty = int(locked["remaining_qty"] * fraction)
-        if exit_qty <= 0:
-            return
-        states.validate_transition(locked["state"], states.PARTIAL_EXIT_SUBMITTED)
-        locked["state"] = states.PARTIAL_EXIT_SUBMITTED
-        locked["state_history"].append(
-            {"state": states.PARTIAL_EXIT_SUBMITTED, "at": _now_iso(),
-             "reason": f"target_1 reached, exiting {exit_qty}"}
-        )
-        response, _ = _submit_exit_order(symbol, exit_qty, order_date=order_date, broker=broker)
-        if response.status_code in (200, 201):
-            _add_realized_pnl(locked, exit_qty, locked["target_1_price"])
-            locked["remaining_qty"] -= exit_qty
-            states.validate_transition(locked["state"], states.PARTIAL_EXITED)
-            locked["state"] = states.PARTIAL_EXITED
-            locked["state_history"].append(
-                {"state": states.PARTIAL_EXITED, "at": _now_iso(),
-                 "reason": f"partial exit filled, remaining_qty={locked['remaining_qty']}"}
-            )
-        else:
-            states.validate_transition(locked["state"], states.MANUAL_REVIEW)
-            locked["state"] = states.MANUAL_REVIEW
-            locked["state_history"].append(
-                {"state": states.MANUAL_REVIEW, "at": _now_iso(),
-                 "reason": f"partial exit broker rejection, status_code={response.status_code}"}
-            )
-    return store.load_position(position_id)
+        return int(locked["remaining_qty"] * fraction)
+
+    return _execute_exit(
+        position_id, symbol, order_date, broker, "PARTIAL_TARGET_1", _qty_selector, lock_timeout,
+        on_fully_filled_state=states.PARTIAL_EXITED,
+    )
 
 
 def _force_full_exit(position_id, symbol, order_date, broker, reason, lock_timeout):
-    with store.locked_position(position_id, lock_timeout=lock_timeout) as locked:
-        if not _exit_states_reachable_from(locked["state"]):
-            return  # already exited or being exited by another caller
-        exit_qty = locked["remaining_qty"]
-        if exit_qty <= 0:
-            states.validate_transition(locked["state"], states.CLOSED)
-            locked["state"] = states.CLOSED
-            locked["exit_reason"] = reason
-            locked["state_history"].append(
-                {"state": states.CLOSED, "at": _now_iso(), "reason": f"{reason} (nothing left to exit)"}
-            )
-            return
-        states.validate_transition(locked["state"], states.EXIT_SUBMITTED)
-        locked["state"] = states.EXIT_SUBMITTED
-        locked["state_history"].append(
-            {"state": states.EXIT_SUBMITTED, "at": _now_iso(), "reason": f"{reason}, exiting {exit_qty}"}
-        )
-        response, _ = _submit_exit_order(symbol, exit_qty, order_date=order_date, broker=broker)
-        if response.status_code in (200, 201):
-            exit_price = (response.data or {}).get("filled_avg_price") if isinstance(response.data, dict) else None
-            exit_price = exit_price if exit_price is not None else locked["stop_price"]
-            _add_realized_pnl(locked, exit_qty, exit_price)
-            locked["remaining_qty"] = 0
-            locked["exit_reason"] = reason
-            states.validate_transition(locked["state"], states.CLOSED)
-            locked["state"] = states.CLOSED
-            locked["state_history"].append(
-                {"state": states.CLOSED, "at": _now_iso(), "reason": f"{reason}, fill confirmed"}
-            )
-        else:
-            states.validate_transition(locked["state"], states.MANUAL_REVIEW)
-            locked["state"] = states.MANUAL_REVIEW
-            locked["state_history"].append(
-                {"state": states.MANUAL_REVIEW, "at": _now_iso(),
-                 "reason": f"{reason} exit broker rejection, status_code={response.status_code}"}
-            )
-    return store.load_position(position_id)
+    def _qty_selector(locked):
+        return locked["remaining_qty"]
+
+    return _execute_exit(
+        position_id, symbol, order_date, broker, reason, _qty_selector, lock_timeout,
+        on_fully_filled_state=states.CLOSED,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -508,11 +701,28 @@ def recover_on_restart(*, broker=None, lock_timeout=store.LOCK_TIMEOUT_SECONDS):
             broker_positions=broker_positions,
         )
 
+    exit_conn = _open_exit_db()
     results = []
     for position_id, record in non_terminal.items():
         if record["state"] == states.RECOVERY_REQUIRED:
             results.append(record)
             continue
+
+        # CODEX-024: a position with a pending exit intent (or already
+        # sitting in EXIT_SUBMITTED/PARTIAL_EXIT_SUBMITTED from a prior
+        # process) is reconciled through the same broker-lookup-by-
+        # client_order_id path _execute_exit() itself uses on retry --
+        # never through the generic entry-reconciliation branch below,
+        # and never by resubmitting.
+        if eil.get_active_intent(exit_conn, position_id) is not None or record["state"] in (
+            states.EXIT_SUBMITTED, states.PARTIAL_EXIT_SUBMITTED,
+        ):
+            reconciled = reconcile_pending_exit(
+                position_id, broker=broker, lock_timeout=lock_timeout, db_conn=exit_conn,
+            )
+            results.append(reconciled or store.load_position(position_id))
+            continue
+
         with store.locked_position(position_id, lock_timeout=lock_timeout) as locked:
             if locked["state"] == states.RECOVERY_REQUIRED:
                 results.append(dict(locked))

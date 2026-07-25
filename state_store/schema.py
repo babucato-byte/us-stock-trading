@@ -136,9 +136,47 @@ MIGRATION_1_STATEMENTS = [
     KILL_SWITCH_EVENTS_TABLE,
 ]
 
+# ---------------------------------------------------------------------------
+# Migration 2 (CODEX-024): durable exit-intent ledger.
+#
+# A position's exit is reserved here BEFORE any broker call is made, so
+# that a crash/timeout between "we decided to exit" and "we know what the
+# broker actually did" is recoverable on restart instead of silently
+# resubmitting a second sell. No FOREIGN KEY to positions/store.py's own
+# JSON-based position records -- position_id is an informal correlation
+# key, exactly like fills.client_order_id already is to orders (see
+# migration 1's own note on this), since positions are not themselves
+# stored in this database.
+# ---------------------------------------------------------------------------
+
+EXIT_INTENTS_TABLE = """
+CREATE TABLE exit_intents (
+    intent_id TEXT PRIMARY KEY,
+    position_id TEXT NOT NULL,
+    client_order_id TEXT NOT NULL UNIQUE,
+    reason TEXT NOT NULL,
+    requested_qty REAL NOT NULL,
+    confirmed_filled_qty REAL NOT NULL DEFAULT 0,
+    state TEXT NOT NULL,
+    broker_order_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+"""
+
+EXIT_INTENTS_POSITION_INDEX = """
+CREATE INDEX idx_exit_intents_position_id ON exit_intents (position_id)
+"""
+
+MIGRATION_2_STATEMENTS = [
+    EXIT_INTENTS_TABLE,
+    EXIT_INTENTS_POSITION_INDEX,
+]
+
 # Every table this schema version creates -- used by export.py's
 # export_all() and by tests asserting the full table set exists.
 ALL_TABLES = [
     "orders", "fills", "positions", "position_events",
     "strategy_runs", "risk_events", "kill_switch_events",
+    "exit_intents",
 ]

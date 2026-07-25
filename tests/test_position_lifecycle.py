@@ -34,9 +34,17 @@ class FakeBrokerResponse:
 
 
 class FakeBroker:
+    """submit_order()'s default behavior (no explicit default_response
+    override) synthesizes a realistic *filled* response per call --
+    status="filled", filled_qty=the requested qty -- since CODEX-023
+    means a bare status_code=200 with no order status is UNKNOWN (fails
+    closed to MANUAL_REVIEW), not an implicit fill. Tests that need to
+    exercise the accepted/partially-filled/rejected/unknown paths pass an
+    explicit default_response or per-(symbol, side) submit_side_effects."""
+
     def __init__(self, submit_side_effects=None, default_response=None, orders_by_client_id=None):
         self._submit_side_effects = submit_side_effects or {}
-        self._default_response = default_response or FakeBrokerResponse()
+        self._default_response = default_response
         self._orders_by_client_id = orders_by_client_id or {}
         self.submit_calls = []
 
@@ -45,7 +53,14 @@ class FakeBroker:
         effect = self._submit_side_effects.get((symbol, side))
         if isinstance(effect, Exception):
             raise effect
-        return effect or self._default_response
+        if effect is not None:
+            return effect
+        if self._default_response is not None:
+            return self._default_response
+        return FakeBrokerResponse(status_code=200, text="OK", data={
+            "status": "filled", "filled_qty": qty, "filled_avg_price": None,
+            "id": f"broker-{client_order_id}",
+        })
 
     def get_order_by_client_order_id(self, client_order_id):
         return self._orders_by_client_id.get(client_order_id)
@@ -98,6 +113,7 @@ def _isolate_everything(tmp_path, monkeypatch):
     monkeypatch.setenv("POSITION_STORE_FILE", str(tmp_path / "POSITION_STORE.json"))
     monkeypatch.setenv("KILL_SWITCH_FILE", str(tmp_path / "KILL_SWITCH"))
     monkeypatch.setenv("KILL_SWITCH_STATE_FILE", str(tmp_path / "KILL_SWITCH_STATE.json"))
+    monkeypatch.setenv("STATE_STORE_DB_FILE", str(tmp_path / "TEST_STATE.db"))
     monkeypatch.setattr(pso, "ORDER_HISTORY_FILE", tmp_path / "order_history.csv")
     monkeypatch.setattr(pso, "ORDER_HISTORY_LOCK_FILE", tmp_path / "order_history.lock")
     monkeypatch.setattr(pso, "ORDER_RECONCILIATION_FILE", tmp_path / "order_reconciliation.csv")
@@ -407,7 +423,10 @@ def test_invalidation_noop_when_strategy_says_still_valid():
 def test_concurrent_stop_loss_checks_only_submit_one_exit_order():
     import threading
 
+    from state_store import db as state_db
+
     record, broker = _filled_position(qty=10)
+    state_db.open_db()  # pre-warm: ensure the SQLite schema exists before concurrent access
     position_id = record["position_id"]
     barrier = threading.Barrier(2)
     errors = []

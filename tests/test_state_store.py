@@ -35,15 +35,17 @@ def test_init_db_creates_every_expected_table(conn):
 
 
 def test_init_db_records_schema_version(conn):
-    assert db.get_schema_version(conn) == 1
+    from state_store.migrations import CURRENT_SCHEMA_VERSION
+    assert db.get_schema_version(conn) == CURRENT_SCHEMA_VERSION
 
 
 def test_init_db_is_idempotent(conn):
+    from state_store.migrations import MIGRATIONS
     version_before = db.get_schema_version(conn)
     result = db.init_db(conn)  # re-run against an already-migrated database
     assert result == version_before
     row_count = conn.execute("SELECT COUNT(*) AS c FROM schema_migrations").fetchone()["c"]
-    assert row_count == 1  # migration 1 was not re-applied/re-recorded
+    assert row_count == len(MIGRATIONS)  # no migration was re-applied/re-recorded
 
 
 def test_get_schema_version_zero_on_fresh_uninitialized_connection(tmp_path):
@@ -234,7 +236,8 @@ def test_reset_schema_clears_data_and_reinitializes(conn):
 
     version = export.reset_schema(conn)
 
-    assert version == 1
+    from state_store.migrations import CURRENT_SCHEMA_VERSION
+    assert version == CURRENT_SCHEMA_VERSION
     assert conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"] == 0
 
 
@@ -251,3 +254,46 @@ def test_reset_schema_never_touches_source_csv(conn, tmp_path):
 
 def test_real_db_file_never_created_by_tests():
     assert not db.DEFAULT_DB_FILE.exists()
+
+
+# ---------------------------------------------------------------------------
+# Concurrent first-time schema creation retries on "database is locked"
+# instead of failing outright (see db._run_with_lock_retry()).
+# ---------------------------------------------------------------------------
+
+def test_run_with_lock_retry_succeeds_after_transient_lock_error():
+    import sqlite3
+    attempts = []
+
+    def flaky():
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise sqlite3.OperationalError("database is locked")
+        return "ok"
+
+    result = db._run_with_lock_retry(flaky, retries=5, retry_delay_seconds=0.001)
+    assert result == "ok"
+    assert len(attempts) == 3
+
+
+def test_run_with_lock_retry_gives_up_after_max_retries():
+    import sqlite3
+
+    def always_locked():
+        raise sqlite3.OperationalError("database is locked")
+
+    with pytest.raises(sqlite3.OperationalError):
+        db._run_with_lock_retry(always_locked, retries=3, retry_delay_seconds=0.001)
+
+
+def test_run_with_lock_retry_does_not_retry_unrelated_errors():
+    import sqlite3
+    attempts = []
+
+    def different_error():
+        attempts.append(1)
+        raise sqlite3.OperationalError("no such table: bogus")
+
+    with pytest.raises(sqlite3.OperationalError):
+        db._run_with_lock_retry(different_error, retries=5, retry_delay_seconds=0.001)
+    assert len(attempts) == 1  # not retried -- not a locking error

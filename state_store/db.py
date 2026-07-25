@@ -52,6 +52,18 @@ def connect(db_path=None, *, busy_timeout_ms=5000):
     return conn
 
 
+def open_db(db_path=None, *, busy_timeout_ms=5000):
+    """connect() + init_db() in one call -- the convenience entry point for
+    callers (e.g. positions/lifecycle.py's exit-intent reservation) that
+    just need a ready-to-use, current-schema connection and don't care
+    about the connect/migrate split. init_db() is itself idempotent, so
+    calling this on every exit attempt is safe (a no-op migration check)
+    rather than expensive schema work."""
+    conn = connect(db_path, busy_timeout_ms=busy_timeout_ms)
+    init_db(conn)
+    return conn
+
+
 def get_schema_version(conn):
     """Return the highest applied migration version, or 0 if the
     schema_migrations table doesn't exist yet (fresh database)."""
@@ -64,23 +76,50 @@ def get_schema_version(conn):
     return row["v"] or 0
 
 
-def init_db(conn):
+def _run_with_lock_retry(fn, *, retries, retry_delay_seconds):
+    """Run `fn()` (a zero-arg callable performing some DDL/write), retrying
+    on sqlite3.OperationalError("database is locked") a few times with a
+    short backoff. Two threads/processes racing to run first-time schema
+    creation on a brand-new database file can hit this even with
+    busy_timeout set -- DDL/CREATE TABLE contention on a just-created file
+    isn't always covered by the busy handler the same way row-level write
+    contention is. This is purely a "who gets there first" race, not a
+    real data conflict, so retrying is safe. Any other error, or the final
+    attempt, propagates immediately."""
+    import time as _time
+
+    for attempt in range(retries):
+        try:
+            return fn()
+        except sqlite3.OperationalError as exc:
+            if attempt == retries - 1 or "locked" not in str(exc).lower():
+                raise
+            _time.sleep(retry_delay_seconds)
+
+
+def init_db(conn, *, _retries=5, _retry_delay_seconds=0.05):
     """Apply every migration in MIGRATIONS not yet recorded as applied.
 
     Idempotent: calling this against an already-current database is a
     no-op. Each migration runs inside its own transaction -- a failure
     partway through one migration's statements rolls that migration back
-    entirely rather than leaving a half-created set of tables.
+    entirely rather than leaving a half-created set of tables. See
+    _run_with_lock_retry() for why first-time schema creation is retried.
     """
     from state_store.schema import SCHEMA_MIGRATIONS_TABLE
-    conn.execute(SCHEMA_MIGRATIONS_TABLE)
-    conn.commit()
+
+    def _create_migrations_table():
+        conn.execute(SCHEMA_MIGRATIONS_TABLE)
+        conn.commit()
+
+    _run_with_lock_retry(_create_migrations_table, retries=_retries, retry_delay_seconds=_retry_delay_seconds)
 
     current_version = get_schema_version(conn)
     for version, description, statements in MIGRATIONS:
         if version <= current_version:
             continue
-        try:
+
+        def _apply_migration(statements=statements, version=version, description=description):
             for statement in statements:
                 conn.execute(statement)
             conn.execute(
@@ -88,6 +127,9 @@ def init_db(conn):
                 (version, description, now_iso()),
             )
             conn.commit()
+
+        try:
+            _run_with_lock_retry(_apply_migration, retries=_retries, retry_delay_seconds=_retry_delay_seconds)
         except sqlite3.Error as exc:
             conn.rollback()
             raise StateStoreError(f"Migration {version} ({description!r}) failed: {exc}") from exc
