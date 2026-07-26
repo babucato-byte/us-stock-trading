@@ -513,12 +513,25 @@ def _execute_exit(position_id, symbol, order_date, broker, reason, qty_selector,
     if response.status_code not in (200, 201):
         # Broker explicitly rejected the order -- it never reached an
         # in-flight state at all, so the intent is aborted outright, not
-        # left pending for reconciliation. mark_aborted() commits on its
-        # own (Phase B is deliberately outside any position lock, so
-        # there's no position write to keep it atomic with here); the
-        # MANUAL_REVIEW transition below is its own separate, later commit.
-        eil.mark_aborted(conn, intent_id)
+        # left pending for reconciliation.
+        #
+        # CODEX-032: mark_aborted() and the position's MANUAL_REVIEW
+        # transition must commit together, in the SAME SQLite transaction
+        # -- previously mark_aborted() committed on its own (default
+        # commit=True) before the position write's own separate
+        # transaction even began, so a failure in that second write left
+        # a permanently inconsistent pair: exit_intents shows a terminal
+        # ABORTED intent (nothing left to reconcile) while the position
+        # stays stuck in EXIT_SUBMITTED forever -- invisible to both
+        # reconcile_pending_exit() (no active intent to find) and
+        # recover_on_restart() (which only routes through
+        # reconcile_pending_exit() for positions with an active intent).
+        # commit=False here defers the actual commit to
+        # store.locked_position(conn=conn)'s single commit point below,
+        # exactly like Phase A's eil.reserve(..., commit=False) already
+        # does for the reservation side.
         with store.locked_position(position_id, lock_timeout=lock_timeout, conn=conn) as locked:
+            eil.mark_aborted(conn, intent_id, commit=False)
             states.validate_transition(locked["state"], states.MANUAL_REVIEW)
             locked["state"] = states.MANUAL_REVIEW
             locked["state_history"].append(

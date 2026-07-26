@@ -603,3 +603,139 @@ def test_stale_existing_intent_read_after_position_already_closed_does_not_raise
     assert result["remaining_qty"] == 0
     sell_calls = [c for c in broker.submit_calls if c[2] == "sell"]
     assert len(sell_calls) == 1  # the real check_and_manage call inside the monkeypatch did the only submission
+
+
+# ---------------------------------------------------------------------------
+# CODEX-032 (and CODEX-024/028's shared remaining risk): broker rejection's
+# exit-intent ABORTED transition and the position's MANUAL_REVIEW
+# transition must commit atomically -- previously mark_aborted() committed
+# on its own before the position write even began, so a failure in the
+# position write left a permanently inconsistent pair (terminal ABORTED
+# intent, position stuck in EXIT_SUBMITTED forever, invisible to both
+# reconcile_pending_exit() and recover_on_restart()).
+# ---------------------------------------------------------------------------
+
+def _rejected_response(status_code=422, order_id="b-rejected"):
+    return FakeBrokerResponse(status_code=status_code, text="Unprocessable Entity", data={"id": order_id})
+
+
+def test_broker_rejection_marks_intent_aborted_and_position_manual_review_atomically():
+    record, broker = _filled_position(qty=10, broker_submit_responses=[_rejected_response()])
+    updated = lifecycle.check_and_manage(record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker)
+
+    assert updated["state"] == states.MANUAL_REVIEW
+    conn = state_db.open_db()
+    intent = eil.get_by_client_order_id(conn, updated["client_order_id"])
+    assert intent["state"] == eil.STATE_ABORTED
+    assert eil.get_active_intent(conn, record["position_id"]) is None
+
+
+def test_broker_rejection_transaction_failure_leaves_intent_and_position_unchanged():
+    """Simulate the position-row write inside the shared transaction
+    failing (e.g. a disk/DB error on the position_events INSERT) --
+    the intent's ABORTED transition must roll back together with it,
+    never leaving a terminal intent paired with an unmoved position.
+
+    Uses a scoped pytest.MonkeyPatch() (not the function-fixture
+    `monkeypatch`) so the patch can be undone mid-test without also
+    undoing the autouse `_isolate_everything` fixture's env var overrides
+    -- calling the shared fixture's .undo() reverts EVERYTHING it patched
+    so far in this test, including STATE_STORE_DB_FILE/POSITION_STORE_FILE,
+    which would silently repoint subsequent store reads at the real
+    repo-root operational files."""
+    record, broker = _filled_position(qty=10, broker_submit_responses=[_rejected_response()])
+
+    # Phase A's own commit (reserving the exit intent and transitioning to
+    # EXIT_SUBMITTED, before the broker is ever called) ALSO calls
+    # store._insert_new_events() -- a blanket patch would fail that first,
+    # unrelated commit instead of the rejection-handling commit this test
+    # actually targets. Let the first call through for real; fail only the
+    # second (the rejection-handling transaction).
+    real_insert_new_events = store._insert_new_events
+    call_count = {"n": 0}
+
+    def _boom(conn, position_id, new_events):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return real_insert_new_events(conn, position_id, new_events)
+        raise Exception("simulated DB failure writing position_events")
+
+    with pytest.MonkeyPatch().context() as mp:
+        mp.setattr(store, "_insert_new_events", _boom)
+        with pytest.raises(Exception, match="simulated DB failure"):
+            lifecycle.check_and_manage(record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker)
+
+    reloaded = store.load_position(record["position_id"])
+    assert reloaded["state"] == states.EXIT_SUBMITTED  # unchanged, not stuck mid-transition
+
+    conn = state_db.open_db()
+    intent = eil.get_by_client_order_id(conn, reloaded["client_order_id"])
+    assert intent["state"] != eil.STATE_ABORTED  # rolled back together with the position write
+    assert intent["state"] in eil.NON_TERMINAL_STATES
+    assert eil.get_active_intent(conn, record["position_id"]) is not None  # still reconcilable
+
+
+def test_broker_rejection_mark_aborted_failure_leaves_position_unchanged():
+    """The reverse ordering: if the exit-intent side of the shared
+    transaction fails, the position's MANUAL_REVIEW transition must not
+    have been applied either. See the previous test's docstring for why a
+    scoped pytest.MonkeyPatch() is used instead of the shared fixture."""
+    record, broker = _filled_position(qty=10, broker_submit_responses=[_rejected_response()])
+
+    def _boom(conn, intent_id, *, commit=True):
+        raise Exception("simulated failure marking intent aborted")
+
+    with pytest.MonkeyPatch().context() as mp:
+        mp.setattr(lifecycle.eil, "mark_aborted", _boom)
+        with pytest.raises(Exception, match="simulated failure marking intent aborted"):
+            lifecycle.check_and_manage(record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker)
+
+    reloaded = store.load_position(record["position_id"])
+    assert reloaded["state"] == states.EXIT_SUBMITTED  # MANUAL_REVIEW was never persisted
+
+    conn = state_db.open_db()
+    assert eil.get_active_intent(conn, record["position_id"]) is not None  # intent still active, reconcilable
+
+
+def test_broker_rejection_after_transaction_failure_never_auto_resubmits_on_retry():
+    """After a failed rejection-handling transaction leaves the position
+    EXIT_SUBMITTED with its active (still-non-terminal) intent intact:
+
+    - check_and_manage() itself is a no-op for an EXIT_SUBMITTED position
+      (not in _exit_states_reachable_from()) -- it never re-attempts a
+      submission on its own, by design.
+    - reconcile_pending_exit() (what restart recovery/an operator-
+      triggered retry actually calls) must never resubmit either. The
+      broker genuinely rejected this order (it never reached an in-flight
+      state), so it has nothing to report by client_order_id; the correct,
+      safe outcome is RECONCILIATION_REQUIRED, not a blind resubmission.
+
+    See the first test's docstring for why a scoped pytest.MonkeyPatch()
+    is used."""
+    record, broker = _filled_position(qty=10, broker_submit_responses=[_rejected_response()])
+
+    real_insert_new_events = store._insert_new_events
+    call_count = {"n": 0}
+
+    def _boom(conn, position_id, new_events):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return real_insert_new_events(conn, position_id, new_events)
+        raise Exception("simulated DB failure writing position_events")
+
+    with pytest.MonkeyPatch().context() as mp:
+        mp.setattr(store, "_insert_new_events", _boom)
+        with pytest.raises(Exception, match="simulated DB failure"):
+            lifecycle.check_and_manage(record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker)
+
+    noop = lifecycle.check_and_manage(record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker)
+    assert noop["state"] == states.EXIT_SUBMITTED  # check_and_manage() is a no-op here, as designed
+
+    retried = lifecycle.reconcile_pending_exit(record["position_id"], broker=broker)
+    assert retried["state"] == states.EXIT_SUBMITTED  # never silently closed or reverted
+    sell_calls = [c for c in broker.submit_calls if c[2] == "sell"]
+    assert len(sell_calls) == 1  # only the original rejected attempt -- never resubmitted
+
+    conn = state_db.open_db()
+    intent = eil.get_by_client_order_id(conn, retried["client_order_id"])
+    assert intent["state"] == eil.STATE_RECONCILIATION_REQUIRED
