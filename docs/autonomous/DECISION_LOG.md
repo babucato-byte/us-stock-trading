@@ -539,3 +539,42 @@
   `NOT_FRACTIONABLE`/`BELOW_MINIMUM_ORDER`/`UNKNOWN_ACCOUNT_STATE`)로 명시적으로 구분해, "예산
   없음"과 "이 종목만 분할 불가"를 caller가 구분할 수 있게 했다.
 - 승인 필요 여부: 아니오(코드 구현·테스트 추가·문서화 범위, 실거래/승인/main/push와 무관).
+
+## CODEX-034~038 최종 수정 사이클 (2026-07-27)
+
+- 결정 1(CODEX-035, definitive rejection allowlist) — "HTTPError에 response가 존재하는가"만으로
+  definitive/ambiguous를 나누던 기존 판정을 폐기하고, Alpaca가 실제 주문 거절에 사용하는 status
+  code의 allowlist(400/401/403/404/409/410/422) + 파싱 가능한 JSON body 조합만 definitive로
+  인정하도록 바꿨다. 근거: HTTP 500/502/503/504/408/425/429는 모두 "response는 있지만 주문이
+  실제로 처리됐는지 알 수 없는" 상태(upstream/gateway 오류, rate limit, timeout류)이며, response의
+  유무만으로는 이 차이를 구분할 수 없다. Codex의 HTTP 500 fault-injection 반례(첫 reservation이
+  RELEASED되고 두 번째 27,000원 주문이 실제 session에 도달)가 이 설계 결함을 직접 증명했다.
+  allowlist에 없는 status code(예: 418)나 definitive code라도 body가 JSON으로 파싱되지 않는
+  경우는 전부 fail-closed 기본값(ambiguous)으로 처리한다 — 새로운/예상치 못한 status code가
+  실수로 definitive로 오분류될 수 없다.
+- 결정 2(CODEX-036, authoritative cash를 어디서 강제할지) — 처음에는
+  `AlpacaBroker.submit_order()`가 `self.get_account()`를 즉시 호출해 매 주문 검증마다 실제 잔고를
+  가져오도록 구현했으나, 이 저장소의 `broker_config.py::validate_order_allowed()`가 dry-run 여부와
+  무관하게 live 모드의 모든 broker 호출을 이미 차단하고 있다는 사실과 정면으로 충돌했다 — 그
+  결과 sizing-only 검증(예: dry-run, 순수 단위 테스트)까지 "Real live trading is disabled"로
+  실패하기 시작했다. 즉시 즉시-fetch 설계를 폐기하고, `validate_and_size_live_entry()`가
+  이미 만들어진 `AccountCashSnapshot` 객체를 optional 인자로만 받는 방식으로 재설계했다 —
+  `fetch_account_cash_snapshot()`으로 실제 fetch를 수행하는 책임은 향후 실거래가 승인되어 live
+  네트워크 호출이 실제로 허용되는 시점의 production caller에게 넘긴다. 이 설계는 caller가 스냅샷을
+  아예 제공하지 않으면 CODEX-036 이전과 동일하게 동작한다(opt-in 보호) — 실제 배선은 별도의 명시적
+  결정(향후 실거래 승인 이후)이 필요하다는 점을 인정하되, 스냅샷을 제공하는 caller에 대해서는 지금
+  당장 갭을 완전히 닫는다.
+- 결정 3(CODEX-036, cash_usage_percent 트러스트 상수) — `available_cash_krw`와 달리
+  `cash_usage_percent`는 시장/계좌 사실이 아니라 순수 운영 정책값이라 broker에 물어볼 대상이 없다.
+  `MAX_CONCURRENT_LIVE_POSITIONS`/`MAX_DAILY_LIVE_ENTRIES`와 동일한 "신뢰 가능한 코드 상수 +
+  min()으로만 교차" 패턴을 재사용해 `TRUSTED_CASH_USAGE_PERCENT_CEILING=50`(보수적 초기값)을
+  도입했다. account snapshot 제공 여부와 무관하게 항상 적용되므로, snapshot 배선이 아직 없는
+  현재 상태에서도 이 특정 반례(cash_usage_percent=100 요청)는 즉시 차단된다.
+- 결정 4(CODEX-037, 검증 시점) — optional numeric cap 5개(주문/일일손실/거래당위험/전략수량/
+  손절가)의 finite/양수 검증을 reservation lock 진입 이전, 다른 caller-input 검증(FX/현금)과 같은
+  자리에 배치했다 — risk/strategy 재사이징 로직이 실행되기 전에 실패해야 "NaN이 대소 비교를
+  통과해 조용히 무시된다"는 원래 결함의 재발을 구조적으로 막을 수 있기 때문이다.
+- 결정 5(CODEX-038, 근본 원인) — `write_performance_files()` 자체는 수정하지 않았다(정책/동작
+  변경 없음). 문제는 순수하게 테스트 격리 누락이었으므로, 테스트에 누락된 `monkeypatch.setattr`
+  한 줄만 추가하는 최소 수정으로 해결했다.
+- 승인 필요 여부: 아니오(코드 구현·테스트 추가·문서화 범위, 실거래/승인/main/push와 무관).

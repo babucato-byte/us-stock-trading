@@ -1,5 +1,52 @@
 # VALIDATION_REPORT
 
+## 2026-07-27 — CODEX-034~038 최종 수정 사이클 해결
+
+Codex 독립 검증(`CODEX_REVIEW.md`, 커밋 `5da6662`/`5316cd1`/`72bbb6c` 포함 범위, overall verdict
+**FAIL**)이 CODEX-034를 `PARTIALLY_RESOLVED`로 재확인하고 신규 CODEX-035/036/037(HIGH)·
+CODEX-038(LOW)을 제기했다. 상세는 `REMEDIATION_PLAN.md`의 동일 날짜 섹션 참고.
+
+- **CODEX-035**(HIGH, HTTP 5xx/408/425/429를 definitive rejection으로 오분류):
+  `_is_ambiguous_broker_failure()`를 "response 유무" 대신 "definitive status code
+  allowlist(400/401/403/404/409/410/422) + 파싱 가능한 JSON body" 기준으로 재작성.
+- **CODEX-036**(HIGH, 잔고/사용비율이 caller assertion에 의존): `live_readiness/account_cash.py`
+  신설 — `TRUSTED_CASH_USAGE_PERCENT_CEILING`(트러스트 코드 상수)과 `AccountCashSnapshot`/
+  `fetch_account_cash_snapshot()`(broker.get_account() 기반 유일한 생성 경로).
+  `validate_and_size_live_entry()`가 optional `account_cash_snapshot`으로 caller 선언 잔고를
+  `min()`으로만 제한.
+- **CODEX-037**(HIGH, NaN optional cap이 fail-open): 5개 optional numeric cap 전부에 예약 전
+  finite/양수 검증 추가.
+- **CODEX-038**(LOW, 테스트가 운영 CSV mtime 변경): `test_summary_csv_generation`에 누락된
+  `STRATEGY_PERFORMANCE_FILE` 격리 추가.
+
+### 테스트 결과
+
+```
+venv/bin/python -m pytest -q                              1,125 passed, 0 failed, 2 warnings
+```
+
+이전 사이클 종료 시점(1,044 passed) 대비 81건 신규.
+
+### 코드 변경 검증
+
+- `broker/alpaca_client.py`/`paper_strategy_order.py`(ambiguous-failure allowlist 재작성),
+  `live_readiness/account_cash.py`(신규), `live_readiness/order_gateway.py`(trusted percent
+  ceiling, account_cash_snapshot 파라미터, optional cap fail-closed 검증),
+  `tests/test_performance_analytics.py`(STRATEGY_PERFORMANCE_FILE 격리) — 모두 커밋 diff로 직접
+  확인.
+- 안전 크리티컬 파일(`risk_config.py`, `broker/broker_config.py`, `kill_switch_state.py`,
+  `order_intent_ledger.py`)는 SHA-256이 이전 사이클과 완전히 동일.
+
+### 미검증 영역
+
+- CODEX-036의 `account_cash_snapshot`은 opt-in이다 — 실제 production 호출 경로가
+  `fetch_account_cash_snapshot()`을 호출해 스냅샷을 채워 넣는 배선은 아직 존재하지 않는다(실거래
+  승인 이후의 별도 결정, `DECISION_LOG.md` 결정 2 참고). 스냅샷을 제공하지 않는 caller는
+  CODEX-036 이전과 동일하게 caller 선언 잔고만으로 판단된다.
+- `entry_reservation_ledger.reconcile_by_client_order_id()`는 여전히 재시작/크래시 복구 경로에
+  자동 배선되지 않았다(CODEX-034 시점부터 이어진 잔여 위험).
+- Limited live review(제한적 실거래 검토)는 여전히 BLOCKED, 실거래 없음.
+
 ## 2026-07-27 — CODEX-034 + 잔고 비율 기반 주문 사이징 사이클 해결
 
 Codex 독립 검증(`CODEX_REVIEW.md`, 커밋 `5da6662` 포함 범위, overall verdict **FAIL**)이 신규

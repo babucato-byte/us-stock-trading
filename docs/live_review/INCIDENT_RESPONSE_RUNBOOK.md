@@ -293,6 +293,36 @@ wrapper뿐 아니라 `broker/alpaca_client.py::AlpacaBroker._request()` 자체�
   4. broker 재조회 자체가 계속 실패하면(네트워크 문제 등) Kill Switch를 `MANUAL_REVIEW`로
      활성화하고 사용자에게 보고한다 — SUBMISSION_UNKNOWN을 임의로 RELEASED로 바꾸지 않는다.
 
+**갱신(2026-07-27, CODEX-035)**: "broker 응답이 유실됐다"는 timeout/connection reset뿐 아니라
+HTTP 408/425/429 및 모든 5xx 응답(response는 받았지만 upstream/gateway/rate-limit 문제로 주문
+접수 여부를 알 수 없는 경우)도 포함하도록 판정 기준이 확장됐다 — 이런 응답을 받은 예약도 위와
+동일하게 `SUBMISSION_UNKNOWN`으로 남는다. definitive rejection으로 즉시 `RELEASED`되는 것은
+`_DEFINITIVE_REJECTION_STATUS_CODES`(400/401/403/404/409/410/422) + 파싱 가능한 JSON body
+조합뿐이다.
+
+## 17. Live 진입이 caller가 선언한 잔고/비율보다 훨씬 작은 수량으로 승인되거나 예상보다 훨씬 낮은 한도에서 차단됨 (2026-07-27, CODEX-036 수정 이후)
+
+- **감지**: `LiveEntryContext.available_cash_krw`/`cash_usage_percent`로 계산했을 때 기대한
+  수량보다 실제 승인된 수량(`LiveEntryApproval.quantity`)이 훨씬 작음.
+- **원인 1(의도된 동작)**: `cash_usage_percent`는 `live_readiness/account_cash.py::
+  TRUSTED_CASH_USAGE_PERCENT_CEILING`(현재 50%)으로 항상 상한이 걸린다 — caller가 100%를
+  요청해도 실제로는 50%만 적용된다. 운영자가 더 높은 비율을 승인했다면, 이 상수 자체를 코드
+  리뷰를 거쳐 올려야 한다(caller가 per-call로 우회할 수 없다, 의도된 설계).
+- **원인 2(의도된 동작, snapshot이 배선된 경우)**: caller가 `account_cash_snapshot`을 함께
+  전달했다면 `available_cash_krw`는 `min(caller 선언값, snapshot.cash_krw)`로 계산된다 — 실제
+  broker 계좌 잔고가 caller가 선언한 것보다 적으면 더 낮은 값이 적용된다. 이는 CODEX-036이
+  막으려던 정확히 그 시나리오(caller가 잔고를 부풀려 선언)의 정상적인 차단 동작이다.
+- **절차**:
+  1. `live_readiness/order_gateway.py`의 `TRUSTED_CASH_USAGE_PERCENT_CEILING` 현재 값을
+     확인한다.
+  2. `account_cash_snapshot`을 실제로 전달했는지, 전달했다면 그 `cash_krw`/`as_of` 값을 확인한다
+     (전달하지 않았다면 이 원인 2는 해당하지 않는다 — CODEX-036의 잔고 캡핑은 opt-in이며,
+     production 배선 자체는 아직 존재하지 않는다. `docs/autonomous/DECISION_LOG.md`의
+     CODEX-034~038 사이클 섹션 결정 2 참고).
+  3. 트러스트 상수나 스냅샷 캡핑 자체가 잘못됐다고 판단되면(예: `TRUSTED_CASH_USAGE_PERCENT_CEILING`
+     을 올려야 한다) 사용자 승인 하에 코드를 수정한다 — 운영자 승인 없이 임의로 상수를 올리지
+     않는다.
+
 ## 공통 유의사항
 
 - 모든 활성화/해제는 `kill_switch_state.py`의 감사 이력(`get_history()`)에 남으므로,

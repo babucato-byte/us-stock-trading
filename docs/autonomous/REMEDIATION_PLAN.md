@@ -932,3 +932,93 @@ overall verdict **FAIL**)이 CODEX-029/030을 `RESOLVED`로 재확인하고, COD
   않았고, 고정 30,000원 상수 제거는 사용자가 명시적으로 지시한 정책 변경(예시 값 → 잔고 비율
   모델)이지 임의의 한도 완화가 아니다 — `cash_usage_percent`가 100이어도 실제 계좌 현금을 초과할
   수 없다는 제약은 그대로 유지된다.
+
+## CODEX-034~038 최종 수정 사이클 (2026-07-27)
+
+### CODEX-034(PARTIALLY_RESOLVED → 잔여 분류 결함, Codex 4차 검증)
+
+- 재현(`CODEX_REVIEW.md` 기록): 모든 `HTTPError`가 response를 가졌다는 이유만으로 definitive
+  rejection으로 분류됨. HTTP 500 fault injection에서 첫 27,000원 reservation이 `RELEASED`되고
+  두 번째 27,000원 주문이 실제 session에 도달(broker call 2회).
+- 처리 상태: CODEX-035로 전환/해결(아래).
+
+### CODEX-035(HIGH, HTTP 5xx/ambiguous HTTP response를 definitive rejection으로 오분류)
+
+- 수정: `broker/alpaca_client.py::_is_ambiguous_broker_failure()`와
+  `paper_strategy_order.py::_is_ambiguous_wrapper_broker_failure()`를 "response 유무"가 아니라
+  "definitive rejection status code allowlist(400/401/403/404/409/410/422) + 파싱 가능한 JSON
+  body" 기준으로 재작성. allowlist에 없는 코드(408/425/429/5xx/미인식 코드) 또는 body 파싱 실패는
+  전부 ambiguous(SUBMISSION_UNKNOWN) 기본값.
+- 신규 테스트: `tests/test_live_order_gateway.py`에 HTTP 408/425/429/500/502/503/504
+  fault-injection(각각 ambiguous 확인 + 동일 조건 재시도가 session 호출 0회로 차단), 미인식
+  status code(418) ambiguous 확인, definitive 코드 + 파싱 불가 body ambiguous 확인,
+  definitive allowlist 코드(400/401/403/404/409/410/422) + 파싱 가능 body가 실제로 `RELEASED`되고
+  재시도가 broker에 도달함을 확인.
+- 처리 상태: RESOLVED
+
+### CODEX-036(HIGH, available cash와 cash usage percent가 caller assertion에 의존)
+
+- 재현(`CODEX_REVIEW.md` 기록): 실제 계좌 30,000원 가정에서 caller가 `available_cash_krw=
+  3,000,000`/`cash_usage_percent=100`을 선언하면 2,997,000원 주문이 승인됨. broker account/cash
+  endpoint 조회 0회.
+- 수정: `live_readiness/account_cash.py` 신설.
+  `TRUSTED_CASH_USAGE_PERCENT_CEILING=50`(신뢰 가능한 코드 상수, `MAX_CONCURRENT_LIVE_POSITIONS`/
+  `MAX_DAILY_LIVE_ENTRIES`와 동일 패턴)이 `cash_usage_percent`를 항상 caller-untightenable하게
+  제한한다. `AccountCashSnapshot`/`fetch_account_cash_snapshot(broker, fx_rate)`가 유일한 잔고
+  스냅샷 생성 경로(`broker.get_account()` 기반). `validate_and_size_live_entry()`가 신규 optional
+  `account_cash_snapshot` 인자를 받아 `min(caller 선언값, 실제 스냅샷)`으로 caller가 잔고를 부풀릴
+  수 없게 한다. `AccountCashSnapshot`이 아닌 타입이 전달되면 즉시 차단, snapshot staleness도 검증.
+- 설계 결정(`DECISION_LOG.md` 결정 2 참고): `AlpacaBroker.submit_order()` 내부에서 매 호출 자동
+  fetch하는 최초 설계는 이 저장소의 pre-live 안전 게이트(dry-run 여부와 무관하게 모든 live 모드
+  broker 호출 차단)와 충돌해 dry-run/sizing-only 검증까지 깨뜨렸으므로 폐기. 스냅샷을 이미 만들어진
+  객체로 전달받는 방식으로 재설계 — 실제 fetch 배선은 향후 실거래 승인 이후 production caller의
+  책임으로 명시적으로 남겼다.
+- 신규 테스트: `tests/test_live_order_gateway.py`에 Codex의 정확한 반례(30,000원 실제 + 3,000,000원
+  선언 → 15,000원 이하로 capping), 실제 잔고가 더 큰 경우도 caller 선언값을 초과하지 않음, 잘못된
+  타입 차단, stale snapshot 차단, snapshot 미제공 시 기존 동작 유지(하위 호환) 검증.
+  `tests/test_account_cash.py`(17건) 신설 — 정상 fetch/USD→KRW 변환, cash 필드 누락/비숫자/음수/
+  NaN/Infinity 차단, FX rate 무효값 차단(broker 호출 전 차단), 네트워크 실패 wrapping,
+  `RuntimeError`(pre-network 안전 게이트) 비-wrapping 전파 확인.
+- 처리 상태: RESOLVED
+
+### CODEX-037(HIGH, NaN optional sizing/risk caps가 fail-open)
+
+- 재현(`CODEX_REVIEW.md` 기록): fractional entry + `max_risk_per_trade_krw=NaN` → qty
+  0.222222..., 3,000원 주문 승인. fractional + `strategy_max_quantity=NaN` 동일. whole-share +
+  `max_order_notional_krw=NaN` → qty 2, 27,000원 주문 승인. 원인은 `NaN <= 0`/`NaN > 0`이 모두
+  False이고 `min(x, nan)`이 인자 순서에 따라 x를 그대로 반환할 수 있다는 Python의 NaN 비교
+  특성.
+- 수정: `live_readiness/order_gateway.py`에 `_validate_optional_positive_number()` 신설,
+  `max_order_notional_krw`/`max_daily_loss_krw`/`max_risk_per_trade_krw`/`strategy_max_quantity`/
+  `stop_price_usd` 5개 전부에 reservation lock 진입 전 적용(bool 제외, finite, 양수 검증;
+  `None`만 통과 허용).
+- 신규 테스트: `tests/test_live_order_gateway.py`에 5개 필드 × {NaN/Infinity/-Infinity/True/False/
+  문자열/음수/0} 조합 차단 확인, Codex의 정확한 3개 반례(fractional+risk NaN, fractional+strategy
+  NaN, whole-share+notional NaN)가 reservation 0건으로 차단됨을 확인.
+- 처리 상태: RESOLVED
+
+### CODEX-038(LOW, 테스트가 운영 CSV mtime 변경)
+
+- 재현(`CODEX_REVIEW.md` 기록): 전체 테스트 전후 `strategy_performance.csv` content SHA-256/크기는
+  동일하나 mtime이 `1785082147` → `1785083284`로 변경.
+- 원인: `tests/test_performance_analytics.py::test_summary_csv_generation`이
+  `PERFORMANCE_SUMMARY_FILE`/`PERFORMANCE_TRADES_FILE`만 격리하고 `STRATEGY_PERFORMANCE_FILE`은
+  격리하지 않음 — `write_performance_files()`가 `strategy_df` 미지정 시 항상
+  `build_strategy_performance()`를 호출해 실제 저장소 루트 `strategy_performance.csv`에 기록.
+- 수정: 해당 테스트에 `monkeypatch.setattr(analytics, "STRATEGY_PERFORMANCE_FILE", tmp_path / ...)`
+  추가(1줄). `write_performance_files()` 자체는 변경하지 않음(정책/동작 불변).
+- 처리 상태: RESOLVED
+
+### 검증 결과 (CODEX-034~038 전체)
+
+- 전체 회귀: `venv/bin/python -m pytest -q` **1,125 passed, 0 failed, 2 warnings**. 이전 사이클
+  종료 시점 1,044 passed 대비 81건 신규.
+- 실제 Alpaca/Slack/Yahoo 호출 0회. 실제 저장소 루트 `TRADING_STATE.db*`/
+  `LIVE_ENTRY_RESERVATION.lock`이 회귀 실행 전후 존재하지 않음을 확인.
+- `order_history.csv`/`universe.csv`/`strategy_performance.csv` content **및 mtime** 모두 불변
+  (CODEX-038 수정 이후 재확인) — `.env`·kill switch/notification 상태 파일 변경 없음.
+- `git diff --check` 통과.
+- main 병합, origin push, 운영 배포, 실거래 활성화, `approved`/`live_enabled` 변경 없음.
+- 테스트 삭제/조건 완화 없음 — 4건 모두 신규 검증 추가 또는 기존 테스트의 격리 누락 보완이며,
+  기존에 통과하던 assertion을 약화한 사례는 없다(단, 트러스트 퍼센트 상한 도입으로 값이 바뀐
+  기존 사이징 테스트 일부는 새 기대값으로 갱신 — 검증 자체의 엄격도는 동일하거나 강화됨).

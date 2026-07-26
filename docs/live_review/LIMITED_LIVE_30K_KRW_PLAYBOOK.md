@@ -58,6 +58,22 @@ reservation을 더 이상 `RELEASED`하지 않고 `SUBMISSION_UNKNOWN`으로 유
 여부를 미리 분류한다 — `fractionable=true` 종목은 1주 가격이 잔고를 초과해도 최소주문금액을
 충족하면 후보로 유지된다(절대 단순 가격 비교만으로 배제하지 않음).
 
+**추가 갱신(2026-07-27, CODEX-035/036/037)**: 위 공식의 세 가지 잔여 취약점이 Codex 4차 검증에서
+지적되어 모두 수정됐다.
+1) HTTP 5xx/408/425/429 응답도 timeout과 동일하게 `SUBMISSION_UNKNOWN`으로 처리되도록 ambiguous
+   판정 기준이 "response 존재 여부"에서 "definitive rejection status code allowlist(400/401/
+   403/404/409/410/422) + 파싱 가능한 body" 기준으로 강화됐다(CODEX-035).
+2) 위 문단이 "여전히 caller가 매 호출 완화할 수 없는 운영자 설정"이라고 서술했던
+   `cash_usage_percent`는 이 서술 시점까지도 실제로는 그것을 강제하는 트러스트 코드 상수가
+   없었다 — `live_readiness/account_cash.py::TRUSTED_CASH_USAGE_PERCENT_CEILING=50`이 신설되어
+   이제 실제로 caller가 100%를 요청해도 50%로 상한이 걸린다(CODEX-036). `available_cash_krw`도
+   `AccountCashSnapshot`(broker.get_account() 기반)을 optional로 전달하면 `min()`으로 caller
+   선언값을 초과할 수 없게 됐다 — 다만 이 스냅샷 전달 자체는 아직 opt-in이며, 실제 production
+   호출 경로에서 스냅샷을 채워 넣는 배선은 여전히 존재하지 않는다.
+3) `max_order_notional_krw`/`max_daily_loss_krw`/`max_risk_per_trade_krw`/`strategy_max_quantity`/
+   `stop_price_usd` 5개 optional cap에 NaN/Infinity 값을 넣으면 조용히 무시되고 한도가 사라지는
+   결함이 있었다 — 전부 예약 전 finite/양수 검증이 추가됐다(CODEX-037).
+
 ## 1. 마이크로 주문 수량 계산
 
 `live_readiness/sizing.py::calculate_micro_order_quantity(available_krw, fx_rate_krw_per_usd,

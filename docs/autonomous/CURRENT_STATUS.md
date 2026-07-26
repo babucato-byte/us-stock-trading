@@ -3,7 +3,37 @@
 마지막 갱신: 2026-07-27
 
 ## 현재 Phase
-**CODEX-034 + 잔고 비율 기반 주문 사이징 사이클 — 전부 RESOLVED (2026-07-27).**
+**CODEX-034~038 최종 수정 사이클 — 전부 RESOLVED (2026-07-27).**
+Codex 독립 검증(`CODEX_REVIEW.md`, 커밋 `5da6662`/`5316cd1`/`72bbb6c` 포함 범위, overall verdict
+`FAIL`)이 CODEX-034를 `PARTIALLY_RESOLVED`로 재확인하고 신규 CODEX-035(HIGH, HTTP 5xx/408/425/429를
+definitive rejection으로 오분류)·CODEX-036(HIGH, 잔고/사용비율이 authoritative source 없이 caller
+선언에 의존)·CODEX-037(HIGH, optional NaN sizing/risk cap이 fail-open)·CODEX-038(LOW, 테스트가
+운영 CSV mtime 변경)을 제기했다. 4건 전부 로컬 브랜치에서 수정·테스트했다(커밋 `40abc58`).
+
+- **CODEX-035**: `broker/alpaca_client.py`/`paper_strategy_order.py`의 ambiguous-failure 분류를
+  "response 존재 여부"에서 "definitive rejection status code allowlist(400/401/403/404/409/410/422)
+  + 파싱 가능한 JSON body" 기준으로 재작성. 408/425/429/5xx/파싱 불가 body/미인식 코드는 전부
+  ambiguous(SUBMISSION_UNKNOWN) 기본값 — 새로운 status code도 fail-closed로 처리된다.
+- **CODEX-036**: `live_readiness/account_cash.py` 신설 — `TRUSTED_CASH_USAGE_PERCENT_CEILING`(신뢰
+  가능한 코드 상수, `cash_usage_percent`를 caller가 절대 완화 불가)와 `AccountCashSnapshot`/
+  `fetch_account_cash_snapshot()`(broker.get_account() 기반, 유일한 생성 경로). `validate_and_
+  size_live_entry()`가 신규 optional `account_cash_snapshot` 인자를 받아 `min(caller 선언값, 실제
+  스냅샷)`으로 caller가 잔고를 부풀릴 수 없게 한다. `AlpacaBroker.submit_order()` 내부에서 자동
+  fetch하지는 않음 — 이 저장소의 pre-live 안전 게이트가 dry-run 여부와 무관하게 모든 live 모드
+  broker 호출을 차단하므로, 내부에서 fetch를 시도하면 sizing-only 검증 자체가 깨진다(실거래 승인
+  이후 production caller가 채워야 할 배선, `DECISION_LOG.md` 참고).
+- **CODEX-037**: `max_order_notional_krw`/`max_daily_loss_krw`/`max_risk_per_trade_krw`/
+  `strategy_max_quantity`/`stop_price_usd` 5개 optional cap 전부에 finite/양수 검증을 예약 이전에
+  추가 — NaN이 `<=0` 가드와 `min()` 비교를 통과해 위험/주문 한도를 무력화하던 결함 수정.
+- **CODEX-038**: `tests/test_performance_analytics.py::test_summary_csv_generation`이
+  `STRATEGY_PERFORMANCE_FILE`을 격리하지 않아 실제 저장소 루트 `strategy_performance.csv`의 mtime을
+  매 테스트 실행마다 변경하던 결함 수정.
+
+전체 회귀 **1,125 passed, 0 failed**(직전 1,044에서 81건 신규). `approved: false`, `live_enabled:
+false` 유지, **Live trading: DO_NOT_ENABLE**. 다음 작업은 새 `FINAL_VALIDATION_PACKAGE.md`(새
+SHA-256 포함) 작성 후 상태를 `READY_FOR_FINAL_CODEX_REVALIDATION`으로 종료하는 것.
+
+## CODEX-034 + 잔고 비율 기반 주문 사이징 사이클 (2026-07-27)
 Codex 독립 검증(`CODEX_REVIEW.md`, 커밋 `5da6662` 포함 범위, overall verdict `FAIL`)이 제기한
 신규 CODEX-034(HIGH, broker 응답 유실 시 live-entry reservation을 해제해 중복 주문과 예산 우회
 허용)를 수정. 동시에 사용자 지시에 따라 고정 `30,000원` 파일럿 예산을 영구 정책으로 굳히지 않고,
