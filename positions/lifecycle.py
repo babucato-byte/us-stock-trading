@@ -33,6 +33,7 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 import paper_strategy_order
+from clock import DEFAULT_CLOCK
 from config import scalping_strategy_v1_config as cfg
 from market_hours import MARKET_REGULAR_END, combine_eastern, eastern_now
 from positions import fill_validation, order_status, states, store
@@ -516,7 +517,7 @@ def _exit_states_reachable_from(current_state):
     )
 
 
-def check_and_manage(position_id, *, current_price, bars=None, now=None, broker=None,
+def check_and_manage(position_id, *, current_price, bars=None, now=None, clock=None, broker=None,
                       order_date=None, lock_timeout=store.LOCK_TIMEOUT_SECONDS):
     """The core "tick" function: given the current price (and optionally
     fresh bars for an invalidation check), decide whether this position
@@ -529,8 +530,23 @@ def check_and_manage(position_id, *, current_price, bars=None, now=None, broker=
     exit) > stop-loss. EOD/time-stop/invalidation/stop-loss all force a
     FULL exit of remaining_qty regardless of which target stage the
     position is in -- they are safety overrides, not another target level.
+
+    CODEX-030: `now`, if supplied, must be an explicit timezone-aware
+    Eastern-zoned moment (a naive datetime is rejected, not silently
+    assumed to already be Eastern -- the ambiguity that let tests
+    accidentally depend on wall-clock time is exactly what this guards
+    against). Without `now`, `clock` (default: clock.DEFAULT_CLOCK, the
+    real wall clock) supplies it via clock.now_eastern() -- production
+    behavior is unchanged; tests should pass a clock.FrozenClock (or an
+    explicit `now`) fixed to an unambiguous mid-session moment instead of
+    relying on whatever time the suite happens to run.
     """
-    now = now or eastern_now()
+    if now is not None and now.tzinfo is None:
+        raise PositionLifecycleError(
+            "check_and_manage(now=...) must be timezone-aware; a naive datetime is ambiguous"
+        )
+    clock = clock or DEFAULT_CLOCK
+    now = now if now is not None else clock.now_eastern()
     record = store.load_position(position_id)
     if record is None:
         raise PositionLifecycleError(f"No such position: {position_id!r}")
@@ -582,18 +598,27 @@ def check_and_manage(position_id, *, current_price, bars=None, now=None, broker=
     return record
 
 
-def check_invalidation(position_id, strategy, bars, *, order_date=None, broker=None,
-                        lock_timeout=store.LOCK_TIMEOUT_SECONDS):
+def check_invalidation(position_id, strategy, bars, *, order_date=None, now=None, clock=None,
+                        broker=None, lock_timeout=store.LOCK_TIMEOUT_SECONDS):
     """Separate from check_and_manage() because invalidation needs fresh
     bar data and a strategy instance, whereas check_and_manage() only
     needs a price -- callers that don't have new bars this tick can skip
-    this check entirely and still get the price-based exits."""
+    this check entirely and still get the price-based exits.
+
+    CODEX-030: same Clock injection as check_and_manage() -- see its
+    docstring for the naive-datetime rejection and clock/now precedence.
+    """
     record = store.load_position(position_id)
     if record is None or not _exit_states_reachable_from(record["state"]):
         return record
     if not strategy.invalidate(bars, symbol=record["symbol"]):
         return record
-    now = eastern_now()
+    if now is not None and now.tzinfo is None:
+        raise PositionLifecycleError(
+            "check_invalidation(now=...) must be timezone-aware; a naive datetime is ambiguous"
+        )
+    clock = clock or DEFAULT_CLOCK
+    now = now if now is not None else clock.now_eastern()
     order_date = order_date or now.strftime("%Y-%m-%d")
     return _force_full_exit(position_id, record["symbol"], order_date, broker,
                              "STRATEGY_INVALIDATION", lock_timeout)

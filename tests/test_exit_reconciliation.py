@@ -6,6 +6,8 @@ history, and kill switches to tmp_path -- never touches real operational
 files. No real network calls (FakeBroker/SequencedBroker only).
 """
 import threading
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
@@ -19,6 +21,11 @@ from strategy.registry import StrategyRegistry
 from strategy.status import ACTIVE
 
 TODAY = pso.eastern_now().strftime("%Y-%m-%d")
+
+# CODEX-030: fixed mid-session moment -- see tests/test_position_lifecycle.py's
+# MID_SESSION_NOW for why check_and_manage() must never be called with an
+# implicit real-wall-clock `now` from a test.
+MID_SESSION_NOW = datetime(2026, 7, 15, 11, 0, tzinfo=ZoneInfo("America/New_York"))
 
 
 class FakeBrokerResponse:
@@ -143,7 +150,7 @@ def _exit_conn(tmp_path=None):
 
 def test_accepted_sell_leaves_position_exit_submitted_not_closed():
     record, broker = _filled_position(qty=10, broker_submit_responses=[_accepted_response()])
-    updated = lifecycle.check_and_manage(record["position_id"], current_price=94.0, broker=broker)
+    updated = lifecycle.check_and_manage(record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker)
     assert updated["state"] == states.EXIT_SUBMITTED
     assert updated["remaining_qty"] == 10  # unchanged -- not filled yet
     assert updated["realized_pnl"] == 0.0
@@ -153,14 +160,14 @@ def test_new_sell_leaves_position_exit_submitted_remaining_qty_unchanged():
     record, broker = _filled_position(qty=10, broker_submit_responses=[
         FakeBrokerResponse(data={"status": "new", "filled_qty": 0, "filled_avg_price": None, "id": "b-new"})
     ])
-    updated = lifecycle.check_and_manage(record["position_id"], current_price=94.0, broker=broker)
+    updated = lifecycle.check_and_manage(record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker)
     assert updated["state"] == states.EXIT_SUBMITTED
     assert updated["remaining_qty"] == 10
 
 
 def test_partially_filled_sell_reduces_only_confirmed_quantity():
     record, broker = _filled_position(qty=10, broker_submit_responses=[_partial_response(4, price=94.0)])
-    updated = lifecycle.check_and_manage(record["position_id"], current_price=94.0, broker=broker)
+    updated = lifecycle.check_and_manage(record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker)
     assert updated["state"] == states.EXIT_SUBMITTED  # intent not complete yet
     assert updated["remaining_qty"] == 6
     assert updated["realized_pnl"] == pytest.approx(4 * (94.0 - 100.0))
@@ -168,7 +175,7 @@ def test_partially_filled_sell_reduces_only_confirmed_quantity():
 
 def test_filled_sell_closes_when_remaining_reaches_zero():
     record, broker = _filled_position(qty=10, broker_submit_responses=[_filled_response(10, price=94.0)])
-    updated = lifecycle.check_and_manage(record["position_id"], current_price=94.0, broker=broker)
+    updated = lifecycle.check_and_manage(record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker)
     assert updated["state"] == states.CLOSED
     assert updated["remaining_qty"] == 0
     assert updated["realized_pnl"] == pytest.approx(10 * (94.0 - 100.0))
@@ -176,7 +183,7 @@ def test_filled_sell_closes_when_remaining_reaches_zero():
 
 def test_accepted_then_later_filled_event_closes_normally():
     record, broker = _filled_position(qty=10, broker_submit_responses=[_accepted_response(order_id="b-x")])
-    pending = lifecycle.check_and_manage(record["position_id"], current_price=94.0, broker=broker)
+    pending = lifecycle.check_and_manage(record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker)
     assert pending["state"] == states.EXIT_SUBMITTED
 
     # The broker later reports the same order as filled.
@@ -191,7 +198,7 @@ def test_accepted_then_later_filled_event_closes_normally():
 
 def test_repeated_accepted_events_do_not_double_reduce_quantity():
     record, broker = _filled_position(qty=10, broker_submit_responses=[_accepted_response(order_id="b-y")])
-    first = lifecycle.check_and_manage(record["position_id"], current_price=94.0, broker=broker)
+    first = lifecycle.check_and_manage(record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker)
     broker._orders_by_client_id[first["client_order_id"]] = {
         "status": "accepted", "filled_qty": 0, "filled_avg_price": None, "id": "b-y",
     }
@@ -204,7 +211,7 @@ def test_repeated_accepted_events_do_not_double_reduce_quantity():
 
 def test_repeated_filled_events_do_not_double_apply_pnl():
     record, broker = _filled_position(qty=10, broker_submit_responses=[_accepted_response(order_id="b-z")])
-    lifecycle.check_and_manage(record["position_id"], current_price=94.0, broker=broker)
+    lifecycle.check_and_manage(record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker)
     broker._orders_by_client_id["exit-will-not-match"] = None  # noop, keyed correctly below
     pending = store.load_position(record["position_id"])
     broker._orders_by_client_id[pending["client_order_id"]] = {
@@ -226,7 +233,7 @@ def test_repeated_filled_events_do_not_double_apply_pnl():
 def test_partial_fill_quantity_regression_rejected():
     conn = state_db.open_db()
     record, broker = _filled_position(qty=10, broker_submit_responses=[_partial_response(6, price=94.0)])
-    lifecycle.check_and_manage(record["position_id"], current_price=94.0, broker=broker)
+    lifecycle.check_and_manage(record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker)
     pending = store.load_position(record["position_id"])
     intent = eil.get_active_intent(conn, record["position_id"])
     assert intent["confirmed_filled_qty"] == 6
@@ -244,14 +251,14 @@ def test_unrecognized_broker_status_fails_closed_to_manual_review():
     record, broker = _filled_position(qty=10, broker_submit_responses=[
         FakeBrokerResponse(data={"status": "some_new_status_alpaca_might_add", "filled_qty": None, "filled_avg_price": None, "id": "b-w"})
     ])
-    updated = lifecycle.check_and_manage(record["position_id"], current_price=94.0, broker=broker)
+    updated = lifecycle.check_and_manage(record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker)
     assert updated["state"] == states.MANUAL_REVIEW
     assert updated["remaining_qty"] == 10  # never touched
 
 
 def test_no_path_turns_an_accepted_order_directly_into_closed():
     record, broker = _filled_position(qty=10, broker_submit_responses=[_accepted_response()])
-    updated = lifecycle.check_and_manage(record["position_id"], current_price=94.0, broker=broker)
+    updated = lifecycle.check_and_manage(record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker)
     assert updated["state"] != states.CLOSED
     assert updated["state"] == states.EXIT_SUBMITTED
 
@@ -262,7 +269,7 @@ def test_no_path_turns_an_accepted_order_directly_into_closed():
 
 def test_timeout_then_direct_retry_submits_broker_sell_exactly_once():
     record, broker = _filled_position(qty=10, broker_submit_responses=[TimeoutError("simulated timeout")])
-    lifecycle.check_and_manage(record["position_id"], current_price=94.0, broker=broker)  # times out, no crash propagates
+    lifecycle.check_and_manage(record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker)  # times out, no crash propagates
     pending = store.load_position(record["position_id"])
     assert pending["state"] == states.EXIT_SUBMITTED  # not reverted to STOP_ACTIVE
 
@@ -283,7 +290,7 @@ def test_concurrent_exit_attempts_submit_broker_sell_exactly_once():
     def worker():
         try:
             barrier.wait(timeout=2)
-            lifecycle.check_and_manage(position_id, current_price=94.0, broker=broker)
+            lifecycle.check_and_manage(position_id, current_price=94.0, now=MID_SESSION_NOW, broker=broker)
         except Exception as exc:  # pragma: no cover
             errors.append(exc)
 
@@ -339,7 +346,7 @@ def test_exit_intent_reservation_failure_prevents_broker_call(monkeypatch):
         raise RuntimeError("simulated durable-storage failure")
 
     monkeypatch.setattr(eil, "reserve", _broken_reserve)
-    lifecycle.check_and_manage(record["position_id"], current_price=94.0, broker=broker)
+    lifecycle.check_and_manage(record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker)
     sell_calls = [c for c in broker.submit_calls if c[2] == "sell"]
     assert sell_calls == []
     unchanged = store.load_position(record["position_id"])
@@ -348,7 +355,7 @@ def test_exit_intent_reservation_failure_prevents_broker_call(monkeypatch):
 
 def test_restart_recovery_reconciles_pending_exit_via_client_order_id():
     record, broker = _filled_position(qty=10, broker_submit_responses=[_accepted_response(order_id="b-restart")])
-    pending = lifecycle.check_and_manage(record["position_id"], current_price=94.0, broker=broker)
+    pending = lifecycle.check_and_manage(record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker)
     assert pending["state"] == states.EXIT_SUBMITTED
 
     broker._orders_by_client_id[pending["client_order_id"]] = {
@@ -362,7 +369,7 @@ def test_restart_recovery_reconciles_pending_exit_via_client_order_id():
 
 def test_broker_confirms_no_such_order_marks_reconciliation_required_no_resubmit():
     record, broker = _filled_position(qty=10, broker_submit_responses=[TimeoutError("timeout")])
-    lifecycle.check_and_manage(record["position_id"], current_price=94.0, broker=broker)
+    lifecycle.check_and_manage(record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker)
     pending = store.load_position(record["position_id"])
     # broker has never heard of this client_order_id (not registered in orders_by_client_id -> None)
     resolved = lifecycle.reconcile_pending_exit(record["position_id"], broker=broker)
@@ -380,7 +387,7 @@ def test_broker_confirms_no_such_order_marks_reconciliation_required_no_resubmit
 
 def test_broker_lookup_failure_during_reconciliation_does_not_resubmit():
     record, broker = _filled_position(qty=10, broker_submit_responses=[TimeoutError("timeout")])
-    lifecycle.check_and_manage(record["position_id"], current_price=94.0, broker=broker)
+    lifecycle.check_and_manage(record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker)
     pending = store.load_position(record["position_id"])
     broker._orders_by_client_id[pending["client_order_id"]] = ConnectionError("broker unreachable")
 
@@ -392,14 +399,14 @@ def test_broker_lookup_failure_during_reconciliation_does_not_resubmit():
 
 def test_partially_filled_exit_only_manages_remaining_quantity():
     record, broker = _filled_position(qty=10, broker_submit_responses=[_partial_response(4, price=94.0)])
-    updated = lifecycle.check_and_manage(record["position_id"], current_price=94.0, broker=broker)
+    updated = lifecycle.check_and_manage(record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker)
     assert updated["remaining_qty"] == 6
     assert updated["state"] == states.EXIT_SUBMITTED  # still tracking the rest of this exit's intent
 
 
 def test_full_fill_transitions_to_closed_with_zero_remaining():
     record, broker = _filled_position(qty=10, broker_submit_responses=[_filled_response(10, price=94.0)])
-    updated = lifecycle.check_and_manage(record["position_id"], current_price=94.0, broker=broker)
+    updated = lifecycle.check_and_manage(record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker)
     assert updated["state"] == states.CLOSED
     assert updated["remaining_qty"] == 0
 

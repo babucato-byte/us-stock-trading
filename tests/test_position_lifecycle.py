@@ -5,12 +5,14 @@ ledger, and both kill switches to tmp_path via env-var/monkeypatch
 overrides -- never touches real operational files. No real network calls
 (FakeBroker only), no real Slack (send_slack_alert monkeypatched to a spy).
 """
-from datetime import timedelta
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
 
 import paper_strategy_order as pso
+from config import scalping_strategy_v1_config as cfg
 from positions import fill_validation, lifecycle, states, store
 from strategy.interface import (
     STATE_ENTRY_SIGNAL,
@@ -23,6 +25,14 @@ from strategy.status import ACTIVE, STRUCTURED
 
 
 TODAY = pso.eastern_now().strftime("%Y-%m-%d")
+
+# CODEX-030: a fixed, unambiguous mid-regular-session moment (Wednesday,
+# no holiday, DST in effect) for every check_and_manage()/check_invalidation()
+# call below that is not itself testing time-of-day/EOD behavior. Using the
+# real wall clock here previously made target/stop/no-action tests fail
+# whenever the suite happened to run within EOD_FORCE_CLOSE_MINUTES_BEFORE_
+# CLOSE minutes of the real 16:00 ET close (CODEX-030).
+MID_SESSION_NOW = datetime(2026, 7, 15, 11, 0, tzinfo=ZoneInfo("America/New_York"))
 
 
 class FakeBrokerResponse:
@@ -316,7 +326,9 @@ def _filled_position(qty=10, stop_price=95.0, target_1=105.0, target_2=110.0):
 
 def test_target_1_hit_submits_50_percent_partial_exit():
     record, broker = _filled_position(qty=10)
-    updated = lifecycle.check_and_manage(record["position_id"], current_price=105.0, broker=broker)
+    updated = lifecycle.check_and_manage(
+        record["position_id"], current_price=105.0, now=MID_SESSION_NOW, broker=broker,
+    )
 
     assert updated["state"] == states.PARTIAL_EXITED
     assert updated["remaining_qty"] == 5
@@ -328,14 +340,20 @@ def test_target_1_hit_submits_50_percent_partial_exit():
 
 def test_target_2_after_partial_exit_closes_remaining():
     record, broker = _filled_position(qty=10)
-    record = lifecycle.check_and_manage(record["position_id"], current_price=105.0, broker=broker)
+    record = lifecycle.check_and_manage(
+        record["position_id"], current_price=105.0, now=MID_SESSION_NOW, broker=broker,
+    )
     assert record["state"] == states.PARTIAL_EXITED
 
     # move to breakeven trailing stop first (deliberate simple policy)
-    record = lifecycle.check_and_manage(record["position_id"], current_price=106.0, broker=broker)
+    record = lifecycle.check_and_manage(
+        record["position_id"], current_price=106.0, now=MID_SESSION_NOW, broker=broker,
+    )
     assert record["state"] == states.TRAILING
 
-    record = lifecycle.check_and_manage(record["position_id"], current_price=110.0, broker=broker)
+    record = lifecycle.check_and_manage(
+        record["position_id"], current_price=110.0, now=MID_SESSION_NOW, broker=broker,
+    )
     assert record["state"] == states.CLOSED
     assert record["remaining_qty"] == 0
     assert record["exit_reason"] == "TARGET_2"
@@ -343,7 +361,9 @@ def test_target_2_after_partial_exit_closes_remaining():
 
 def test_stop_loss_before_target_1_closes_full_position():
     record, broker = _filled_position(qty=10)
-    updated = lifecycle.check_and_manage(record["position_id"], current_price=94.0, broker=broker)
+    updated = lifecycle.check_and_manage(
+        record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker,
+    )
 
     assert updated["state"] == states.CLOSED
     assert updated["exit_reason"] == "STOP_LOSS"
@@ -353,7 +373,9 @@ def test_stop_loss_before_target_1_closes_full_position():
 
 def test_check_and_manage_no_action_when_price_between_stop_and_target_1():
     record, broker = _filled_position(qty=10)
-    updated = lifecycle.check_and_manage(record["position_id"], current_price=100.0, broker=broker)
+    updated = lifecycle.check_and_manage(
+        record["position_id"], current_price=100.0, now=MID_SESSION_NOW, broker=broker,
+    )
     assert updated["state"] == states.STOP_ACTIVE
     assert [c for c in broker.submit_calls if c[2] == "sell"] == []
 
@@ -363,13 +385,19 @@ def test_check_and_manage_no_action_when_price_between_stop_and_target_1():
 # ---------------------------------------------------------------------------
 
 def test_time_stop_forces_full_exit():
+    # CODEX-030: entry_time is pinned to MID_SESSION_NOW (rather than the
+    # real entry_time enter_position() recorded at whatever moment the
+    # test happened to run) so that "61 minutes later" lands at a fixed,
+    # unambiguous point well inside the same regular session and well
+    # before the EOD cutoff -- otherwise this test's pass/fail would
+    # depend on what wall-clock time the suite ran at.
     record, broker = _filled_position(qty=10)
-    from datetime import datetime, timezone
-    entry_time = datetime.fromisoformat(record["entry_time"])
-    far_future = entry_time + timedelta(minutes=999)
+    with store.locked_position(record["position_id"]) as locked:
+        locked["entry_time"] = MID_SESSION_NOW.isoformat()
+    held_past_max = MID_SESSION_NOW + timedelta(minutes=cfg.MAX_POSITION_HOLD_MINUTES + 1)
 
     updated = lifecycle.check_and_manage(
-        record["position_id"], current_price=100.0, now=far_future, broker=broker,
+        record["position_id"], current_price=100.0, now=held_past_max, broker=broker,
     )
     assert updated["state"] == states.CLOSED
     assert updated["exit_reason"] == "TIME_STOP"
@@ -377,8 +405,8 @@ def test_time_stop_forces_full_exit():
 
 def test_eod_forces_full_exit_regardless_of_price():
     record, broker = _filled_position(qty=10)
-    from market_hours import combine_eastern, eastern_now, MARKET_REGULAR_END
-    near_close = combine_eastern(eastern_now().date(), MARKET_REGULAR_END) - timedelta(minutes=1)
+    from market_hours import combine_eastern, MARKET_REGULAR_END
+    near_close = combine_eastern(MID_SESSION_NOW.date(), MARKET_REGULAR_END) - timedelta(minutes=1)
 
     updated = lifecycle.check_and_manage(
         record["position_id"], current_price=100.0, now=near_close, broker=broker,
@@ -401,7 +429,9 @@ def test_invalidation_forces_full_exit():
     )
     record = lifecycle.record_fill(record["position_id"], filled_qty=10, average_fill_price=100.0)
 
-    updated = lifecycle.check_invalidation(record["position_id"], strategy, bars, broker=broker)
+    updated = lifecycle.check_invalidation(
+        record["position_id"], strategy, bars, now=MID_SESSION_NOW, broker=broker,
+    )
     assert updated["state"] == states.CLOSED
     assert updated["exit_reason"] == "STRATEGY_INVALIDATION"
 
@@ -411,7 +441,9 @@ def test_invalidation_noop_when_strategy_says_still_valid():
     strategy = FakeStrategy(invalidate_result=False)
     bars = pd.DataFrame([{"Close": 100.0}])
 
-    updated = lifecycle.check_invalidation(record["position_id"], strategy, bars, broker=broker)
+    updated = lifecycle.check_invalidation(
+        record["position_id"], strategy, bars, now=MID_SESSION_NOW, broker=broker,
+    )
     assert updated["state"] == states.STOP_ACTIVE
     assert [c for c in broker.submit_calls if c[2] == "sell"] == []
 
@@ -434,7 +466,7 @@ def test_concurrent_stop_loss_checks_only_submit_one_exit_order():
     def worker():
         try:
             barrier.wait(timeout=2)
-            lifecycle.check_and_manage(position_id, current_price=90.0, broker=broker)
+            lifecycle.check_and_manage(position_id, current_price=90.0, now=MID_SESSION_NOW, broker=broker)
         except Exception as exc:  # pragma: no cover - fails the test via errors list
             errors.append(exc)
 
@@ -464,7 +496,9 @@ def test_compute_unrealized_pnl():
 
 def test_compute_unrealized_pnl_zero_when_no_remaining_qty():
     record, broker = _filled_position(qty=10)
-    closed = lifecycle.check_and_manage(record["position_id"], current_price=94.0, broker=broker)
+    closed = lifecycle.check_and_manage(
+        record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker,
+    )
     assert lifecycle.compute_unrealized_pnl(closed, current_price=200.0) == 0.0
 
 
@@ -503,7 +537,7 @@ def test_recover_on_restart_leaves_already_recovery_required_untouched():
 
 def test_recover_on_restart_skips_terminal_positions():
     record, broker = _filled_position(qty=10)
-    lifecycle.check_and_manage(record["position_id"], current_price=94.0, broker=broker)  # closes it
+    lifecycle.check_and_manage(record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker)  # closes it
 
     result = lifecycle.recover_on_restart(broker=broker)
     assert result.positions == []
