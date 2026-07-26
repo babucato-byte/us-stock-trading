@@ -490,3 +490,52 @@
   점을 명시했다. `FINAL_VALIDATION_PACKAGE.md`를 최신 검증 상태의 단일 진실 공급원으로 문서에
   명시적으로 지정해, 향후 유사한 불일치가 재발하지 않도록 했다.
 - 승인 필요 여부: 아니오(코드 구현·테스트 추가·문서화 범위, 실거래/승인/main/push와 무관).
+
+## CODEX-034 + 잔고 비율 기반 주문 사이징 사이클 (2026-07-27)
+
+- 결정 1(CODEX-034, ambiguous vs definitive 실패 분류) — `requests.exceptions.HTTPError`이며
+  `.response`가 실제로 설정된 경우(broker가 실제로 4xx/5xx를 응답)만 "definitive rejection"으로
+  분류해 `RELEASED`, `requests.exceptions.RequestException`(Timeout/ConnectionError 등, `.response`
+  없음)은 전부 "ambiguous"로 분류해 `SUBMISSION_UNKNOWN`으로 남긴다. 그 외 예외(kill switch,
+  purpose/side 불일치, 자격증명 재검증 실패 등 broker 호출 자체에 도달하지 못한 사전 실패)는
+  네트워크에 도달하지 않았음이 코드상 확정적이므로 안전하게 `RELEASED`. 근거: `.response`의
+  유무가 "broker가 요청을 실제로 수신했는가"를 구분할 수 있는 유일한 신뢰 가능한 신호이며,
+  HTTPError라도 `.response`가 None이면(예: mock/프록시 계층에서 발생) definitive로 오분류할 수
+  없으므로 별도로 확인한다.
+- 결정 2(CODEX-034, client_order_id 단일 정체성) — `entry_reservation_ledger.reserve()`가
+  `client_order_id`를 필수 인자로 요구하도록 변경했다. `validate_and_size_live_entry()`는 caller가
+  이미 생성한 `client_order_id`(예: `paper_strategy_order.py`의 `try_reserve_order()`/
+  `order_intent_ledger.py` 경로)를 그대로 재사용하고, 없을 때만 자체적으로 채번한다 — 게이트웨이가
+  독자적인 두 번째 ID를 채번했다면 예약(reservation)과 실제 broker 주문이 서로 다른 정체성을 갖게
+  되어 `order_intent_ledger`의 추적이 깨지는 문제가 있었기 때문이다.
+- 결정 3(CODEX-031/034, 누적 vs 현재 상태 시맨틱 재검토) — 이전 CODEX-031 설계는 30,000원 총
+  예산을 파일럿 전체에 걸친 누적(lifetime) 배분으로 취급해 포지션 종료 후에도 반환하지 않았다.
+  이번 사이클에서 `available_cash_krw`가 매 호출마다 caller가 새로 조회한 실시간 broker 잔고
+  값으로 바뀌면서(이미 정산된 지출을 자연히 반영), 원장이 더 이상 lifetime 누적 지출을 추적할
+  필요가 없어졌다 — 아직 정산되지 않은 노출(pending/unknown_submission/open position cost)만
+  추적하면 충분하다. `entry_reservation_ledger.build_snapshot()`을 이 세 항목으로 재구성했다.
+- 결정 4(사용자 지시, 고정 예산 제거) — `PILOT_TOTAL_BUDGET_KRW=30_000` 상수를
+  `live_readiness/order_gateway.py`에서 완전히 삭제했다(사용자가 "30,000원은 예시일 뿐 영구
+  상한이 아니다"라고 명시적으로 지시). `cash_usage_percent`(1~100, NaN/Infinity/bool/문자열/None
+  차단)는 여전히 caller가 매 호출 완화할 수 없는 운영자 설정으로 유지하고,
+  `MAX_CONCURRENT_LIVE_POSITIONS`/`MAX_DAILY_LIVE_ENTRIES`(신뢰 가능한 코드 상수, `min()`으로만
+  교차)는 이번 사이클에서 변경하지 않았다. margin/leverage는 사용하지 않으며 `available_cash_krw`
+  만을 기준으로 계산한다.
+- 결정 5(actual_qty = min(잔고, 위험, 전략) 재사이징) — 손절 위험 금액이 잔고 기준 수량보다 더
+  타이트한 경우, 이전 설계(risk 초과 시 주문 전체 거부)를 "risk_based_qty만큼 수량을 줄인다"로
+  변경했다. 근거: 사용자가 명시한 최종 흐름이 "리스크 기준 수량과 잔고 기준 수량 중 작은 값
+  선택"이며, 거부가 아니라 축소가 이 요구사항과 일치한다. `max_risk_per_trade_krw`/
+  `strategy_max_quantity`는 신규 optional 필드이며 미지정 시 해당 캡은 사실상 무제한으로
+  작동해(제약 없음) 기존 caller의 동작을 바꾸지 않는다 — 실제로 회귀 테스트에서 기존 71건이
+  변경 없이 그대로 통과함을 확인했다(재사이징 로직 추가 후에도 무변화).
+- 결정 6(watchlist affordability, 배선 범위 제외) — `live_readiness/watchlist_affordability.py`를
+  `daily_candidate_scanner.py`/`scalping_watchlist/pipeline.py`에 배선하지 않고 순수 계산 모듈로만
+  남겼다. 근거: Stage 10의 `live_readiness/` 자체가 이미 "building block, 아직 실거래 경로에 배선
+  안 됨"이라는 선례를 갖고 있고, 이미 광범위하게 검증된 Paper 후보 파이프라인에 실시간 잔고 필터를
+  끼워 넣는 것은 별도의 명시적 결정이 필요한 범위 확장이다. 계정 상태(`AccountState`)는 스캔당
+  1회만 계산해 모든 후보에 공유하도록 설계했다(candidate마다 SQLite를 재조회하지 않음).
+  `fractionable=true`인 종목은 1주 가격이 잔고를 초과해도 최소주문금액을 충족하면 후보로 유지하는
+  것을 6개 상태 분류(`AFFORDABLE_WHOLE_SHARE`/`AFFORDABLE_FRACTIONAL`/`INSUFFICIENT_BALANCE`/
+  `NOT_FRACTIONABLE`/`BELOW_MINIMUM_ORDER`/`UNKNOWN_ACCOUNT_STATE`)로 명시적으로 구분해, "예산
+  없음"과 "이 종목만 분할 불가"를 caller가 구분할 수 있게 했다.
+- 승인 필요 여부: 아니오(코드 구현·테스트 추가·문서화 범위, 실거래/승인/main/push와 무관).

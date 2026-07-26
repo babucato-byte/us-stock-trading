@@ -843,3 +843,92 @@ overall verdict **FAIL**)이 CODEX-029/030을 `RESOLVED`로 재확인하고, COD
 - main 병합, origin push, 운영 배포, 실거래 활성화, `approved`/`live_enabled` 변경 없음.
 - 기존 리스크 한도 완화 없음 — 이번 사이클은 기존 한도를 오히려 더 엄격하게(caller가 완화할 수
   없도록) 만들었을 뿐이다.
+
+## CODEX-034 + 잔고 비율 기반 주문 사이징 사이클 (2026-07-27)
+
+### CODEX-034(HIGH, broker 응답 유실 시 reservation 해제로 중복 주문/예산 우회 허용)
+
+- 재현(`CODEX_REVIEW.md` 기록): AAPL 27,000원 live entry에서 첫 broker 세션 호출이 timeout →
+  `_release_live_entry_reservation()`이 즉시 호출됨 → 재시도가 성공 → 세션 호출 총 2회, 실제
+  노출 최대 54,000원/2 포지션이 가능하지만 authoritative 스냅샷은 27,000원/1 포지션만 반영.
+- 수정: `state_store/schema.py`/`migrations.py`에 migration 5 — `live_entry_reservations`에
+  `client_order_id`(UNIQUE) 컬럼 추가. `entry_reservation_ledger.py`에 `STATE_SUBMISSION_UNKNOWN`
+  신설, `reserve()`가 `client_order_id`를 필수 인자로 요구, `mark_submission_unknown()`/
+  `reconcile_by_client_order_id()`(broker에 client_order_id로 재조회해 최종 상태 확정) 신규.
+  `build_snapshot()`이 `unknown_submission_reservations_krw`를 별도 항목으로 집계해 예산 계산에서
+  계속 차감 상태로 유지.
+- `broker/alpaca_client.py::AlpacaBroker.submit_order()`: 기존 중첩 try/except를 단일 flat
+  try/except로 재작성(중첩 구조는 `SUBMISSION_UNKNOWN`이 non-terminal이라 외부 핸들러가 재차
+  `mark_released()`를 호출해 상태를 되돌릴 수 있는 설계 결함이 있었음 — 구현 중 자체 코드 리뷰로
+  발견, 테스트 실패로 발견된 것 아님). `_is_ambiguous_broker_failure(exc)`가
+  `requests.exceptions.HTTPError`(`.response` 있음)/사전-네트워크 예외는 definitive(release),
+  `requests.exceptions.RequestException`(`.response` 없음)은 ambiguous(SUBMISSION_UNKNOWN)로 분류.
+  `paper_strategy_order.py`도 동일 로직의 별도 헬퍼로 동일하게 처리(모듈 최상단에 `requests` 의존을
+  추가하지 않기 위해 로컬 import).
+- 재시도 차단 메커니즘: 별도의 "동일 의도 식별" 중복 감지 시스템을 만들지 않고,
+  `SUBMISSION_UNKNOWN`이 `unknown_submission_reservations_krw`에 계속 집계되는 것만으로 동일
+  심볼/유사 크기의 재시도가 `available_for_new_order_krw <= 0`에서 자연히 차단되도록 설계를
+  단순화했다(Codex가 요구한 "broker submit 총 1회" 테스트와 일치).
+- 신규 테스트: `tests/test_live_order_gateway.py`에
+  `test_ambiguous_broker_failure_marks_submission_unknown_not_released` — timeout 후 예약이
+  `SUBMISSION_UNKNOWN`으로 남고, 동일 조건 재시도가 broker 세션 호출 없이(session.calls==1 유지)
+  423으로 차단됨을 검증.
+- 처리 상태: RESOLVED
+
+### 잔고 비율 기반 주문 사이징 (사용자 지시, 고정 30,000원 예산 제거)
+
+- 수정: `live_readiness/order_gateway.py`에서 `PILOT_TOTAL_BUDGET_KRW=30_000` 상수를 완전히
+  삭제. `LiveEntryContext`에 `available_cash_krw`/`cash_usage_percent`(1~100, NaN/Infinity/bool/
+  문자열/None 차단)/`cash_as_of`(FX rate와 동일한 staleness 검증) 신설.
+  `max_allocatable_cash = available_cash_krw × cash_usage_percent/100` →
+  `available_for_new_order = max_allocatable_cash - pending_buy_reservations -
+  unknown_submission_reservations - current_open_position_cost`(전부
+  `entry_reservation_ledger.build_snapshot()`의 SQLite 집계, caller 선언 아님). margin/leverage는
+  전혀 사용하지 않음 — `available_cash_krw` 하나만이 기준.
+- 최종 수량: `actual_qty = min(balance_based_qty, risk_based_qty, strategy_max_qty)`. 이전 설계는
+  손절 위험이 한도를 넘으면 주문 전체를 거부했으나, 사용자가 명시한 흐름("리스크 기준 수량과 잔고
+  기준 수량 중 작은 값 선택")에 맞춰 거부 대신 수량 축소로 변경. `max_risk_per_trade_krw`/
+  `strategy_max_quantity` 신규 optional 필드(미지정 시 무제한, 기존 caller 동작 불변 — 회귀
+  테스트에서 이전 71건이 로직 변경 후에도 동일하게 통과함을 확인).
+- 신규 테스트: `tests/test_live_order_gateway.py`를 새 모델 기준으로 전면 재작성(78건) —
+  100%/90% 경계, 잔고 변경 즉시 반영, pending/unknown/open-position 차감, cash 조회 실패/stale/
+  NaN/Infinity/음수/0 차단, `cash_usage_percent` 잘못된 값(0/음수/101/None/문자열/NaN/Infinity/
+  bool) 차단, 동시 진입 원자성, 위험/전략 캡 축소 및 0 이하로 축소 시 차단, 재사이징된 실제 수량이
+  reservation notional에 반영됨. `tests/test_broker_safety.py`/`test_paper_order_execution.py`의
+  `_live_entry_context()` 헬퍼를 새 필드셋으로 갱신.
+- 처리 상태: RESOLVED
+
+### 관심종목 잔고 기준 매수 가능 종목 필터 (신규 building block)
+
+- 신설: `live_readiness/watchlist_affordability.py` — 순수 계산 모듈(SQLite/네트워크/파일 I/O
+  없음). `AccountState`(스캔당 1회 계산, 모든 후보가 공유)와 `WatchlistCandidate`
+  (symbol/latest_price/estimated_entry_price/fractionable/minimum_order_amount/slippage)를 입력받아
+  `AffordabilityResult`(6개 상태: `AFFORDABLE_WHOLE_SHARE`/`AFFORDABLE_FRACTIONAL`/
+  `INSUFFICIENT_BALANCE`/`NOT_FRACTIONABLE`/`BELOW_MINIMUM_ORDER`/`UNKNOWN_ACCOUNT_STATE`)를 반환.
+  `fractionable=true` 종목은 1주 가격이 잔고를 초과해도 최소주문금액을 충족하면 후보로 유지
+  (명시적 요구사항 — 절대 단순 가격 비교만으로 배제하지 않음). 수량 계산은 기존
+  `live_readiness/sizing.py::calculate_micro_order_quantity()`를 재사용(fractionable=true →
+  `budget/price`, false → `floor(budget/price)`, 최소주문금액 미달 시 별도 상태로 구분).
+- 배선 범위 결정: `daily_candidate_scanner.py`/`scalping_watchlist/pipeline.py`에는 아직 배선하지
+  않음(Stage 10 선례와 동일하게 building block으로 보류, `DECISION_LOG.md` 결정 6 참고).
+- 신규 테스트: `tests/test_watchlist_affordability.py`(30건) — account-state 검증(cash/percent/fx
+  각각 invalid 값), 100%/90% 공식, pending/unknown/open exposure 차감, fractionable 고가 종목 후보
+  유지, non-fractionable 고가 종목 제외, 최소주문금액 미달(whole/fractional 양쪽) 제외, slippage가
+  수량에 반영, `filter_watchlist()`가 순서 보존 및 전체 결과(제외 사유 포함) 반환.
+- 처리 상태: RESOLVED
+
+### 검증 결과 (CODEX-034 + 잔고 비율 사이징 전체)
+
+- 전체 회귀: `venv/bin/python -m pytest -q` **1,044 passed, 0 failed, 2 warnings**. 이전 사이클
+  종료 시점 986 passed 대비 58건 신규(CODEX-034/사이징 78건 + watchlist affordability 30건 −
+  기존 `test_live_order_gateway.py`의 이전 버전 건수 차이 반영).
+- 실제 Alpaca/Slack/Yahoo 호출 0회. 실제 저장소 루트 `TRADING_STATE.db*`/
+  `LIVE_ENTRY_RESERVATION.lock`이 회귀 실행 전후 존재하지 않음을 확인.
+- `order_history.csv`/`universe.csv`/`strategy_performance.csv` 변경 없음, `.env`·kill switch/
+  notification 상태 파일 변경 없음.
+- `git diff --check` 통과.
+- main 병합, origin push, 운영 배포, 실거래 활성화, `approved`/`live_enabled` 변경 없음.
+- 기존 리스크 한도 완화 없음 — `MAX_CONCURRENT_LIVE_POSITIONS`/`MAX_DAILY_LIVE_ENTRIES`는 변경하지
+  않았고, 고정 30,000원 상수 제거는 사용자가 명시적으로 지시한 정책 변경(예시 값 → 잔고 비율
+  모델)이지 임의의 한도 완화가 아니다 — `cash_usage_percent`가 100이어도 실제 계좌 현금을 초과할
+  수 없다는 제약은 그대로 유지된다.

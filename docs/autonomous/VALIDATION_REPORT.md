@@ -1,5 +1,55 @@
 # VALIDATION_REPORT
 
+## 2026-07-27 — CODEX-034 + 잔고 비율 기반 주문 사이징 사이클 해결
+
+Codex 독립 검증(`CODEX_REVIEW.md`, 커밋 `5da6662` 포함 범위, overall verdict **FAIL**)이 신규
+CODEX-034(HIGH)를 제기했다. 동시에 사용자 지시에 따라 고정 30,000원 파일럿 예산을 잔고
+비율(`cash_usage_percent`) 모델로 전면 교체했다. 상세는 `REMEDIATION_PLAN.md`의 동일 날짜 섹션
+참고.
+
+- **CODEX-034**(HIGH, broker 응답 유실 시 reservation 해제로 중복 주문/예산 우회 허용):
+  `live_entry_reservations`에 `client_order_id`(migration 5, UNIQUE) 추가, `SUBMISSION_UNKNOWN`
+  상태 신설. Ambiguous(timeout/connection reset, `.response` 없음)는 release하지 않고
+  `SUBMISSION_UNKNOWN`으로 유지, definitive(HTTPError with response, 또는 broker에 도달 못한
+  사전 실패)만 release. `reconcile_by_client_order_id()`로 재시작/재시도 시 broker 재조회 화해 경로.
+- **잔고 비율 사이징**(사용자 지시, 정책 변경): `PILOT_TOTAL_BUDGET_KRW=30_000` 상수 완전 제거.
+  `max_allocatable_cash = available_cash_krw × cash_usage_percent/100`,
+  `available_for_new_order = max_allocatable_cash - pending - unknown_submission -
+  open_position_cost`. `actual_qty = min(balance_based_qty, risk_based_qty, strategy_max_qty)` —
+  위험 초과 시 거부 대신 수량 축소로 변경.
+- **watchlist affordability**(신규 building block): `live_readiness/watchlist_affordability.py`
+  — 잔고 기준 매수 가능 종목 분류(6개 상태), `fractionable=true` 종목은 1주 가격이 잔고를 초과해도
+  최소주문금액 충족 시 후보 유지. 기존 파이프라인에는 미배선.
+
+### 테스트 결과
+
+```
+venv/bin/python -m pytest -q                              1,044 passed, 0 failed, 2 warnings
+```
+
+이전 사이클 종료 시점(986 passed) 대비 58건 신규.
+
+### 코드 변경 검증
+
+- `live_readiness/entry_reservation_ledger.py`(SUBMISSION_UNKNOWN/client_order_id/reconcile 신설),
+  `live_readiness/order_gateway.py`(고정 예산 제거, 잔고 비율 모델, risk/strategy 재사이징),
+  `live_readiness/watchlist_affordability.py`(신규), `broker/alpaca_client.py`/
+  `paper_strategy_order.py`(ambiguous-vs-definitive 분류, flat try/except로 재작성),
+  `state_store/schema.py`/`migrations.py`(migration 5) — 모두 커밋 diff로 직접 확인.
+- 안전 크리티컬 파일(`risk_config.py`, `broker/broker_config.py`, `kill_switch_state.py`,
+  `order_intent_ledger.py`)는 SHA-256이 이전 사이클과 완전히 동일.
+
+### 미검증 영역
+
+- `live_readiness/watchlist_affordability.py`는 실제 `daily_candidate_scanner.py`/
+  `scalping_watchlist/pipeline.py`에 배선되지 않았다 — 순수 계산 모듈 단위 테스트만 존재하며,
+  실제 스캔 파이프라인과의 통합은 별도 사이클 범위.
+- `entry_reservation_ledger.reconcile_by_client_order_id()`는 단위 테스트로만 검증됐고, 실제
+  재시작/크래시 복구 경로(`positions/lifecycle.py`의 `recover_on_restart()`류)에 아직 배선되지
+  않았다 — 프로세스 재시작 시 SUBMISSION_UNKNOWN 예약을 자동으로 화해하는 훅은 이번 사이클 범위
+  밖.
+- Limited live review(제한적 실거래 검토)는 여전히 BLOCKED, 실거래 없음.
+
 ## 2026-07-26 — Stage 3~10 최종 통합 수정 사이클: CODEX-024/026/028/031/032/033 해결
 
 Codex 통합 재검증(`CODEX_REVIEW.md`, 대상 커밋 `f04a123`/`aee663c`/`09b9237`/`b78e444`/`fe3e9b7`,

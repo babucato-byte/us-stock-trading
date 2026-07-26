@@ -1,17 +1,52 @@
 # CURRENT_STATUS
 
-마지막 갱신: 2026-07-26
+마지막 갱신: 2026-07-27
 
 ## 현재 Phase
-**Stage 3~10 최종 통합 수정 사이클 — CODEX-024/026/028/031/032/033 전부 RESOLVED (2026-07-26).**
+**CODEX-034 + 잔고 비율 기반 주문 사이징 사이클 — 전부 RESOLVED (2026-07-27).**
+Codex 독립 검증(`CODEX_REVIEW.md`, 커밋 `5da6662` 포함 범위, overall verdict `FAIL`)이 제기한
+신규 CODEX-034(HIGH, broker 응답 유실 시 live-entry reservation을 해제해 중복 주문과 예산 우회
+허용)를 수정. 동시에 사용자 지시에 따라 고정 `30,000원` 파일럿 예산을 영구 정책으로 굳히지 않고,
+`available_cash × cash_usage_percent`(margin/leverage 미사용, 현금 기준) 잔고 비율 모델로
+전면 교체했다.
+
+- **CODEX-034**: `live_entry_reservations`에 `client_order_id` 컬럼 추가(SQLite migration 5,
+  UNIQUE), 상태에 `SUBMISSION_UNKNOWN` 신설. `broker/alpaca_client.py::AlpacaBroker.submit_order()`
+  와 `paper_strategy_order.py`가 `requests.exceptions.HTTPError`(응답 있음)/사전-네트워크 실패는
+  안전하게 `RELEASED`, `requests.exceptions.RequestException`(timeout/connection reset, 응답
+  없음)은 `SUBMISSION_UNKNOWN`으로 분류해 예산/포지션 집계에서 계속 차감 상태를 유지한다.
+  `entry_reservation_ledger.reconcile_by_client_order_id()`가 재시작/재시도 시 broker에
+  `client_order_id`로 재조회해 최종 상태(commit/release)를 확정하는 화해 경로.
+- **잔고 비율 사이징**: `live_readiness/order_gateway.py`에서 `PILOT_TOTAL_BUDGET_KRW` 고정 상수
+  완전 제거. `LiveEntryContext`에 `available_cash_krw`/`cash_usage_percent`(1~100, 검증)/
+  `cash_as_of`를 신설, `max_allocatable_cash = available_cash × cash_usage_percent/100` →
+  `available_for_new_order = max_allocatable_cash - pending - unknown_submission -
+  open_position_cost`(전부 `entry_reservation_ledger.build_snapshot()`의 authoritative SQLite
+  집계, caller 선언 아님)로 매 호출마다 재계산. `actual_qty = min(balance_based_qty,
+  risk_based_qty, strategy_max_qty)` — 손절 위험이 잔고 기준 수량보다 더 타이트하면 거부가 아니라
+  수량을 줄이는 방식으로 변경(`max_risk_per_trade_krw`/`strategy_max_quantity` 신규 optional
+  필드).
+- **관심종목 affordability 필터**: `live_readiness/watchlist_affordability.py` 신설(순수 계산
+  모듈, `daily_candidate_scanner.py`/`scalping_watchlist/` 파이프라인에 아직 배선 안 함 — Stage 10
+  선례와 동일하게 building block으로 보류). `AFFORDABLE_WHOLE_SHARE`/`AFFORDABLE_FRACTIONAL`/
+  `INSUFFICIENT_BALANCE`/`NOT_FRACTIONABLE`/`BELOW_MINIMUM_ORDER`/`UNKNOWN_ACCOUNT_STATE` 6개
+  상태로 분류하며, `fractionable=true` 종목은 1주 가격이 잔고를 초과해도 최소주문금액을 충족하면
+  후보로 유지한다(명시적 요구사항).
+
+전체 회귀 **1,044 passed, 0 failed**(직전 986에서 58건 신규 — CODEX-034/사이징 78건 +
+watchlist affordability 30건, 기존 테스트 파일 2종의 `LiveEntryContext` 필드셋 갱신 포함).
+`approved: false`, `live_enabled: false` 유지, **Live trading: DO_NOT_ENABLE**. 다음 작업은 새
+`FINAL_VALIDATION_PACKAGE.md`(새 SHA-256 포함) 작성 후 상태를 `READY_FOR_FINAL_CODEX_REVALIDATION`
+으로 종료하는 것.
+
+## Stage 3~10 최종 통합 수정 사이클 — CODEX-024/026/028/031/032/033 (2026-07-26)
 Codex 통합 재검증(대상 커밋 `f04a123`/`aee663c`/`09b9237`/`b78e444`/`fe3e9b7`, overall verdict
 `FAIL`)이 CODEX-029/030을 `RESOLVED`로 재확인하고, CODEX-024/026/028을 `PARTIALLY_RESOLVED`로,
 신규 CODEX-031(HIGH, 30K/count/pending 제한이 caller 선언에 의존)·CODEX-032(HIGH, rejected exit의
 intent/position 비원자적 갱신)·CODEX-033(MEDIUM, governance 문서 불일치)을 제기했다. 6건 전부
 로컬 브랜치에서 수정·테스트했다(커밋 `55f3806`/`8a3be50`/`9c43862`). 전체 회귀 **986 passed,
 0 failed**(직전 973에서 13건 신규). `approved: false`, `live_enabled: false` 유지,
-**Live trading: DO_NOT_ENABLE**. 다음 작업은 새 `FINAL_VALIDATION_PACKAGE.md`(새 SHA-256 포함)
-작성 후 상태를 `READY_FOR_FINAL_CODEX_REVALIDATION`으로 종료하는 것. Stage 10 —
+**Live trading: DO_NOT_ENABLE**. Stage 10 —
 30,000원 제한 실거래 준비(`live_readiness/` + 플레이북 문서) `IMPLEMENTED`(문서화·계산 모듈,
 실거래 준비 완료 아님), 변경 없음. Stage 9 —
 운영 관제(Dashboard/CLI, `ops_dashboard/`) `IMPLEMENTED`, 변경 없음. Stage 8 — 전략 선택 엔진

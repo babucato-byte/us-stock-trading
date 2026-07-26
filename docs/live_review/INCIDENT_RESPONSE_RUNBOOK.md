@@ -244,29 +244,54 @@ wrapper뿐 아니라 `broker/alpaca_client.py::AlpacaBroker._request()` 자체�
      수정 없이 즉시 Kill Switch를 `MANUAL_REVIEW`로 활성화하고 사용자에게 보고한다 — 리스크
      한도를 완화하거나 재조정 로직을 우회하는 방향으로 임시 수정하지 않는다.
 
-## 15. Live 진입 예산이 실제보다 적게 남은 것으로 보이거나(예약이 반환되지 않음), 반대로 예상보다 쉽게 승인됨 (2026-07-26, CODEX-031 수정 이후)
+## 15. Live 진입 예산이 실제보다 적게 남은 것으로 보이거나(예약이 반환되지 않음), 반대로 예상보다 쉽게 승인됨 (2026-07-27, 잔고 비율 사이징 수정 이후)
 
 - **감지**: `live_readiness/entry_reservation_ledger.py`의 `build_snapshot()`이 보고하는
-  `active_notional_krw`/`active_position_count`/`today_entry_count`가 실제 broker 계좌 상태와
-  맞지 않아 보임.
-- **원인**: 30,000원 총 예산은 **파일럿 전체에 걸친 누적 배분**으로 설계되어 있어 포지션이
-  종료돼도 절대 반환되지 않는다(의도된 동작, `docs/autonomous/DECISION_LOG.md`의 CODEX-024/026/
-  028/031/032/033 섹션 결정 3 참고) — "예산이 줄어들지 않는다"는 관측은 대부분 버그가 아니다.
-  반대로 동시 포지션 수(`active_position_count`)는 연결된 position이 종료되면 자동으로
-  감소한다.
+  `pending_buy_reservations_krw`/`unknown_submission_reservations_krw`/
+  `current_open_position_cost_krw`/`active_position_count`/`today_entry_count`가 실제 broker
+  계좌 상태와 맞지 않아 보임.
+- **원인**: 2026-07-27 사이클부터 고정 `PILOT_TOTAL_BUDGET_KRW=30,000` 상수는 더 이상 존재하지
+  않는다 — `available_for_new_order = (available_cash_krw × cash_usage_percent/100) - pending -
+  unknown_submission - open_position_cost`이며, `available_cash_krw`는 caller가 매 호출 새로
+  조회한 실시간 broker 잔고다(이미 정산된 지출을 자연히 반영하므로, 예산이 lifetime 누적으로
+  줄어들지 않는다는 과거 가정은 더 이상 적용되지 않는다). 세 가지 차감 항목(pending/unknown/
+  open position cost)은 아직 정산되지 않은 노출만 추적한다. 반대로 동시 포지션 수
+  (`active_position_count`)는 연결된 position이 종료되면 자동으로 감소한다.
 - **절차**:
   1. `live_entry_reservations` 테이블을 직접 조회해 각 예약의 `state`(RESERVED/COMMITTED/
-     RELEASED)와 `position_id` 연결 여부를 확인한다.
+     SUBMISSION_UNKNOWN/RELEASED)와 `client_order_id`/`position_id` 연결 여부를 확인한다.
   2. broker 호출이 성공했는데도 예약이 `RESERVED`에 머물러 있다면(commit이 실패한 경우),
      `positions/lifecycle.py::enter_position()`이 응답을 어떻게 처리했는지 확인 — 이 상태 자체가
      예산을 과소 사용으로 잘못 보고하지는 않는다(RESERVED도 활성으로 집계됨, fail-closed).
-  3. broker 호출이 실패/거부됐는데도 예약이 `RELEASED`로 전환되지 않았다면, 해당 예약은
-     계속 예산을 점유한다 — 이는 의도된 fail-closed 동작(release 실패 시 더 보수적으로 남음)이며
-     코드를 우회해 수동으로 `RELEASED`로 바꾸는 것은 리스크 한도 완화에 해당하므로 하지 않는다.
-     실제로 그 예약이 잘못된 것으로 확인되면(예: 실제로 broker가 절대 받지 않은 주문), 사용자
-     승인 하에만 수동 정정한다.
-  4. `PILOT_TOTAL_BUDGET_KRW`/`MAX_CONCURRENT_LIVE_POSITIONS`/`MAX_DAILY_LIVE_ENTRIES` 값 자체를
+  3. broker 호출 결과가 애매(timeout/connection reset)했다면 예약은 `SUBMISSION_UNKNOWN`으로
+     남아 계속 예산을 점유해야 정상이다 — 시나리오 16을 따른다.
+  4. broker 호출이 명시적으로 실패/거부됐는데도 예약이 `RELEASED`로 전환되지 않았다면, 해당
+     예약은 계속 예산을 점유한다 — 이는 의도된 fail-closed 동작(release 실패 시 더 보수적으로
+     남음)이며 코드를 우회해 수동으로 `RELEASED`로 바꾸는 것은 리스크 한도 완화에 해당하므로
+     하지 않는다. 실제로 그 예약이 잘못된 것으로 확인되면(예: 실제로 broker가 절대 받지 않은
+     주문), 사용자 승인 하에만 수동 정정한다.
+  5. `cash_usage_percent`/`MAX_CONCURRENT_LIVE_POSITIONS`/`MAX_DAILY_LIVE_ENTRIES` 값 자체를
      완화하는 코드 변경은 이 런북의 범위가 아니다 — 사용자의 명시적 지시 없이는 수행하지 않는다.
+
+## 16. broker 응답이 유실(timeout/connection reset)된 뒤 예약이 계속 `SUBMISSION_UNKNOWN`으로 남아 있음 (2026-07-27, CODEX-034 수정 이후)
+
+- **감지**: `live_entry_reservations`의 한 행이 `SUBMISSION_UNKNOWN` 상태로 오래 머물러 있고,
+  같은 심볼로의 신규 진입 시도가 예산 부족으로 계속 차단됨.
+- **원인**: 이는 버그가 아니라 CODEX-034 수정의 의도된 동작이다 — broker 응답이 유실되면 실제로
+  주문이 접수됐는지 알 수 없으므로, 절대 자동으로 `RELEASED`(재시도/중복 주문 허용)하지 않는다.
+  `docs/autonomous/DECISION_LOG.md`의 CODEX-034+잔고 비율 사이징 사이클 섹션 결정 1 참고.
+- **절차**:
+  1. `live_entry_reservations`에서 해당 행의 `client_order_id`를 확인한다.
+  2. `live_readiness/entry_reservation_ledger.py::reconcile_by_client_order_id(conn,
+     client_order_id, broker)`를 실행해 broker에 그 `client_order_id`로 실제 주문 상태를
+     재조회한다 — accepted/new/partial/filled면 `COMMITTED`로, rejected/canceled/expired면
+     `RELEASED`로 확정하고, broker가 그 주문을 전혀 모른다고 답하거나 재조회 자체가 실패하면
+     `SUBMISSION_UNKNOWN`을 그대로 유지한다(자동 재시도 없음).
+  3. 이 함수는 아직 `positions/lifecycle.py`의 재시작/크래시 복구 경로에 배선되지 않았다
+     (`docs/autonomous/VALIDATION_REPORT.md`의 미검증 영역 참고) — 운영자가 수동으로 실행해야
+     한다.
+  4. broker 재조회 자체가 계속 실패하면(네트워크 문제 등) Kill Switch를 `MANUAL_REVIEW`로
+     활성화하고 사용자에게 보고한다 — SUBMISSION_UNKNOWN을 임의로 RELEASED로 바꾸지 않는다.
 
 ## 공통 유의사항
 

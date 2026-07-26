@@ -32,6 +32,32 @@ alpaca_client.py::AlpacaBroker.submit_order()` 자체가 동일한 게이트(all
 숫자값(운영자 미기입) 자체는 여전히 TBD_OPERATOR이지만, 이제 그 값이 실제로 강제된다는 점은
 코드로 보장된다.
 
+**추가 갱신(2026-07-27, CODEX-034 + 잔고 비율 사이징)**: 위 `PILOT_TOTAL_BUDGET_KRW=30_000` 고정
+상수 및 "파일럿 전체 누적 예산" 모델은 **완전히 폐기됐다**. 사용자가 명시적으로 "30,000원은
+사용자가 첫 실거래 시 계좌에 넣을 예정인 초기 잔고 예시일 뿐이며, 시스템의 고정 상한이 아니다"라고
+지시함에 따라, 이 문서 제목의 "30,000 KRW"는 이제 역사적 예시 값일 뿐 코드상의 상한이 아니다.
+실제 주문 한도는 다음 공식으로 매 호출 재계산된다(margin/leverage 사용 안 함, 현금 기준):
+
+```
+max_allocatable_cash = current_available_cash_krw × (cash_usage_percent / 100)
+available_for_new_order = max_allocatable_cash
+    - pending_buy_reservations_krw       (state=RESERVED)
+    - unknown_submission_reservations_krw (state=SUBMISSION_UNKNOWN, CODEX-034)
+    - current_open_position_cost_krw      (state=COMMITTED, 연결된 position이 아직 open)
+```
+
+`cash_usage_percent`(1~100, `LiveEntryContext`의 필수 검증 필드)는 여전히 caller가 매 호출
+완화할 수 없는 운영자 설정으로 남는다 — "예시 30,000원을 폐기했다"는 것이 "아무 한도도 없다"는
+뜻이 아니다. `MAX_CONCURRENT_LIVE_POSITIONS=1`/`MAX_DAILY_LIVE_ENTRIES=2`는 이번 사이클에서
+변경하지 않았다. 또한 CODEX-034로 broker 응답이 timeout/connection reset으로 유실된 경우
+reservation을 더 이상 `RELEASED`하지 않고 `SUBMISSION_UNKNOWN`으로 유지해 예산 계산에서 계속
+차감 상태로 남긴다(재시도 시 중복 주문/예산 우회 방지) — 상세는
+`docs/autonomous/DECISION_LOG.md`의 CODEX-034+잔고 비율 사이징 사이클 섹션, 실제 사고 대응 절차는
+`INCIDENT_RESPONSE_RUNBOOK.md` 시나리오 15/16 참고. 신규 `live_readiness/watchlist_affordability.py`
+(순수 계산 모듈, 아직 스캔 파이프라인 미배선)가 관심종목 단계에서 이 동일 공식으로 매수 가능
+여부를 미리 분류한다 — `fractionable=true` 종목은 1주 가격이 잔고를 초과해도 최소주문금액을
+충족하면 후보로 유지된다(절대 단순 가격 비교만으로 배제하지 않음).
+
 ## 1. 마이크로 주문 수량 계산
 
 `live_readiness/sizing.py::calculate_micro_order_quantity(available_krw, fx_rate_krw_per_usd,
