@@ -1,5 +1,6 @@
 import multiprocessing
 import threading
+from datetime import datetime, timezone
 
 import pandas as pd
 import pytest
@@ -8,6 +9,21 @@ import requests
 import order_safety
 import paper_strategy_order as pso
 from broker import AlpacaBroker, BrokerConfig
+from live_readiness.order_gateway import LiveEntryContext
+
+
+def _live_entry_context(symbol="AAPL"):
+    """CODEX-026/029: see tests/test_broker_safety.py's identical helper --
+    AlpacaBroker.submit_order() now requires a valid LiveEntryContext for
+    any side="buy" call on a live-mode config, before the pre-existing
+    dry-run/hard-disable checks below even run."""
+    now = datetime.now(timezone.utc)
+    return LiveEntryContext(
+        symbol=symbol, expected_fill_price_usd=10.0, allow_list=[symbol],
+        available_cash_krw=30_000, fx_rate_krw_per_usd=1_350.0, fx_rate_as_of=now.isoformat(),
+        max_order_notional_krw=30_000, max_daily_loss_krw=10_000, max_position_count=1,
+        current_open_position_count=0, max_daily_entries=2, today_entry_count=0, now=now,
+    )
 
 
 def _mp_update_reconciliation(reconciliation_path, lock_path, client_order_id, symbol, order_date, incoming, barrier):
@@ -169,7 +185,7 @@ def test_live_url_order_blocked():
     broker = AlpacaBroker(config=config, session=DummySession())
 
     with pytest.raises(RuntimeError):
-        broker.submit_order("AAPL", qty=1, side="buy")
+        broker.submit_order("AAPL", qty=1, side="buy", live_entry_context=_live_entry_context())
 
 
 def test_non_paper_mode_blocked_by_trading_mode_check(monkeypatch):

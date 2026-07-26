@@ -1,9 +1,28 @@
 import importlib
+from datetime import datetime, timezone
 
 import pytest
 
 from broker import AlpacaBroker, BrokerConfig
 from broker import broker_config as broker_config_module
+from live_readiness.order_gateway import LiveEntryContext
+
+
+def _live_entry_context(symbol="AAPL"):
+    """CODEX-026/029: AlpacaBroker.submit_order() now requires a valid
+    LiveEntryContext for any side="buy" call on a live-mode config, before
+    it ever reaches the pre-existing dry-run/hard-disable checks these
+    tests exercise. A minimal, fully-valid context that passes the
+    CODEX-026/029 gate lets those older checks still run exactly as
+    before -- this fixture does not weaken or bypass anything, it just
+    supplies the input the newer gate now also requires."""
+    now = datetime.now(timezone.utc)
+    return LiveEntryContext(
+        symbol=symbol, expected_fill_price_usd=10.0, allow_list=[symbol],
+        available_cash_krw=30_000, fx_rate_krw_per_usd=1_350.0, fx_rate_as_of=now.isoformat(),
+        max_order_notional_krw=30_000, max_daily_loss_krw=10_000, max_position_count=1,
+        current_open_position_count=0, max_daily_entries=2, today_entry_count=0, now=now,
+    )
 
 # Every environment variable BrokerConfig's dataclass fields read a default
 # from. Needed because those defaults are computed once when broker_config
@@ -47,7 +66,7 @@ def test_live_dry_run_order_not_submitted():
         ),
         session=session,
     )
-    response = broker.submit_order("AAPL", qty=1, side="buy")
+    response = broker.submit_order("AAPL", qty=1, side="buy", live_entry_context=_live_entry_context())
     assert response.dry_run is True
     assert session.posts == []
 
@@ -64,7 +83,7 @@ def test_live_real_order_disabled_even_with_flags():
         session=DummySession(),
     )
     try:
-        broker.submit_order("AAPL", qty=1, side="buy")
+        broker.submit_order("AAPL", qty=1, side="buy", live_entry_context=_live_entry_context())
     except RuntimeError as exc:
         assert "Real live trading is disabled" in str(exc)
     else:
@@ -168,7 +187,7 @@ def test_live_endpoint_blocks_order_post():
     broker = AlpacaBroker(config=config, session=DummySession())
 
     with pytest.raises(RuntimeError):
-        broker.submit_order("AAPL", qty=1, side="buy")
+        broker.submit_order("AAPL", qty=1, side="buy", live_entry_context=_live_entry_context())
 
 
 def test_endpoint_tampering_after_construction_blocks_all_calls():
@@ -190,7 +209,7 @@ def test_endpoint_tampering_after_construction_blocks_all_calls():
     with pytest.raises(RuntimeError):
         broker.get_positions()
     with pytest.raises(RuntimeError):
-        broker.submit_order("AAPL", qty=1, side="buy")
+        broker.submit_order("AAPL", qty=1, side="buy", live_entry_context=_live_entry_context())
 
 
 def test_paper_endpoint_allows_mock_account_and_positions_calls(monkeypatch):

@@ -428,15 +428,23 @@ def _execute_exit(position_id, symbol, order_date, broker, reason, qty_selector,
 
     # ---- Phase A: find-or-reserve a durable intent, durably persisted
     # before any broker call. ----
+    # `existing_intent` is read WITHOUT holding the position lock -- two
+    # concurrent callers can both see None (both racing into the "fresh
+    # reservation" branch below, safely resolved there since that branch
+    # re-checks reachability AFTER acquiring the lock) or one can see the
+    # other's already-reserved intent here. Only the second case is
+    # handled in this branch, and the position's CURRENT state (re-read
+    # fresh under the lock just below, not this stale existing_intent
+    # snapshot) is the only thing ever trusted to decide what to do next.
     existing_intent = eil.get_active_intent(conn, position_id)
     if existing_intent is not None:
-        # A prior attempt already reserved (and maybe submitted) an exit
-        # for this position -- crash/timeout recovery, not a fresh
-        # decision. Catch the position's own state up to reflect that if
-        # a crash happened before the first attempt's Phase A finished
-        # writing it, then resolve via the same path restart recovery uses.
+        # A prior attempt already reserved (and maybe submitted, maybe by
+        # now even fully resolved) an exit for this position -- crash/
+        # timeout recovery or a same-process race, not a fresh decision.
         with store.locked_position(position_id, lock_timeout=lock_timeout, conn=conn) as locked:
-            if locked["state"] not in (states.EXIT_SUBMITTED, states.PARTIAL_EXIT_SUBMITTED):
+            if locked["state"] in (states.EXIT_SUBMITTED, states.PARTIAL_EXIT_SUBMITTED):
+                pass  # already reflects the pending exit -- nothing to catch up
+            elif _exit_states_reachable_from(locked["state"]):
                 fully_filled_state = on_fully_filled_state or (
                     states.PARTIAL_EXITED if existing_intent["reason"] == "PARTIAL_TARGET_1" else states.CLOSED
                 )
@@ -444,6 +452,14 @@ def _execute_exit(position_id, symbol, order_date, broker, reason, qty_selector,
                     locked, fully_filled_state, existing_intent["client_order_id"],
                     f"resuming pending exit intent {existing_intent['intent_id']} instead of resubmitting",
                 )
+            else:
+                # The position has already been resolved (e.g. a
+                # concurrent caller finished Phase C, including a full
+                # CLOSED, while this thread's stale `existing_intent` read
+                # was still in flight) -- there is nothing left to catch
+                # up or reconcile, and forcing a transition here would be
+                # illegal (e.g. CLOSED -> EXIT_SUBMITTED).
+                return dict(locked)
         return reconcile_pending_exit(
             position_id, broker=broker, on_fully_filled_state=on_fully_filled_state,
             lock_timeout=lock_timeout, db_conn=conn,

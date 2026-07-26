@@ -317,13 +317,43 @@ class AlpacaBroker:
             not_found_is_none=True,
         )
 
-    def submit_order(self, symbol, qty=1, *, side, order_type="market", time_in_force="day", client_order_id=None):
+    def submit_order(self, symbol, qty=1, *, side, order_type="market", time_in_force="day",
+                      client_order_id=None, live_entry_context=None):
         # Long-only v1.0: buy is always an entry, sell is always an exit --
         # see _SIDE_TO_PURPOSE. There is no short-selling path in this
         # version, so this if/else is the complete mapping.
         if side not in {"buy", "sell"}:
             raise ValueError("side must be exactly 'buy' or 'sell'")
         purpose = _SIDE_TO_PURPOSE[side]
+
+        # CODEX-026/CODEX-029: the same live-entry gate
+        # paper_strategy_order.submit_order() applies, re-run here at the
+        # true final network boundary so a caller that bypasses that
+        # wrapper and calls this method directly cannot escape the
+        # allow-list/budget/FX/symbol-identity checks. Scope is identical
+        # to the wrapper's: side="buy" AND self.config.is_live_mode only --
+        # Paper trading and every exit are entirely unaffected. See
+        # live_readiness/order_gateway.py's module docstring for the full
+        # rationale (including why this duplicates, rather than replaces,
+        # the wrapper's own copy of the same gate).
+        if side == "buy" and self.config.is_live_mode:
+            from live_readiness.order_gateway import LiveOrderBlockedError, validate_and_size_live_entry
+            if live_entry_context is None:
+                return BrokerResponse(
+                    status_code=423,
+                    text="Live entry blocked: no LiveEntryContext supplied, order not submitted.",
+                    data={"blocked_reason": "MISSING_LIVE_ENTRY_CONTEXT"},
+                    dry_run=False,
+                )
+            try:
+                qty = validate_and_size_live_entry(live_entry_context, symbol)
+            except LiveOrderBlockedError as exc:
+                return BrokerResponse(
+                    status_code=423,
+                    text=f"Live entry blocked: {exc}",
+                    data={"blocked_reason": str(exc)},
+                    dry_run=False,
+                )
 
         order = {
             "symbol": symbol,

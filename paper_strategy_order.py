@@ -183,15 +183,19 @@ def submit_order(symbol, qty=1, broker=None, client_order_id=None, *, side, live
     Both gates must pass for the broker to be called; either one blocking
     returns a 423 response without ever reaching `broker`.
 
-    CODEX-026: a THIRD gate applies only when side="buy" AND the broker is
-    configured for live trading (broker.config.is_live_mode) -- Paper
-    trading is entirely unaffected. live_entry_context must be a
+    CODEX-026/CODEX-029: a THIRD gate applies only when side="buy" AND the
+    broker is configured for live trading (broker.config.is_live_mode) --
+    Paper trading is entirely unaffected. live_entry_context must be a
     live_readiness.order_gateway.LiveEntryContext describing the pilot's
     allow-list/budget/FX-rate/position-count state; missing it, or it
-    failing any check (see live_readiness/order_gateway.py), blocks the
-    order with a 423 before the broker is ever called and re-sizes `qty`
-    to the gateway's fail-closed-computed quantity when all checks pass
-    (never trusts a caller-supplied qty for a live entry).
+    failing any check -- including CODEX-029's exact-match requirement
+    that live_entry_context.symbol equal this call's own `symbol` -- blocks
+    the order with a 423 before the broker is ever called and re-sizes
+    `qty` to the gateway's fail-closed-computed quantity when all checks
+    pass (never trusts a caller-supplied qty for a live entry). The same
+    gate also runs a second time inside AlpacaBroker.submit_order() itself
+    (see broker/alpaca_client.py) so a caller that bypasses this wrapper
+    entirely and calls broker.submit_order() directly is still covered.
     """
     if is_trading_halted():
         print(f"Kill switch engaged: {symbol} order not submitted.")
@@ -222,7 +226,8 @@ def submit_order(symbol, qty=1, broker=None, client_order_id=None, *, side, live
     # .config attribute at all, and `broker.config` would raise
     # AttributeError before getattr's default ever applies.
     broker_config = getattr(broker, "config", None)
-    if side == "buy" and getattr(broker_config, "is_live_mode", False):
+    is_live_entry = side == "buy" and getattr(broker_config, "is_live_mode", False)
+    if is_live_entry:
         from live_readiness.order_gateway import LiveOrderBlockedError, validate_and_size_live_entry
         if live_entry_context is None:
             print(f"CODEX-026: live entry for {symbol} blocked -- no LiveEntryContext supplied.")
@@ -233,7 +238,7 @@ def submit_order(symbol, qty=1, broker=None, client_order_id=None, *, side, live
                 dry_run=False,
             )
         try:
-            qty = validate_and_size_live_entry(live_entry_context)
+            qty = validate_and_size_live_entry(live_entry_context, symbol)
         except LiveOrderBlockedError as exc:
             print(f"CODEX-026: live entry for {symbol} blocked -- {exc}")
             return BrokerResponse(
@@ -243,12 +248,15 @@ def submit_order(symbol, qty=1, broker=None, client_order_id=None, *, side, live
                 dry_run=False,
             )
 
-    response = broker.submit_order(
-        symbol,
-        qty=qty,
-        side=side,
-        client_order_id=client_order_id,
-    )
+    submit_kwargs = dict(qty=qty, side=side, client_order_id=client_order_id)
+    if is_live_entry:
+        # Only passed for the exact scenario AlpacaBroker.submit_order()'s
+        # own copy of this gate understands (CODEX-026/029) -- every other
+        # broker double across the test suite has a submit_order() with no
+        # live_entry_context parameter at all, so this must never be passed
+        # outside the one case that needs it.
+        submit_kwargs["live_entry_context"] = live_entry_context
+    response = broker.submit_order(symbol, **submit_kwargs)
     print(f"{symbol} order result: {response.status_code} {response.text[:500]}")
     return response
 

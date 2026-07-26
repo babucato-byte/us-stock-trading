@@ -1,10 +1,11 @@
-"""CODEX-026: the final common pre-trade gate for LIVE-mode entry orders.
+"""CODEX-026/CODEX-029: the final common pre-trade gate for LIVE-mode
+entry orders, including symbol-identity enforcement between the approved
+context and the actual order submitted.
 
-Scope decision (recorded here and in DECISION_LOG.md's CODEX-026 section):
-this gate is wired into paper_strategy_order.submit_order() and only
-activates when broker.config.is_live_mode is True AND side == "buy" --
-i.e. it constrains entries in live trading specifically, never Paper
-trading. Rationale:
+Scope decision (recorded here and in DECISION_LOG.md's CODEX-023~030
+section): this gate activates only when broker.config.is_live_mode is
+True AND side == "buy" -- i.e. it constrains entries in live trading
+specifically, never Paper trading. Rationale:
 
   - The 30,000 KRW budget, symbol allow-list, and FX-rate requirements
     are meaningless for Paper trading (no real money, no real FX
@@ -16,17 +17,25 @@ trading. Rationale:
     ACTIVE-vs-ENTRY_DISABLED asymmetry, already established throughout
     this project: an existing position must always be closeable,
     regardless of whether new entries are currently allowed).
-  - A caller that bypasses paper_strategy_order.submit_order() and calls
-    broker.submit_order() directly is NOT covered by this Python-level
-    gate -- documented as a residual scope limitation (DECISION_LOG.md),
-    not silently claimed to be closed. Nothing in this codebase does that
-    today; every internal entry path (positions/lifecycle.py::
-    enter_position(), paper_strategy_order.py::main()) already funnels
-    through submit_order().
+
+CODEX-026's original residual risk -- "a caller that bypasses
+paper_strategy_order.submit_order() and calls broker.submit_order()
+directly is NOT covered by this Python-level gate" -- is now closed:
+broker/alpaca_client.py::AlpacaBroker.submit_order() itself runs this
+exact gate (validate_and_size_live_entry(), including the CODEX-029
+symbol-identity check below) before ever reaching self.session.request(),
+so the check applies at the true final network boundary regardless of
+which caller reaches it. paper_strategy_order.submit_order() also keeps
+its own copy of this gate for defense-in-depth and because it is broker-
+agnostic (test doubles that aren't AlpacaBroker instances don't inherit
+AlpacaBroker's gate) -- running it twice on a real AlpacaBroker call is
+redundant but harmless, since validate_and_size_live_entry() is a pure
+function of its inputs with no side effects.
 
 Every check here fails closed: a missing/unconfigured input (no FX rate,
-no allow-list, no available-cash figure) blocks the order, it never
-defaults to "allow."
+no allow-list, no available-cash figure, no order_symbol, a symbol that
+doesn't match the context) blocks the order, it never defaults to
+"allow."
 """
 
 import math
@@ -72,10 +81,32 @@ def _now(ctx):
     return ctx.now or datetime.now(timezone.utc)
 
 
-def validate_and_size_live_entry(ctx: LiveEntryContext) -> int:
+def validate_and_size_live_entry(ctx: LiveEntryContext, order_symbol: str) -> int:
     """Returns the fail-closed-validated whole-share quantity to submit.
     Raises LiveOrderBlockedError with a specific reason string on any
-    violation -- never returns a fallback/default quantity."""
+    violation -- never returns a fallback/default quantity.
+
+    CODEX-029: `order_symbol` -- the symbol the caller is actually about
+    to submit an order for -- is now a required, separate argument, not
+    implicitly trusted to equal `ctx.symbol`. Before this, only
+    `ctx.symbol` was checked against the allow-list; nothing compared it
+    to the real order about to be placed, so an approved context for one
+    symbol (e.g. AAPL) could be paired with a submit_order() call for any
+    other symbol (e.g. TSLA) and the mismatch would never be caught. The
+    match required here is byte-for-byte exact -- deliberately NOT
+    case/whitespace-normalized like the allow-list membership check below
+    is, so a case or whitespace mutation between context and order is
+    itself treated as a mismatch and blocked, never silently equated.
+    """
+    if not isinstance(order_symbol, str) or not order_symbol:
+        raise LiveOrderBlockedError(f"order symbol is empty or not a string: {order_symbol!r}")
+    if not isinstance(ctx.symbol, str) or not ctx.symbol:
+        raise LiveOrderBlockedError(f"live entry context symbol is empty or not a string: {ctx.symbol!r}")
+    if ctx.symbol != order_symbol:
+        raise LiveOrderBlockedError(
+            f"order symbol {order_symbol!r} does not match live entry context symbol {ctx.symbol!r}"
+        )
+
     if not is_symbol_allowed(ctx.symbol, ctx.allow_list):
         raise LiveOrderBlockedError(f"symbol {ctx.symbol!r} is not on the allow-list")
 

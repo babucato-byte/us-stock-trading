@@ -564,3 +564,42 @@ def test_concurrent_reconciliation_calls_reach_same_final_state():
     assert final["state"] == states.CLOSED
     assert final["remaining_qty"] == 0
     assert final["realized_pnl"] == pytest.approx(10 * (94.0 - 100.0))
+
+
+def test_stale_existing_intent_read_after_position_already_closed_does_not_raise(monkeypatch):
+    """Regression for a race in _execute_exit()'s existing_intent branch:
+    eil.get_active_intent() is read without holding the position lock, so
+    a second (concurrent, or merely delayed) caller can see an intent
+    that was active at read time but has since resolved to CLOSED by the
+    time this caller actually acquires the lock. Forcing that exact
+    ordering here (rather than relying on real thread scheduling) pins
+    down that the illegal 'CLOSED -> EXIT_SUBMITTED' transition this used
+    to attempt can never happen -- the position's freshly re-read state
+    under the lock is what decides, never the stale existing_intent
+    snapshot."""
+    record, broker = _filled_position(qty=10, broker_submit_responses=[_filled_response(10, price=94.0)])
+    conn = state_db.open_db()
+    position_id = record["position_id"]
+
+    real_get_active_intent = eil.get_active_intent
+    call_count = {"n": 0}
+
+    def _delayed_get_active_intent(conn_arg, pos_id):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # First call (this test's own "late" caller): simulate having
+            # observed the intent while it was still active, then let the
+            # real position resolve to CLOSED before this caller's Phase A
+            # lock acquisition below actually runs.
+            snapshot = real_get_active_intent(conn_arg, pos_id)
+            lifecycle.check_and_manage(pos_id, current_price=94.0, now=MID_SESSION_NOW, broker=broker)
+            return snapshot
+        return real_get_active_intent(conn_arg, pos_id)
+
+    monkeypatch.setattr(lifecycle.eil, "get_active_intent", _delayed_get_active_intent)
+
+    result = lifecycle.check_and_manage(position_id, current_price=94.0, now=MID_SESSION_NOW, broker=broker)
+    assert result["state"] == states.CLOSED
+    assert result["remaining_qty"] == 0
+    sell_calls = [c for c in broker.submit_calls if c[2] == "sell"]
+    assert len(sell_calls) == 1  # the real check_and_manage call inside the monkeypatch did the only submission
