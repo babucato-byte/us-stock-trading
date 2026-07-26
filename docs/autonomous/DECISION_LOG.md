@@ -386,3 +386,57 @@
 - 승인 필요 여부: 아니오(코드 구현·테스트 추가·문서화 범위, 실거래/승인/main/push와 무관). 결정
   3·4에 기록된 "Live 모드 게이트가 direct broker 호출을 막지 못한다"는 잔여 범위는 실제 제한적
   실거래 검토 시점에 사용자 재확인이 필요한 `NEEDS_USER_DECISION`으로 별도 기록.
+
+## Stage 3~10 최종 재수정 사이클 — CODEX-024/026/028/029/030 (2026-07-26)
+
+- 결정 1(CODEX-028, 아키텍처) — `positions/store.py`의 canonical 저장소를 JSON에서 SQLite
+  (`positions`/`position_events` 테이블, Stage 5 스키마에 이미 존재했으나 미사용)로 전환하고,
+  `POSITION_STORE.json`은 SQLite 커밋 이후에만 쓰는 best-effort projection(재생성 가능,
+  `store.regenerate_projection()`)으로 재정의했다. 범위는 `positions`/`position_events`/
+  `exit_intents`로 한정하고 `orders`/`fills`(Stage 5 스키마에 있으나 진입 주문 이력은 여전히
+  `order_history.csv`/`order_intent_ledger.csv`가 담당)는 이번에도 마이그레이션하지 않았다.
+  근거: CODEX-028의 실제 재현(SQLite exit intent가 JSON position보다 먼저 커밋되어 fill 반영이
+  유실됨)은 청산 경로의 포지션 상태 드리프트 문제이며, 진입 주문의 CSV 감사 이력과는 무관하다.
+  이전 사이클(결정 1, CODEX-023/024)의 "JSON은 유지, exit intent만 SQLite로 분리" 결정을
+  뒤집은 것이 아니라 완성한 것 — 그 결정이 명시적으로 인정했던 잔여 위험("두 저장소 간 진짜 단일
+  트랜잭션은 없음")이 이번에 `positions.store.locked_position(conn=...)`이 exit intent 커밋과
+  동일한 SQLite 트랜잭션을 공유하도록 만들어 해소됐다.
+- 결정 2(CODEX-025, 재적용) — CODEX-025의 손상 감지 의미론(구조적으로 corrupted vs
+  legitimately empty 구분, `PositionStoreCorruptedError`, `check_store_health()`)은 그대로
+  유지하되 진단 대상을 JSON 파일에서 SQLite 파일로 옮겼다. JSON projection 단독 손상은 더 이상
+  "store 손상"이 아니다 — SQLite가 살아있는 한 언제든 `regenerate_projection()`으로 다시
+  만들 수 있으므로, CODEX-025가 막으려던 "손상을 빈 것으로 오인"하는 실패 모드가 애초에
+  JSON에는 더 이상 적용되지 않는다(SQLite 손상에 대해서만 여전히 적용).
+- 결정 3(CODEX-029, symbol 식별) — `LiveEntryContext.symbol`과 실제 주문 symbol의 일치 검사는
+  `is_symbol_allowed()`(대소문자/공백 정규화, allow-list 매칭용)와 별개의, 완전히 엄격한
+  (정규화 없는) 동일성 비교로 구현했다. 근거: allow-list 매칭은 "운영자가 적어둔 표기"와
+  "실제 심볼"을 관대하게 대조해야 하지만, context와 실제 주문 사이의 동일성은 오히려
+  대소문자/공백이 다르면 그 자체가 이상 징후(버그 또는 변조)이므로 엄격하게 차단하는 것이
+  더 안전하다.
+- 결정 4(CODEX-026, direct broker 우회 해소) — CODEX-026의 잔여 위험(direct broker 호출이
+  게이트를 우회)을 `broker/alpaca_client.py::AlpacaBroker.submit_order()` 자체에 동일한 게이트를
+  중복 배치하는 방식으로 닫았다. `broker/alpaca_client.py::_request()` 레벨(CODEX-016~022로
+  검증 완료된 kill switch/purpose 게이트)은 건드리지 않고, `submit_order()` 메서드 상단에만
+  추가했다 — 기존에 검증된 네트워크 경계 코드를 재작업하는 위험을 피하면서도 "최종 공통 주문
+  경계"라는 요구를 충족한다. `paper_strategy_order.submit_order()` 쪽 게이트는 제거하지 않고
+  유지했다(FakeBroker 등 AlpacaBroker가 아닌 테스트 더블에 대한 방어 및 이중 방어).
+  이 변경으로 `broker.submit_order(side="buy")`를 live 모드에서 직접 호출하는 기존 안전 테스트
+  (`test_broker_safety.py`, `test_paper_order_execution.py`)들이 최소한의 유효한
+  `LiveEntryContext`를 함께 넘기도록 갱신이 필요했다 — 원래 검증하려던 "실거래는 항상 비활성화"
+  라는 주장 자체는 변경 없이 그대로 통과한다(더 앞선 게이트를 하나 통과해야 원래 검사에 도달할
+  뿐이다).
+- 결정 5(동시성 버그, 발견 및 수정) — CODEX-024 사이클에서 이미 존재했던 `_execute_exit()`의
+  `existing_intent` 분기가, lock 없이 읽은 `eil.get_active_intent()` 스냅샷이 실제 lock 획득
+  시점에는 이미 CLOSED로 해소된 경우 `CLOSED -> EXIT_SUBMITTED`라는 불법 전이를 시도할 수 있는
+  경쟁 조건을 갖고 있었다(전체 회귀 실행 중 1회 관측, `InvalidTransitionError`). lock 아래에서
+  다시 읽은 실제 상태만 신뢰하도록 수정하고, 결정적 재현 테스트를 추가했다. 이 finding 목록에
+  명시적으로 없었지만, CODEX-024의 "중복 sell 방지"가 실제로 성립하려면 이 경로도 안전해야
+  하므로 이번 사이클 범위에 포함했다.
+- 결정 6(CODEX-030, 범위) — `clock.py`의 Clock 주입은 `positions/lifecycle.py`의
+  `check_and_manage()`/`check_invalidation()`(EOD/시간 의존 판단이 실제로 일어나는 지점)에만
+  적용했다. `state_history`/`entry_time` 타임스탬프 기록에 쓰이는 `_now_iso()`(실제 UTC 기록
+  용도)는 대상에서 제외했다 — 이 값들은 "포지션 상태가 실제로 언제 바뀌었는가"를 기록하는
+  감사 로그이며, 시뮬레이션된 클락으로 대체하면 오히려 실제 발생 시각과 감사 기록이 어긋나는
+  새로운 문제를 만든다. CODEX-030의 실제 재현(EOD 근처 실행 시 target/stop/no-action 테스트가
+  EOD_FORCED_CLOSE로 바뀜)은 전적으로 `check_and_manage()`의 `now` 인자 누락이 원인이었다.
+- 승인 필요 여부: 아니오(코드 구현·테스트 추가·문서화 범위, 실거래/승인/main/push와 무관).

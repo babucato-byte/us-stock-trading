@@ -195,6 +195,31 @@ wrapper뿐 아니라 `broker/alpaca_client.py::AlpacaBroker._request()` 자체�
      수정 — 코드가 자동으로 "일단 통과시키는" 방향으로 완화되어서는 안 됨.
   4. 이 프로젝트는 현재 `ENABLE_REAL_TRADING=False`/`live_dry_run`이 기본값이므로, 이 시나리오는
      실제 실거래 파일럿 준비/검토 단계에서만 실질적으로 발생한다.
+  5. **갱신(2026-07-26, CODEX-029)**: `blocked_reason`이 `"order symbol ... does not match live
+     entry context symbol ..."`이면, 승인된 context와 실제 제출된 symbol이 서로 다르다는 뜻이다
+     — 이는 정상적인 fail-closed 차단이며, 코드가 두 값을 자동으로 맞추려 시도해서는 안 된다.
+     호출부(전략 신호 → sizing → context 조립 → 실제 주문 제출)의 어느 단계에서 symbol이
+     바뀌었는지 추적한다. 이 차단은 이제 `paper_strategy_order.submit_order()` 경로뿐 아니라
+     `AlpacaBroker.submit_order()`를 직접 호출하는 경로에서도 동일하게 발생한다.
+
+## 13. 청산 경로에서 SQLite와 JSON position 상태 불일치 의심 (2026-07-26, CODEX-028 수정 이후)
+
+- **감지**: `ops_dashboard`나 `POSITION_STORE.json`을 직접 읽은 값이 실제와 다르게 보이거나,
+  `positions.projection_status`가 `FAILED`로 기록된 포지션이 있음.
+- **원인**: CODEX-028 수정 이후 SQLite(`positions`/`position_events` 테이블)가 유일한 canonical
+  저장소이고, `POSITION_STORE.json`은 그 SQLite 커밋이 성공한 뒤에만 쓰는 best-effort projection
+  이다 — projection 쓰기 자체가 실패해도(디스크 공간 부족 등) 거래 상태(SQLite)는 정상이며 절대
+  롤백되지 않는다.
+- **절차**:
+  1. **JSON 파일이 아니라 SQLite(또는 `store.load_position()`/`store.load_all()`이 반환하는 값)를
+     항상 신뢰한다.** `POSITION_STORE.json`은 참고용 스냅샷일 뿐이다.
+  2. `positions.projection_status`/`positions.projection_updated_at` 컬럼을 조회해 마지막
+     projection 쓰기 성공/실패 시각을 확인한다.
+  3. projection이 오래됐거나 손상됐다고 의심되면 `positions.store.regenerate_projection()`을
+     실행해 SQLite에서 전체 JSON을 다시 생성한다 — 이 함수는 읽기 전용으로 SQLite를 조회할 뿐,
+     거래 상태 자체를 변경하지 않는다.
+  4. SQLite 데이터베이스 파일 자체가 손상된 경우는 이 시나리오가 아니라 시나리오 11(Position
+     store 손상 감지)을 따른다 — `check_store_health()`로 구분한다.
 
 ## 공통 유의사항
 

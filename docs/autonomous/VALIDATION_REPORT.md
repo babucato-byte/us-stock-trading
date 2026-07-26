@@ -1,5 +1,80 @@
 # VALIDATION_REPORT
 
+## 2026-07-26 — Stage 3~10 최종 재수정 사이클: CODEX-024/026/028/029/030 해결
+
+Codex 통합 재검증(`CODEX_REVIEW.md`, 대상 커밋 `4de0714`/`e49753f`, overall verdict **FAIL**)이
+CODEX-023/025/027을 `RESOLVED`로, CODEX-024/026을 `PARTIALLY_RESOLVED`로 재확인하고 신규
+CODEX-028(HIGH)/CODEX-029(HIGH)/CODEX-030(MEDIUM)을 제기했다. 상세 재현·수정 내용은
+`REMEDIATION_PLAN.md`의 동일 날짜 섹션 참고. 이 문서는 최종 검증 결과만 요약한다.
+
+- **CODEX-030**(MEDIUM, wall-clock 의존 테스트): `clock.py` 신설(Clock/ProductionClock/
+  FrozenClock), `check_and_manage()`/`check_invalidation()`이 명시적 `now`/`clock`을 받도록
+  변경. 실제 결함은 테스트 쪽(`now` 미전달)에 있었으므로 모든 관련 테스트에 고정 시각을 전달.
+- **CODEX-028**(HIGH, SQLite/JSON commit 불일치) + **CODEX-024 잔여분**(단일 트랜잭션 아님):
+  `positions/store.py`를 SQLite(`positions`/`position_events`) canonical로 재작성,
+  `POSITION_STORE.json`은 커밋 후에만 쓰는 재생성 가능한 projection으로 재정의.
+  `locked_position(conn=...)`이 exit intent 커밋과 동일 트랜잭션을 공유.
+- **CODEX-029**(HIGH, live context symbol과 실제 주문 symbol 불일치) + **CODEX-026 잔여분**
+  (direct broker 우회): `validate_and_size_live_entry(ctx, order_symbol)`에 엄격한 symbol
+  동일성 검사 추가, `AlpacaBroker.submit_order()` 자체에도 동일 게이트 배선.
+- 부수 발견 및 수정: `_execute_exit()`의 lock-없는 `existing_intent` 읽기로 인한 드문 경쟁
+  조건(`CLOSED -> EXIT_SUBMITTED` 불법 전이) 1건, 발견 즉시 수정 및 결정적 재현 테스트 추가.
+  `tests/test_position_store.py`/`tests/test_ops_dashboard.py`의 `STATE_STORE_DB_FILE` 격리
+  누락(실제 저장소 루트 DB 파일에 쓰던 문제) 발견 즉시 수정.
+
+### 테스트 결과
+
+```
+venv/bin/python -m pytest -q       973 passed, 0 failed, 2 warnings
+venv/bin/pytest -q                 973 passed, 0 failed, 2 warnings
+(상위 디렉터리) python -m pytest us-stock-trading -q   973 passed, 0 failed, 2 warnings
+```
+
+이전 사이클 종료 시점(923 passed) 대비 50건 신규(CODEX-030 24건, CODEX-028/029 각각 다수,
+CODEX-025 테스트의 SQLite 계층 이식 포함).
+
+### 코드 변경 검증
+
+- `positions/store.py`(SQLite canonical 재작성), `positions/lifecycle.py`(exit intent conn
+  공유, 경쟁 조건 수정, Clock 주입), `state_store/exit_intent_ledger.py`(`commit=False` 옵션),
+  `state_store/schema.py`/`migrations.py`(migration 3: `projection_status` 컬럼),
+  `clock.py`(신규), `live_readiness/order_gateway.py`(symbol 동일성 검사),
+  `broker/alpaca_client.py`(broker-level 게이트), `paper_strategy_order.py`(live_entry_context
+  전달) — 모두 커밋 diff로 직접 확인.
+- 안전 크리티컬 파일(`risk_config.py`, `broker/broker_config.py`, `kill_switch_state.py`,
+  `order_intent_ledger.py`)는 SHA-256이 이전 사이클과 완전히 동일 — 이번 사이클에서 전혀 건드리지
+  않았음을 재확인.
+
+### 미검증 영역
+
+- 실제 Alpaca live 계좌를 통한 E2E symbol-mismatch/direct-broker-bypass 재현(모두 fake
+  session/broker로만 검증).
+- 실제 프로세스 kill/전원 차단을 이용한 SQLite WAL 파일 복구 시나리오(파일 손상 시뮬레이션은
+  garbage bytes 덮어쓰기로 대체).
+- 장시간(수 시간) 반복 실행을 통한 동시성 경쟁 조건의 통계적 재현율 측정(20회 반복 실행으로
+  안정성만 확인).
+
+### 안전 관련 변경 사항
+
+- `positions/lifecycle.py::recover_on_restart()`가 SQLite 손상 시 Kill Switch를
+  `MANUAL_REVIEW`로 자동 전환하는 기존 동작은 대상이 SQLite로 바뀌었을 뿐 유지.
+- `AlpacaBroker.submit_order()`가 live 모드 buy에 대해 자체적으로 CODEX-026/029 게이트를
+  실행하는 것이 신규 동작 — Paper 거래와 모든 청산은 완전히 영향받지 않음(테스트로 확인).
+
+### 운영 영향
+
+- 없음. 코드/테스트/문서 변경만 수행했으며 운영 파일(`order_history.csv`, `universe.csv`,
+  `strategy_performance.csv`)과 승인 상태(`approved`/`live_enabled`)는 변경하지 않았다.
+
+### 잔여 위험
+
+- `docs/autonomous/DECISION_LOG.md`의 이번 사이클 섹션에 기록된 6개 결정 참고. 특히 결정 1
+  (orders/fills 테이블은 여전히 canonical 대상 밖)과 결정 4(broker-level 게이트가
+  `_request()` 자체가 아니라 `submit_order()`에만 배선됨 — 동일 클래스의 다른 신규 메서드가
+  추가되면 재검토 필요)는 향후 Codex 재검증에서 특히 확인이 필요하다.
+
+---
+
 ## 2026-07-26 — Stage 3~10 통합 수정 사이클: CODEX-023~027 해결
 
 Codex 독립 검증(`CODEX_REVIEW.md`, 대상 범위 `415c129`~`64a5551`, overall verdict **FAIL**,

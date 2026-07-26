@@ -657,3 +657,109 @@ CODEX-025(HIGH), CODEX-026(HIGH), CODEX-027(MEDIUM). 처리 순서: CODEX-027 �
 - main 병합, origin push, 운영 배포, 실거래 활성화, `approved`/`live_enabled` 변경 없음.
 - 기존 리스크 한도(`risk_config.py`, `order_safety.py`)를 완화한 곳 없음 — 이번 사이클은 오직
   새로운 fail-closed 검증을 추가했을 뿐, 기존 한도값을 낮추거나 우회 경로를 넓힌 곳이 없다.
+
+## Stage 3~10 최종 재수정 사이클 — CODEX-024/026/028/029/030 (2026-07-26)
+
+Codex 통합 재검증(`CODEX_REVIEW.md`, 대상 커밋 `4de0714`/`e49753f`, overall verdict **FAIL**)이
+이전 사이클의 CODEX-024/026을 `PARTIALLY_RESOLVED`로, CODEX-023/025/027을 `RESOLVED`로 재확인하고,
+신규 HIGH 2건(CODEX-028, CODEX-029) + MEDIUM 1건(CODEX-030)을 제기했다. 이번 사이클은
+CODEX-024/026/028/029/030 5건만 수정하고, RESOLVED로 재확인된 CODEX-023/025/027은 회귀 테스트만
+재실행했다.
+
+### CODEX-030(MEDIUM, wall-clock 의존 테스트)
+
+- 재현: `positions/lifecycle.py::check_and_manage()`가 `now=None`이면 실제 `eastern_now()`(진짜
+  시스템 시각)를 쓰는데, `tests/test_position_lifecycle.py`의 여러 테스트가 `now`를 명시적으로
+  넘기지 않아 실제 미국 동부 장 마감 근처 시각에 실행되면 EOD 강제 청산 우선순위 규칙에 의해
+  target/stop/no-action 검증이 `EOD_FORCED_CLOSE`로 바뀌어 실패했다(4건).
+- 수정: `clock.py` 신설(`Clock`/`ProductionClock`/`FrozenClock`). `check_and_manage()`/
+  `check_invalidation()`이 `now`/`clock` 파라미터를 명시적으로 받고, naive datetime은 즉시
+  거부한다. 프로덕션 기본값(`clock.DEFAULT_CLOCK`)은 실제 시스템 시각으로 이전과 동일하게
+  동작 — 실제 버그는 테스트 쪽에 있었으므로, `tests/test_position_lifecycle.py`/
+  `tests/test_exit_reconciliation.py`의 모든 `check_and_manage()`/`check_invalidation()` 호출에
+  고정된 `MID_SESSION_NOW`(2026-07-15 11:00 ET, 평일·비휴장일·DST 적용 중)를 명시적으로 전달하도록
+  변경했다.
+- 신규 테스트: `tests/test_clock.py` 23건 — Clock 프로토콜 단위 테스트(ProductionClock/FrozenClock/
+  naive 거부) + 정규장/EOD 직전/EOD 정확히/EOD 이후/프리마켓/휴장일/DST 시작·종료/UTC-ET 날짜
+  경계/반복 실행 동일성/실제 시스템 시각 무관(poisoned `market_hours.eastern_now` 주입으로 증명)/
+  기존 실패 4건(target/stop/no-action) 고정 재현.
+- 처리 상태: RESOLVED
+- 구현 커밋: `f04a123`
+
+### CODEX-028(HIGH, SQLite/JSON commit 불일치) + CODEX-024 잔여분(단일 트랜잭션 아님)
+
+- 재현: `positions/lifecycle.py::_apply_exit_fill_progress()`가 SQLite `exit_intents`(즉시 커밋)와
+  JSON position(별도 파일 쓰기)을 서로 다른 시점에 커밋해, partial fill 4주 확정 후 JSON 쓰기만
+  실패하면 SQLite intent의 `confirmed_filled_qty`만 앞서가고, 이후 cumulative 10주 이벤트가 delta
+  6만 반영해 `state=CLOSED`인데 `remaining_qty=4`인 모순 상태가 영속화됐다.
+  - CODEX-024 잔여분: "SQLite intent와 JSON position은 단일 트랜잭션이 아니다."
+- 수정: `positions/store.py`를 재작성해 SQLite(`positions`/`position_events` 테이블, 이미 Stage 5
+  스키마에 존재했으나 미사용)를 유일한 canonical 저장소로 삼았다. `POSITION_STORE.json`은 SQLite
+  커밋 **이후에만** 쓰는 best-effort projection(`positions.projection_status` 컬럼으로 성공/실패
+  기록, `store.regenerate_projection()`으로 언제든 재생성 가능)이 됐다. `positions.store.
+  locked_position()`이 `conn` 파라미터를 받아 `positions/lifecycle.py`의 exit-intent
+  예약/재조정 호출과 **같은 SQLite 트랜잭션**을 공유하도록 재배선했고(`state_store/
+  exit_intent_ledger.py`의 각 mutation 함수에 `commit=False` 옵션 추가), 이로써 CODEX-024
+  잔여분도 함께 해소됐다. CODEX-025의 손상 감지 의미론은 SQLite 파일 대상으로 이식했다(JSON
+  projection 단독 손상은 더 이상 store corruption이 아님).
+- 신규/이관 테스트: `tests/test_position_store.py`(CODEX-025 테스트 SQLite 대상으로 전면 이식 +
+  SQLite-succeeds-JSON-fails/DB-commit-failure-rollback/projection-regenerate 등 CODEX-028
+  전용 신규), `tests/test_exit_reconciliation.py`에 partial4→cumulative10→remaining0/CLOSED/전체
+  PnL, delta 4/3/3 순차 반영, out-of-order regression 차단, JSON 손상 중 청산 흐름 무영향,
+  반복/동시 reconciliation 멱등성 추가.
+- 부수 발견: `tests/test_position_store.py`/`tests/test_ops_dashboard.py`가 `POSITION_STORE_FILE`만
+  격리하고 `STATE_STORE_DB_FILE`은 격리하지 않아, SQLite가 canonical이 된 이후 실제 저장소 루트
+  `TRADING_STATE.db`에 테스트 포지션을 쓰고 있었다 — 즉시 발견해 격리를 추가하고 생성된 stray
+  파일(gitignored, 커밋되지 않음)을 삭제했다.
+- 처리 상태: RESOLVED
+- 구현 커밋: `09b9237`
+
+### CODEX-029(HIGH, live context symbol과 실제 주문 symbol 불일치) + CODEX-026 잔여분(direct broker 우회)
+
+- 재현: `validate_and_size_live_entry(ctx)`가 `ctx.symbol`만 allow-list와 대조하고 실제
+  `submit_order(symbol)` 인자와 비교하지 않아, `ctx.symbol="AAPL"`로 승인받고 실제로는
+  `symbol="TSLA"`를 제출해도 통과했다.
+  - CODEX-026 잔여분: `AlpacaBroker.submit_order()`를 직접 호출하면 게이트를 전혀 거치지 않음.
+- 수정: `live_readiness/order_gateway.py::validate_and_size_live_entry(ctx, order_symbol)`에
+  `order_symbol` 필수 인자를 추가하고, `ctx.symbol`과의 완전 일치(대소문자/공백 정규화 없음)를
+  최우선으로 검사한다. `broker/alpaca_client.py::AlpacaBroker.submit_order()`가 동일 게이트를
+  자체적으로 실행하도록 배선해(`side="buy" AND is_live_mode`에만 적용, 범위는 CODEX-026과 동일)
+  direct broker 호출도 더 이상 우회할 수 없다. `paper_strategy_order.submit_order()`는 자체
+  게이트를 유지(방어 심층화 + AlpacaBroker가 아닌 테스트 더블 보호)하고 `live_entry_context`를
+  broker 호출로 전달하도록 갱신했다.
+- 신규 테스트: `tests/test_live_order_gateway.py`에 symbol 불일치/대소문자·공백 변형/빈 문자열/
+  None 차단, direct broker 호출(context 없음/allow-list 불일치/symbol 불일치/stale FX/유효
+  전량일치) 각각 세션 호출 0회 검증, 30,000원 정확한 경계 테스트 추가.
+- 부수 수정: 기존 안전 테스트(`test_broker_safety.py`, `test_paper_order_execution.py`)의
+  `broker.submit_order(side="buy")` 직접 호출부가 이제 broker-level 게이트를 통과해야 하므로
+  최소 유효 `LiveEntryContext`를 추가로 전달하도록 갱신 — 원래 검증하려던 "실거래는 항상 비활성화"
+  주장 자체는 변경 없음.
+- 처리 상태: RESOLVED
+- 구현 커밋: `b78e444`
+
+### 부수 발견: `_execute_exit()` 동시성 경쟁 조건 (finding 목록에 없었으나 발견 즉시 수정)
+
+- 전체 회귀 실행 중 1회, `test_concurrent_exit_attempts_submit_broker_sell_exactly_once`가
+  `InvalidTransitionError("CLOSED -> EXIT_SUBMITTED")`로 실패. lock 없이 읽는
+  `eil.get_active_intent()` 스냅샷이 실제 lock 획득 시점에는 이미 CLOSED로 해소된 경우를
+  처리하지 못하던 기존(CODEX-024 사이클부터 존재) 경쟁 조건.
+- 수정: lock 아래에서 다시 읽은 실제 상태만으로 전이 여부를 결정하도록 `positions/
+  lifecycle.py::_execute_exit()`의 `existing_intent` 분기를 재작성. 결정적 재현 테스트
+  (`test_stale_existing_intent_read_after_position_already_closed_does_not_raise`) 추가,
+  동시성 테스트 20회 반복 실행으로 안정성 확인.
+- 처리 상태: RESOLVED(CODEX-029 커밋 `b78e444`에 포함)
+
+### 검증 결과 (CODEX-024/026/028/029/030 전체)
+
+- 전체 회귀: `venv/bin/python -m pytest -q` / `venv/bin/pytest -q` / 상위 디렉터리에서
+  `python -m pytest us-stock-trading -q` 세 가지 실행 형태 모두 **973 passed, 0 failed,
+  2 warnings**(신규 안전 관련 warning 없음). 이전 사이클 종료 시점 923 passed 대비 50건 신규
+  (CODEX-030 24건 + CODEX-028 다수 + CODEX-029 다수 + 기존 CODEX-025 테스트 SQLite 이식분 포함).
+- 실제 Alpaca/Slack/Yahoo 호출 0회(모든 direct-broker 테스트가 `_NetworkForbiddenSession`으로
+  세션 호출 0회를 직접 검증). 실제 저장소 루트 `TRADING_STATE.db*`가 두 차례 전체 회귀 실행
+  전후 존재하지 않음을 확인.
+- `order_history.csv`/`universe.csv`/`strategy_performance.csv`는 이전 사이클 기록값과 동일(md5
+  재확인), `.env`·kill switch/notification 상태 파일 변경 없음.
+- `git diff --check`(`415c129^..HEAD`) 통과 — whitespace 오류 없음.
+- main 병합, origin push, 운영 배포, 실거래 활성화, `approved`/`live_enabled` 변경 없음.
+- 기존 리스크 한도(`risk_config.py`, `order_safety.py`)를 완화한 곳 없음.

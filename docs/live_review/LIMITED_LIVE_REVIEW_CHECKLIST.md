@@ -126,6 +126,28 @@ order_gateway.py`, `side="buy" AND is_live_mode`에만 적용).
 | `.env`, kill switch/notification 상태 파일 변경 여부 | 없음 | 이번 사이클에서 생성/수정하지 않음(단, `recover_on_restart()`가 store 손상 시 Kill Switch를 `MANUAL_REVIEW`로 자동 전환하는 신규 코드 경로 자체는 추가됨 — 실제 상태 파일이 사전에 변경된 것은 아님) |
 | 상세 | [FINAL_VALIDATION_PACKAGE.md](../autonomous/FINAL_VALIDATION_PACKAGE.md) | Codex 재검증 대기 중, 상태 `READY_FOR_FINAL_CODEX_REVALIDATION` |
 
+### 1.6 Stage 3~10 최종 재수정 사이클 — CODEX-024/026/028/029/030 후 재확인 (2026-07-26)
+
+Codex 통합 재검증(`CODEX_REVIEW.md`, 대상 커밋 `4de0714`/`e49753f`)이 overall verdict **FAIL**을
+내렸다: CODEX-023/025/027은 RESOLVED로 재확인됐으나 CODEX-024/026이 PARTIALLY_RESOLVED로 남았고
+신규 CODEX-028(HIGH, exit SQLite/JSON commit 순서가 fill 진행량을 유실), CODEX-029(HIGH, live
+context symbol과 실제 주문 symbol 불일치 허용), CODEX-030(MEDIUM, lifecycle 테스트가 wall-clock에
+의존)이 제기됐다. 이번 사이클(커밋 `f04a123`/`09b9237`/`b78e444`)에서 5건 모두 수정: Clock 주입
+(`clock.py`) + SQLite canonical 전환(`positions/store.py`, `positions`/`position_events`
+테이블) + exit intent와 동일 트랜잭션 공유(`state_store/exit_intent_ledger.py`의 `commit=False`)
++ symbol 동일성 검사(`live_readiness/order_gateway.py`) + broker-level 게이트 배선
+(`broker/alpaca_client.py::AlpacaBroker.submit_order()`).
+
+| 확인 항목 | 결과 | 근거 |
+|---|---|---|
+| `venv/bin/python -m pytest -q` / `venv/bin/pytest -q` / 상위 디렉터리 `python -m pytest us-stock-trading -q` | 세 형태 모두 exit code 0, **973 passed, 0 failed, 2 warnings** | 커밋 `b78e444` 기준 |
+| 신규 안전 관련 warning 여부 | 없음 | 2건 warning은 기존 urllib3 LibreSSL 경고와 의도된 scanner unknown-field 경고뿐 |
+| 운영 데이터 파일 변경 여부 (`order_history.csv`, `universe.csv`, `strategy_performance.csv`) | 변경 없음 | md5가 이전 사이클 기록값과 동일 |
+| 실제 저장소 루트 `TRADING_STATE.db*` | 존재하지 않음 | 두 차례 전체 회귀 실행 전후 확인(SQLite canonical 전환 직후 발견한 테스트 격리 누락 버그를 수정한 뒤) |
+| `git diff --check` | 통과 | whitespace 오류 없음 |
+| `.env`, kill switch/notification 상태 파일 변경 여부 | 없음 | 이번 사이클에서 생성/수정하지 않음 |
+| 상세 | [FINAL_VALIDATION_PACKAGE.md](../autonomous/FINAL_VALIDATION_PACKAGE.md) | Codex 재검증 대기 중, 상태 `READY_FOR_FINAL_CODEX_REVALIDATION` |
+
 ## 2. Broker 설정 (실측: `broker/broker_config.py`, `risk_config.py`)
 
 | 항목 | 값 | 근거 |
@@ -149,7 +171,7 @@ order_gateway.py`, `side="buy" AND is_live_mode`에만 적용).
 | 최대 동시 포지션 수 | `MAX_OPEN_POSITIONS = 5` | `risk_config.py:11` |
 | 최대 일일 주문 수 | `MAX_TRADES_PER_DAY = 3` | `risk_config.py:10` |
 | 계좌 총 익스포저 상한 | `MAX_TOTAL_EXPOSURE_RATE = 0.5` (계좌 자본의 50%) | `risk_config.py:15` |
-| 허용 종목 범위(심볼 allow-list) | `TBD(운영자 기입)` | `risk_config.py`, `account_risk.py`에는 여전히 없으나, `live_readiness/allowlist.py::is_symbol_allowed()`(CODEX-026, 2026-07-26, 커밋 `f482e90`)가 live 진입 경계에서 fail-closed로 실제 강제한다(빈 목록은 전부 차단). 남은 것은 실제 종목 목록의 기입뿐 |
+| 허용 종목 범위(심볼 allow-list) | `TBD(운영자 기입)` | `risk_config.py`, `account_risk.py`에는 여전히 없으나, `live_readiness/allowlist.py::is_symbol_allowed()`(CODEX-026, 2026-07-26, 커밋 `f482e90`)가 live 진입 경계에서 fail-closed로 실제 강제한다(빈 목록은 전부 차단). **갱신(2026-07-26, CODEX-029, 커밋 `b78e444`)**: allow-list와 대조되는 `ctx.symbol`이 실제 제출 symbol과 완전히 일치하는지도 이제 별도로 강제되며(대소문자/공백 변형도 차단), 이 게이트는 `AlpacaBroker.submit_order()` 자체에도 배선되어 direct 호출도 우회할 수 없다. 남은 것은 실제 종목 목록의 기입뿐 |
 | 허용 거래 시간대 | `TBD(운영자 기입)` | `risk_config.py`에 거래 시간 창(time window) 설정 없음 |
 
 ## 4. Kill Switch 상태 (실측)

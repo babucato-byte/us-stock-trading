@@ -12,8 +12,14 @@
 `paper_strategy_order.submit_order()`의 **`side="buy" AND broker.config.is_live_mode`인 경우에
 한해** 실제로 강제되도록 배선됐다(커밋 `f482e90`). Paper 거래와 모든 청산 주문은 이 게이트의
 영향을 받지 않는다 — 근거는 `docs/autonomous/DECISION_LOG.md`의 CODEX-023~027 섹션 결정 3.
-`paper_strategy_order.submit_order()`를 우회하는 direct broker 호출은 여전히 이 게이트의 보호를
-받지 못한다(같은 결정 로그의 결정 4, `NEEDS_USER_DECISION`으로 유지).
+**추가 갱신(2026-07-26, CODEX-029)**: `paper_strategy_order.submit_order()`를 우회하는 direct
+broker 호출이 이 게이트의 보호를 받지 못한다는 위 잔여 위험은 해소됐다 — `broker/
+alpaca_client.py::AlpacaBroker.submit_order()` 자체가 동일한 게이트(allow-list/예산/FX/symbol
+동일성)를 실행하도록 배선되어(커밋 `b78e444`), `AlpacaBroker` 인스턴스에 대한 direct 호출도 더
+이상 우회할 수 없다. 같은 사이클에서 `LiveEntryContext.symbol`과 실제 제출 symbol이 반드시
+일치해야 한다는 검사도 추가됐다(CODEX-029) — 승인된 context로 다른 symbol을 제출하는 경로를
+차단한다. 남은 잔여 범위는 `docs/autonomous/DECISION_LOG.md`의 CODEX-024/026/028/029/030
+섹션 결정 4 참고(동일 클래스의 향후 신규 메서드는 이 게이트를 자동으로 상속받지 않음).
 
 ## 1. 마이크로 주문 수량 계산
 

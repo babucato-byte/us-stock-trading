@@ -3,14 +3,15 @@
 마지막 갱신: 2026-07-26
 
 ## 현재 Phase
-**Stage 3~10 통합 수정 사이클 — CODEX-023~027 전부 RESOLVED (2026-07-26).** Codex 독립 검증
-(대상 범위 `415c129`~`64a5551`, overall verdict `FAIL`, Stage 3~10 판정 `KEEP_IN_PROGRESS`)이
-제기한 HIGH 4건(CODEX-023 accepted≠filled, CODEX-024 durable exit intent, CODEX-025 fail-closed
-store 복구, CODEX-026 30,000원/allow-list 실배선) + MEDIUM 1건(CODEX-027 fill 검증)을 전부
-로컬 브랜치에서 수정·테스트했다(커밋 `0f60ec9`/`c5c56c4`/`ee6dae2`/`f482e90`). 전체 회귀
-**923 passed, 0 failed**(착수 전 820에서 103건 신규). `approved: false`, `live_enabled: false`
-유지, **Live trading: DO_NOT_ENABLE**. 다음 작업은 새 `FINAL_VALIDATION_PACKAGE.md`(새 SHA-256
-포함) 작성 후 상태를 `READY_FOR_FINAL_CODEX_REVALIDATION`으로 종료하는 것. Stage 10 —
+**Stage 3~10 최종 재수정 사이클 — CODEX-024/026/028/029/030 전부 RESOLVED (2026-07-26).** Codex
+통합 재검증(대상 커밋 `4de0714`/`e49753f`, overall verdict `FAIL`)이 CODEX-023/025/027을
+`RESOLVED`로 재확인하고, CODEX-024/026을 `PARTIALLY_RESOLVED`로, 신규 CODEX-028(HIGH,
+SQLite/JSON commit 불일치)·CODEX-029(HIGH, live context symbol과 실제 주문 symbol 불일치)·
+CODEX-030(MEDIUM, wall-clock 의존 테스트)을 제기했다. 5건 전부 로컬 브랜치에서 수정·테스트했다
+(커밋 `f04a123`/`09b9237`/`b78e444`). 전체 회귀 **973 passed, 0 failed**(직전 923에서 50건
+신규). `approved: false`, `live_enabled: false` 유지, **Live trading: DO_NOT_ENABLE**. 다음
+작업은 새 `FINAL_VALIDATION_PACKAGE.md`(새 SHA-256 포함) 작성 후 상태를
+`READY_FOR_FINAL_CODEX_REVALIDATION`으로 종료하는 것. Stage 10 —
 30,000원 제한 실거래 준비(`live_readiness/` + 플레이북 문서) `IMPLEMENTED`(문서화·계산 모듈,
 실거래 준비 완료 아님), 변경 없음. Stage 9 —
 운영 관제(Dashboard/CLI, `ops_dashboard/`) `IMPLEMENTED`, 변경 없음. Stage 8 — 전략 선택 엔진
@@ -63,6 +64,43 @@ SQLite 의존성이 격리되지 않았던 실제 버그를 발견·수정한 �
 잔여 범위: `paper_strategy_order.submit_order()`를 우회한 direct broker 호출은 CODEX-026 게이트의
 보호를 받지 않음(현재 이 저장소에 그런 경로 없음을 확인, 향후 유지보수 시 재확인 필요). 첫 오류
 시 `ENTRY_DISABLED` 자동 배선은 여전히 미구현(Stage 10에서 이미 `NEEDS_USER_DECISION`으로 기록).
+
+## Stage 3~10 최종 재수정 사이클 — CODEX-024/026/028/029/030 (2026-07-26)
+Codex 통합 재검증(`CODEX_REVIEW.md`, 대상 커밋 `4de0714`/`e49753f`, overall verdict `FAIL`)이
+제기한 5건을 전부 로컬 브랜치에서 수정. 상세는 `docs/autonomous/REMEDIATION_PLAN.md`/
+`VALIDATION_REPORT.md`의 동일 날짜 섹션, ASSUMPTION·범위 결정은 `DECISION_LOG.md` 참고.
+
+- **CODEX-030**(MEDIUM): `clock.py` 신설(Clock/ProductionClock/FrozenClock).
+  `check_and_manage()`/`check_invalidation()`이 명시적 timezone-aware `now`/`clock`을 받도록
+  변경(naive datetime 거부). 실제 결함은 테스트가 `now`를 전달하지 않아 실행 시각(특히 EOD 근처)에
+  결과가 좌우된 것 — 관련 테스트 전부에 고정 시각(`MID_SESSION_NOW`)을 전달하도록 수정.
+- **CODEX-028**(HIGH) + CODEX-024 잔여분: `positions/store.py`를 SQLite(`positions`/
+  `position_events`) canonical로 재작성, `POSITION_STORE.json`은 커밋 후에만 쓰는 재생성 가능한
+  projection(`projection_status` 컬럼)으로 재정의. `locked_position(conn=...)`이 exit intent
+  커밋과 동일 SQLite 트랜잭션을 공유하도록 배선 — CODEX-028의 "SQLite가 JSON보다 먼저 커밋되어
+  fill 반영이 유실"되는 재현을 닫았고, CODEX-024가 인정했던 "단일 트랜잭션 아님" 잔여 위험도
+  함께 해소됐다. CODEX-025의 손상 감지도 SQLite 파일 대상으로 이식(JSON 단독 손상은 더 이상
+  store 손상이 아님).
+- **CODEX-029**(HIGH) + CODEX-026 잔여분: `live_readiness/order_gateway.py::
+  validate_and_size_live_entry(ctx, order_symbol)`에 `ctx.symbol`과 실제 주문 symbol의 완전 일치
+  검사(대소문자/공백 정규화 없음) 추가. `broker/alpaca_client.py::AlpacaBroker.submit_order()`
+  자체에 동일 게이트를 배선해 direct broker 호출도 더 이상 우회 불가.
+- 부수 발견: `_execute_exit()`의 lock-없는 읽기로 인한 드문 경쟁 조건(`CLOSED -> EXIT_SUBMITTED`
+  불법 전이) 1건 발견 즉시 수정. `tests/test_position_store.py`/`tests/test_ops_dashboard.py`의
+  `STATE_STORE_DB_FILE` 격리 누락(실제 저장소 루트 DB에 쓰던 문제) 발견 즉시 수정.
+
+전체 회귀: **973 passed, 0 failed**(직전 923에서 50건 신규). 세 가지 실행 형태(`venv/bin/python
+-m pytest -q`/`venv/bin/pytest -q`/상위 디렉터리에서 `python -m pytest us-stock-trading -q`)
+모두 동일 결과. 실제 네트워크 호출 0회, 운영 CSV 변경 0건, 실제 저장소 루트 `TRADING_STATE.db*`
+미생성 재확인, `git diff --check` 통과. `approved`/`live_enabled`/`main`/`origin` 변경 없음.
+기존 리스크 한도 완화 없음.
+
+커밋: `f04a123`(CODEX-030), `09b9237`(CODEX-028/024), `b78e444`(CODEX-029/026 + 경쟁 조건 수정),
+`aee663c`(Codex 재검증 원문 기록).
+
+잔여 범위: `AlpacaBroker.submit_order()`가 아닌 동일 클래스의 향후 신규 메서드는 이번 게이트를
+자동으로 상속받지 않음(향후 유지보수 시 재확인 필요). 첫 오류 시 `ENTRY_DISABLED` 자동 배선은
+여전히 미구현(Stage 10에서 이미 `NEEDS_USER_DECISION`으로 기록).
 
 ## Stage 10 — 30,000원 제한 실거래 준비 (2026-07-26)
 `live_readiness/`(`sizing.py`/`allowlist.py`) + `docs/live_review/LIMITED_LIVE_30K_KRW_PLAYBOOK.md`.
@@ -466,18 +504,19 @@ binary kill switch(`kill_switch.is_trading_halted()`)와 다단계 kill switch
 - 전체 회귀 267 passed(레포 루트 `pytest -q`/`python -m pytest -q` 동일), 실제 외부 API 호출 0회, `order_history.csv` 해시 불변, 운영 파일 변경 없음 확인.
 
 ## 현재 테스트 수
-923 passed, 0 failed (CODEX-023~027 수정 사이클 신규 103건 포함: CODEX-027 fill_validation 18건 +
-position_lifecycle 6건, CODEX-025 position_store 14건 + position_lifecycle 4건, CODEX-023/024
-exit_reconciliation 20건 + exit_intent_ledger 13건 + state_store 3건, CODEX-026
-live_order_gateway 25건. Stage 3~10 자체는 820 passed 기준 완료)
+973 passed, 0 failed (CODEX-024/026/028/029/030 최종 재수정 사이클 신규 약 50건 포함:
+CODEX-030 test_clock.py 23건, CODEX-028 test_position_store.py 이식+신규 다수 +
+test_exit_reconciliation.py CODEX-028 전용 신규, CODEX-029 test_live_order_gateway.py 신규
+다수 + 경쟁 조건 재현 테스트 1건. 직전 CODEX-023~027 사이클은 923 passed 기준 완료)
 
 ## 실패 테스트
 없음
 
 ## 현재 블로커
 없음 (코드 수준). CODEX-016~022는 이전 사이클에서 Codex 최종 독립 재검증까지 `PASS_WITH_CONDITIONS`로
-종결됨. CODEX-023~027도 이번 사이클에서 전부 RESOLVED로 로컬 수정·테스트 완료됨 — **유일한
-블로커는 아직 이번 수정에 대한 Codex 통합 재검증을 요청/수행하지 않았다는 것뿐**.
+종결됨. CODEX-023~027은 재검증에서 RESOLVED로 재확인됐고, CODEX-024/026/028/029/030도 이번
+사이클에서 전부 RESOLVED로 로컬 수정·테스트 완료됨 — **유일한 블로커는 아직 이번 수정에 대한
+Codex 통합 재검증을 요청/수행하지 않았다는 것뿐**.
 `approved: false`, `live_enabled: false` 유지. **Limited live review: BLOCKED**(신규 수정이
 아직 Codex 검증을 거치지 않았으므로), **Live trading: DO_NOT_ENABLE**.
 
@@ -485,13 +524,20 @@ live_order_gateway 25건. Stage 3~10 자체는 820 passed 기준 완료)
 1. **새 `FINAL_VALIDATION_PACKAGE.md` 작성**(새 SHA-256 포함) 후 상태를
    `READY_FOR_FINAL_CODEX_REVALIDATION`으로 종료.
 2. **Codex 통합 재검증 요청** — 결과(`PASS`/`PASS_WITH_CONDITIONS`/`FAIL`)에 따라 후속 조치:
-   - `PASS`/`PASS_WITH_CONDITIONS`: `CODEX_REVIEW.md`에 기록하고, 남은 잔여 범위(direct broker
-     호출 우회 미차단, `ENTRY_DISABLED` 자동 배선 미구현)에 대한 후속 조치 여부를 사용자와 논의.
+   - `PASS`/`PASS_WITH_CONDITIONS`: `CODEX_REVIEW.md`에 기록하고, 남은 잔여 범위(`AlpacaBroker`의
+     향후 신규 메서드가 게이트를 자동 상속받지 않는 점, `ENTRY_DISABLED` 자동 배선 미구현)에 대한
+     후속 조치 여부를 사용자와 논의.
    - `FAIL`: 지적된 CRITICAL/HIGH를 동일한 패턴으로 수정 후 재검증.
 3. 어떤 결과든 `approved`/`live_enabled`/`main`/`origin`/실거래 활성화는 사용자의 명시적 승인
    없이는 건드리지 않는다.
 
 ## 최근 커밋
+- `b78e444` Enforce symbol-identity lock and close direct-broker bypass (CODEX-029/026)
+- `09b9237` Make SQLite canonical for position/exit-intent state (CODEX-028/024)
+- `aee663c` Record Codex independent review: FAIL, CODEX-024/026 PARTIALLY_RESOLVED, CODEX-028/029 HIGH, CODEX-030 MEDIUM
+- `f04a123` Inject deterministic clock into lifecycle checks (CODEX-030)
+- `e49753f` Regenerate FINAL_VALIDATION_PACKAGE for CODEX-023~027 cycle
+- `4de0714` Update governance docs for CODEX-023~027 remediation cycle
 - `f482e90` Enforce 30000 KRW budget and allow-list at the order boundary (CODEX-026)
 - `ee6dae2` Separate order acceptance from fills and add durable exit intents (CODEX-023/024)
 - `c5c56c4` Fail closed on corrupted position store (CODEX-025)
