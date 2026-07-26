@@ -1,10 +1,10 @@
 # CODEX_REVIEW
 
-Review target: Stage 3~10 최종 수정분 독립 재검증
+Review target: Stage 3~10 final remediation independent revalidation
 
-Commits: `f04a123`, `aee663c`, `09b9237`, `b78e444`, `fe3e9b7`
+Commits: `07548d1`, `55f3806`, `8a3be50`, `9c43862`, `45cf8f9`
 
-Validation package SHA-256: `1dc78103ffa64757308136ae09292428698713788fca9628ded8bc1f82d82712`
+Validation package SHA-256: `a5ba04d79af3b73a145775f7fb6146a86a0b9cc1fe32f4818a97741beb8bf764`
 
 Date: 2026-07-26
 
@@ -16,39 +16,48 @@ Limited live review: **BLOCKED**
 
 Live trading: **DO_NOT_ENABLE**
 
-Clock 주입, accepted-vs-filled, timeout 중복 sell 차단, symbol identity 및 direct `AlpacaBroker.submit_order()` 게이트, partial-fill/JSON projection 장애의 SQLite canonical 처리는 재현됐다. 전체 973개 테스트도 네 실행 형태에서 모두 통과했다. 그러나 30,000원 상한과 일일·동시·pending 위험 수치는 신뢰할 수 없는 caller context가 직접 정하며 authoritative 저장소에서 산출되지 않는다. 실제로 300만원 context가 2,997,000원 주문을 승인했다. 또한 broker 명시적 rejection에서는 exit intent를 `ABORTED`로 먼저 commit한 뒤 position을 별도 commit하여 두 번째 write 실패 시 `EXIT_SUBMITTED` position과 terminal intent가 영구 불일치한다. 신규 HIGH Finding 2건이므로 진행할 수 없다.
+CODEX-032의 rejected-exit 원자성, CODEX-031의 durable reservation 및 trusted 30,000원 상한,
+CODEX-033의 governance 상태 정정은 코드와 fault-injection 테스트에서 확인됐다. 전체 986개
+테스트도 네 실행 형태에서 모두 통과했다. 그러나 live entry의 broker 응답이 유실되면
+`AlpacaBroker.submit_order()`가 broker 수신 여부를 확인할 수 없는 상태에서도 reservation을
+즉시 `RELEASED`한다. 동일 entry 재시도가 허용되어 broker call 2회, 잠재 노출 54,000원,
+authoritative snapshot 27,000원으로 직접 재현됐다. 이는 현재 최종 주문 경계에서 중복 주문과
+30K 한도 우회를 일으키는 신규 HIGH Finding이므로 진행할 수 없다.
 
 ## Finding summary
 
 | Finding | Status |
 |---|---|
-| CODEX-024 | PARTIALLY_RESOLVED |
+| CODEX-024 | RESOLVED |
 | CODEX-026 | PARTIALLY_RESOLVED |
-| CODEX-028 | PARTIALLY_RESOLVED |
+| CODEX-028 | RESOLVED |
 | CODEX-029 | RESOLVED |
 | CODEX-030 | RESOLVED |
-| CODEX-031 HIGH — 30K·count·pending limits가 caller assertion에 의존 | UNRESOLVED |
-| CODEX-032 HIGH — rejection 시 ABORTED intent와 position commit 분리 | UNRESOLVED |
-| CODEX-033 MEDIUM — limited-live checklist가 최신 FAIL과 모순 | UNRESOLVED |
+| CODEX-031 | PARTIALLY_RESOLVED |
+| CODEX-032 | RESOLVED |
+| CODEX-033 | RESOLVED |
+| CODEX-034 HIGH — broker 응답 유실 시 live-entry reservation 해제로 중복 주문·30K 우회 | UNRESOLVED |
 
 ## Finding verification
 
 ### [CODEX-024]
 
-Status: **PARTIALLY_RESOLVED**
+Status: **RESOLVED**
 
 Evidence:
 
-- fresh exit는 broker 호출 전 `exit_intents.RESERVED`와 position의 `EXIT_SUBMITTED`/`PARTIAL_EXIT_SUBMITTED`를 같은 SQLite transaction으로 commit한다.
-- timeout 후 재시도는 기존 client order ID를 조회하며 sell을 다시 제출하지 않는다.
-- stop/target 동시 실행과 concurrent exit 테스트에서 active intent 및 broker sell은 한 건이었다.
-- restart recovery는 pending intent의 client order ID로 broker를 조회한다.
-- accepted/new는 remaining quantity와 PnL을 변경하지 않는다.
+- exit intent는 broker 호출 전에 position의 `EXIT_SUBMITTED` 전이와 같은 SQLite transaction으로 저장된다.
+- timeout/unknown submission 후 재시도는 동일 client order ID로 broker를 조회하며 sell을 다시 제출하지 않는다.
+- concurrent stop/target/time/EOD 경로는 active exit intent와 broker sell을 한 건으로 제한한다.
+- accepted/new 상태는 fill로 분류되지 않아 `remaining_qty`와 PnL을 변경하지 않는다.
+- explicit rejection은 이제 `mark_aborted(commit=False)`와 position `MANUAL_REVIEW` 전이를
+  `store.locked_position(conn=conn)`의 한 transaction에서 commit한다.
+- position event write와 `mark_aborted()` 각각의 실패 주입에서 양쪽 상태가 함께 rollback되고,
+  active intent가 남아 reconciliation 가능함을 집중 테스트로 확인했다.
 
 Remaining risk:
 
-- broker 명시적 rejection 경로는 `eil.mark_aborted()`를 독립 commit한 뒤 position을 별도 `locked_position()` transaction에서 `MANUAL_REVIEW`로 바꾼다.
-- 두 번째 transaction 실패 시 terminal intent만 남고 position은 `EXIT_SUBMITTED`에 고정된다(CODEX-032).
+- entry-side response-loss reconciliation은 exit-intent와 별개이며 신규 CODEX-034로 기록한다.
 
 ### [CODEX-026]
 
@@ -56,34 +65,38 @@ Status: **PARTIALLY_RESOLVED**
 
 Evidence:
 
-- wrapper와 direct Alpaca broker live-buy 경계 모두 context 누락, allow-list 위반, symbol mismatch, stale/missing FX 및 context가 보고한 count/limit 위반을 HTTP 전에 차단한다.
-- gateway가 산출한 qty로 caller qty를 대체한다.
-- paper order와 liquidation은 live entry gate에 막히지 않는다.
+- trusted code constant `PILOT_TOTAL_BUDGET_KRW=30_000`, 주문별 cap, 일일 entry 2건,
+  동시 position 1건을 gateway가 caller 제공 상한과 `min()`으로 결합한다.
+- caller가 3,000,000원을 선언해도 sizing은 30,000원 이하로 제한된다.
+- durable SQLite reservation의 RESERVED/COMMITTED 상태는 budget과 concurrent position 계산에 포함된다.
+- missing/stale FX, allow-list 외 symbol, fractional 미지원 및 context/order symbol mismatch는
+  broker session 호출 전에 차단된다.
+- `AlpacaBroker.submit_order()` 직접 호출도 동일 live-buy gate를 통과해야 한다.
 
 Remaining risk:
 
-- 30,000원 ceiling, available cash, 일일 entry count, open position count, pending/reserved exposure가 authoritative 저장소에서 계산되지 않는다.
-- production code에는 `LiveEntryContext` 생성기나 durable-state snapshot builder가 없고 모든 값은 주문 caller가 제공한다.
-- pending/reserved 주문을 합산하는 코드와 테스트도 없다.
-- `max_order_notional_krw` 자체에 30,000원 절대 상한이 없다(CODEX-031).
+- broker timeout/응답 유실을 definitive rejection과 구분하지 않고 reservation을 `RELEASED`한다.
+  실제 broker가 주문을 수신했을 수 있는데 budget과 position count에서 제외되어 재시도 주문을 허용한다.
+- 따라서 30K 및 pending/reserved 강제는 success/rejection 정상 경로에는 적용되지만 unknown-submission
+  경로에는 fail-closed가 아니다(CODEX-034).
 
 ### [CODEX-028]
 
-Status: **PARTIALLY_RESOLVED**
+Status: **RESOLVED**
 
 Evidence:
 
-- `positions`, `position_events`, `exit_intents`가 동일 SQLite DB에 있으며 JSON은 projection으로만 사용된다.
-- partial fill 4 → JSON projection 실패 → cumulative fill 10 회귀는 `CLOSED`, `remaining_qty=0`, 10주 전체 PnL로 통과한다.
-- position + position events + exit fill progress는 shared connection 및 `commit=False`를 사용해 한 transaction으로 commit한다.
-- DB commit failure는 position/event mutation을 rollback하고 JSON failure는 canonical SQLite를 변경하지 않는다.
-- repeated/out-of-order reconciliation 회귀가 통과한다.
+- SQLite `positions`, `position_events`, `exit_intents`가 position/fill/exit-intent의 canonical source다.
+- JSON projection failure는 canonical transaction의 성공/실패 판정에 영향을 주지 않는다.
+- partial fill 4 → JSON projection failure → cumulative fill 10 회귀는 `CLOSED`,
+  `remaining_qty=0`, 전체 10주 기준 PnL로 통과한다.
+- position, events, fill progress 및 rejected-exit abort 전이의 failure injection은 transaction 전체를 rollback한다.
+- repeated/out-of-order reconciliation은 멱등적으로 처리된다.
 
 Remaining risk:
 
-- “exit intent와 position이 항상 동일 transaction”이라는 주장은 rejection/abort 경로에는 적용되지 않는다.
-- terminal `ABORTED`가 position보다 먼저 commit되는 실제 inconsistency가 CODEX-032로 재현됐다.
-- entry `orders`/`fills` 테이블은 여전히 canonical flow에 연결되지 않았으며 CSV/ledger와 SQLite 사이 단일 transaction이 없다. 이번 직접 재현은 exit rejection이므로 단순 미래 위험으로만 볼 수 없다.
+- entry orders/fills가 canonical position transaction과 완전히 통합되지 않은 구조는 CODEX-034의
+  unknown entry 상태에서 실제 결함으로 이어지므로 그 Finding에서 HIGH로 평가한다.
 
 ### [CODEX-029]
 
@@ -91,14 +104,15 @@ Status: **RESOLVED**
 
 Evidence:
 
-- `validate_and_size_live_entry(ctx, order_symbol)`이 context symbol과 실제 order symbol의 byte-exact 일치를 요구한다.
-- AAPL context + TSLA order, 대소문자·공백 변형, 빈/None symbol은 wrapper와 direct broker 양쪽에서 차단된다.
-- `AlpacaBroker.submit_order()` 자체가 live buy gateway를 실행하므로 wrapper 우회에서도 session 호출은 0회다.
-- broker가 구성하는 final payload symbol은 검증에 사용된 동일 `symbol` 인자에서 파생된다.
+- context, strategy, sizing, reservation 및 payload symbol의 byte-exact 일치가 요구된다.
+- context=AAPL, order/payload=TSLA와 case/whitespace mutation은 HTTP 호출 0회로 차단된다.
+- direct `AlpacaBroker.submit_order()`도 allow-list, symbol, 30K context 없이 session에 도달하지 않는다.
+- 현재 live order network method는 `submit_order()` 하나이며 final payload는 검증된 동일 symbol에서 구성된다.
 
 Remaining risk:
 
-- 향후 별도 주문 제출 메서드가 추가되면 자동으로 이 gate를 상속하지 않는다. 현재 코드에 다른 live order network method가 없어 미래 확장 위험은 LOW 조건으로 기록한다.
+- 향후 별도 주문 method가 추가되면 gate 적용을 보장하는 구조적 interface가 없다. 현재 우회 method가
+  존재하지 않으므로 LOW future-maintenance risk다.
 
 ### [CODEX-030]
 
@@ -106,83 +120,95 @@ Status: **RESOLVED**
 
 Evidence:
 
-- `check_and_manage()`와 `check_invalidation()`은 timezone-aware `now` 또는 injected Clock을 사용하며 naive datetime을 거부한다.
-- `FrozenClock` 테스트가 정규장, EOD 직전/정확한 cutoff/이후, premarket, DST spring/fall 및 UTC/ET 날짜 경계를 고정 입력으로 재현한다.
-- 이전 wall-clock 의존 lifecycle 테스트는 고정된 mid-session 시각을 전달한다.
-- 실제 장 마감 이후 실행한 이번 전체 suite에서도 이전 4개 EOD 오염 실패가 재발하지 않았다.
+- lifecycle/EOD decision은 timezone-aware `now` 또는 injected Clock을 사용하고 naive datetime을 거부한다.
+- FrozenClock 회귀가 장중, EOD 전후, premarket, DST spring/fall 및 UTC/ET 날짜 경계를 고정 입력으로 재현한다.
+- 서로 다른 실제 시각에 수행한 네 전체 suite가 동일한 986 결과를 냈다.
+
+Remaining risk: 없음.
+
+### [CODEX-031]
+
+Status: **PARTIALLY_RESOLVED**
+
+Evidence:
+
+- `live_entry_reservations` SQLite ledger가 snapshot-read와 reserve를 process lock 아래 원자화한다.
+- caller가 risk limit/count를 늘려도 trusted 30K/1 position/2 daily entry ceiling을 넘길 수 없다.
+- concurrent reservation 테스트에서 한 entry만 승인되고 다른 entry는 차단된다.
+- released attempt도 당일 entry count에는 포함되고, RESERVED/COMMITTED notional은 budget에 포함된다.
+
+Remaining risk:
+
+- unknown submission에서 reservation을 해제하므로 durable ledger가 실제 broker exposure를 과소계상한다.
+- reservation schema에는 broker reconciliation에 필요한 `client_order_id`/broker order identity가 없으며
+  restart reconciliation 경로도 없다(CODEX-034).
+
+### [CODEX-032]
+
+Status: **RESOLVED**
+
+Evidence:
+
+- broker 422 rejection에서 exit intent `ABORTED`와 position `MANUAL_REVIEW`가 한 transaction으로 commit된다.
+- position-event insert 실패 시 position은 `EXIT_SUBMITTED`, intent는 non-terminal active 상태로 함께 rollback된다.
+- `mark_aborted()` 실패 시 position 전이도 commit되지 않는다.
+- 실패 후 `check_and_manage()`/restart reconciliation은 sell을 재제출하지 않고 reconciliation-required로 유지한다.
+
+Remaining risk: 없음.
+
+### [CODEX-033]
+
+Status: **RESOLVED**
+
+Evidence:
+
+- `docs/live_review/LIMITED_LIVE_REVIEW_CHECKLIST.md` 최종 상태가 `BLOCKED`로 수정됐다.
+- `FINAL_VALIDATION_PACKAGE.md`, `CURRENT_STATUS.md`의 재검증 대기 상태와 일치한다.
+- 과거 CODEX-016~022 판정이 현재 readiness 근거가 아님을 명시한다.
+
+Remaining risk: 없음.
 
 ## New findings
 
-### [CODEX-031] HIGH — “30,000원 제한”과 count/exposure가 caller가 선언한 값에 불과함
+### [CODEX-034] HIGH — broker 응답 유실 시 live-entry reservation을 해제해 중복 주문과 30K 우회 허용
 
 Status: **UNRESOLVED**
 
 Evidence:
 
-- `LiveEntryContext.max_order_notional_krw`, `available_cash_krw`, `max_daily_loss_krw`, `max_position_count`, `current_open_position_count`, `max_daily_entries`, `today_entry_count`는 모두 caller 입력이다.
-- gateway 또는 broker boundary가 이를 order history, positions, active order intents, broker account/open orders에서 재계산하지 않는다.
-- pending/reserved entry notional을 일일/총예산에 포함하는 구현이 없다.
-- 코드에 immutable `PILOT_TOTAL_BUDGET_KRW = 30_000` 또는 동등한 absolute ceiling이 없다.
+- `broker/alpaca_client.py::AlpacaBroker.submit_order()`는 `_request()`의 모든 exception에서
+  `_release_live_entry_reservation()`을 호출한다.
+- timeout/connection reset은 broker가 주문을 받지 않았다는 definitive rejection이 아니다.
+- `entry_reservation_ledger`는 `RESERVED`, `COMMITTED`, `RELEASED`만 가지며 submission-unknown 상태,
+  `client_order_id`, broker order ID 또는 reconciliation API 연결이 없다.
+- 코드 주석과 validation package도 response-loss 후 실제 exposure under-count 가능성을 명시하지만,
+  이를 scope residual로 분류했다.
 
 Direct reproduction:
 
-- context의 `available_cash_krw`, `max_order_notional_krw`, `max_daily_loss_krw`를 각각 3,000,000원으로 설정하고 AAPL $10, FX 1,350을 전달했다.
-- gateway는 qty 222, notional **2,997,000원**을 승인했다.
+1. isolated SQLite/kill-switch 파일과 recording session을 사용하고 실제 network는 사용하지 않았다.
+2. AAPL 27,000원 live entry의 첫 session call이 “broker accepted, response lost” timeout을 반환하도록 했다.
+3. 첫 결과는 `TimeoutError`; reservation은 즉시 `RELEASED`.
+4. 동일 조건으로 두 번째 entry를 재시도하자 status 200, session call 총 2회.
+5. ledger 최종 상태는 첫 27,000원 `RELEASED`, 둘째 27,000원 `COMMITTED`;
+   authoritative snapshot은 27,000원/1 position만 인식했다.
+6. 실제 broker가 첫 주문을 수신한 가정에서는 잠재 주문·노출은 2건/54,000원이다.
 
 Impact:
 
-- wrapper/direct broker 게이트가 존재해도 동일 caller가 context limit과 counters를 높이거나 0으로 보고해 30K, 일일 진입, 동시 position 및 pending budget 제한을 우회할 수 있다.
-- 테스트의 “30,001원 차단”은 context ceiling을 30,000원으로 이미 신뢰한 상태에서 한 주 가격이 예산을 넘는 경우만 검증한다.
+- response-loss 및 process exception 후 동일 entry가 중복 제출될 수 있다.
+- 30,000원 pilot total budget과 동시 position 한도가 실제 broker exposure에 대해 fail-open 된다.
+- 이는 미래 order method 확장 위험이 아니라 현재 `AlpacaBroker.submit_order()`의 live entry exception 경로다.
 
 Required behavior:
 
-- 30K pilot absolute total ceiling은 caller가 올릴 수 없는 trusted config/approval record에 고정한다.
-- 최종 broker boundary가 durable order reservations, pending/open orders, filled positions 및 당일 entry history에서 사용·예약 금액과 count를 lock-protected snapshot으로 계산한다.
-- caller context는 시장 입력(FX/price 등)만 제공하고 risk limits/counters의 권위 있는 출처가 되어서는 안 된다.
-- concurrent entry 두 건이 각각 사전 검사를 통과해 합계 한도를 넘지 못하도록 reservation과 검증을 원자화한다.
-
-### [CODEX-032] HIGH — rejected exit의 intent와 position이 원자적으로 갱신되지 않음
-
-Status: **UNRESOLVED**
-
-Evidence:
-
-- `_execute_exit()`의 non-200/201 경로는 `eil.mark_aborted(conn, intent_id)`를 default `commit=True`로 먼저 실행한다.
-- 이후 별도 `store.locked_position(conn=conn)`에서 position을 `MANUAL_REVIEW`로 바꾼다.
-
-Fault-injection reproduction:
-
-1. stop-loss exit intent와 `EXIT_SUBMITTED` position을 정상 예약.
-2. broker가 HTTP 422 rejected를 반환.
-3. intent `ABORTED` commit 이후 position row write만 실패시킴.
-4. 결과: position `EXIT_SUBMITTED`, exit intent `ABORTED`, active intent 없음.
-5. `recover_on_restart()` 결과 status는 `OK`; position은 계속 `EXIT_SUBMITTED`이고 reconciliation 대상 intent는 없다.
-
-Impact:
-
-- 실제 포지션은 청산되지 않았는데 로컬 상태가 영구 submitted에 머물며 자동 재청산과 reconciliation이 모두 중단된다.
-- stop/EOD/time exit가 실패한 실제 open position을 관리하지 못하는 HIGH 안전 문제다.
-
-Required behavior:
-
-- rejection의 intent `ABORTED`와 position `MANUAL_REVIEW`를 shared connection의 한 transaction에서 commit한다.
-- commit failure 시 둘 다 기존 pending 상태로 rollback되어 restart reconciliation 가능한 intent가 남아야 한다.
-- abort-before-position-write, position-before-abort, hard crash fault-injection 테스트를 추가한다.
-
-### [CODEX-033] MEDIUM — governance checklist가 최신 검증 상태와 모순됨
-
-Status: **UNRESOLVED**
-
-Evidence:
-
-- `FINAL_VALIDATION_PACKAGE.md`는 재검증 전 limited live review를 `BLOCKED`로 기록한다.
-- `CURRENT_STATUS.md`도 최신 재검증 대기 상태를 설명한다.
-- 하지만 `docs/live_review/LIMITED_LIVE_REVIEW_CHECKLIST.md`의 최종 상태는 과거 CODEX-016~022 PASS를 근거로 이미 `READY_FOR_LIMITED_LIVE_REVIEW`다.
-- 최신 Stage 3~10 HIGH Finding과 이번 재검증 판정을 최종 상태에 반영하지 않는다.
-
-Impact:
-
-- 운영자가 최신 package보다 checklist만 확인하면 잘못된 live-review readiness를 판단할 수 있다.
+- broker 호출 전에 reconciliation 가능한 durable entry intent를 만들고 `client_order_id`를 저장한다.
+- timeout/connection reset/프로세스 종료는 `RELEASED`가 아니라 submission-unknown/pending으로 유지해
+  budget, daily entry, concurrent position 계산에 계속 포함한다.
+- restart/retry 시 client order ID로 broker를 조회하여 accepted/new/partial/filled/rejected를 구분한 뒤
+  definitive rejection에서만 release한다.
+- “broker accepted then response lost → retry” 회귀에서 broker submit 총 1회, active reservation 유지,
+  30K ceiling 불변을 검증한다.
 
 ## Regression
 
@@ -192,69 +218,98 @@ Status: **RESOLVED — no observed regression**
 
 Evidence:
 
-- RequestPurpose/purpose-side-payload consistency, runtime credential/mode/endpoint, binary/4-state Kill Switch, notification health, entry intent, accepted-vs-filled, corrupted SQLite fail-closed 및 strict fill validation 집중 테스트가 통과했다.
-- 손상 SQLite는 빈 position으로 처리되지 않고 recovery escalation/new position 차단 경로로 이동한다.
+- trading mode/endpoint/credential revalidation, RequestPurpose와 purpose-side-payload consistency,
+  binary/4-state Kill Switch, notification health, entry intent, strict fill validation,
+  accepted-vs-filled 및 corrupted SQLite fail-closed 회귀가 통과했다.
+- 손상 SQLite는 빈 position으로 처리되지 않고 recovery escalation/new entry 차단 경로로 이동한다.
 
 ## Executed tests
 
-- Stage/broker/position/SQLite/clock 집중 9개 파일 → **249 passed, 0 failed, 1 warning**
-- 저장소 루트 `venv/bin/python -m pytest -q` → **973 passed, 0 failed, 2 warnings**
-- 저장소 루트 `venv/bin/pytest -q` → **973 passed, 0 failed, 2 warnings**
-- 저장소 상위 `us-stock-trading/venv/bin/python -m pytest us-stock-trading -q` → **973 passed, 0 failed, 2 warnings**
-- 저장소 상위 `us-stock-trading/venv/bin/pytest us-stock-trading -q` → **973 passed, 0 failed, 2 warnings**
-- `git diff --check` 통과.
+- exit/live-order/position/SQLite/broker 집중 9개 파일:
+  **294 passed, 0 failed, 1 warning**
+- 저장소 루트 `venv/bin/python -m pytest -q`:
+  **986 passed, 0 failed, 2 warnings**
+- 저장소 루트 `venv/bin/pytest -q`:
+  **986 passed, 0 failed, 2 warnings**
+- 저장소 상위 `us-stock-trading/venv/bin/python -m pytest us-stock-trading -q`:
+  **986 passed, 0 failed, 2 warnings**
+- 저장소 상위 `us-stock-trading/venv/bin/pytest us-stock-trading -q`:
+  **986 passed, 0 failed, 2 warnings**
+- direct response-loss reproduction: first reservation `RELEASED`, second broker submit allowed,
+  session calls 2, ledger-recognized notional 27,000원.
+- `git diff --check`: 통과.
+
+Warnings review:
+
+- `urllib3`의 macOS LibreSSL `NotOpenSSLWarning` 1건은 test/runtime 환경 호환 경고이며 주문 판정과 무관하다.
+- unsupported scanner field를 의도적으로 skip하는 회귀 테스트의 `RuntimeWarning` 1건은 기대된 경고다.
+- 안전성과 직접 관련된 신규 warning은 없다.
 
 ## Concurrency verification
 
-- concurrent exit 및 stop/target 동시 실행 회귀가 통과했고 broker sell은 한 건이었다.
-- repeated/out-of-order exit reconciliation은 idempotent였다.
-- 신규 CODEX-031의 concurrent live-entry budget reservation은 구현·검증되지 않았다.
-- 신규 CODEX-032의 rejection commit fault는 기존 concurrency suite 범위 밖이다.
+- concurrent exit와 stop/target 동시 실행은 active intent/broker sell 한 건으로 제한된다.
+- rejected-exit shared transaction 양방향 failure injection이 rollback된다.
+- concurrent live-entry snapshot/reserve lock은 정상 경로에서 한 entry만 승인한다.
+- unknown submission을 `RELEASED`하는 CODEX-034 때문에 timeout 이후의 순차 또는 재시작 retry는
+  concurrency lock과 무관하게 허용된다.
 
 ## SQLite consistency verification
 
-- partial 4 → projection failure → cumulative 10 정상 결과와 projection regeneration을 재현했다.
-- canonical position/event/exit progress transaction rollback 테스트가 통과했다.
-- 실제 root `TRADING_STATE.db*` 및 `POSITION_STORE.json`은 생성되지 않았다.
-- rejection/abort transition만 여전히 transaction 밖에서 먼저 commit된다.
+- canonical partial/cumulative fill, PnL, event rollback 및 JSON projection 장애 회귀가 통과했다.
+- rejected exit의 intent/position transition도 한 SQLite transaction으로 확인됐다.
+- response-loss entry reservation은 DB 손상이 아니라 application이 명시적으로 `RELEASED`로 저장한
+  잘못된 authoritative state이므로 store 무결성 검사로 탐지되지 않는다.
 
 ## Order boundary verification
 
-- context/order symbol mismatch와 direct broker wrapper bypass는 session 호출 0회로 차단된다.
-- missing/stale context와 allow-list 위반도 차단된다.
-- caller-supplied qty는 gateway sizing으로 대체된다.
-- absolute 30K와 authoritative counts/pending exposure는 강제되지 않는다.
+- symbol mismatch, missing context, allow-list, stale FX 및 caller-inflated limits는 HTTP 전에 차단된다.
+- direct broker entry도 동일 gate를 통과한다.
+- 정상 broker response 경로에서는 reservation이 budget/count를 강제한다.
+- timeout/response-loss 경로에서는 final boundary 자체가 reservation을 해제해 retry를 허용한다(CODEX-034).
 
 ## Clock determinism
 
-- FrozenClock의 장중/EOD/premarket/DST 테스트가 통과했다.
-- 네 전체 실행이 실제 실행 시각 차이에도 동일한 973 결과를 냈다.
+- FrozenClock 기반 lifecycle/EOD/DST 회귀가 통과했다.
+- 네 전체 실행 형태가 동일한 986개 결과를 냈다.
 
 ## Network safety
 
-- 실제 Alpaca, Slack, Yahoo 또는 기타 외부 API 호출을 수행하지 않았다.
-- HTTP 관련 검증은 fake broker 및 network-forbidden recording session을 사용했다.
-- 테스트 출력과 저장소 변경에서 실제 socket 연결 증거는 없었다.
+- 실제 Alpaca, Slack, Yahoo 또는 기타 외부 API 호출은 수행하지 않았다.
+- 모든 HTTP 검증과 신규 timeout 재현은 fake broker/recording session을 사용했다.
+- 테스트 suite의 Slack/network forbidden spy 및 broker session call-count 검증이 통과했다.
 
 ## Operational file safety
 
-- `order_history.csv`: SHA-256 `153feb31c2539c19cd60f63e3f90d0d0f734ba7a209ed1800af7c0070a0a91c7`, 31 bytes, mtime `1784558966` 불변.
-- `universe.csv`: SHA-256 `9fdaf3ac0ba7d94e24b6276fc603709a0c79c6842cf8143b8a242acdd16188b3`, 833518 bytes, mtime `1784558966` 불변.
-- `strategy_performance.csv`: SHA-256 `ca012439cb2ba6a8f285b3f95493f9b17d22abb5b01a924ef2bd4cfe96f66da8`, 69 bytes 불변. 테스트가 mtime만 변경하여 검증 기준 `1785038260`으로 복원했다.
-- `docs/live_review/LIVE_APPROVAL_RECORD.md`: SHA-256 `27e640537c41334859eb8ad89eb3d013b17b0c95b8abf7b5385e2b76adbd5bfe`, `approved: false`, `live_enabled: false` 불변.
-- `.env`, credential, Kill Switch, notification state 및 운영 데이터는 변경하지 않았다.
-- main은 `158671e`, 검증 branch HEAD는 `fe3e9b7`; merge/push/deploy 없음.
+- `order_history.csv`: SHA-256
+  `153feb31c2539c19cd60f63e3f90d0d0f734ba7a209ed1800af7c0070a0a91c7`,
+  31 bytes, mtime `1784558966`, 전후 불변.
+- `universe.csv`: SHA-256
+  `9fdaf3ac0ba7d94e24b6276fc603709a0c79c6842cf8143b8a242acdd16188b3`,
+  833518 bytes, mtime `1784558966`, 전후 불변.
+- root `TRADING_STATE.db*`, `POSITION_STORE.json`, `LIVE_ENTRY_RESERVATION.lock`, `.env`는 생성되지 않았다.
+- `strategy_performance.csv` content SHA-256
+  `ca012439cb2ba6a8f285b3f95493f9b17d22abb5b01a924ef2bd4cfe96f66da8`,
+  69 bytes로 유지됐다. 이번 실행 전 mtime baseline은 별도 캡처하지 않아 mtime 불변은 검증하지 못했다.
+- `LIVE_APPROVAL_RECORD.md`: SHA-256
+  `27e640537c41334859eb8ad89eb3d013b17b0c95b8abf7b5385e2b76adbd5bfe`,
+  `approved: false`, `live_enabled: false` 불변.
+- main `158671e`, 검증 branch HEAD `45cf8f9`; merge/push/deploy 없음.
+- 보고서 갱신 전 working tree는 clean이었고, 구현 파일은 수정하지 않았다.
 
 ## Residual risks
 
-1. Entry orders/fills와 CSV/ledger/SQLite 미통합은 현재 CODEX-031의 authoritative pending/count 부재와 결합해 실제 한도 우회로 이어지므로 **HIGH**, 단순 미래 위험이 아니다.
-2. 향후 `AlpacaBroker`에 새 order method가 생길 때 gateway를 자동 상속하지 않는 점은 현재 다른 제출 method가 없으므로 **LOW future-maintenance risk**다.
+1. entry orders/fills와 canonical position SQLite의 미통합은 response-loss 후 실제 중복 주문,
+   budget under-count 및 상태 불일치로 직접 이어져 **HIGH (CODEX-034)** 다.
+2. 향후 추가될 다른 order method가 gateway를 구조적으로 상속하지 않는 점은 현재 다른 live submit
+   method가 없어 **LOW future-maintenance risk** 다.
 3. 일반 주문 오류의 자동 `ENTRY_DISABLED` 전환은 계속 `NEEDS_USER_DECISION`이다.
-4. 실제 FX provider, broker minimum/fractional policy 및 live data feed는 미검증이다.
+4. 실제 FX provider, broker minimum/fractional policy, live market data 및 실계좌 reconciliation은 미검증이다.
 
 ## Required next action
 
-1. CODEX-031: trusted 30K ceiling 및 durable pending/reserved/order/position 기반 atomic risk snapshot을 최종 broker entry boundary에 연결한다.
-2. CODEX-032: rejected exit의 intent abort와 position manual-review 전이를 한 SQLite transaction으로 묶고 fault-injection 회귀를 추가한다.
-3. CODEX-033: 최신 FAIL/BLOCKED 판정을 limited-live checklist에 반영한다.
-4. 재검증 전 Stage 3~10 `KEEP_IN_PROGRESS`, limited live review `BLOCKED`, live trading `DO_NOT_ENABLE`을 유지한다.
+1. CODEX-034를 해결한다: entry intent/client order identity를 broker 호출 전에 durable하게 예약하고,
+   ambiguous timeout/crash에서는 release하지 말고 restart reconciliation 전까지 모든 risk count에 포함한다.
+2. broker의 definitive rejected/canceled 상태가 확인된 경우에만 reservation을 release한다.
+3. response-loss, process restart, repeated/out-of-order reconciliation 및 multiprocessing retry 회귀를 추가한다.
+4. 재검증 전 Stage 3~10 `KEEP_IN_PROGRESS`, limited live review `BLOCKED`,
+   live trading `DO_NOT_ENABLE`을 유지한다.
