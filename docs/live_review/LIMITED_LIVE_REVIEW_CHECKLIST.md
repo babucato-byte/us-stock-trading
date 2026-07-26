@@ -211,14 +211,29 @@ context symbol과 실제 주문 symbol 불일치 허용), CODEX-030(MEDIUM, life
 
 이 문서의 최종 상태는 아래 두 값 중 하나로만 표기한다: `READY_FOR_LIMITED_LIVE_REVIEW` 또는 `BLOCKED`.
 
-**최종 상태: `READY_FOR_LIMITED_LIVE_REVIEW`**
+**최종 상태: `BLOCKED`**
 
-근거: Codex 독립 재검증(`CODEX_REVIEW.md`, 2026-07-25, 대상 커밋 `a31290b`/`5aac75b`/`8803252`)이
-**`PASS_WITH_CONDITIONS`**을 내리고 CODEX-016~022 전부 **RESOLVED**로 최종 확정했으며, 신규
-CRITICAL/HIGH/MEDIUM Finding이 없다. 이에 따라 이 문서의 최종 상태를 `READY_FOR_LIMITED_LIVE_REVIEW`로
-승격한다 — **단 이 값은 사람 검토 단계 진입 준비가 됐다는 의미일 뿐, 실거래 활성화가 아니다.**
-6~7절의 운영자 기입 항목(실제 계좌, 현재 포지션·미체결 주문·reconciliation, 허용 종목·거래시간·
-주문당 절대 한도, 승인자·검토 시각·롤백 담당자)이 전부 채워지고 운영자가 명시적으로 승인하기
-전까지는 실거래를 개시하지 않는다. **Live trading: DO_NOT_ENABLE**을 계속 유지하며,
-`approved: false`/`live_enabled: false`는 변경하지 않았다. 각 TBD 항목의 권장값 초안은
+**갱신(2026-07-26, CODEX-033)**: 이 절은 이전에 `READY_FOR_LIMITED_LIVE_REVIEW`로 표기되어 있었으나,
+그 근거였던 CODEX-016~022 `PASS_WITH_CONDITIONS`(2026-07-25, 커밋 `a31290b`/`5aac75b`/`8803252`
+대상)는 제한적 실거래 검토 사이클 자체에 대한 판정일 뿐, 그 이후 착수된 Stage 3~10(전략 플랫폼·
+포지션 생명주기·SQLite 저장소·30,000원 게이트 등)에 대한 판정이 아니다. §1.5/§1.6에 기록된 대로
+Stage 3~10에 대한 Codex 독립/통합 재검증은 반복적으로 **`FAIL`**을 냈고(CODEX-023~033 다수 Finding),
+이 문서의 §8만 그 사실을 반영하지 않은 채 예전 판정을 근거로 `READY_FOR_LIMITED_LIVE_REVIEW`를
+유지하고 있었다 — 최신 `docs/autonomous/FINAL_VALIDATION_PACKAGE.md`/`CURRENT_STATUS.md`가 이미
+`BLOCKED`/`KEEP_IN_PROGRESS`로 정확히 기록하고 있는 것과 모순되는 상태였다. 운영자가 이 문서만
+보고 최신 `FINAL_VALIDATION_PACKAGE.md`를 확인하지 않을 경우, 실제로는 아직 안전하지 않은
+상태를 "실거래 검토 준비 완료"로 오판할 위험이 있었다(CODEX-033의 지적).
+
+근거: Stage 3~10에 대한 Codex 최신 통합 재검증(`docs/autonomous/CODEX_REVIEW.md`)이 아직
+**`FAIL`**이거나, 그 수정 결과에 대한 재검증을 아직 요청/완료하지 않은 상태다. 이 문서의 최종
+상태는 Stage 3~10 관련 모든 Finding이 Codex 재검증에서 **`PASS`** 또는 **`PASS_WITH_CONDITIONS`**로
+확정되고, 6~7절의 운영자 기입 항목(실제 계좌, 현재 포지션·미체결 주문·reconciliation, 허용 종목·
+거래시간·주문당 절대 한도, 승인자·검토 시각·롤백 담당자)이 전부 채워지기 전까지는
+`READY_FOR_LIMITED_LIVE_REVIEW`로 다시 승격하지 않는다. **Live trading: DO_NOT_ENABLE**을 계속
+유지하며, `approved: false`/`live_enabled: false`는 변경하지 않았다. 최신 검증 상태의 단일
+진실 공급원(source of truth)은 항상 [FINAL_VALIDATION_PACKAGE.md](../autonomous/FINAL_VALIDATION_PACKAGE.md)이며,
+이 절은 그 문서가 갱신될 때마다 함께 갱신한다. 각 TBD 항목의 권장값 초안은
 [TBD_REVIEW_RECOMMENDATIONS.md](./TBD_REVIEW_RECOMMENDATIONS.md) 참조.
+
+(참고: CODEX-016~022 자체는 `PASS_WITH_CONDITIONS`로 여전히 유효하며 이번 갱신으로 재개된 것은
+아니다 — §8이 `BLOCKED`인 이유는 그 이후 Stage 3~10에서 발견된 별개의 Finding들 때문이다.)
