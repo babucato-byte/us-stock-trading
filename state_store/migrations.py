@@ -9,7 +9,9 @@ never edited in place once released, matching the project's general
 own append-only design).
 """
 
-from state_store.schema import MIGRATION_1_STATEMENTS, MIGRATION_2_STATEMENTS, MIGRATION_3_STATEMENTS
+from state_store.schema import (
+    MIGRATION_1_STATEMENTS, MIGRATION_2_STATEMENTS, MIGRATION_3_STATEMENTS, MIGRATION_4_STATEMENTS,
+)
 
 MIGRATIONS = [
     (1, "initial schema: orders/fills/positions/position_events/strategy_runs/risk_events/kill_switch_events",
@@ -17,6 +19,8 @@ MIGRATIONS = [
     (2, "CODEX-024: durable exit_intents ledger", MIGRATION_2_STATEMENTS),
     (3, "CODEX-028: positions.projection_status/projection_updated_at for canonical-SQLite/JSON-projection split",
      MIGRATION_3_STATEMENTS),
+    (4, "CODEX-031: durable live_entry_reservations ledger for authoritative 30K budget/count tracking",
+     MIGRATION_4_STATEMENTS),
 ]
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1][0]

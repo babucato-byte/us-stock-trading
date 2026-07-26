@@ -12,6 +12,20 @@ from broker import AlpacaBroker, BrokerConfig
 from live_readiness.order_gateway import LiveEntryContext
 
 
+@pytest.fixture(autouse=True)
+def _isolate_live_entry_state_db(tmp_path, monkeypatch):
+    # CODEX-031: the live-entry gate now reads/writes an authoritative
+    # SQLite ledger (live_readiness/entry_reservation_ledger.py) -- tests
+    # that exercise it via _live_entry_context() below must isolate that
+    # database exactly like every other SQLite-touching test file, or
+    # they silently accumulate real reservations in the repo-root
+    # TRADING_STATE.db.
+    from live_readiness import entry_reservation_ledger as live_ledger
+    monkeypatch.setenv("STATE_STORE_DB_FILE", str(tmp_path / "TEST_STATE.db"))
+    monkeypatch.setattr(live_ledger, "_LOCK_FILE", tmp_path / "LIVE_ENTRY_RESERVATION.lock")
+    yield
+
+
 def _live_entry_context(symbol="AAPL"):
     """CODEX-026/029: see tests/test_broker_safety.py's identical helper --
     AlpacaBroker.submit_order() now requires a valid LiveEntryContext for

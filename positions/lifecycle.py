@@ -35,6 +35,7 @@ from typing import List, Optional
 import paper_strategy_order
 from clock import DEFAULT_CLOCK
 from config import scalping_strategy_v1_config as cfg
+from live_readiness import entry_reservation_ledger as eil_entry
 from market_hours import MARKET_REGULAR_END, combine_eastern, eastern_now
 from positions import fill_validation, order_status, states, store
 from state_store import db as state_db
@@ -145,6 +146,29 @@ def enter_position(strategy, symbol, bars, qty, *, order_date, mode="paper", dry
                 {"state": states.ENTRY_SUBMITTED, "at": _now_iso(),
                  "reason": f"broker accepted, status_code={response.status_code}"}
             )
+            reservation_id = (
+                response.data.get("live_entry_reservation_id")
+                if isinstance(response.data, dict) else None
+            )
+            if reservation_id:
+                # CODEX-031: link this position to its durable budget
+                # reservation so entry_reservation_ledger.build_snapshot()
+                # can later tell whether the position it funded has since
+                # closed (used for the concurrent-open-position count,
+                # not the cumulative 30K notional ceiling -- see that
+                # module's docstring for why the two are scoped
+                # differently). Best-effort: a failure here just means
+                # this reservation stays counted as open a bit longer
+                # than strictly necessary -- fail-closed (over-counts),
+                # never fail-open.
+                try:
+                    conn = state_db.open_db()
+                    try:
+                        eil_entry.link_position(conn, reservation_id, position_id)
+                    finally:
+                        conn.close()
+                except Exception:
+                    pass
         else:
             import order_intent_ledger
             order_intent_ledger.abort(ledger_path, ledger_lock_path, client_order_id)

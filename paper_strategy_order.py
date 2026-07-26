@@ -183,19 +183,30 @@ def submit_order(symbol, qty=1, broker=None, client_order_id=None, *, side, live
     Both gates must pass for the broker to be called; either one blocking
     returns a 423 response without ever reaching `broker`.
 
-    CODEX-026/CODEX-029: a THIRD gate applies only when side="buy" AND the
-    broker is configured for live trading (broker.config.is_live_mode) --
-    Paper trading is entirely unaffected. live_entry_context must be a
-    live_readiness.order_gateway.LiveEntryContext describing the pilot's
-    allow-list/budget/FX-rate/position-count state; missing it, or it
-    failing any check -- including CODEX-029's exact-match requirement
-    that live_entry_context.symbol equal this call's own `symbol` -- blocks
-    the order with a 423 before the broker is ever called and re-sizes
-    `qty` to the gateway's fail-closed-computed quantity when all checks
-    pass (never trusts a caller-supplied qty for a live entry). The same
-    gate also runs a second time inside AlpacaBroker.submit_order() itself
-    (see broker/alpaca_client.py) so a caller that bypasses this wrapper
+    CODEX-026/CODEX-029/CODEX-031: a THIRD gate applies only when
+    side="buy" AND the broker is configured for live trading
+    (broker.config.is_live_mode) -- Paper trading is entirely unaffected.
+    live_entry_context must be a live_readiness.order_gateway.
+    LiveEntryContext describing the pilot's allow-list/FX-rate/price
+    state; missing it, or it failing any check -- including CODEX-029's
+    exact-match requirement that live_entry_context.symbol equal this
+    call's own `symbol`, or CODEX-031's authoritative (not
+    caller-trusted) 30,000 KRW budget/daily-entry/position-count checks
+    -- blocks the order with a 423 before the broker is ever called and
+    re-sizes `qty` to the gateway's fail-closed-computed quantity when
+    all checks pass.
+
+    AlpacaBroker.submit_order() itself runs this exact gate too (see
+    broker/alpaca_client.py) so a caller that bypasses this wrapper
     entirely and calls broker.submit_order() directly is still covered.
+    Because the gate now durably reserves budget as a side effect
+    (CODEX-031), this wrapper deliberately SKIPS its own copy of the
+    gate when `broker` is an AlpacaBroker instance -- letting the broker
+    run it exactly once avoids reserving the same notional twice against
+    the pilot budget for a single order. For any other broker (test
+    doubles that don't implement the gate themselves), this wrapper
+    remains the only protection and is responsible for committing/
+    releasing the reservation itself once the broker call resolves.
     """
     if is_trading_halted():
         print(f"Kill switch engaged: {symbol} order not submitted.")
@@ -227,7 +238,15 @@ def submit_order(symbol, qty=1, broker=None, client_order_id=None, *, side, live
     # AttributeError before getattr's default ever applies.
     broker_config = getattr(broker, "config", None)
     is_live_entry = side == "buy" and getattr(broker_config, "is_live_mode", False)
-    if is_live_entry:
+
+    # CODEX-031: validate_and_size_live_entry() durably reserves budget as
+    # a side effect. If `broker` is a real AlpacaBroker, IT runs this gate
+    # itself (broker/alpaca_client.py) -- running it again here would
+    # reserve the same notional twice for one order. `approval` stays None
+    # in that case; this wrapper only owns the reservation lifecycle
+    # (commit/release below) when it's the one that created it.
+    approval = None
+    if is_live_entry and not isinstance(broker, AlpacaBroker):
         from live_readiness.order_gateway import LiveOrderBlockedError, validate_and_size_live_entry
         if live_entry_context is None:
             print(f"CODEX-026: live entry for {symbol} blocked -- no LiveEntryContext supplied.")
@@ -238,7 +257,7 @@ def submit_order(symbol, qty=1, broker=None, client_order_id=None, *, side, live
                 dry_run=False,
             )
         try:
-            qty = validate_and_size_live_entry(live_entry_context, symbol)
+            approval = validate_and_size_live_entry(live_entry_context, symbol)
         except LiveOrderBlockedError as exc:
             print(f"CODEX-026: live entry for {symbol} blocked -- {exc}")
             return BrokerResponse(
@@ -247,18 +266,69 @@ def submit_order(symbol, qty=1, broker=None, client_order_id=None, *, side, live
                 data={"blocked_reason": str(exc)},
                 dry_run=False,
             )
+        qty = approval.quantity
 
     submit_kwargs = dict(qty=qty, side=side, client_order_id=client_order_id)
-    if is_live_entry:
+    if is_live_entry and isinstance(broker, AlpacaBroker):
         # Only passed for the exact scenario AlpacaBroker.submit_order()'s
-        # own copy of this gate understands (CODEX-026/029) -- every other
-        # broker double across the test suite has a submit_order() with no
-        # live_entry_context parameter at all, so this must never be passed
-        # outside the one case that needs it.
+        # own copy of this gate understands (CODEX-026/029/031) -- every
+        # other broker double across the test suite has a submit_order()
+        # with no live_entry_context parameter at all, so this must never
+        # be passed outside the one case that needs it.
         submit_kwargs["live_entry_context"] = live_entry_context
-    response = broker.submit_order(symbol, **submit_kwargs)
+
+    try:
+        response = broker.submit_order(symbol, **submit_kwargs)
+    except Exception:
+        if approval is not None:
+            _release_wrapper_owned_reservation(approval.reservation_id)
+        raise
+
+    if approval is not None:
+        if response.status_code in (200, 201):
+            _commit_wrapper_owned_reservation(approval.reservation_id)
+            if isinstance(response.data, dict):
+                # See broker/alpaca_client.py's identical injection for why:
+                # lets enter_position() link this reservation to the
+                # position_id it's about to create.
+                response.data = {**response.data, "live_entry_reservation_id": approval.reservation_id}
+        else:
+            _release_wrapper_owned_reservation(approval.reservation_id)
+
     print(f"{symbol} order result: {response.status_code} {response.text[:500]}")
     return response
+
+
+def _commit_wrapper_owned_reservation(reservation_id):
+    """Best-effort CODEX-031 reservation commit for the non-AlpacaBroker
+    (test-double-only) path -- see submit_order()'s docstring. A failure
+    here must not fail the already-successful order submission."""
+    from live_readiness import entry_reservation_ledger as live_ledger
+    from state_store import db as state_db
+    try:
+        conn = state_db.open_db()
+        try:
+            live_ledger.mark_committed(conn, reservation_id)
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def _release_wrapper_owned_reservation(reservation_id):
+    """Best-effort CODEX-031 reservation release for the non-AlpacaBroker
+    (test-double-only) path -- see submit_order()'s docstring. A failure
+    here must not mask the original error/response."""
+    from live_readiness import entry_reservation_ledger as live_ledger
+    from state_store import db as state_db
+    try:
+        conn = state_db.open_db()
+        try:
+            live_ledger.mark_released(conn, reservation_id)
+        finally:
+            conn.close()
+    except Exception:
+        pass
 
 
 def analyze_stock(symbol):

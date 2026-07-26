@@ -197,10 +197,46 @@ MIGRATION_3_STATEMENTS = [
     POSITIONS_ADD_PROJECTION_UPDATED_AT,
 ]
 
+# ---------------------------------------------------------------------------
+# Migration 4 (CODEX-031): durable live-entry budget/count reservations.
+#
+# Before this table, the 30,000 KRW ceiling, daily entry count, and
+# concurrent-position count enforced by live_readiness/order_gateway.py
+# were entirely caller-supplied (LiveEntryContext fields) -- a caller
+# could self-report a 3,000,000 KRW budget and have it approved, since
+# nothing independently tracked how much of the pilot's real budget was
+# already committed or reserved. This table is the authoritative record
+# of every live-entry attempt's reserved notional, keyed by day (via
+# created_at), so the gateway can compute "how much of the 30,000 KRW is
+# actually still available" from durable state instead of trusting the
+# caller's own accounting.
+# ---------------------------------------------------------------------------
+
+LIVE_ENTRY_RESERVATIONS_TABLE = """
+CREATE TABLE live_entry_reservations (
+    reservation_id TEXT PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    notional_krw REAL NOT NULL,
+    state TEXT NOT NULL,
+    position_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+"""
+
+LIVE_ENTRY_RESERVATIONS_CREATED_AT_INDEX = """
+CREATE INDEX idx_live_entry_reservations_created_at ON live_entry_reservations (created_at)
+"""
+
+MIGRATION_4_STATEMENTS = [
+    LIVE_ENTRY_RESERVATIONS_TABLE,
+    LIVE_ENTRY_RESERVATIONS_CREATED_AT_INDEX,
+]
+
 # Every table this schema version creates -- used by export.py's
 # export_all() and by tests asserting the full table set exists.
 ALL_TABLES = [
     "orders", "fills", "positions", "position_events",
     "strategy_runs", "risk_events", "kill_switch_events",
-    "exit_intents",
+    "exit_intents", "live_entry_reservations",
 ]

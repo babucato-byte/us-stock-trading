@@ -326,16 +326,20 @@ class AlpacaBroker:
             raise ValueError("side must be exactly 'buy' or 'sell'")
         purpose = _SIDE_TO_PURPOSE[side]
 
-        # CODEX-026/CODEX-029: the same live-entry gate
+        # CODEX-026/CODEX-029/CODEX-031: the same live-entry gate
         # paper_strategy_order.submit_order() applies, re-run here at the
         # true final network boundary so a caller that bypasses that
         # wrapper and calls this method directly cannot escape the
-        # allow-list/budget/FX/symbol-identity checks. Scope is identical
-        # to the wrapper's: side="buy" AND self.config.is_live_mode only --
-        # Paper trading and every exit are entirely unaffected. See
-        # live_readiness/order_gateway.py's module docstring for the full
-        # rationale (including why this duplicates, rather than replaces,
-        # the wrapper's own copy of the same gate).
+        # allow-list/budget/FX/symbol-identity/authoritative-budget
+        # checks. Scope is identical to the wrapper's: side="buy" AND
+        # self.config.is_live_mode only -- Paper trading and every exit
+        # are entirely unaffected. This is also now the SOLE reservation
+        # point for real trading (paper_strategy_order.submit_order()
+        # skips its own copy of the gate when `broker` is an AlpacaBroker
+        # instance, to avoid double-reserving the same notional -- see
+        # that module). See live_readiness/order_gateway.py's module
+        # docstring for the full rationale.
+        approval = None
         if side == "buy" and self.config.is_live_mode:
             from live_readiness.order_gateway import LiveOrderBlockedError, validate_and_size_live_entry
             if live_entry_context is None:
@@ -346,7 +350,7 @@ class AlpacaBroker:
                     dry_run=False,
                 )
             try:
-                qty = validate_and_size_live_entry(live_entry_context, symbol)
+                approval = validate_and_size_live_entry(live_entry_context, symbol)
             except LiveOrderBlockedError as exc:
                 return BrokerResponse(
                     status_code=423,
@@ -354,6 +358,7 @@ class AlpacaBroker:
                     data={"blocked_reason": str(exc)},
                     dry_run=False,
                 )
+            qty = approval.quantity
 
         order = {
             "symbol": symbol,
@@ -365,31 +370,63 @@ class AlpacaBroker:
         if client_order_id:
             order["client_order_id"] = client_order_id
 
-        if self.config.is_live_mode and not self.config.can_submit_live_order:
-            return BrokerResponse(
-                status_code=200,
-                text="LIVE_DRY_RUN: order was validated but not submitted.",
-                data={"dry_run": True, "order": order, "mode": self.config.status_label},
-                dry_run=True,
-            )
+        try:
+            if self.config.is_live_mode and not self.config.can_submit_live_order:
+                # LIVE_DRY_RUN: nothing was actually submitted -- release
+                # the budget hold immediately rather than counting it
+                # against the pilot ceiling until the next daily reset.
+                if approval is not None:
+                    _release_live_entry_reservation(approval.reservation_id)
+                return BrokerResponse(
+                    status_code=200,
+                    text="LIVE_DRY_RUN: order was validated but not submitted.",
+                    data={"dry_run": True, "order": order, "mode": self.config.status_label},
+                    dry_run=True,
+                )
 
-        # CODEX-021 defense-in-depth: verify the outgoing payload's side
-        # still matches the purpose derived from it before ever reaching
-        # HTTP, so a future edit that mutates `order["side"]` after `purpose`
-        # was computed fails loudly instead of silently submitting a
-        # mismatched order under the wrong kill-switch gate.
-        if _SIDE_TO_PURPOSE.get(order["side"]) is not purpose:
-            raise RuntimeError(
-                "Order payload side does not match the submission purpose; refusing to submit."
-            )
+            # CODEX-021 defense-in-depth: verify the outgoing payload's side
+            # still matches the purpose derived from it before ever reaching
+            # HTTP, so a future edit that mutates `order["side"]` after `purpose`
+            # was computed fails loudly instead of silently submitting a
+            # mismatched order under the wrong kill-switch gate.
+            if _SIDE_TO_PURPOSE.get(order["side"]) is not purpose:
+                raise RuntimeError(
+                    "Order payload side does not match the submission purpose; refusing to submit."
+                )
 
-        response = self._request(
-            "POST", "/v2/orders", purpose=purpose, order_side=side, json=order, return_response=True
-        )
+            response = self._request(
+                "POST", "/v2/orders", purpose=purpose, order_side=side, json=order, return_response=True
+            )
+        except Exception:
+            # The broker call never confirmed success (rejected, timed
+            # out, or some earlier safety gate raised) -- release the
+            # budget hold so it isn't permanently locked against a live
+            # entry that (as far as this process can tell) never went
+            # through. Residual risk, documented in DECISION_LOG.md: if
+            # the order actually reached the broker despite a local
+            # exception (e.g. the response was lost after submission),
+            # this release could under-count real exposure -- the same
+            # class of gap this codebase's entry path has never had
+            # crash-safe reconciliation for (see Phase 1B's "다중 파일
+            # 트랜잭션 부재" residual risk).
+            if approval is not None:
+                _release_live_entry_reservation(approval.reservation_id)
+            raise
+
+        if approval is not None:
+            _commit_live_entry_reservation(approval.reservation_id)
+        response_data = _safe_json(response)
+        if approval is not None and isinstance(response_data, dict):
+            # Surface the reservation id so positions/lifecycle.py::
+            # enter_position() can link it to the position_id it's about
+            # to create -- entry_reservation_ledger.build_snapshot() uses
+            # that link to tell whether a COMMITTED reservation's funded
+            # position has since closed (see that module's docstring).
+            response_data = {**response_data, "live_entry_reservation_id": approval.reservation_id}
         return BrokerResponse(
             status_code=response.status_code,
             text=response.text,
-            data=_safe_json(response),
+            data=response_data,
             dry_run=False,
         )
 
@@ -407,3 +444,41 @@ def _safe_json(response):
         return response.json()
     except Exception:
         return None
+
+
+def _commit_live_entry_reservation(reservation_id):
+    """Best-effort: mark a CODEX-031 live-entry budget reservation
+    COMMITTED after the broker has actually accepted the order. A
+    failure here must not fail the (already-successful) order submission
+    itself -- it would only mean the reservation stays RESERVED instead
+    of COMMITTED, which is still counted as active budget/count
+    consumption by entry_reservation_ledger.build_snapshot() either way."""
+    from live_readiness import entry_reservation_ledger as live_ledger
+    from state_store import db as state_db
+    try:
+        conn = state_db.open_db()
+        try:
+            live_ledger.mark_committed(conn, reservation_id)
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def _release_live_entry_reservation(reservation_id):
+    """Best-effort: release a CODEX-031 live-entry budget reservation
+    that will never become a real order (dry-run, rejection, or any
+    exception during submission). A failure here must not mask the
+    original error/response -- the reservation simply stays RESERVED
+    until the next daily reset, a strictly more conservative (never
+    fail-open) outcome than releasing it."""
+    from live_readiness import entry_reservation_ledger as live_ledger
+    from state_store import db as state_db
+    try:
+        conn = state_db.open_db()
+        try:
+            live_ledger.mark_released(conn, reservation_id)
+        finally:
+            conn.close()
+    except Exception:
+        pass
