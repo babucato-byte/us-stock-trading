@@ -546,12 +546,20 @@ def test_recover_on_restart_skips_terminal_positions():
 
 # ---------------------------------------------------------------------------
 # CODEX-025: corrupted store fails closed on restart, not silently empty
+# CODEX-028: since SQLite is now canonical, these corrupt the SQLite
+# database file (STATE_STORE_DB_FILE) -- corrupting POSITION_STORE.json
+# alone no longer means anything (it's a regenerable projection, see
+# tests/test_position_store.py's
+# test_corrupted_json_projection_alone_is_not_store_corruption).
 # ---------------------------------------------------------------------------
 
+def _corrupt_state_db(tmp_path):
+    db_path = tmp_path / "TEST_STATE.db"
+    db_path.write_bytes(b"not a sqlite database, just garbage bytes" * 50)
+
+
 def test_recover_on_restart_store_unavailable_on_corrupted_file(tmp_path, monkeypatch):
-    store_path = tmp_path / "POSITION_STORE.json"
-    monkeypatch.setenv("POSITION_STORE_FILE", str(store_path))
-    store_path.write_text("{not valid json")
+    _corrupt_state_db(tmp_path)
 
     result = lifecycle.recover_on_restart(broker=None)
     assert result.status == lifecycle.RECOVERY_STATUS_STORE_UNAVAILABLE
@@ -561,15 +569,13 @@ def test_recover_on_restart_store_unavailable_on_corrupted_file(tmp_path, monkey
 
 def test_recover_on_restart_store_unavailable_escalates_kill_switch(tmp_path, monkeypatch):
     import kill_switch_state
-    store_path = tmp_path / "POSITION_STORE.json"
-    monkeypatch.setenv("POSITION_STORE_FILE", str(store_path))
-    store_path.write_text("{not valid json")
+    _corrupt_state_db(tmp_path)
 
     lifecycle.recover_on_restart(broker=None)
     assert kill_switch_state.get_state() == kill_switch_state.MANUAL_REVIEW
 
 
-def test_recover_on_restart_store_unavailable_fetches_broker_positions_best_effort():
+def test_recover_on_restart_store_unavailable_fetches_broker_positions_best_effort(tmp_path):
     strategy = FakeStrategy()
     registry = _active_registry(strategy)
     broker = FakeBroker()
@@ -577,9 +583,7 @@ def test_recover_on_restart_store_unavailable_fetches_broker_positions_best_effo
     bars = pd.DataFrame([{"Close": 100.0}])
     lifecycle.enter_position(strategy, "AAPL", bars, qty=10, order_date=TODAY, broker=broker, registry=registry)
 
-    import positions.store as store_module
-    store_path = store_module._resolve_store_path()
-    store_path.write_text("{not valid json")
+    _corrupt_state_db(tmp_path)
 
     def _get_positions():
         return [{"symbol": "AAPL", "qty": 5}]
@@ -591,9 +595,7 @@ def test_recover_on_restart_store_unavailable_fetches_broker_positions_best_effo
 
 
 def test_new_entry_refused_when_store_corrupted(tmp_path, monkeypatch):
-    store_path = tmp_path / "POSITION_STORE.json"
-    monkeypatch.setenv("POSITION_STORE_FILE", str(store_path))
-    store_path.write_text("{not valid json")
+    _corrupt_state_db(tmp_path)
 
     strategy = FakeStrategy()
     registry = _active_registry(strategy)

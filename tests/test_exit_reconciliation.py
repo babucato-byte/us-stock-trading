@@ -431,3 +431,136 @@ def test_stale_reserved_intent_is_never_auto_resubmitted(monkeypatch):
     assert sell_calls == []  # never resubmitted
     updated_intent = eil.get_by_id(conn, intent_id)
     assert updated_intent["state"] == eil.STATE_RECONCILIATION_REQUIRED
+
+
+# ---------------------------------------------------------------------------
+# CODEX-028: SQLite is canonical for exit fill progress -- these pin down
+# the exact reproduction scenario from the finding (partial 4, then a
+# later cumulative-10 event, must reach remaining=0/CLOSED with the FULL
+# 10-share PnL, never losing track of the first 4 shares' worth) and a
+# few store-level guarantees at the lifecycle-call level.
+# ---------------------------------------------------------------------------
+
+def test_partial_4_then_cumulative_10_reaches_remaining_0_closed_full_pnl():
+    record, broker = _filled_position(qty=10, broker_submit_responses=[_partial_response(4, price=94.0)])
+    pending = lifecycle.check_and_manage(record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker)
+    assert pending["state"] == states.EXIT_SUBMITTED
+    assert pending["remaining_qty"] == 6
+    assert pending["realized_pnl"] == pytest.approx(4 * (94.0 - 100.0))
+
+    # The broker later reports the SAME order fully filled at cumulative 10
+    # (not a second order) -- exactly CODEX-028's reproduction step 3/4.
+    broker._orders_by_client_id[pending["client_order_id"]] = {
+        "status": "filled", "filled_qty": 10, "filled_avg_price": 94.0, "id": "b-partial",
+    }
+    resolved = lifecycle.reconcile_pending_exit(record["position_id"], broker=broker)
+    assert resolved["state"] == states.CLOSED
+    assert resolved["remaining_qty"] == 0
+    # Full 10-share PnL, not just the delta (6) applied by the second event.
+    assert resolved["realized_pnl"] == pytest.approx(10 * (94.0 - 100.0))
+
+
+def test_delta_sequencing_4_3_3_applies_incremental_pnl_correctly():
+    """partial 4 -> partial 7 (delta 3) -> full 10 (delta 3): each step
+    must apply only its own delta's PnL, and the running total after all
+    three must equal exactly the full 10-share PnL at the final price."""
+    record, broker = _filled_position(qty=10, broker_submit_responses=[_partial_response(4, price=90.0)])
+    step1 = lifecycle.check_and_manage(record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker)
+    assert step1["remaining_qty"] == 6
+    assert step1["realized_pnl"] == pytest.approx(4 * (90.0 - 100.0))
+
+    broker._orders_by_client_id[step1["client_order_id"]] = {
+        "status": "partially_filled", "filled_qty": 7, "filled_avg_price": 91.0, "id": "b-partial",
+    }
+    step2 = lifecycle.reconcile_pending_exit(record["position_id"], broker=broker)
+    assert step2["remaining_qty"] == 3
+    assert step2["realized_pnl"] == pytest.approx(4 * (90.0 - 100.0) + 3 * (91.0 - 100.0))
+
+    broker._orders_by_client_id[step1["client_order_id"]] = {
+        "status": "filled", "filled_qty": 10, "filled_avg_price": 92.0, "id": "b-partial",
+    }
+    step3 = lifecycle.reconcile_pending_exit(record["position_id"], broker=broker)
+    assert step3["state"] == states.CLOSED
+    assert step3["remaining_qty"] == 0
+    assert step3["realized_pnl"] == pytest.approx(
+        4 * (90.0 - 100.0) + 3 * (91.0 - 100.0) + 3 * (92.0 - 100.0)
+    )
+
+
+def test_out_of_order_cumulative_regression_after_full_fill_blocked():
+    """An event reporting cumulative 6 arriving AFTER cumulative 10 has
+    already been confirmed must be rejected outright, not silently
+    reapplied or allowed to move the (already-terminal) intent backward."""
+    record, broker = _filled_position(qty=10, broker_submit_responses=[_filled_response(10, price=94.0)])
+    closed = lifecycle.check_and_manage(record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker)
+    assert closed["state"] == states.CLOSED
+
+    conn = state_db.open_db()
+    intent = eil.get_by_client_order_id(conn, closed["client_order_id"])
+    assert intent["state"] == eil.STATE_CONFIRMED
+    with pytest.raises(eil.ExitIntentError):
+        eil.update_progress(conn, intent["intent_id"], confirmed_filled_qty=6)  # terminal -- cannot move at all
+
+
+def test_json_projection_corrupted_mid_exit_flow_does_not_block_reconciliation(tmp_path):
+    """SQLite (not the JSON projection) drives every decision in the exit
+    flow -- corrupting POSITION_STORE.json between two reconciliation
+    calls must not affect the outcome of the second one at all."""
+    record, broker = _filled_position(qty=10, broker_submit_responses=[_partial_response(4, price=94.0)])
+    pending = lifecycle.check_and_manage(record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker)
+    assert pending["remaining_qty"] == 6
+
+    store_path = store._resolve_store_path()
+    store_path.write_text("{not valid json at all, mid-flow corruption")
+
+    broker._orders_by_client_id[pending["client_order_id"]] = {
+        "status": "filled", "filled_qty": 10, "filled_avg_price": 94.0, "id": "b-partial",
+    }
+    resolved = lifecycle.reconcile_pending_exit(record["position_id"], broker=broker)
+    assert resolved["state"] == states.CLOSED
+    assert resolved["remaining_qty"] == 0
+    assert resolved["realized_pnl"] == pytest.approx(10 * (94.0 - 100.0))
+
+
+def test_repeated_reconciliation_with_unchanged_broker_state_is_idempotent():
+    record, broker = _filled_position(qty=10, broker_submit_responses=[_partial_response(4, price=94.0)])
+    pending = lifecycle.check_and_manage(record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker)
+    broker._orders_by_client_id[pending["client_order_id"]] = {
+        "status": "partially_filled", "filled_qty": 4, "filled_avg_price": 94.0, "id": "b-partial",
+    }
+    first = lifecycle.reconcile_pending_exit(record["position_id"], broker=broker)
+    second = lifecycle.reconcile_pending_exit(record["position_id"], broker=broker)
+    assert first["remaining_qty"] == second["remaining_qty"] == 6
+    assert first["realized_pnl"] == second["realized_pnl"] == pytest.approx(4 * (94.0 - 100.0))
+
+
+def test_concurrent_reconciliation_calls_reach_same_final_state():
+    import threading
+
+    record, broker = _filled_position(qty=10, broker_submit_responses=[_partial_response(4, price=94.0)])
+    pending = lifecycle.check_and_manage(record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker)
+    broker._orders_by_client_id[pending["client_order_id"]] = {
+        "status": "filled", "filled_qty": 10, "filled_avg_price": 94.0, "id": "b-partial",
+    }
+    state_db.open_db()  # pre-warm before spawning threads (SQLite first-use race)
+    barrier = threading.Barrier(3)
+    errors = []
+
+    def worker():
+        try:
+            barrier.wait(timeout=2)
+            lifecycle.reconcile_pending_exit(record["position_id"], broker=broker)
+        except Exception as exc:  # pragma: no cover - fails the test via errors list
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=3)
+
+    assert not errors
+    final = store.load_position(record["position_id"])
+    assert final["state"] == states.CLOSED
+    assert final["remaining_qty"] == 0
+    assert final["realized_pnl"] == pytest.approx(10 * (94.0 - 100.0))

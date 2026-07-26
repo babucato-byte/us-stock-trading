@@ -77,11 +77,18 @@ def get_by_client_order_id(conn, client_order_id):
     return dict(row) if row else None
 
 
-def reserve(conn, position_id, reason, requested_qty, client_order_id):
+def reserve(conn, position_id, reason, requested_qty, client_order_id, *, commit=True):
     """Durably reserve a new exit intent. Raises DuplicateExitIntentError
     without writing anything if an active (non-terminal) intent already
     exists for this position_id -- the caller must not call the broker in
-    that case. Returns the new intent_id."""
+    that case. Returns the new intent_id.
+
+    CODEX-028: `commit=False` lets a caller (positions/store.py's
+    locked_position()) fold this INSERT into the same SQLite transaction
+    as the position/position_events writes it makes in the same `with`
+    block, so a crash between the two can never leave one committed
+    without the other. Standalone callers keep the default `commit=True`
+    (unchanged behavior)."""
     existing = get_active_intent(conn, position_id)
     if existing is not None:
         raise DuplicateExitIntentError(
@@ -97,11 +104,12 @@ def reserve(conn, position_id, reason, requested_qty, client_order_id):
         "VALUES (?, ?, ?, ?, ?, 0, ?, NULL, ?, ?)",
         (intent_id, position_id, client_order_id, reason, requested_qty, STATE_RESERVED, now, now),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return intent_id
 
 
-def _transition(conn, intent_id, new_state, *, broker_order_id=None, confirmed_filled_qty=None):
+def _transition(conn, intent_id, new_state, *, broker_order_id=None, confirmed_filled_qty=None, commit=True):
     if new_state not in VALID_STATES:
         raise ExitIntentError(f"Unknown exit intent state: {new_state!r}")
     existing = get_by_id(conn, intent_id)
@@ -121,29 +129,30 @@ def _transition(conn, intent_id, new_state, *, broker_order_id=None, confirmed_f
         values.append(confirmed_filled_qty)
     values.append(intent_id)
     conn.execute(f"UPDATE exit_intents SET {', '.join(fields)} WHERE intent_id = ?", values)
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
-def mark_submitted(conn, intent_id, broker_order_id=None):
-    _transition(conn, intent_id, STATE_SUBMITTED, broker_order_id=broker_order_id)
+def mark_submitted(conn, intent_id, broker_order_id=None, *, commit=True):
+    _transition(conn, intent_id, STATE_SUBMITTED, broker_order_id=broker_order_id, commit=commit)
 
 
-def mark_submission_unknown(conn, intent_id):
+def mark_submission_unknown(conn, intent_id, *, commit=True):
     """The broker call raised/timed out -- we genuinely don't know if the
     order reached the broker. Never auto-retried from this state; only an
     explicit reconciliation call may move it forward."""
-    _transition(conn, intent_id, STATE_SUBMISSION_UNKNOWN)
+    _transition(conn, intent_id, STATE_SUBMISSION_UNKNOWN, commit=commit)
 
 
-def mark_reconciliation_required(conn, intent_id):
-    _transition(conn, intent_id, STATE_RECONCILIATION_REQUIRED)
+def mark_reconciliation_required(conn, intent_id, *, commit=True):
+    _transition(conn, intent_id, STATE_RECONCILIATION_REQUIRED, commit=commit)
 
 
-def mark_confirmed(conn, intent_id, confirmed_filled_qty):
-    _transition(conn, intent_id, STATE_CONFIRMED, confirmed_filled_qty=confirmed_filled_qty)
+def mark_confirmed(conn, intent_id, confirmed_filled_qty, *, commit=True):
+    _transition(conn, intent_id, STATE_CONFIRMED, confirmed_filled_qty=confirmed_filled_qty, commit=commit)
 
 
-def update_progress(conn, intent_id, confirmed_filled_qty):
+def update_progress(conn, intent_id, confirmed_filled_qty, *, commit=True):
     """Record a partial-fill observation without closing the intent out --
     state stays whatever it already was (typically SUBMITTED). Used when a
     broker reports partially_filled: some quantity has genuinely traded
@@ -157,12 +166,13 @@ def update_progress(conn, intent_id, confirmed_filled_qty):
         "UPDATE exit_intents SET confirmed_filled_qty = ?, updated_at = ? WHERE intent_id = ?",
         (confirmed_filled_qty, _now_iso(), intent_id),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
-def mark_aborted(conn, intent_id):
+def mark_aborted(conn, intent_id, *, commit=True):
     """The intent never reached the broker at all (e.g. it turned out
     there was nothing left to exit). Distinct from CONFIRMED so an
     aborted intent is never mistaken for "the broker confirmed 0 shares
     filled"."""
-    _transition(conn, intent_id, STATE_ABORTED)
+    _transition(conn, intent_id, STATE_ABORTED, commit=commit)

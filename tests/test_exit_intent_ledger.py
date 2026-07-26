@@ -15,7 +15,7 @@ def conn(tmp_path):
 def test_migration_2_creates_exit_intents_table(conn):
     tables = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert "exit_intents" in tables
-    assert db.get_schema_version(conn) == 2
+    assert db.get_schema_version(conn) >= 2  # >= : later migrations (e.g. CODEX-028) may have applied too
 
 
 def test_reserve_creates_intent_in_reserved_state(conn):

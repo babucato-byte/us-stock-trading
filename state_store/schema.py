@@ -173,6 +173,30 @@ MIGRATION_2_STATEMENTS = [
     EXIT_INTENTS_POSITION_INDEX,
 ]
 
+# ---------------------------------------------------------------------------
+# Migration 3 (CODEX-028): positions/position_events become the canonical
+# trading-state tables -- see positions/store.py's module docstring. Two
+# columns track the health of POSITION_STORE.json, which is now a
+# best-effort *projection* of this table, never the source of truth:
+# projection_status distinguishes "never attempted", "written
+# successfully", and "write failed" (the failure case that used to be
+# silently indistinguishable from success before this migration), and
+# projection_updated_at records when the projection was last written.
+# ---------------------------------------------------------------------------
+
+POSITIONS_ADD_PROJECTION_STATUS = """
+ALTER TABLE positions ADD COLUMN projection_status TEXT
+"""
+
+POSITIONS_ADD_PROJECTION_UPDATED_AT = """
+ALTER TABLE positions ADD COLUMN projection_updated_at TEXT
+"""
+
+MIGRATION_3_STATEMENTS = [
+    POSITIONS_ADD_PROJECTION_STATUS,
+    POSITIONS_ADD_PROJECTION_UPDATED_AT,
+]
+
 # Every table this schema version creates -- used by export.py's
 # export_all() and by tests asserting the full table set exists.
 ALL_TABLES = [

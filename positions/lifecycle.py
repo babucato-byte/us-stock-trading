@@ -327,8 +327,16 @@ def _apply_exit_fill_progress(conn, locked, intent, fill_state, confirmed_qty, c
         _add_realized_pnl(locked, delta, price)
         locked["remaining_qty"] = max(0, locked["remaining_qty"] - delta)
 
+    # CODEX-028: commit=False -- these exit_intents mutations must land in
+    # the SAME SQLite transaction as this call's position/position_events
+    # write, which is only true because _apply_exit_fill_progress() always
+    # runs inside a store.locked_position(conn=conn) block sharing this
+    # exact `conn`. store.locked_position()'s __exit__ is the single commit
+    # point for both, closing the gap CODEX-028 exists to fix (a fill
+    # progress observation committed to exit_intents with no matching
+    # position update ever landing, or vice versa).
     if fill_state == order_status.FILL_STATE_FILLED:
-        eil.mark_confirmed(conn, intent["intent_id"], confirmed_filled_qty=target_cumulative)
+        eil.mark_confirmed(conn, intent["intent_id"], confirmed_filled_qty=target_cumulative, commit=False)
         states.validate_transition(locked["state"], on_fully_filled_state)
         locked["state"] = on_fully_filled_state
         if on_fully_filled_state == states.CLOSED:
@@ -338,11 +346,11 @@ def _apply_exit_fill_progress(conn, locked, intent, fill_state, confirmed_qty, c
         )
     elif fill_state == order_status.FILL_STATE_PARTIALLY_FILLED:
         if delta > 0:
-            eil.update_progress(conn, intent["intent_id"], confirmed_filled_qty=target_cumulative)
+            eil.update_progress(conn, intent["intent_id"], confirmed_filled_qty=target_cumulative, commit=False)
     elif fill_state == order_status.FILL_STATE_NOT_FILLED:
         pass  # accepted/new/etc. -- genuinely nothing to do yet
     else:  # UNKNOWN -- an order status we don't recognize; fail closed
-        eil.mark_reconciliation_required(conn, intent["intent_id"])
+        eil.mark_reconciliation_required(conn, intent["intent_id"], commit=False)
         states.validate_transition(locked["state"], states.MANUAL_REVIEW)
         locked["state"] = states.MANUAL_REVIEW
         locked["state_history"].append(
@@ -386,14 +394,16 @@ def reconcile_pending_exit(position_id, *, broker=None, on_fully_filled_state=No
         # The broker has never heard of this client_order_id -- most
         # likely a crash happened before the order was ever actually
         # sent. Policy: flag for operator reconciliation, never
-        # auto-resubmit.
+        # auto-resubmit. No position write is being made alongside this
+        # (the function returns immediately after), so this commits on
+        # its own -- there is nothing to keep it atomic with.
         eil.mark_reconciliation_required(conn, intent["intent_id"])
         return store.load_position(position_id)
 
     order_info = order_status.extract_order_info(broker_order)
     fill_state = order_status.classify_broker_order_status(order_info.get("status"))
 
-    with store.locked_position(position_id, lock_timeout=lock_timeout) as locked:
+    with store.locked_position(position_id, lock_timeout=lock_timeout, conn=conn) as locked:
         current_intent = eil.get_by_id(conn, intent["intent_id"])
         if current_intent is None or current_intent["state"] in eil.TERMINAL_STATES:
             return dict(locked)  # already resolved by a concurrent/prior call
@@ -425,7 +435,7 @@ def _execute_exit(position_id, symbol, order_date, broker, reason, qty_selector,
         # decision. Catch the position's own state up to reflect that if
         # a crash happened before the first attempt's Phase A finished
         # writing it, then resolve via the same path restart recovery uses.
-        with store.locked_position(position_id, lock_timeout=lock_timeout) as locked:
+        with store.locked_position(position_id, lock_timeout=lock_timeout, conn=conn) as locked:
             if locked["state"] not in (states.EXIT_SUBMITTED, states.PARTIAL_EXIT_SUBMITTED):
                 fully_filled_state = on_fully_filled_state or (
                     states.PARTIAL_EXITED if existing_intent["reason"] == "PARTIAL_TARGET_1" else states.CLOSED
@@ -442,7 +452,7 @@ def _execute_exit(position_id, symbol, order_date, broker, reason, qty_selector,
     intent_id = None
     client_order_id = None
     exit_qty = None
-    with store.locked_position(position_id, lock_timeout=lock_timeout) as locked:
+    with store.locked_position(position_id, lock_timeout=lock_timeout, conn=conn) as locked:
         if not _exit_states_reachable_from(locked["state"]):
             return dict(locked)  # already handled by a concurrent/prior call
         exit_qty = qty_selector(locked)
@@ -457,7 +467,13 @@ def _execute_exit(position_id, symbol, order_date, broker, reason, qty_selector,
             return dict(locked)
         client_order_id = f"exit-{symbol}-{order_date}-{uuid.uuid4().hex[:10]}"
         try:
-            intent_id = eil.reserve(conn, position_id, reason, exit_qty, client_order_id)
+            # CODEX-028: commit=False -- this reservation must land in the
+            # same SQLite transaction as the position's own transition to
+            # its submitted state below, both committed together when this
+            # `with` block exits (store.locked_position(conn=conn)'s single
+            # commit point). Durable before the broker is ever called, and
+            # genuinely atomic with the position write this time.
+            intent_id = eil.reserve(conn, position_id, reason, exit_qty, client_order_id, commit=False)
         except Exception:
             # Could not durably record the intent -- refuse to call the broker.
             return dict(locked)
@@ -481,9 +497,12 @@ def _execute_exit(position_id, symbol, order_date, broker, reason, qty_selector,
     if response.status_code not in (200, 201):
         # Broker explicitly rejected the order -- it never reached an
         # in-flight state at all, so the intent is aborted outright, not
-        # left pending for reconciliation.
+        # left pending for reconciliation. mark_aborted() commits on its
+        # own (Phase B is deliberately outside any position lock, so
+        # there's no position write to keep it atomic with here); the
+        # MANUAL_REVIEW transition below is its own separate, later commit.
         eil.mark_aborted(conn, intent_id)
-        with store.locked_position(position_id, lock_timeout=lock_timeout) as locked:
+        with store.locked_position(position_id, lock_timeout=lock_timeout, conn=conn) as locked:
             states.validate_transition(locked["state"], states.MANUAL_REVIEW)
             locked["state"] = states.MANUAL_REVIEW
             locked["state_history"].append(
@@ -497,7 +516,7 @@ def _execute_exit(position_id, symbol, order_date, broker, reason, qty_selector,
     fill_state = order_status.classify_broker_order_status(order_info.get("status"))
 
     # ---- Phase C: apply whatever Phase B learned. ----
-    with store.locked_position(position_id, lock_timeout=lock_timeout) as locked:
+    with store.locked_position(position_id, lock_timeout=lock_timeout, conn=conn) as locked:
         current_intent = eil.get_by_id(conn, intent_id)
         _apply_exit_fill_progress(
             conn, locked, current_intent, fill_state,
@@ -748,7 +767,7 @@ def recover_on_restart(*, broker=None, lock_timeout=store.LOCK_TIMEOUT_SECONDS):
             results.append(reconciled or store.load_position(position_id))
             continue
 
-        with store.locked_position(position_id, lock_timeout=lock_timeout) as locked:
+        with store.locked_position(position_id, lock_timeout=lock_timeout, conn=exit_conn) as locked:
             if locked["state"] == states.RECOVERY_REQUIRED:
                 results.append(dict(locked))
                 continue

@@ -38,6 +38,7 @@ def pso(tmp_path, monkeypatch):
     import scalping_watchlist.repository as wl_repo
 
     monkeypatch.setenv("POSITION_STORE_FILE", str(tmp_path / "POSITION_STORE.json"))
+    monkeypatch.setenv("STATE_STORE_DB_FILE", str(tmp_path / "TEST_STATE.db"))
     monkeypatch.setenv("KILL_SWITCH_FILE", str(tmp_path / "KILL_SWITCH"))
     monkeypatch.setenv("KILL_SWITCH_STATE_FILE", str(tmp_path / "KILL_SWITCH_STATE.json"))
     monkeypatch.setattr(pso_module, "ORDER_HISTORY_FILE", tmp_path / "order_history.csv")
