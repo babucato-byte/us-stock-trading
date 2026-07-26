@@ -44,10 +44,29 @@ the broker just before calling -- exactly like `fx_rate_krw_per_usd`/
 validated (1-100, no NaN/Infinity/bool/string/None) setting; there is no
 implicit default -- an operator must state it explicitly, and CHANGING
 its deployed value is an operational decision outside this code, not
-something a caller can bump per-call to unlock more spending (`min()`ing
-it against anything would be meaningless since 100 is already the
-universal cash-only ceiling -- margin/leverage are never used, so
-`cash_usage_percent` itself, validated in-range, IS the full protection).
+something a caller can bump per-call to unlock more spending.
+
+CODEX-036: validated in-range alone is NOT the full protection -- a
+caller can still simply lie about `available_cash_krw` (declare a real
+30,000 KRW account as 3,000,000) or about `cash_usage_percent` (declare
+100% when the operator only approved a lower figure), and nothing before
+CODEX-036 compared either value against anything authoritative. Two
+independent, caller-untightenable ceilings now apply, both via `min()`
+(caller can only ever ask for LESS, never more):
+
+  - `cash_usage_percent` is capped against `live_readiness.account_cash.
+    TRUSTED_CASH_USAGE_PERCENT_CEILING`, a trusted CODE constant --
+    exactly the same pattern as `MAX_CONCURRENT_LIVE_POSITIONS`/
+    `MAX_DAILY_LIVE_ENTRIES` below. This is unconditional, whether or not
+    a real broker snapshot is available.
+  - `available_cash_krw` is capped against the caller-supplied
+    `account_cash_snapshot` parameter (a `live_readiness.account_cash.
+    AccountCashSnapshot`, the ONLY type `fetch_account_cash_snapshot()`
+    can produce -- see that module's docstring for why this gate does
+    NOT fetch one itself). This is OPT-IN: if omitted, `available_cash_krw`
+    is used as-is, matching the pre-CODEX-036 behavior -- closing this
+    half of the gap end-to-end still requires a future production caller
+    to actually supply a snapshot.
 
 The three deductions come from live_readiness/entry_reservation_ledger.py
 -- a durable SQLite record of every reservation this gate has ever made,
@@ -91,6 +110,10 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 from live_readiness import entry_reservation_ledger as ledger
+from live_readiness.account_cash import (
+    TRUSTED_CASH_USAGE_PERCENT_CEILING,
+    AccountCashSnapshot,
+)
 from live_readiness.allowlist import is_symbol_allowed
 from live_readiness.sizing import (
     STATUS_OK,
@@ -200,8 +223,32 @@ def _validate_available_cash(ctx, now):
         )
 
 
+def _validate_optional_positive_number(name, value):
+    """CODEX-037: fail-closed validation for every OPTIONAL numeric cap
+    (max_order_notional_krw/max_daily_loss_krw/max_risk_per_trade_krw/
+    strategy_max_quantity/stop_price_usd). `None` (unset -- no cap) is the
+    only value that passes silently; anything else must be a real,
+    finite, positive number.
+
+    Without this, a NaN cap slipped through undetected: `NaN <= 0` and
+    `NaN > 0` are both False in Python, so guard clauses written as `if
+    value <= 0: raise ...` never fire for NaN, and `min(x, float("nan"))`
+    is order-dependent (sometimes silently returns `x`, sometimes `nan`)
+    -- either way a malformed cap could end up NOT constraining the order
+    at all instead of blocking it. Every optional cap must be validated
+    explicitly, here, before it is ever used in a comparison."""
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise LiveOrderBlockedError(f"{name} must be a number, got {value!r}")
+    if not math.isfinite(value):
+        raise LiveOrderBlockedError(f"{name} must be finite, got {value!r}")
+    if value <= 0:
+        raise LiveOrderBlockedError(f"{name} must be positive, got {value!r}")
+
+
 def validate_and_size_live_entry(ctx: LiveEntryContext, order_symbol: str, client_order_id=None,
-                                  *, conn=None) -> LiveEntryApproval:
+                                  *, conn=None, account_cash_snapshot=None) -> LiveEntryApproval:
     """Returns a LiveEntryApproval (fail-closed-validated quantity plus a
     durable reservation already placed for it). Raises
     LiveOrderBlockedError with a specific reason string on any
@@ -231,6 +278,32 @@ def validate_and_size_live_entry(ctx: LiveEntryContext, order_symbol: str, clien
     concurrent entry attempts can never both observe "cash available"
     before either has actually reserved it. See module docstring for the
     percent-of-balance formula.
+
+    CODEX-036: `account_cash_snapshot`, if supplied, MUST be a
+    `live_readiness.account_cash.AccountCashSnapshot` -- the ONLY type
+    that can be constructed by `fetch_account_cash_snapshot()` (a real
+    `broker.get_account()` query), never a bare number. Its `cash_krw`
+    becomes a CEILING on -- never a replacement floor for --
+    `ctx.available_cash_krw`: `effective_cash = min(ctx.available_cash_krw,
+    snapshot.cash_krw)`. A caller-declared cash figure can therefore never
+    exceed what the broker's own account actually reported as of the
+    snapshot's `as_of` timestamp (checked for staleness against
+    `ctx.max_cash_age_seconds`, same as the FX/cash timestamps above).
+    This function does NOT itself fetch a snapshot -- doing so here would
+    require a live network call on every validation attempt, including
+    from Paper-mode/dry-run/unit-test callers that must never touch a
+    real broker. Fetching is the CALLER's responsibility, at whatever
+    point in its own flow live network calls are actually permitted (this
+    codebase's pre-live safety gate currently disables ALL live-mode
+    broker calls regardless of dry-run status -- see
+    broker_config.py::validate_order_allowed() -- so no current call site
+    can construct a real snapshot yet; this parameter exists so that,
+    once live trading is eventually approved, doing so closes the gap
+    immediately without another code change here). If omitted, `ctx.
+    available_cash_krw` is used as-is, unchanged from prior behavior.
+    `cash_usage_percent` is capped the same way against the
+    caller-untightenable `TRUSTED_CASH_USAGE_PERCENT_CEILING` code
+    constant regardless of whether a snapshot is supplied.
     """
     if not isinstance(order_symbol, str) or not order_symbol:
         raise LiveOrderBlockedError(f"order symbol is empty or not a string: {order_symbol!r}")
@@ -267,6 +340,14 @@ def validate_and_size_live_entry(ctx: LiveEntryContext, order_symbol: str, clien
     _validate_cash_usage_percent(ctx.cash_usage_percent)
     _validate_available_cash(ctx, now)
 
+    # CODEX-037: validate every optional numeric cap up front, before any
+    # of them is ever used in a min()/comparison below.
+    _validate_optional_positive_number("max_order_notional_krw", ctx.max_order_notional_krw)
+    _validate_optional_positive_number("max_daily_loss_krw", ctx.max_daily_loss_krw)
+    _validate_optional_positive_number("max_risk_per_trade_krw", ctx.max_risk_per_trade_krw)
+    _validate_optional_positive_number("strategy_max_quantity", ctx.strategy_max_quantity)
+    _validate_optional_positive_number("stop_price_usd", ctx.stop_price_usd)
+
     own_conn = conn is None
     active_conn = conn if conn is not None else state_db.open_db()
     try:
@@ -287,7 +368,32 @@ def validate_and_size_live_entry(ctx: LiveEntryContext, order_symbol: str, clien
                     f"({snapshot.today_entry_count}/{effective_max_daily_entries}, authoritative)"
                 )
 
-            max_allocatable_cash_krw = ctx.available_cash_krw * (ctx.cash_usage_percent / 100.0)
+            # CODEX-036: cash_usage_percent can only ever be tightened by
+            # the trusted code ceiling, never loosened by the caller --
+            # identical pattern to MAX_CONCURRENT_LIVE_POSITIONS/
+            # MAX_DAILY_LIVE_ENTRIES above.
+            effective_cash_usage_percent = min(ctx.cash_usage_percent, TRUSTED_CASH_USAGE_PERCENT_CEILING)
+
+            effective_available_cash_krw = ctx.available_cash_krw
+            if account_cash_snapshot is not None:
+                if not isinstance(account_cash_snapshot, AccountCashSnapshot):
+                    raise LiveOrderBlockedError(
+                        f"account_cash_snapshot must be an AccountCashSnapshot, "
+                        f"got {type(account_cash_snapshot).__name__}"
+                    )
+                snapshot_age_seconds = (now - account_cash_snapshot.as_of).total_seconds()
+                if snapshot_age_seconds < 0 or snapshot_age_seconds > ctx.max_cash_age_seconds:
+                    raise LiveOrderBlockedError(
+                        f"account cash snapshot is stale (age={snapshot_age_seconds:.0f}s, "
+                        f"max={ctx.max_cash_age_seconds}s)"
+                    )
+                # A caller-declared figure can only ever be reduced by the
+                # broker's own real balance, never inflated past it -- the
+                # exact CODEX-036 counterexample (declared 3,000,000 vs
+                # real 30,000) is closed by this min().
+                effective_available_cash_krw = min(ctx.available_cash_krw, account_cash_snapshot.cash_krw)
+
+            max_allocatable_cash_krw = effective_available_cash_krw * (effective_cash_usage_percent / 100.0)
             available_for_new_order_krw = max_allocatable_cash_krw - snapshot.total_committed_krw
             if available_for_new_order_krw <= 0:
                 raise LiveOrderBlockedError(

@@ -169,7 +169,8 @@ def calculate_rsi(df, period=14):
     return 100 - (100 / (1 + rs))
 
 
-def submit_order(symbol, qty=1, broker=None, client_order_id=None, *, side, live_entry_context=None):
+def submit_order(symbol, qty=1, broker=None, client_order_id=None, *, side, live_entry_context=None,
+                  account_cash_snapshot=None):
     """Submit one order, gated by two independent kill switches, both
     re-checked fresh on every call (never cached):
 
@@ -260,7 +261,14 @@ def submit_order(symbol, qty=1, broker=None, client_order_id=None, *, side, live
             # CODEX-034: reuse the caller's own client_order_id (if any)
             # for the reservation, exactly like broker/alpaca_client.py
             # does -- see that module's identical comment.
-            approval = validate_and_size_live_entry(live_entry_context, symbol, client_order_id)
+            # CODEX-036: account_cash_snapshot, if the caller supplied one
+            # (see live_readiness/account_cash.py), is passed through
+            # unchanged -- identical to broker/alpaca_client.py's copy of
+            # this gate.
+            approval = validate_and_size_live_entry(
+                live_entry_context, symbol, client_order_id,
+                account_cash_snapshot=account_cash_snapshot,
+            )
         except LiveOrderBlockedError as exc:
             print(f"CODEX-026: live entry for {symbol} blocked -- {exc}")
             return BrokerResponse(
@@ -309,15 +317,31 @@ def submit_order(symbol, qty=1, broker=None, client_order_id=None, *, side, live
     return response
 
 
+# CODEX-035: identical allowlist to broker/alpaca_client.py's
+# _DEFINITIVE_REJECTION_STATUS_CODES -- see that module for the full
+# rationale on why 408/425/429/5xx/unparseable-body/unrecognized codes
+# must all stay ambiguous rather than definitive.
+_WRAPPER_DEFINITIVE_REJECTION_STATUS_CODES = frozenset({400, 401, 403, 404, 409, 410, 422})
+
+
 def _is_ambiguous_wrapper_broker_failure(exc):
-    """CODEX-034: identical rationale to broker/alpaca_client.py's
+    """CODEX-034/CODEX-035: identical rationale to broker/alpaca_client.py's
     _is_ambiguous_broker_failure() -- kept as a separate copy here (not
     imported) since this module deliberately doesn't depend on `requests`
     directly, and test doubles on this (non-AlpacaBroker) path may raise
     plain exceptions to simulate ambiguous failures."""
     import requests
     if isinstance(exc, requests.exceptions.HTTPError):
-        return exc.response is None
+        response = exc.response
+        if response is None:
+            return True
+        if getattr(response, "status_code", None) not in _WRAPPER_DEFINITIVE_REJECTION_STATUS_CODES:
+            return True
+        try:
+            body = response.json()
+        except Exception:
+            return True
+        return not isinstance(body, dict)
     if isinstance(exc, requests.exceptions.RequestException):
         return True
     return False

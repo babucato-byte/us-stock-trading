@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from live_readiness import entry_reservation_ledger as ledger
+from live_readiness.account_cash import TRUSTED_CASH_USAGE_PERCENT_CEILING, AccountCashSnapshot
 from live_readiness.order_gateway import (
     MAX_CONCURRENT_LIVE_POSITIONS,
     MAX_DAILY_LIVE_ENTRIES,
@@ -163,32 +164,102 @@ def test_valid_cash_usage_percent_accepted(good_value):
 # Core formula: max_allocatable_cash = available_cash * percent/100.
 # ---------------------------------------------------------------------------
 
-def test_100_percent_uses_full_balance():
+def test_requesting_100_percent_is_capped_at_trusted_ceiling():
+    # CODEX-036: cash_usage_percent is capped by TRUSTED_CASH_USAGE_PERCENT_CEILING
+    # (50) regardless of what the caller requests -- 100% must NOT use
+    # the full 30,000 balance, only the trusted ceiling's 50% (15,000).
     ctx = _ctx(available_cash_krw=30_000, cash_usage_percent=100, fx_rate_krw_per_usd=1_000.0,
-               expected_fill_price_usd=30.0, stop_price_usd=None)
+               expected_fill_price_usd=15.0, stop_price_usd=None)
     qty = _sized(ctx)
-    assert qty * 30.0 * 1_000.0 <= 30_000
-    assert qty * 30.0 * 1_000.0 > 29_000  # close to the full 30,000 ceiling
+    assert qty * 15.0 * 1_000.0 <= 15_000
+    assert qty * 15.0 * 1_000.0 > 14_000  # close to the trusted 50% (15,000) ceiling, not 30,000
 
 
-def test_90_percent_caps_at_90_percent_of_balance():
-    ctx = _ctx(available_cash_krw=30_000, cash_usage_percent=90, fx_rate_krw_per_usd=1_000.0,
-               expected_fill_price_usd=27.0, stop_price_usd=None)
+def test_percent_below_trusted_ceiling_uses_requested_percent():
+    ctx = _ctx(available_cash_krw=30_000, cash_usage_percent=40, fx_rate_krw_per_usd=1_000.0,
+               expected_fill_price_usd=12.0, stop_price_usd=None)
     qty = _sized(ctx)
-    assert qty * 27.0 * 1_000.0 <= 27_000
-    assert qty * 27.0 * 1_000.0 > 26_000  # close to the 90% (27,000) ceiling, not the full 30,000
+    assert qty * 12.0 * 1_000.0 <= 12_000
+    assert qty * 12.0 * 1_000.0 > 11_000  # close to the requested 40% (12,000), below the 50% ceiling
+
+
+# ---------------------------------------------------------------------------
+# CODEX-036: available cash and cash_usage_percent must be capped by an
+# authoritative source, never taken at face value from the caller.
+# ---------------------------------------------------------------------------
+
+def _account_snapshot(cash_krw, *, as_of=None):
+    return AccountCashSnapshot(cash_krw=cash_krw, as_of=as_of or NOW, source="broker_account_endpoint")
+
+
+def test_codex036_repro_inflated_cash_capped_by_real_account_snapshot():
+    # Codex's exact reproduction: a real 30,000 KRW account, caller
+    # declares 3,000,000/100% -- must NOT approve anywhere close to the
+    # ~2,997,000 KRW order the old (uncapped) design allowed.
+    ctx = _ctx(available_cash_krw=3_000_000, cash_usage_percent=100, fx_rate_krw_per_usd=1_000.0,
+               expected_fill_price_usd=1.0, fractional_shares_allowed=True,
+               min_order_amount_usd=0.01, stop_price_usd=None)
+    approval = validate_and_size_live_entry(
+        ctx, ctx.symbol, account_cash_snapshot=_account_snapshot(30_000),
+    )
+    conn = state_db.open_db()
+    row = ledger.get_by_id(conn, approval.reservation_id)
+    # capped at the trusted ceiling (50%) of the REAL 30,000 balance, not
+    # the caller's declared 3,000,000 -- nowhere near 2,997,000 KRW.
+    assert row["notional_krw"] <= 15_000
+
+
+def test_account_snapshot_can_only_lower_never_raise_caller_cash():
+    # The opposite direction: a real account with MORE cash than the
+    # caller declared must NOT let the caller exceed their own declared
+    # figure either -- min() cuts both ways.
+    ctx = _ctx(available_cash_krw=1_000, cash_usage_percent=50, fx_rate_krw_per_usd=1_000.0,
+               expected_fill_price_usd=0.10, fractional_shares_allowed=True,
+               min_order_amount_usd=0.01, stop_price_usd=None)
+    approval = validate_and_size_live_entry(
+        ctx, ctx.symbol, account_cash_snapshot=_account_snapshot(10_000_000),
+    )
+    conn = state_db.open_db()
+    row = ledger.get_by_id(conn, approval.reservation_id)
+    assert row["notional_krw"] <= 500  # 1,000 * 50%, not 10,000,000-derived
+
+
+def test_account_snapshot_wrong_type_blocked():
+    ctx = _ctx()
+    with pytest.raises(LiveOrderBlockedError, match="AccountCashSnapshot"):
+        validate_and_size_live_entry(ctx, ctx.symbol, account_cash_snapshot=3_000_000)
+
+
+def test_account_snapshot_stale_blocked():
+    stale = NOW - timedelta(hours=1)
+    ctx = _ctx(max_cash_age_seconds=300)
+    with pytest.raises(LiveOrderBlockedError, match="stale"):
+        validate_and_size_live_entry(ctx, ctx.symbol, account_cash_snapshot=_account_snapshot(30_000, as_of=stale))
+
+
+def test_no_snapshot_supplied_uses_caller_cash_unchanged():
+    # Backward compatibility: omitting account_cash_snapshot entirely
+    # (order_gateway.py's own unit tests, or a caller that hasn't wired
+    # snapshot-fetching yet) leaves ctx.available_cash_krw as the only
+    # cash input, exactly like before CODEX-036.
+    ctx = _ctx(available_cash_krw=30_000, cash_usage_percent=40, fx_rate_krw_per_usd=1_000.0,
+               expected_fill_price_usd=12.0, stop_price_usd=None)
+    qty = _sized(ctx)
+    assert qty * 12.0 * 1_000.0 > 11_000
 
 
 def test_no_fixed_30000_ceiling_larger_balance_allows_larger_order():
     """CODEX-034's explicit requirement: 30,000 KRW must not be baked in
     as a permanent system ceiling -- a larger real balance must allow a
-    correspondingly larger order."""
-    ctx = _ctx(available_cash_krw=300_000, cash_usage_percent=100, fx_rate_krw_per_usd=1_000.0,
-               expected_fill_price_usd=250.0, stop_price_usd=None)
+    correspondingly larger order. Uses cash_usage_percent=50 (at, not
+    above, the CODEX-036 trusted ceiling) so this test isolates the
+    balance-scaling behavior from the ceiling-capping behavior."""
+    ctx = _ctx(available_cash_krw=300_000, cash_usage_percent=50, fx_rate_krw_per_usd=1_000.0,
+               expected_fill_price_usd=100.0, stop_price_usd=None)
     qty = _sized(ctx)
-    notional = qty * 250.0 * 1_000.0
+    notional = qty * 100.0 * 1_000.0
     assert notional > 30_000  # would have been impossible under the old fixed ceiling
-    assert notional <= 300_000
+    assert notional <= 300_000 * 0.5
 
 
 def test_balance_change_is_reflected_immediately():
@@ -260,7 +331,10 @@ def test_pending_reservation_deducted(monkeypatch):
     monkeypatch.setattr("live_readiness.order_gateway.MAX_CONCURRENT_LIVE_POSITIONS", 5)
     conn = state_db.open_db()
     _seed_reservation(conn, notional_krw=20_000, state=ledger.STATE_RESERVED)
-    ctx = _ctx(available_cash_krw=30_000, cash_usage_percent=100, expected_fill_price_usd=1_000.0,
+    # CODEX-036: cash_usage_percent=100 is capped to the trusted 50%
+    # ceiling, so available_cash_krw is doubled here to keep the same
+    # 30,000 KRW effective allocatable cash this test's math depends on.
+    ctx = _ctx(available_cash_krw=60_000, cash_usage_percent=50, expected_fill_price_usd=1_000.0,
                fx_rate_krw_per_usd=1_000.0, stop_price_usd=None, max_position_count=5)
     # 30,000 - 20,000 pending = 10,000 available; 1 share costs 1,000,000 KRW -> unaffordable.
     with pytest.raises(LiveOrderBlockedError, match="sizing blocked"):
@@ -271,7 +345,7 @@ def test_unknown_submission_reservation_deducted(monkeypatch):
     monkeypatch.setattr("live_readiness.order_gateway.MAX_CONCURRENT_LIVE_POSITIONS", 5)
     conn = state_db.open_db()
     _seed_reservation(conn, notional_krw=20_000, state=ledger.STATE_SUBMISSION_UNKNOWN)
-    ctx = _ctx(available_cash_krw=30_000, cash_usage_percent=100, expected_fill_price_usd=1_000.0,
+    ctx = _ctx(available_cash_krw=60_000, cash_usage_percent=50, expected_fill_price_usd=1_000.0,
                fx_rate_krw_per_usd=1_000.0, stop_price_usd=None, max_position_count=5)
     with pytest.raises(LiveOrderBlockedError, match="sizing blocked"):
         _sized(ctx)
@@ -291,7 +365,7 @@ def test_open_position_cost_deducted(monkeypatch):
     conn = state_db.open_db()
     _seed_reservation(conn, notional_krw=20_000, state=ledger.STATE_COMMITTED, position_id=record["position_id"])
 
-    ctx = _ctx(available_cash_krw=30_000, cash_usage_percent=100, expected_fill_price_usd=1_000.0,
+    ctx = _ctx(available_cash_krw=60_000, cash_usage_percent=50, expected_fill_price_usd=1_000.0,
                fx_rate_krw_per_usd=1_000.0, stop_price_usd=None, max_position_count=5)
     with pytest.raises(LiveOrderBlockedError, match="sizing blocked"):
         _sized(ctx)
@@ -320,6 +394,81 @@ def test_closed_position_cost_not_deducted():
 # strategy_max_qty) -- resize down, don't just reject.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# CODEX-037: NaN/Infinity/bool/string/negative/zero optional caps must be
+# rejected up front (fail-closed), never silently ignored ("fail-open").
+# ---------------------------------------------------------------------------
+
+_INVALID_OPTIONAL_CAP_VALUES = [float("nan"), float("inf"), float("-inf"), True, False, "10", -1, 0]
+
+
+@pytest.mark.parametrize("bad_value", _INVALID_OPTIONAL_CAP_VALUES)
+def test_invalid_max_order_notional_krw_blocked(bad_value):
+    ctx = _ctx(max_order_notional_krw=bad_value)
+    with pytest.raises(LiveOrderBlockedError, match="max_order_notional_krw"):
+        _sized(ctx)
+
+
+@pytest.mark.parametrize("bad_value", _INVALID_OPTIONAL_CAP_VALUES)
+def test_invalid_max_daily_loss_krw_blocked(bad_value):
+    ctx = _ctx(max_daily_loss_krw=bad_value)
+    with pytest.raises(LiveOrderBlockedError, match="max_daily_loss_krw"):
+        _sized(ctx)
+
+
+@pytest.mark.parametrize("bad_value", _INVALID_OPTIONAL_CAP_VALUES)
+def test_invalid_max_risk_per_trade_krw_blocked(bad_value):
+    ctx = _ctx(max_risk_per_trade_krw=bad_value)
+    with pytest.raises(LiveOrderBlockedError, match="max_risk_per_trade_krw"):
+        _sized(ctx)
+
+
+@pytest.mark.parametrize("bad_value", _INVALID_OPTIONAL_CAP_VALUES)
+def test_invalid_strategy_max_quantity_blocked(bad_value):
+    ctx = _ctx(strategy_max_quantity=bad_value)
+    with pytest.raises(LiveOrderBlockedError, match="strategy_max_quantity"):
+        _sized(ctx)
+
+
+@pytest.mark.parametrize("bad_value", _INVALID_OPTIONAL_CAP_VALUES)
+def test_invalid_stop_price_usd_blocked(bad_value):
+    ctx = _ctx(stop_price_usd=bad_value)
+    with pytest.raises(LiveOrderBlockedError, match="stop_price_usd"):
+        _sized(ctx)
+
+
+def test_codex037_repro_fractional_nan_risk_cap_blocked_zero_reservations():
+    # Codex's exact reproduction: fractional entry + NaN risk cap used to
+    # silently approve a ~$3 order (qty 0.2222...) instead of blocking.
+    conn = state_db.open_db()
+    ctx = _ctx(available_cash_krw=13_500, cash_usage_percent=100, fx_rate_krw_per_usd=1_350.0,
+               expected_fill_price_usd=10.0, stop_price_usd=9.0, fractional_shares_allowed=True,
+               max_risk_per_trade_krw=float("nan"))
+    with pytest.raises(LiveOrderBlockedError, match="max_risk_per_trade_krw"):
+        _sized(ctx)
+    assert conn.execute("SELECT COUNT(*) AS n FROM live_entry_reservations").fetchone()["n"] == 0
+
+
+def test_codex037_repro_fractional_nan_strategy_cap_blocked_zero_reservations():
+    conn = state_db.open_db()
+    ctx = _ctx(available_cash_krw=13_500, cash_usage_percent=100, fx_rate_krw_per_usd=1_350.0,
+               expected_fill_price_usd=10.0, stop_price_usd=None, fractional_shares_allowed=True,
+               strategy_max_quantity=float("nan"))
+    with pytest.raises(LiveOrderBlockedError, match="strategy_max_quantity"):
+        _sized(ctx)
+    assert conn.execute("SELECT COUNT(*) AS n FROM live_entry_reservations").fetchone()["n"] == 0
+
+
+def test_codex037_repro_whole_share_nan_order_notional_cap_blocked_zero_reservations():
+    conn = state_db.open_db()
+    ctx = _ctx(available_cash_krw=40_500, cash_usage_percent=100, fx_rate_krw_per_usd=1_350.0,
+               expected_fill_price_usd=10.0, stop_price_usd=None, fractional_shares_allowed=False,
+               max_order_notional_krw=float("nan"))
+    with pytest.raises(LiveOrderBlockedError, match="max_order_notional_krw"):
+        _sized(ctx)
+    assert conn.execute("SELECT COUNT(*) AS n FROM live_entry_reservations").fetchone()["n"] == 0
+
+
 def test_risk_cap_resizes_quantity_down_instead_of_rejecting():
     # Balance affords 3 shares ($30 budget / $10 = 3); a tight per-trade
     # risk cap should shrink the quantity, not reject the whole order.
@@ -331,7 +480,10 @@ def test_risk_cap_resizes_quantity_down_instead_of_rejecting():
 
 
 def test_risk_cap_looser_than_balance_does_not_reduce_quantity():
-    ctx = _ctx(available_cash_krw=13_500, cash_usage_percent=100, fx_rate_krw_per_usd=1_350.0,
+    # CODEX-036: available_cash_krw doubled to 27,000 so the trusted 50%
+    # ceiling still leaves 13,500 KRW effective budget (1 share at $10 *
+    # 1,350 KRW/$), matching this test's original intent.
+    ctx = _ctx(available_cash_krw=27_000, cash_usage_percent=100, fx_rate_krw_per_usd=1_350.0,
                expected_fill_price_usd=10.0, stop_price_usd=9.0,
                max_risk_per_trade_krw=1_000_000.0)  # far looser than the balance ceiling
     qty = _sized(ctx)
@@ -354,16 +506,18 @@ def test_strategy_max_quantity_resizes_quantity_down():
 
 
 def test_strategy_max_quantity_looser_than_balance_does_not_increase_quantity():
-    ctx = _ctx(available_cash_krw=13_500, cash_usage_percent=100, fx_rate_krw_per_usd=1_350.0,
+    ctx = _ctx(available_cash_krw=27_000, cash_usage_percent=100, fx_rate_krw_per_usd=1_350.0,
                expected_fill_price_usd=10.0, stop_price_usd=None, strategy_max_quantity=100)
     qty = _sized(ctx)
     assert qty == 1
 
 
 def test_strategy_max_quantity_zero_blocked():
+    # CODEX-037: strategy_max_quantity=0 is now caught by the upfront
+    # "must be positive" optional-cap validation, before sizing even runs.
     ctx = _ctx(available_cash_krw=40_500, cash_usage_percent=100, fx_rate_krw_per_usd=1_350.0,
                expected_fill_price_usd=10.0, stop_price_usd=None, strategy_max_quantity=0)
-    with pytest.raises(LiveOrderBlockedError, match="no affordable quantity"):
+    with pytest.raises(LiveOrderBlockedError, match="strategy_max_quantity must be positive"):
         _sized(ctx)
 
 
@@ -756,14 +910,127 @@ class _TimeoutThenOkSession:
     correctly-blocked retry must never get that far."""
 
     def __init__(self):
-        self.calls = 0
+        self.order_calls = 0
 
     def request(self, *args, **kwargs):
-        self.calls += 1
-        if self.calls == 1:
+        self.order_calls += 1
+        if self.order_calls == 1:
             import requests
             raise requests.exceptions.Timeout("simulated broker response loss")
         raise AssertionError("retry should have been blocked by the still-active reservation, not reach the broker")
+
+
+class _HTTPErrorThenBlockedSession:
+    """First .request() call raises requests.exceptions.HTTPError with a
+    REAL requests.Response attached (status_code + JSON body), simulating
+    an upstream/gateway/rejection response that WAS received. A second
+    call (if ever reached) fails the test, since a correctly-blocked
+    retry must never get that far."""
+
+    def __init__(self, status_code, body=None, *, malformed_body=False):
+        self.order_calls = 0
+        self.status_code = status_code
+        self.body = body if body is not None else {"message": "simulated response"}
+        self.malformed_body = malformed_body
+
+    def request(self, *args, **kwargs):
+        self.order_calls += 1
+        if self.order_calls == 1:
+            import json
+            import requests
+            resp = requests.Response()
+            resp.status_code = self.status_code
+            resp._content = b"not json {{{" if self.malformed_body else json.dumps(self.body).encode()
+            raise requests.exceptions.HTTPError(response=resp)
+        raise AssertionError("retry should have been blocked, not reach the broker")
+
+
+def _live_broker_for_fault_injection(session, monkeypatch):
+    from broker.broker_config import BrokerConfig as _BC
+
+    broker = AlpacaBroker(
+        config=_BC(trading_mode="live", enable_real_trading=True, live_dry_run=False,
+                   api_key="key", secret_key="secret"),
+        session=session,
+    )
+    monkeypatch.setattr(_BC, "validate_order_allowed", lambda self: True)
+    monkeypatch.setattr(_BC, "validate_for_request", lambda self: None)
+    monkeypatch.setenv("ALPACA_API_KEY", "key")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "secret")
+    monkeypatch.setenv("TRADING_MODE", "live")
+    return broker
+
+
+@pytest.mark.parametrize("status_code", [408, 425, 429, 500, 502, 503, 504])
+def test_ambiguous_http_status_marks_submission_unknown_not_released(monkeypatch, status_code):
+    session = _HTTPErrorThenBlockedSession(status_code)
+    broker = _live_broker_for_fault_injection(session, monkeypatch)
+
+    ctx = _ctx(symbol="AAPL", available_cash_krw=27_000, cash_usage_percent=100,
+               expected_fill_price_usd=10.0, fx_rate_krw_per_usd=1_350.0, stop_price_usd=None)
+    with pytest.raises(Exception):
+        broker.submit_order("AAPL", qty=1, side="buy", client_order_id=None, live_entry_context=ctx)
+
+    conn = state_db.open_db()
+    rows = conn.execute("SELECT state FROM live_entry_reservations").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["state"] == ledger.STATE_SUBMISSION_UNKNOWN  # not RELEASED
+
+    ctx_retry = _ctx(symbol="AAPL", available_cash_krw=27_000, cash_usage_percent=100,
+                      expected_fill_price_usd=10.0, fx_rate_krw_per_usd=1_350.0, stop_price_usd=None)
+    response = broker.submit_order("AAPL", qty=1, side="buy", client_order_id=None,
+                                    live_entry_context=ctx_retry)
+    assert response.status_code == 423
+    assert session.order_calls == 1  # exactly one broker submit call total, never a second
+
+
+def test_ambiguous_unrecognized_http_status_marks_submission_unknown(monkeypatch):
+    # A status code this classifier has never seen before must default to
+    # ambiguous (fail-closed allowlist), not be silently trusted.
+    session = _HTTPErrorThenBlockedSession(418)
+    broker = _live_broker_for_fault_injection(session, monkeypatch)
+    ctx = _ctx(symbol="AAPL", available_cash_krw=27_000, cash_usage_percent=100,
+               expected_fill_price_usd=10.0, fx_rate_krw_per_usd=1_350.0, stop_price_usd=None)
+    with pytest.raises(Exception):
+        broker.submit_order("AAPL", qty=1, side="buy", client_order_id=None, live_entry_context=ctx)
+    conn = state_db.open_db()
+    rows = conn.execute("SELECT state FROM live_entry_reservations").fetchall()
+    assert rows[0]["state"] == ledger.STATE_SUBMISSION_UNKNOWN
+
+
+def test_definitive_status_with_unparseable_body_stays_ambiguous(monkeypatch):
+    # 422 is on the definitive allowlist, but a body that doesn't parse as
+    # JSON can't be confirmed as Alpaca's actual rejection contract.
+    session = _HTTPErrorThenBlockedSession(422, malformed_body=True)
+    broker = _live_broker_for_fault_injection(session, monkeypatch)
+    ctx = _ctx(symbol="AAPL", available_cash_krw=27_000, cash_usage_percent=100,
+               expected_fill_price_usd=10.0, fx_rate_krw_per_usd=1_350.0, stop_price_usd=None)
+    with pytest.raises(Exception):
+        broker.submit_order("AAPL", qty=1, side="buy", client_order_id=None, live_entry_context=ctx)
+    conn = state_db.open_db()
+    rows = conn.execute("SELECT state FROM live_entry_reservations").fetchall()
+    assert rows[0]["state"] == ledger.STATE_SUBMISSION_UNKNOWN
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 403, 404, 409, 410, 422])
+def test_definitive_rejection_status_with_json_body_releases(monkeypatch, status_code):
+    session = _HTTPErrorThenBlockedSession(status_code, body={"code": 40010001, "message": "rejected"})
+    broker = _live_broker_for_fault_injection(session, monkeypatch)
+    ctx = _ctx(symbol="AAPL", available_cash_krw=27_000, cash_usage_percent=100,
+               expected_fill_price_usd=10.0, fx_rate_krw_per_usd=1_350.0, stop_price_usd=None)
+    with pytest.raises(Exception):
+        broker.submit_order("AAPL", qty=1, side="buy", client_order_id=None, live_entry_context=ctx)
+    conn = state_db.open_db()
+    rows = conn.execute("SELECT state FROM live_entry_reservations").fetchall()
+    assert rows[0]["state"] == ledger.STATE_RELEASED  # a genuine definitive rejection frees the cash
+
+    # Because it was safely released, a fresh retry MAY reach the broker
+    # again (this is correct -- the first attempt is confirmed dead).
+    ctx_retry = _ctx(symbol="AAPL", available_cash_krw=27_000, cash_usage_percent=100,
+                      expected_fill_price_usd=10.0, fx_rate_krw_per_usd=1_350.0, stop_price_usd=None)
+    with pytest.raises(Exception):
+        broker.submit_order("AAPL", qty=1, side="buy", client_order_id=None, live_entry_context=ctx_retry)
+    assert session.order_calls == 2
 
 
 def test_ambiguous_broker_failure_marks_submission_unknown_not_released(monkeypatch):
@@ -810,4 +1077,4 @@ def test_ambiguous_broker_failure_marks_submission_unknown_not_released(monkeypa
     response = broker.submit_order("AAPL", qty=1, side="buy", client_order_id=None,
                                     live_entry_context=ctx_retry)
     assert response.status_code == 423
-    assert session.calls == 1  # exactly one broker submit call total, never a second
+    assert session.order_calls == 1  # exactly one broker submit call total, never a second

@@ -318,7 +318,7 @@ class AlpacaBroker:
         )
 
     def submit_order(self, symbol, qty=1, *, side, order_type="market", time_in_force="day",
-                      client_order_id=None, live_entry_context=None):
+                      client_order_id=None, live_entry_context=None, account_cash_snapshot=None):
         # Long-only v1.0: buy is always an entry, sell is always an exit --
         # see _SIDE_TO_PURPOSE. There is no short-selling path in this
         # version, so this if/else is the complete mapping.
@@ -356,7 +356,18 @@ class AlpacaBroker:
                 # reservation and the actual broker order share one
                 # identity -- the gateway mints one itself only if the
                 # caller didn't supply one.
-                approval = validate_and_size_live_entry(live_entry_context, symbol, client_order_id)
+                #
+                # CODEX-036: account_cash_snapshot, if the caller supplied
+                # one (via live_readiness.account_cash.
+                # fetch_account_cash_snapshot(), called earlier in the
+                # caller's own flow -- see that module's docstring for why
+                # this method does not fetch one itself), is passed
+                # through unchanged and caps live_entry_context.
+                # available_cash_krw at the real broker balance.
+                approval = validate_and_size_live_entry(
+                    live_entry_context, symbol, client_order_id,
+                    account_cash_snapshot=account_cash_snapshot,
+                )
             except LiveOrderBlockedError as exc:
                 return BrokerResponse(
                     status_code=423,
@@ -520,17 +531,52 @@ def _mark_live_entry_submission_unknown(reservation_id):
         pass
 
 
+# CODEX-035: an ALLOWLIST of HTTP status codes Alpaca uses for genuine,
+# definitive order-request rejection (a client-side problem with THIS
+# specific request -- bad symbol, bad qty, insufficient buying power,
+# etc. -- that unambiguously means the order was never accepted).
+# Anything not on this allowlist (408/425/429, all 5xx, and any
+# unrecognized code) defaults to ambiguous -- fail-closed by construction,
+# so a new/unexpected status code is never silently trusted as definitive.
+# 408 Request Timeout, 425 Too Early, and 429 Too Many Requests are
+# deliberately excluded even though they are formally 4xx: none of them
+# says "your order was rejected", they say "try again" -- treating them
+# as definitive would be exactly the CODEX-035 bug.
+_DEFINITIVE_REJECTION_STATUS_CODES = frozenset({400, 401, 403, 404, 409, 410, 422})
+
+
 def _is_ambiguous_broker_failure(exc):
-    """CODEX-034: True for a broker-call failure that does NOT prove the
-    order was never received (timeout, connection reset, DNS failure --
-    no HTTP response was ever obtained). False for a definitive outcome:
-    an actual HTTP error response (requests.exceptions.HTTPError with
-    `.response` set, raised by response.raise_for_status()) or any
-    non-network exception (e.g. a pre-network safety-gate RuntimeError),
-    both of which mean the order's fate IS known (rejected, or never
-    sent at all)."""
+    """CODEX-034/CODEX-035: True for a broker-call failure that does NOT
+    prove the order was never received. False only for a DEFINITIVE
+    outcome: a response whose HTTP status is on
+    _DEFINITIVE_REJECTION_STATUS_CODES AND whose body parses as a JSON
+    object (Alpaca's actual error-response shape), or any non-network
+    exception (e.g. a pre-network safety-gate RuntimeError) -- both mean
+    the order's fate IS known (rejected, or never sent at all).
+
+    Ambiguous (SUBMISSION_UNKNOWN, never released) cases, per CODEX-035's
+    direct reproduction: a plain requests.exceptions.RequestException
+    with no response at all (timeout, connection reset, DNS failure);
+    an HTTPError whose response IS present but whose status is 408, 425,
+    429, or any 5xx (500/502/503/504/...) -- an upstream/gateway/rate-limit
+    failure proves nothing about whether Alpaca's own order-matching
+    engine ever received the request; an HTTPError whose status happens to
+    be on the definitive allowlist but whose body doesn't parse as JSON
+    (can't confirm it's actually Alpaca's rejection contract and not some
+    proxy's generic error page); and any status code not on the allowlist
+    at all (fail-closed default for codes this classifier doesn't
+    recognize)."""
     if isinstance(exc, requests.exceptions.HTTPError):
-        return exc.response is None
+        response = exc.response
+        if response is None:
+            return True
+        if getattr(response, "status_code", None) not in _DEFINITIVE_REJECTION_STATUS_CODES:
+            return True
+        try:
+            body = response.json()
+        except Exception:
+            return True
+        return not isinstance(body, dict)
     if isinstance(exc, requests.exceptions.RequestException):
         return True
     return False

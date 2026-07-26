@@ -86,12 +86,19 @@ def test_summary_csv_generation(tmp_path, monkeypatch):
 
     monkeypatch.setattr(analytics, "PERFORMANCE_SUMMARY_FILE", tmp_path / "performance_summary.csv")
     monkeypatch.setattr(analytics, "PERFORMANCE_TRADES_FILE", tmp_path / "performance_trades.csv")
+    # CODEX-038: write_performance_files() also always writes a
+    # strategy-level breakdown (build_strategy_performance() when
+    # strategy_df isn't passed) -- without isolating this path too, it
+    # silently wrote to the real repo-root strategy_performance.csv,
+    # changing its mtime on every test run.
+    monkeypatch.setattr(analytics, "STRATEGY_PERFORMANCE_FILE", tmp_path / "strategy_performance.csv")
     write_performance_files(summary, trades)
 
     result = pd.read_csv(tmp_path / "performance_summary.csv")
     assert result.columns.tolist() == SUMMARY_COLUMNS
     assert result.iloc[0]["win_rate"] == 100.0
     assert (tmp_path / "performance_trades.csv").exists()
+    assert (tmp_path / "strategy_performance.csv").exists()
 
 
 def test_dashboard_performance_route_importable(monkeypatch):
