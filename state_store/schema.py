@@ -233,6 +233,34 @@ MIGRATION_4_STATEMENTS = [
     LIVE_ENTRY_RESERVATIONS_CREATED_AT_INDEX,
 ]
 
+# ---------------------------------------------------------------------------
+# Migration 5 (CODEX-034): client_order_id on live_entry_reservations, so a
+# reservation whose broker response was lost (timeout/connection reset --
+# NOT a definitive rejection) can later be reconciled by looking the same
+# order up at the broker, instead of being guessed at. Before this column,
+# AlpacaBroker.submit_order() had no way to durably record *which* broker
+# order a reservation corresponded to, so an ambiguous failure had only two
+# options: release it (CODEX-034's bug -- silently under-counts real
+# exposure if the broker actually received the order) or leave it stuck
+# forever with no way to ever resolve it. client_order_id is generated and
+# stored before the broker call, exactly like state_store/
+# exit_intent_ledger.py already does for exits.
+# ---------------------------------------------------------------------------
+
+LIVE_ENTRY_RESERVATIONS_ADD_CLIENT_ORDER_ID = """
+ALTER TABLE live_entry_reservations ADD COLUMN client_order_id TEXT
+"""
+
+LIVE_ENTRY_RESERVATIONS_CLIENT_ORDER_ID_INDEX = """
+CREATE UNIQUE INDEX idx_live_entry_reservations_client_order_id
+    ON live_entry_reservations (client_order_id)
+"""
+
+MIGRATION_5_STATEMENTS = [
+    LIVE_ENTRY_RESERVATIONS_ADD_CLIENT_ORDER_ID,
+    LIVE_ENTRY_RESERVATIONS_CLIENT_ORDER_ID_INDEX,
+]
+
 # Every table this schema version creates -- used by export.py's
 # export_all() and by tests asserting the full table set exists.
 ALL_TABLES = [

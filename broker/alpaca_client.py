@@ -350,7 +350,13 @@ class AlpacaBroker:
                     dry_run=False,
                 )
             try:
-                approval = validate_and_size_live_entry(live_entry_context, symbol)
+                # CODEX-034: pass the caller's own client_order_id through
+                # (if it already generated one, e.g. via
+                # paper_strategy_order.try_reserve_order()) so the durable
+                # reservation and the actual broker order share one
+                # identity -- the gateway mints one itself only if the
+                # caller didn't supply one.
+                approval = validate_and_size_live_entry(live_entry_context, symbol, client_order_id)
             except LiveOrderBlockedError as exc:
                 return BrokerResponse(
                     status_code=423,
@@ -359,6 +365,7 @@ class AlpacaBroker:
                     dry_run=False,
                 )
             qty = approval.quantity
+            client_order_id = approval.client_order_id  # always the id actually reserved
 
         order = {
             "symbol": symbol,
@@ -373,8 +380,8 @@ class AlpacaBroker:
         try:
             if self.config.is_live_mode and not self.config.can_submit_live_order:
                 # LIVE_DRY_RUN: nothing was actually submitted -- release
-                # the budget hold immediately rather than counting it
-                # against the pilot ceiling until the next daily reset.
+                # the cash hold immediately rather than counting it
+                # against allocatable cash until the next daily reset.
                 if approval is not None:
                     _release_live_entry_reservation(approval.reservation_id)
                 return BrokerResponse(
@@ -397,20 +404,28 @@ class AlpacaBroker:
             response = self._request(
                 "POST", "/v2/orders", purpose=purpose, order_side=side, json=order, return_response=True
             )
-        except Exception:
-            # The broker call never confirmed success (rejected, timed
-            # out, or some earlier safety gate raised) -- release the
-            # budget hold so it isn't permanently locked against a live
-            # entry that (as far as this process can tell) never went
-            # through. Residual risk, documented in DECISION_LOG.md: if
-            # the order actually reached the broker despite a local
-            # exception (e.g. the response was lost after submission),
-            # this release could under-count real exposure -- the same
-            # class of gap this codebase's entry path has never had
-            # crash-safe reconciliation for (see Phase 1B's "다중 파일
-            # 트랜잭션 부재" residual risk).
+        except Exception as exc:
+            # CODEX-034: distinguish a DEFINITIVE broker rejection (an
+            # HTTP response was actually received, just a 4xx/5xx one --
+            # requests' raise_for_status() raised HTTPError with
+            # exc.response set) or a pre-network failure (kill switch,
+            # credential revalidation, the payload/purpose consistency
+            # check above -- the order definitively never reached the
+            # broker) from an AMBIGUOUS failure (timeout, connection
+            # reset, DNS failure -- no response was ever received, so the
+            # broker may or may not have gotten the order). Only the
+            # first two are safe to release; the ambiguous case must stay
+            # counted against allocatable cash until reconciled (see
+            # entry_reservation_ledger.py's module docstring) --
+            # releasing it unconditionally here was exactly the bug
+            # CODEX-034 found: a naive retry could then double-submit
+            # while the authoritative snapshot under-counted real
+            # exposure by the first (possibly-live) order's notional.
             if approval is not None:
-                _release_live_entry_reservation(approval.reservation_id)
+                if _is_ambiguous_broker_failure(exc):
+                    _mark_live_entry_submission_unknown(approval.reservation_id)
+                else:
+                    _release_live_entry_reservation(approval.reservation_id)
             raise
 
         if approval is not None:
@@ -466,12 +481,14 @@ def _commit_live_entry_reservation(reservation_id):
 
 
 def _release_live_entry_reservation(reservation_id):
-    """Best-effort: release a CODEX-031 live-entry budget reservation
-    that will never become a real order (dry-run, rejection, or any
-    exception during submission). A failure here must not mask the
-    original error/response -- the reservation simply stays RESERVED
-    until the next daily reset, a strictly more conservative (never
-    fail-open) outcome than releasing it."""
+    """Best-effort: release a CODEX-031 live-entry cash reservation that
+    will never become a real order (dry-run, a DEFINITIVE rejection, or a
+    pre-network failure). A failure here must not mask the original
+    error/response -- the reservation simply stays in its current
+    (non-terminal) state until an operator/reconciliation resolves it, a
+    strictly more conservative (never fail-open) outcome than releasing
+    it. CODEX-034: never call this for an AMBIGUOUS failure -- see
+    _mark_live_entry_submission_unknown()."""
     from live_readiness import entry_reservation_ledger as live_ledger
     from state_store import db as state_db
     try:
@@ -482,3 +499,38 @@ def _release_live_entry_reservation(reservation_id):
             conn.close()
     except Exception:
         pass
+
+
+def _mark_live_entry_submission_unknown(reservation_id):
+    """CODEX-034: best-effort transition of a live-entry cash reservation
+    to SUBMISSION_UNKNOWN after an AMBIGUOUS broker-call failure (see
+    _is_ambiguous_broker_failure()) -- deliberately NOT released, so it
+    keeps counting against allocatable cash until
+    entry_reservation_ledger.reconcile_by_client_order_id() (or an
+    operator) resolves it against the broker's own record of the order."""
+    from live_readiness import entry_reservation_ledger as live_ledger
+    from state_store import db as state_db
+    try:
+        conn = state_db.open_db()
+        try:
+            live_ledger.mark_submission_unknown(conn, reservation_id)
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def _is_ambiguous_broker_failure(exc):
+    """CODEX-034: True for a broker-call failure that does NOT prove the
+    order was never received (timeout, connection reset, DNS failure --
+    no HTTP response was ever obtained). False for a definitive outcome:
+    an actual HTTP error response (requests.exceptions.HTTPError with
+    `.response` set, raised by response.raise_for_status()) or any
+    non-network exception (e.g. a pre-network safety-gate RuntimeError),
+    both of which mean the order's fate IS known (rejected, or never
+    sent at all)."""
+    if isinstance(exc, requests.exceptions.HTTPError):
+        return exc.response is None
+    if isinstance(exc, requests.exceptions.RequestException):
+        return True
+    return False

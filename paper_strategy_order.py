@@ -257,7 +257,10 @@ def submit_order(symbol, qty=1, broker=None, client_order_id=None, *, side, live
                 dry_run=False,
             )
         try:
-            approval = validate_and_size_live_entry(live_entry_context, symbol)
+            # CODEX-034: reuse the caller's own client_order_id (if any)
+            # for the reservation, exactly like broker/alpaca_client.py
+            # does -- see that module's identical comment.
+            approval = validate_and_size_live_entry(live_entry_context, symbol, client_order_id)
         except LiveOrderBlockedError as exc:
             print(f"CODEX-026: live entry for {symbol} blocked -- {exc}")
             return BrokerResponse(
@@ -267,6 +270,7 @@ def submit_order(symbol, qty=1, broker=None, client_order_id=None, *, side, live
                 dry_run=False,
             )
         qty = approval.quantity
+        client_order_id = approval.client_order_id  # always the id actually reserved
 
     submit_kwargs = dict(qty=qty, side=side, client_order_id=client_order_id)
     if is_live_entry and isinstance(broker, AlpacaBroker):
@@ -279,9 +283,15 @@ def submit_order(symbol, qty=1, broker=None, client_order_id=None, *, side, live
 
     try:
         response = broker.submit_order(symbol, **submit_kwargs)
-    except Exception:
+    except Exception as exc:
+        # CODEX-034: same ambiguous-vs-definitive classification as
+        # broker/alpaca_client.py -- see that module's
+        # _is_ambiguous_broker_failure() for the full rationale.
         if approval is not None:
-            _release_wrapper_owned_reservation(approval.reservation_id)
+            if _is_ambiguous_wrapper_broker_failure(exc):
+                _mark_wrapper_owned_submission_unknown(approval.reservation_id)
+            else:
+                _release_wrapper_owned_reservation(approval.reservation_id)
         raise
 
     if approval is not None:
@@ -297,6 +307,36 @@ def submit_order(symbol, qty=1, broker=None, client_order_id=None, *, side, live
 
     print(f"{symbol} order result: {response.status_code} {response.text[:500]}")
     return response
+
+
+def _is_ambiguous_wrapper_broker_failure(exc):
+    """CODEX-034: identical rationale to broker/alpaca_client.py's
+    _is_ambiguous_broker_failure() -- kept as a separate copy here (not
+    imported) since this module deliberately doesn't depend on `requests`
+    directly, and test doubles on this (non-AlpacaBroker) path may raise
+    plain exceptions to simulate ambiguous failures."""
+    import requests
+    if isinstance(exc, requests.exceptions.HTTPError):
+        return exc.response is None
+    if isinstance(exc, requests.exceptions.RequestException):
+        return True
+    return False
+
+
+def _mark_wrapper_owned_submission_unknown(reservation_id):
+    """Best-effort CODEX-034 reservation submission-unknown transition
+    for the non-AlpacaBroker (test-double-only) path -- see
+    submit_order()'s docstring."""
+    from live_readiness import entry_reservation_ledger as live_ledger
+    from state_store import db as state_db
+    try:
+        conn = state_db.open_db()
+        try:
+            live_ledger.mark_submission_unknown(conn, reservation_id)
+        finally:
+            conn.close()
+    except Exception:
+        pass
 
 
 def _commit_wrapper_owned_reservation(reservation_id):

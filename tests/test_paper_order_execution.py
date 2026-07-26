@@ -34,9 +34,10 @@ def _live_entry_context(symbol="AAPL"):
     now = datetime.now(timezone.utc)
     return LiveEntryContext(
         symbol=symbol, expected_fill_price_usd=10.0, allow_list=[symbol],
-        available_cash_krw=30_000, fx_rate_krw_per_usd=1_350.0, fx_rate_as_of=now.isoformat(),
+        available_cash_krw=30_000, cash_usage_percent=100, cash_as_of=now.isoformat(),
+        fx_rate_krw_per_usd=1_350.0, fx_rate_as_of=now.isoformat(),
         max_order_notional_krw=30_000, max_daily_loss_krw=10_000, max_position_count=1,
-        current_open_position_count=0, max_daily_entries=2, today_entry_count=0, now=now,
+        max_daily_entries=2, now=now,
     )
 
 
