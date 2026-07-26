@@ -440,3 +440,53 @@
   새로운 문제를 만든다. CODEX-030의 실제 재현(EOD 근처 실행 시 target/stop/no-action 테스트가
   EOD_FORCED_CLOSE로 바뀜)은 전적으로 `check_and_manage()`의 `now` 인자 누락이 원인이었다.
 - 승인 필요 여부: 아니오(코드 구현·테스트 추가·문서화 범위, 실거래/승인/main/push와 무관).
+
+## Stage 3~10 최종 통합 수정 사이클 — CODEX-024/026/028/031/032/033 (2026-07-26)
+
+- 결정 1(CODEX-032/024/028, 원자성) — broker rejection 시 `eil.mark_aborted()`와 position의
+  `MANUAL_REVIEW` 전이를 별도 트랜잭션이 아니라 `store.locked_position(conn=conn)`의 단일
+  트랜잭션(commit=False로 지연된 커밋) 안에서 함께 처리하도록 수정했다. 근거: 이전 설계는
+  "broker 호출 밖에서 실행되는 mark_aborted는 position write와 원자적일 필요가 없다"는 가정에
+  기반했으나, 실제로는 두 write가 서로 다른 트랜잭션이면 두 번째(position) write 실패 시 intent만
+  terminal ABORTED로 남고 position은 영구히 EXIT_SUBMITTED에 갇히는 실제 재현 가능한 결함이었다.
+  Phase A의 `eil.reserve(..., commit=False)`와 동일한 패턴을 재사용해 일관성을 유지했다.
+- 결정 2(CODEX-031/026, 권위 있는 예산 범위) — `LiveEntryContext`가 caller에게 여전히 허용하는
+  필드는 `expected_fill_price_usd`/`stop_price_usd`/`fx_rate_krw_per_usd`/`fx_rate_as_of`/
+  `allow_list`/`available_cash_krw`뿐이다. `available_cash_krw`는 실제 broker 계좌 잔고처럼
+  이 코드베이스가 로컬에서 독립적으로 재계산할 수 없는 시장/계좌 사실이므로 price/FX와 동일하게
+  caller 입력으로 남겼다 — 대신 `min(caller 값, 신뢰 가능한 상한)`으로 caller가 이를 이용해
+  상한을 넘길 수 없도록 막았다. `max_order_notional_krw`/`max_daily_loss_krw`/`max_position_count`/
+  `max_daily_entries`는 여전히 필드로 존재하지만 이제 "완화" 방향으로만 작동할 수 없고 신뢰
+  가능한 코드 상수(`PILOT_TOTAL_BUDGET_KRW=30_000`, `MAX_CONCURRENT_LIVE_POSITIONS=1`,
+  `MAX_DAILY_LIVE_ENTRIES=2`)와 `min()`으로 교차한다. `current_open_position_count`/
+  `today_entry_count`는 완전히 무시하고 `live_readiness/entry_reservation_ledger.py`의 SQLite
+  기록에서만 산출한다.
+- 결정 3(CODEX-031, 예산 vs 포지션 수의 서로 다른 시간 범위) — 30,000원 총 예산은 파일럿 전체에
+  걸친 누적(lifetime) 배분으로 취급해 포지션이 종료돼도 절대 반환하지 않는다(플레이북의 "30,000원은
+  총 테스트 예산" 문구와 일치). 반대로 동시 보유 포지션 수(`MAX_CONCURRENT_LIVE_POSITIONS`)는
+  실제로 "지금 열려 있는" 개념이므로, 커밋된 예약이 연결된 position이 canonical SQLite에서
+  이미 terminal 상태면 카운트에서 제외한다. 일일 진입 횟수는 당일(미국 동부 거래일 기준)로
+  스코프한다. 세 가지 서로 다른 시간 범위를 하나의 캐시된 숫자로 뭉뚱그리지 않고 각각 독립적으로
+  `entry_reservation_ledger.build_snapshot()`에서 계산한다.
+- 결정 4(CODEX-031, 이중 예약 방지) — `AlpacaBroker.submit_order()`와
+  `paper_strategy_order.submit_order()` 양쪽 모두 동일한 게이트를 실행할 수 있는 기존 구조(CODEX-026)
+  때문에, 예약(reservation)이라는 부작용이 추가된 이번 사이클에서는 두 계층이 같은 주문에 대해
+  중복으로 예산을 예약하는 문제가 생길 수 있었다. `broker`가 실제 `AlpacaBroker` 인스턴스이면
+  wrapper가 자신의 게이트 사본을 완전히 건너뛰고 broker 쪽 게이트가 유일한 예약 지점이 되도록
+  했다(`isinstance(broker, AlpacaBroker)` 분기). `AlpacaBroker`가 아닌 테스트 더블(FakeBroker 등)에
+  대해서는 wrapper가 유일한 보호막이므로 그대로 게이트를 실행하고 예약 commit/release도 직접
+  책임진다.
+- 결정 5(CODEX-031, position 연결 및 잔여 위험) — 예약을 실제 position_id에 연결하는
+  `link_position()`은 `BrokerResponse.data`에 `live_entry_reservation_id`를 실어 보내고
+  `positions/lifecycle.py::enter_position()`이 이를 읽어 호출하는 방식으로 구현했다(계층 간
+  reservation_id를 명시적으로 전달할 인터페이스가 없어 응답 데이터를 통해 전달) — best-effort이며
+  실패해도 fail-closed(예약이 계속 활성으로 집계되어 과소평가가 아니라 과대평가로 남는다).
+  broker 호출이 성공했지만(2xx) 로컬에서 예외가 발생해 release가 실행되는 극단적 경쟁 상황은
+  Phase 1B의 "다중 파일 트랜잭션 부재" 잔여 위험과 동일한 성격의 미해결 범위로 남긴다(entry
+  경로에 대한 crash-safe reconciliation은 이번 사이클 범위 밖).
+- 결정 6(CODEX-033, 문서 정합성) — `LIMITED_LIVE_REVIEW_CHECKLIST.md` §8을
+  `READY_FOR_LIMITED_LIVE_REVIEW`에서 `BLOCKED`로 되돌리고, 그 근거가 CODEX-016~022의
+  `PASS_WITH_CONDITIONS`(여전히 유효)가 아니라 이후 Stage 3~10에서 발견된 별개 Finding들이라는
+  점을 명시했다. `FINAL_VALIDATION_PACKAGE.md`를 최신 검증 상태의 단일 진실 공급원으로 문서에
+  명시적으로 지정해, 향후 유사한 불일치가 재발하지 않도록 했다.
+- 승인 필요 여부: 아니오(코드 구현·테스트 추가·문서화 범위, 실거래/승인/main/push와 무관).

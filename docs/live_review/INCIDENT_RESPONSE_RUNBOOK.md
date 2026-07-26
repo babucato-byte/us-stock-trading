@@ -221,6 +221,53 @@ wrapper뿐 아니라 `broker/alpaca_client.py::AlpacaBroker._request()` 자체�
   4. SQLite 데이터베이스 파일 자체가 손상된 경우는 이 시나리오가 아니라 시나리오 11(Position
      store 손상 감지)을 따른다 — `check_store_health()`로 구분한다.
 
+## 14. 청산 주문이 broker에 거부됐는데 position이 EXIT_SUBMITTED에 계속 남아 있음 (2026-07-26, CODEX-032 수정 이후)
+
+- **감지**: broker가 청산 주문을 명시적으로 거부(4xx/5xx)했는데도 position이 `MANUAL_REVIEW`로
+  전이하지 않고 `EXIT_SUBMITTED`에 머물러 있음.
+- **원인(수정 전 과거 결함, 참고용)**: CODEX-032 수정 이전에는 `eil.mark_aborted()`가 position의
+  `MANUAL_REVIEW` 전이와 별도 트랜잭션으로 커밋되어, 두 번째 write가 실패하면 exit intent만
+  terminal `ABORTED`로 남고 position은 영구히 `EXIT_SUBMITTED`에 갇힐 수 있었다. 수정 이후
+  (커밋 `55f3806`)에는 두 전이가 하나의 SQLite 트랜잭션으로 원자적으로 커밋되므로 이 특정
+  불일치는 재발하지 않아야 한다.
+- **절차**:
+  1. `state_store/exit_intent_ledger.py`의 `get_active_intent(conn, position_id)`로 이 position에
+     대한 active exit intent가 있는지 확인한다.
+  2. active intent가 있으면 `positions.lifecycle.reconcile_pending_exit(position_id, broker=...)`
+     을 실행해 broker의 실제 최신 상태로 재조정한다 — 절대 수동으로 position 상태를 직접
+     덮어쓰지 않는다.
+  3. active intent가 없는데도 position이 `EXIT_SUBMITTED`에 남아 있다면(CODEX-032 이전 버전에서
+     발생한 과거 데이터이거나 예기치 않은 새로운 결함), 자동 복구 경로가 없으므로 운영자가
+     broker의 실제 포지션/주문 상태를 직접 조회해 수동으로 `MANUAL_REVIEW`로 전이시키고 후속
+     청산을 수동 처리한다.
+  4. 이 시나리오가 CODEX-032 수정 이후에도 재현되면(즉 수정 자체가 실패했다는 뜻이므로) 코드
+     수정 없이 즉시 Kill Switch를 `MANUAL_REVIEW`로 활성화하고 사용자에게 보고한다 — 리스크
+     한도를 완화하거나 재조정 로직을 우회하는 방향으로 임시 수정하지 않는다.
+
+## 15. Live 진입 예산이 실제보다 적게 남은 것으로 보이거나(예약이 반환되지 않음), 반대로 예상보다 쉽게 승인됨 (2026-07-26, CODEX-031 수정 이후)
+
+- **감지**: `live_readiness/entry_reservation_ledger.py`의 `build_snapshot()`이 보고하는
+  `active_notional_krw`/`active_position_count`/`today_entry_count`가 실제 broker 계좌 상태와
+  맞지 않아 보임.
+- **원인**: 30,000원 총 예산은 **파일럿 전체에 걸친 누적 배분**으로 설계되어 있어 포지션이
+  종료돼도 절대 반환되지 않는다(의도된 동작, `docs/autonomous/DECISION_LOG.md`의 CODEX-024/026/
+  028/031/032/033 섹션 결정 3 참고) — "예산이 줄어들지 않는다"는 관측은 대부분 버그가 아니다.
+  반대로 동시 포지션 수(`active_position_count`)는 연결된 position이 종료되면 자동으로
+  감소한다.
+- **절차**:
+  1. `live_entry_reservations` 테이블을 직접 조회해 각 예약의 `state`(RESERVED/COMMITTED/
+     RELEASED)와 `position_id` 연결 여부를 확인한다.
+  2. broker 호출이 성공했는데도 예약이 `RESERVED`에 머물러 있다면(commit이 실패한 경우),
+     `positions/lifecycle.py::enter_position()`이 응답을 어떻게 처리했는지 확인 — 이 상태 자체가
+     예산을 과소 사용으로 잘못 보고하지는 않는다(RESERVED도 활성으로 집계됨, fail-closed).
+  3. broker 호출이 실패/거부됐는데도 예약이 `RELEASED`로 전환되지 않았다면, 해당 예약은
+     계속 예산을 점유한다 — 이는 의도된 fail-closed 동작(release 실패 시 더 보수적으로 남음)이며
+     코드를 우회해 수동으로 `RELEASED`로 바꾸는 것은 리스크 한도 완화에 해당하므로 하지 않는다.
+     실제로 그 예약이 잘못된 것으로 확인되면(예: 실제로 broker가 절대 받지 않은 주문), 사용자
+     승인 하에만 수동 정정한다.
+  4. `PILOT_TOTAL_BUDGET_KRW`/`MAX_CONCURRENT_LIVE_POSITIONS`/`MAX_DAILY_LIVE_ENTRIES` 값 자체를
+     완화하는 코드 변경은 이 런북의 범위가 아니다 — 사용자의 명시적 지시 없이는 수행하지 않는다.
+
 ## 공통 유의사항
 
 - 모든 활성화/해제는 `kill_switch_state.py`의 감사 이력(`get_history()`)에 남으므로,

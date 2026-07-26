@@ -1,5 +1,67 @@
 # VALIDATION_REPORT
 
+## 2026-07-26 — Stage 3~10 최종 통합 수정 사이클: CODEX-024/026/028/031/032/033 해결
+
+Codex 통합 재검증(`CODEX_REVIEW.md`, 대상 커밋 `f04a123`/`aee663c`/`09b9237`/`b78e444`/`fe3e9b7`,
+overall verdict **FAIL**)이 CODEX-029/030을 `RESOLVED`로 재확인하고 CODEX-024/026/028을
+`PARTIALLY_RESOLVED`로, 신규 CODEX-031(HIGH)/CODEX-032(HIGH)/CODEX-033(MEDIUM)을 제기했다.
+상세는 `REMEDIATION_PLAN.md`의 동일 날짜 섹션 참고.
+
+- **CODEX-032**(HIGH, rejected exit의 intent/position 비원자적 갱신) + CODEX-024/028 잔여분:
+  `eil.mark_aborted()`를 `store.locked_position(conn=conn)`의 동일 SQLite 트랜잭션 안으로
+  이동(`commit=False`), 원자적 커밋 보장.
+- **CODEX-031**(HIGH, 30K/count/pending이 caller 선언에 의존) + CODEX-026 잔여분:
+  `live_readiness/entry_reservation_ledger.py` 신설(SQLite migration 4) — durable 예약/authoritative
+  스냅샷. `PILOT_TOTAL_BUDGET_KRW=30_000`/`MAX_CONCURRENT_LIVE_POSITIONS=1`/
+  `MAX_DAILY_LIVE_ENTRIES=2` 신뢰 가능한 코드 상수와 caller 값을 `min()`으로 교차.
+- **CODEX-033**(MEDIUM, governance 문서 불일치): `LIMITED_LIVE_REVIEW_CHECKLIST.md` §8을
+  `BLOCKED`로 정정.
+
+### 테스트 결과
+
+```
+venv/bin/python -m pytest -q                              986 passed, 0 failed, 2 warnings
+venv/bin/pytest -q                                         986 passed, 0 failed, 2 warnings
+(상위 디렉터리) python -m pytest us-stock-trading -q       986 passed, 0 failed, 2 warnings
+(상위 디렉터리) pytest us-stock-trading -q                 986 passed, 0 failed, 2 warnings
+```
+
+이전 사이클 종료 시점(973 passed) 대비 13건 신규.
+
+### 코드 변경 검증
+
+- `positions/lifecycle.py`(원자적 rejection 처리), `live_readiness/entry_reservation_ledger.py`
+  (신규), `live_readiness/order_gateway.py`(authoritative 예산/카운트), `broker/alpaca_client.py`/
+  `paper_strategy_order.py`(예약 commit/release, 이중 예약 방지), `state_store/schema.py`/
+  `migrations.py`(migration 4) — 모두 커밋 diff로 직접 확인.
+- 안전 크리티컬 파일(`risk_config.py`, `broker/broker_config.py`, `kill_switch_state.py`,
+  `order_intent_ledger.py`)는 SHA-256이 이전 사이클과 완전히 동일.
+
+### 미검증 영역
+
+- 실제 Alpaca 계좌를 이용한 authoritative 예산 집행 E2E(fake session/broker로만 검증).
+- entry 경로의 broker-call-succeeded-but-local-exception 경쟁 상황에 대한 crash-safe
+  reconciliation(Phase 1B의 기존 잔여 위험과 동일 범주, 이번 사이클 범위 밖으로 명시적으로 남김).
+- 실제 FX provider, broker minimum/fractional 정책, live data feed는 여전히 미검증.
+
+### 안전 관련 변경 사항
+
+- `entry_reservation_ledger`의 예약은 broker 호출 **전에** durable하게 기록되며, 실패/거부/
+  dry-run/예외 시 반드시 release되어 예산이 영구적으로 잠기지 않는다(release 자체가
+  best-effort로 실패해도 fail-closed 방향 — 예약이 계속 활성으로 남아 더 보수적으로 집계됨).
+- 30,000원 캡을 caller가 절대 완화할 수 없다는 것이 이번 사이클의 핵심 안전 강화다.
+
+### 운영 영향
+
+- 없음. 코드/테스트/문서 변경만 수행했으며 운영 파일과 승인 상태는 변경하지 않았다.
+
+### 잔여 위험
+
+- `docs/autonomous/DECISION_LOG.md`의 이번 사이클 섹션(결정 1~6) 참고. 특히 결정 5(entry 경로
+  crash-safe reconciliation 미구현)는 향후 Codex 재검증에서 재확인이 필요하다.
+
+---
+
 ## 2026-07-26 — Stage 3~10 최종 재수정 사이클: CODEX-024/026/028/029/030 해결
 
 Codex 통합 재검증(`CODEX_REVIEW.md`, 대상 커밋 `4de0714`/`e49753f`, overall verdict **FAIL**)이

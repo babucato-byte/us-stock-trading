@@ -21,6 +21,17 @@ alpaca_client.py::AlpacaBroker.submit_order()` 자체가 동일한 게이트(all
 차단한다. 남은 잔여 범위는 `docs/autonomous/DECISION_LOG.md`의 CODEX-024/026/028/029/030
 섹션 결정 4 참고(동일 클래스의 향후 신규 메서드는 이 게이트를 자동으로 상속받지 않음).
 
+**추가 갱신(2026-07-26, CODEX-031)**: 위 게이트가 강제하던 30,000원/일일 진입/동시 포지션 한도는
+그동안 여전히 `LiveEntryContext`의 caller 입력값이었다 — caller가 300만원짜리 context를 만들면
+그대로 승인되는 실제 재현 가능한 결함이었다. 신규 `live_readiness/entry_reservation_ledger.py`
+(SQLite)가 모든 live 진입 시도를 broker 호출 전 durable하게 예약하고, 게이트는 이제 caller
+입력이 아니라 이 ledger에서 산출한 실제 사용량을 근거로 판단한다. `PILOT_TOTAL_BUDGET_KRW=30_000`
+/`MAX_CONCURRENT_LIVE_POSITIONS=1`/`MAX_DAILY_LIVE_ENTRIES=2`는 코드 상수로 고정되어 caller가
+완화할 수 없다(커밋 `8a3be50`). 30,000원 총 예산은 파일럿 전체에 걸친 누적 배분으로 취급되어
+포지션이 종료돼도 반환되지 않는다 — 아래 §7 "일일 주문 1~2건"/"30,000원 총 예산" 항목의 실제
+숫자값(운영자 미기입) 자체는 여전히 TBD_OPERATOR이지만, 이제 그 값이 실제로 강제된다는 점은
+코드로 보장된다.
+
 ## 1. 마이크로 주문 수량 계산
 
 `live_readiness/sizing.py::calculate_micro_order_quantity(available_krw, fx_rate_krw_per_usd,

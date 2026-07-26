@@ -763,3 +763,83 @@ CODEX-024/026/028/029/030 5건만 수정하고, RESOLVED로 재확인된 CODEX-0
 - `git diff --check`(`415c129^..HEAD`) 통과 — whitespace 오류 없음.
 - main 병합, origin push, 운영 배포, 실거래 활성화, `approved`/`live_enabled` 변경 없음.
 - 기존 리스크 한도(`risk_config.py`, `order_safety.py`)를 완화한 곳 없음.
+
+## Stage 3~10 최종 통합 수정 사이클 — CODEX-024/026/028/031/032/033 (2026-07-26)
+
+Codex 통합 재검증(`CODEX_REVIEW.md`, 대상 커밋 `f04a123`/`aee663c`/`09b9237`/`b78e444`/`fe3e9b7`,
+overall verdict **FAIL**)이 CODEX-029/030을 `RESOLVED`로 재확인하고, CODEX-024/026/028을
+`PARTIALLY_RESOLVED`로, 신규 HIGH 2건(CODEX-031, CODEX-032) + MEDIUM 1건(CODEX-033)을 제기했다.
+이번 사이클은 CODEX-024/026/028/031/032/033만 수정하고, RESOLVED로 재확인된 CODEX-029/030은
+회귀 테스트만 재실행했다.
+
+### CODEX-032(HIGH, rejected exit의 intent/position 비원자적 갱신) + CODEX-024/028 잔여분
+
+- 재현: `_execute_exit()`의 broker 명시적 rejection 경로가 `eil.mark_aborted(conn, intent_id)`를
+  독립 커밋(default commit=True)한 뒤, 별도의 `store.locked_position(conn=conn)` 트랜잭션에서
+  position을 `MANUAL_REVIEW`로 전이했다. fault-injection으로 두 번째 write만 실패시키면 intent는
+  terminal `ABORTED`, position은 `EXIT_SUBMITTED`에 영구 고정되고, `recover_on_restart()`도 active
+  intent가 없어 이를 재조정하지 못했다.
+- 수정: `eil.mark_aborted(conn, intent_id, commit=False)`를 `store.locked_position(conn=conn)`
+  블록 안으로 이동해 position의 `MANUAL_REVIEW` 전이와 같은 SQLite 트랜잭션에서 커밋되도록 재작성.
+- 신규 테스트: `tests/test_exit_reconciliation.py`에 정상 원자적 커밋 확인, position write 실패 시
+  intent도 함께 롤백, intent write 실패 시 position도 변경되지 않음, 롤백 후 재시도가 안전하게
+  `RECONCILIATION_REQUIRED`로 귀결(맹목적 재제출 없음) 4건 추가.
+- 처리 상태: RESOLVED
+- 구현 커밋: `55f3806`
+
+### CODEX-031(HIGH, 30K/count/pending 제한이 caller 선언에 의존) + CODEX-026 잔여분
+
+- 재현: `LiveEntryContext`의 `max_order_notional_krw`/`available_cash_krw`/`max_daily_loss_krw`/
+  `max_position_count`/`current_open_position_count`/`max_daily_entries`/`today_entry_count`가
+  전부 caller 입력이었다. context를 각각 300만원으로 설정하면 2,997,000원 주문이 승인됐다.
+- 수정: `live_readiness/entry_reservation_ledger.py` 신설(SQLite migration 4,
+  `live_entry_reservations` 테이블) — 모든 live 진입 시도가 broker 호출 전에 예산을 durable하게
+  예약한다. `live_readiness/order_gateway.py`가 caller 입력을 신뢰하는 대신
+  `entry_reservation_ledger.build_snapshot()`에서 산출한 authoritative 예산/카운트를 사용하고,
+  신뢰 가능한 코드 상수(`PILOT_TOTAL_BUDGET_KRW=30_000`, `MAX_CONCURRENT_LIVE_POSITIONS=1`,
+  `MAX_DAILY_LIVE_ENTRIES=2`)와 caller 값을 `min()`으로 교차해 caller가 상한을 완화할 수 없게
+  했다. 30,000원 예산은 파일럿 전체 누적 배분(포지션 종료로 반환되지 않음), 동시 포지션 수는
+  canonical `positions` 테이블과 조인해 실제 종료 여부를 반영(결정 3 참고). 스냅샷 읽기부터
+  예약까지 전체를 `reservation_lock()`으로 원자화해 동시 진입 두 건이 각각 사전 검사를 통과해
+  합계 한도를 넘는 경쟁 조건을 차단했다. `validate_and_size_live_entry()`는 이제
+  `LiveEntryApproval(quantity, reservation_id)`을 반환하며, 두 제출 경로(`paper_strategy_order.
+  submit_order()`/`AlpacaBroker.submit_order()`) 모두 broker 응답에 따라 예약을 commit/release한다.
+  `AlpacaBroker` 인스턴스에 대해서는 wrapper가 자신의 게이트를 건너뛰어 이중 예약을 방지한다
+  (`DECISION_LOG.md` 결정 4).
+- 신규 테스트: `tests/test_live_order_gateway.py`를 authoritative 모델 기준으로 전면 재작성 —
+  caller 인플레이션 무시, RESERVED/COMMITTED 예산 합산, RELEASED 예산 제외, 종료된 position의
+  예약이 카운트에서 제외(예산은 유지), 동시 진입 2건 중 1건만 승인(스레드 테스트), 30,000원 정확한
+  경계/30,001원 차단.
+- 부수 발견: `tests/test_broker_safety.py`/`tests/test_paper_order_execution.py`가 CODEX-026
+  사이클에서 이미 `LiveEntryContext`를 사용하고 있었으나 `STATE_STORE_DB_FILE`을 격리하지 않아,
+  이번 사이클에서 게이트가 SQLite에 실제로 쓰기 시작하자 실제 저장소 루트 `TRADING_STATE.db`에
+  기록하고 있던 것을 발견해 즉시 격리를 추가했다.
+- 처리 상태: RESOLVED
+- 구현 커밋: `8a3be50`
+
+### CODEX-033(MEDIUM, governance 문서 불일치)
+
+- 재현: `docs/live_review/LIMITED_LIVE_REVIEW_CHECKLIST.md` §8이 CODEX-016~022의
+  `PASS_WITH_CONDITIONS`만을 근거로 `READY_FOR_LIMITED_LIVE_REVIEW`를 유지하고 있었으나, 그 이후
+  Stage 3~10에 대한 반복적인 Codex `FAIL` 판정(같은 문서 §1.5/§1.6에는 정확히 기록됨)을 §8에는
+  반영하지 않아 `FINAL_VALIDATION_PACKAGE.md`/`CURRENT_STATUS.md`의 `BLOCKED`/`KEEP_IN_PROGRESS`
+  판정과 모순됐다.
+- 수정: §8 최종 상태를 `BLOCKED`로 되돌리고, CODEX-016~022의 `PASS_WITH_CONDITIONS` 자체는
+  여전히 유효하며 `BLOCKED`의 원인이 그 이후 Stage 3~10에서 발견된 별개 Finding임을 명시.
+  `FINAL_VALIDATION_PACKAGE.md`를 최신 검증 상태의 단일 진실 공급원으로 문서에 명시.
+- 처리 상태: RESOLVED
+- 구현 커밋: `9c43862`
+
+### 검증 결과 (CODEX-024/026/028/031/032/033 전체)
+
+- 전체 회귀: `venv/bin/python -m pytest -q` / `venv/bin/pytest -q` / 상위 디렉터리에서
+  `python -m pytest us-stock-trading -q` / `pytest us-stock-trading -q` 네 가지 실행 형태 모두
+  **986 passed, 0 failed, 2 warnings**. 이전 사이클 종료 시점 973 passed 대비 13건 신규.
+- 실제 Alpaca/Slack/Yahoo 호출 0회. 실제 저장소 루트 `TRADING_STATE.db*`/`LIVE_ENTRY_RESERVATION.lock`
+  이 두 차례 전체 회귀 실행 전후 존재하지 않음을 확인.
+- `order_history.csv`/`universe.csv`/`strategy_performance.csv`는 이전 사이클 기록값과 동일(md5
+  재확인), `.env`·kill switch/notification 상태 파일 변경 없음.
+- `git diff --check`(`415c129^..HEAD`) 통과.
+- main 병합, origin push, 운영 배포, 실거래 활성화, `approved`/`live_enabled` 변경 없음.
+- 기존 리스크 한도 완화 없음 — 이번 사이클은 기존 한도를 오히려 더 엄격하게(caller가 완화할 수
+  없도록) 만들었을 뿐이다.
