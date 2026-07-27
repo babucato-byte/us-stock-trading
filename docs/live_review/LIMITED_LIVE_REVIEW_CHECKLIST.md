@@ -237,3 +237,10 @@ Stage 3~10에 대한 Codex 독립/통합 재검증은 반복적으로 **`FAIL`**
 
 (참고: CODEX-016~022 자체는 `PASS_WITH_CONDITIONS`로 여전히 유효하며 이번 갱신으로 재개된 것은
 아니다 — §8이 `BLOCKED`인 이유는 그 이후 Stage 3~10에서 발견된 별개의 Finding들 때문이다.)
+
+**추가 갱신(2026-07-28, Stage 11)**: `live_readiness/`에 Account/Risk/Sizing/Execution Engine
+계층(신규 `trusted_operator_config.py`/`account_engine.py`/`risk_engine.py`/`sizing_engine.py`/
+`execution_engine.py`)이 추가됐다 — 상세는 `docs/autonomous/PROJECT_CONSTITUTION.md`의 "계층
+분리 원칙" 및 `FINAL_VALIDATION_PACKAGE.md` 참고. 이 계층은 순수 building block이며 실제 운영
+스캔·주문 파이프라인에는 아직 배선되지 않았다 — 이 절의 `BLOCKED` 상태와 위 승격 조건에는 영향을
+주지 않는다.

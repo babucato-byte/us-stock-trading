@@ -1,5 +1,53 @@
 # VALIDATION_REPORT
 
+## 2026-07-28 — Stage 11: Account/Risk/Sizing/Execution Engine 계층 분리
+
+사용자 지시에 따라 주문 경로를 `Market Data → Strategy Engine → Signal → Risk Engine →
+Account Engine → Sizing Engine → Execution Engine → Broker` 계층으로 분리했다. 이 사이클은
+Codex 재검증 대상이 아니라 사용자가 CODEX-034~038 처리와 별도로 요청한 아키텍처 리팩터링이다.
+상세는 `REMEDIATION_PLAN.md`/`DECISION_LOG.md`의 동일 날짜(Stage 11) 섹션 참고.
+
+- `live_readiness/trusted_operator_config.py`(신규): 운영 정책 값의 단일 소스.
+- `live_readiness/account_engine.py`(신규): authoritative `AccountSnapshot`.
+- `live_readiness/risk_engine.py`(신규): 전략 수량 미신뢰, risk_based_qty 독자 계산.
+- `live_readiness/sizing_engine.py`(신규): `actual_qty = min(balance/risk/strategy)`.
+- `live_readiness/execution_engine.py`(신규): `ValidatedOrderCommand` + broker 호출 유일 경로,
+  정적 grep 테스트로 강제.
+- `live_readiness/watchlist_affordability.py`: `STALE_ACCOUNT_STATE` + 신규 필드 2종.
+- `paper_strategy_order.py`: 동작 변경 없음, legacy compat 지위만 문서화.
+
+### 테스트 결과
+
+```
+venv/bin/python -m pytest -q                              1,299 passed, 0 failed, 2 warnings
+```
+
+이전 사이클 종료 시점(1,125 passed) 대비 174건 신규.
+
+### 코드 변경 검증
+
+- 신규 5개 모듈(`trusted_operator_config.py`/`account_engine.py`/`risk_engine.py`/
+  `sizing_engine.py`/`execution_engine.py`) + `account_cash.py`/`order_gateway.py`(상수
+  재노출)/`watchlist_affordability.py`(신규 필드)/`paper_strategy_order.py`(docstring만) — 모두
+  커밋 diff로 직접 확인.
+- 안전 크리티컬 파일(`risk_config.py`, `broker/broker_config.py`, `kill_switch_state.py`,
+  `order_intent_ledger.py`)는 SHA-256이 이전 사이클과 완전히 동일 — 이번 사이클은 그 파일들을
+  전혀 건드리지 않았다.
+- `broker/alpaca_client.py`도 이번 사이클에서 변경되지 않았다(CODEX-034~038 사이클 이후 재수정
+  없음).
+
+### 미검증 영역
+
+- 신규 5개 엔진 모듈은 전부 building block이며, 실제 `daily_candidate_scanner.py`/
+  `paper_strategy_order.py::main()` 파이프라인에는 배선되지 않았다 — Stage 10/CODEX-034
+  watchlist affordability와 동일한 선례. 실제 운영 스캔·전략 루프가 이 계층을 통해 주문을
+  제출하도록 만드는 것은 별도의 명시적 결정이 필요한 범위다.
+- `ValidatedOrderCommand.reservation_id`/`entry_intent_id`가 command 자체가 아니라 broker 호출
+  이후의 `ExecutionResult`에만 존재한다는 설계상의 제약(`DECISION_LOG.md` Stage 11 결정 2)은
+  사용자 지시서의 문자 그대로("command 필수 필드")와 정확히 일치하지 않는다 — 이 저장소의 기존
+  단일-예약-지점 아키텍처(CODEX-031 결정 4)와의 충돌을 피하기 위한 의도적 설계 결정으로 기록.
+- Limited live review(제한적 실거래 검토)는 여전히 BLOCKED, 실거래 없음.
+
 ## 2026-07-27 — CODEX-034~038 최종 수정 사이클 해결
 
 Codex 독립 검증(`CODEX_REVIEW.md`, 커밋 `5da6662`/`5316cd1`/`72bbb6c` 포함 범위, overall verdict

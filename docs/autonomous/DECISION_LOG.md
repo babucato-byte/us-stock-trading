@@ -578,3 +578,42 @@
   변경 없음). 문제는 순수하게 테스트 격리 누락이었으므로, 테스트에 누락된 `monkeypatch.setattr`
   한 줄만 추가하는 최소 수정으로 해결했다.
 - 승인 필요 여부: 아니오(코드 구현·테스트 추가·문서화 범위, 실거래/승인/main/push와 무관).
+
+## Stage 11: Account/Risk/Sizing/Execution Engine 계층 분리 (2026-07-28)
+
+- 결정 1(reservation 이중화 회피) — Execution Engine이 broker 호출 전 자체적으로
+  `entry_reservation_ledger.reserve()`를 먼저 실행하는 설계를 처음 검토했으나, `AlpacaBroker.
+  submit_order()` 자체가 이미 이 저장소의 유일한 예약 지점(CODEX-026/031 결정 4)이라 두 곳에서
+  각각 예약하면 동일 주문의 노출이 이중 계상된다. 대신 Execution Engine은 `client_order_id`로
+  기존 예약을 조회해 대조만 하고(불일치 시 broker 호출 0회로 차단), 실제 예약 생성은 여전히
+  `broker.submit_order()` 내부의 `validate_and_size_live_entry()`가 담당하도록 설계했다 —
+  "broker 호출 전에 SQLite에 예약을 저장한다"는 요구사항은 이미 그 경로에서 충족되고 있었으므로,
+  새 계층이 같은 일을 다시 하지 않도록 한 것이다.
+- 결정 2(ValidatedOrderCommand의 reservation_id/entry_intent_id) — 사용자 지시서는 이 두 필드를
+  command의 필수 필드로 요구했으나, 위 결정 1의 구조상 reservation_id는 broker 호출이 실제로
+  성사된 "이후"에야 존재한다 — command 생성 시점에는 알 수 없다. `ValidatedOrderCommand`는 그
+  대신 사전에 정할 수 있는 `client_order_id`(CODEX-034 방식과 동일)로 정체성을 유지하고,
+  `reservation_id`는 `ExecutionResult`(broker 호출 결과)에 실어 반환하도록 재설계했다. 이 저장소가
+  entry 주문에 대해 별도 `entry_intents` 테이블을 두지 않고(청산측 `exit_intents`와 달리)
+  `live_entry_reservations` 자체가 entry intent 역할을 겸하고 있다는 기존 설계와도 일치한다.
+- 결정 3(Execution Engine이 broker를 직접 만들지 않음) — `ExecutionEngine.submit_validated_
+  command()`는 `broker`와 `live_entry_context`를 인자로 받고 스스로 구성하지 않는다. Account
+  Engine의 snapshot으로부터 `LiveEntryContext`를 조립하는 로직을 Execution Engine 안에 중복
+  구현하는 대신, 이미 order_gateway.py가 정의한 `LiveEntryContext` 계약을 caller가 채워서
+  넘기도록 했다 — 계층 간 경계를 "누가 무엇을 검증하는가"로 유지하고, "누가 어떤 객체를
+  생성하는가"를 중복시키지 않기 위함이다.
+- 결정 4(정적 grep 테스트로 아키텍처 경계 강제) — "Strategy에서 직접 Broker 호출 불가"를
+  런타임에 강제하는 방법(예: 호출 스택 검사, 별도 프로세스 격리)은 이번 사이클 범위에서 과도한
+  복잡성으로 판단해 채택하지 않았다. 대신 `broker\.submit_order\(` 패턴의 실제 호출부(클래스명이
+  아닌 변수명 기준, 즉 `AlpacaBroker.submit_order()`라는 docstring 언급은 제외)를 전체 저장소에서
+  검색해 허용 목록(execution_engine.py, broker/alpaca_client.py 자기 자신, paper_strategy_order.py
+  legacy compat) 밖의 호출부가 있으면 실패하는 테스트를 추가했다 — 코드 리뷰 없이 새 직접 호출이
+  추가되면 CI에서 즉시 발견된다.
+- 결정 5(TRUSTED_CASH_USAGE_PERCENT_CEILING 값 이전) — `trusted_operator_config.py` 신설 시 값
+  자체(50%)는 CODEX-036에서 이미 결정된 것을 그대로 옮겼다(재논의하지 않음) — 이번 사이클은 "어디서
+  읽는가"를 하나로 통합하는 리팩터링이지, 정책 값 자체를 바꾸는 사이클이 아니다.
+- 결정 6(기존 경로 삭제하지 않음) — 사용자가 명시적으로 "기존 기능을 한 번에 삭제하지 말고 호환
+  계층을 두라"고 지시함에 따라, `paper_strategy_order.py`의 `submit_order()`는 동작을 전혀
+  바꾸지 않고 모듈 docstring에 "legacy compat" 지위만 명시했다. 실제 Paper 모드 주문 흐름과 관련
+  기존 테스트 전부(400건 이상)는 이번 사이클에서 단 하나도 수정하지 않았다.
+- 승인 필요 여부: 아니오(코드 구현·테스트 추가·문서화 범위, 실거래/승인/main/push와 무관).

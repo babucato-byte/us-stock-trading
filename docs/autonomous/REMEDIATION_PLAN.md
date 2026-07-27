@@ -1022,3 +1022,77 @@ overall verdict **FAIL**)이 CODEX-029/030을 `RESOLVED`로 재확인하고, COD
 - 테스트 삭제/조건 완화 없음 — 4건 모두 신규 검증 추가 또는 기존 테스트의 격리 누락 보완이며,
   기존에 통과하던 assertion을 약화한 사례는 없다(단, 트러스트 퍼센트 상한 도입으로 값이 바뀐
   기존 사이징 테스트 일부는 새 기대값으로 갱신 — 검증 자체의 엄격도는 동일하거나 강화됨).
+
+## Stage 11: Account/Risk/Sizing/Execution Engine 계층 분리 (2026-07-28)
+
+### 배경
+
+사용자가 CODEX-034~038 처리와 별개로, 주문 경로 전체를 `Market Data → Strategy Engine → Signal →
+Risk Engine → Account Engine → Sizing Engine → Execution Engine → Broker` 계층으로 명시적으로
+분리하라고 지시했다. 핵심 원칙: Strategy는 신호/진입가/손절가/목표가만 결정하고 계좌 잔고·비율·
+최종 수량·주문 가능 금액을 결정하거나 신뢰 기준으로 전달할 수 없다.
+
+### 구현
+
+- `live_readiness/trusted_operator_config.py`(신규) — `cash_usage_percent` 트러스트 상한과
+  동시 포지션/일일 진입 한도의 단일 소스(`get_cash_usage_percent_ceiling()`/
+  `get_max_concurrent_live_positions()`/`get_max_daily_live_entries()`, 매 호출 재검증).
+  `account_cash.py`/`order_gateway.py`가 여기서 값을 가져오도록 갱신(기존 상수명은 하위 호환을
+  위해 재노출).
+- `live_readiness/account_engine.py`(신규) — `AccountSnapshot`(frozen dataclass):
+  broker_cash_krw, non_margin_available_cash_krw, effective_cash_krw(=min), pending/unknown/
+  reconciliation-required/open-position 노출(entry_reservation_ledger 기반), active_position_
+  count, today_entry_count, as_of, trading_mode, account_id, reconciliation_complete.
+  `build_account_snapshot(broker, fx_rate, conn, ...)`가 fail-closed로 조립하며
+  `expected_account_id`/`expected_trading_mode`로 계좌 식별자·Paper/Live 불일치도 차단.
+  `compute_max_allocatable_cash_krw()`/`compute_available_for_new_order_krw()`가 트러스트 상한과
+  ledger 차감을 적용.
+- `live_readiness/risk_engine.py`(신규) — `compute_risk_decision(entry_price, stop_price,
+  fx_rate, daily_loss_remaining_krw, max_risk_per_trade_krw=None, ...)`가 risk_based_qty를
+  계산. 모든 입력 finite 검증, stop_price가 entry_price보다 낮지 않으면 차단.
+  `compute_daily_loss_remaining_krw()` 헬퍼 포함.
+- `live_readiness/sizing_engine.py`(신규) — `compute_sizing_decision(available_for_new_order_krw,
+  buffered_entry_price_usd, fx_rate, fractionable, risk_based_qty, strategy_max_qty=None, ...)`가
+  `actual_qty = min(balance_based_qty, risk_based_qty, strategy_max_qty)`를 계산(세 값 모두
+  None/NaN/Infinity/bool/문자열/음수 검증 통과 시에만). `strategy_max_qty=0`은 무효(하나
+  "cap 없음"은 반드시 `None`). `apply_entry_price_buffer(price, buffer_bps, slippage_usd)`가
+  가격 버퍼를 적용.
+- `live_readiness/execution_engine.py`(신규) — `ValidatedOrderCommand`(frozen dataclass:
+  command_id/signal_id/strategy_id/symbol/side/purpose/qty/estimated_price/estimated_notional/
+  account_snapshot_id/risk_decision_id/sizing_decision_id/client_order_id/created_at/expires_at)
+  + `build_validated_order_command()` + `submit_validated_command(command, broker,
+  live_entry_context, ...)`. broker 호출 전 (1) command 타입 검증 (2) 만료 검증
+  (3) qty*price==estimated_notional 검증(변조 탐지) (4) live_entry_context.symbol==command.symbol
+  검증 (5) `client_order_id`로 기존 SQLite 예약 조회 후 symbol 불일치 시 차단 — 5개 모두 통과해야
+  `broker.submit_order()`를 호출한다. `reservation_id`/`entry_intent_id`는 command 자체가 아니라
+  반환되는 `ExecutionResult`에 실린다(근거는 `DECISION_LOG.md` 결정 2 — 이 저장소의 유일한
+  예약 지점은 여전히 `broker.submit_order()` 내부이므로 broker 호출 전에는 존재하지 않는다).
+- `live_readiness/watchlist_affordability.py` — `STATUS_STALE_ACCOUNT_STATE`(존재하지만 만료된
+  `AccountState.as_of`) 신설, `AccountState.staleness_error()`로 검증(`UNKNOWN_ACCOUNT_STATE`와는
+  별도 실패 경로). `AffordabilityResult`에 `buffered_entry_price`/`account_snapshot_at` 필드 추가.
+- `paper_strategy_order.py` — 동작 변경 없음, 모듈 docstring에 "legacy compat, 신규 작업은
+  Execution Engine 경유" 명시만 추가.
+
+### 아키텍처 경계 강제
+
+`tests/test_execution_engine.py::test_only_execution_engine_and_legacy_compat_call_broker_submit_
+order`가 저장소 전체를 grep해 `broker.submit_order(`/`self.broker.submit_order(` 패턴의 실제
+호출부(변수명 기준, docstring의 클래스명 언급은 제외)를 찾고, 허용 목록(`execution_engine.py`,
+`broker/alpaca_client.py`, `paper_strategy_order.py`) 밖에 있으면 실패시킨다.
+
+### 검증 결과
+
+- 전체 회귀: `venv/bin/python -m pytest -q` **1,299 passed, 0 failed, 2 warnings**. 이전 사이클
+  종료 시점 1,125 passed 대비 174건 신규.
+- 실제 Alpaca/Slack/Yahoo 호출 0회. 실제 저장소 루트 `TRADING_STATE.db*`/
+  `LIVE_ENTRY_RESERVATION.lock`이 회귀 실행 전후 존재하지 않음을 확인.
+- `order_history.csv`/`universe.csv`/`strategy_performance.csv` content 및 mtime 모두 불변.
+- `git diff --check` 통과.
+- main 병합, origin push, 운영 배포, 실거래 활성화, `approved`/`live_enabled` 변경 없음.
+- 기존 테스트 파일(broker/paper order execution/order gateway/watchlist affordability 등) 중
+  단 하나도 삭제하거나 조건을 완화하지 않았다 — `test_watchlist_affordability.py`의 기존 헬퍼에
+  `as_of`/`now` 인자가 추가된 것은 새 STALE_ACCOUNT_STATE 검증을 통과시키기 위한 확장이며, 기존
+  assertion은 전부 그대로 유지된다.
+- 신규 모듈은 전부 building block(순수 계산/검증 함수)이며, 실제 운영 스캔·주문 파이프라인
+  (`daily_candidate_scanner.py`, `paper_strategy_order.py::main()`)에는 아직 배선하지 않았다 —
+  Stage 10/CODEX-034 watchlist affordability와 동일한 선례.

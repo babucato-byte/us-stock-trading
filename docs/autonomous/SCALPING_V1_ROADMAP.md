@@ -249,6 +249,20 @@ Codex `PASS_WITH_CONDITIONS` 검증을 거친 안전 크리티컬 경계이며, 
 TBD_OPERATOR: 실계좌/실환율/Live API Key/실 주문 금액 한도/실 승인자/배포 시각/롤백 담당자/실제
 Alpaca 최소 주문 금액/실제 allow-list 내용 — 전부 미확정 상태로 명시적으로 남김.
 
+## Stage 11 — Account/Risk/Sizing/Execution Engine 계층 분리 (부속, 2026-07-28 완료)
+
+**상태: 신규 계층 모듈 구현·테스트 완료 (실거래 배선 아님, 기존 경로 호환 유지)**
+
+`docs/autonomous/PROJECT_CONSTITUTION.md`의 "계층 분리 원칙"을 코드로 구현: `live_readiness/
+trusted_operator_config.py`(cash_usage_percent 트러스트 상한 + 동시포지션/일일진입 한도의 단일
+소스), `account_engine.py`(AccountSnapshot, broker.get_account() + entry_reservation_ledger
+기반 authoritative 잔고/노출), `risk_engine.py`(risk_based_qty, 전략 수량 미신뢰), `sizing_engine.py`
+(actual_qty=min(balance/risk/strategy), 전부 finite 검증), `execution_engine.py`
+(ValidatedOrderCommand + broker 호출 단일 지점, 정적 grep 테스트로 강제). Stage 10과 동일한
+"building block, 아직 운영 파이프라인 미배선" 패턴 — `paper_strategy_order.py`의 기존 broker 호출
+경로는 legacy compat으로 명시적으로 유지(삭제하지 않음). 신규 테스트 174건, 전체 회귀 1,299
+passed. 커밋 `3494fe3`.
+
 ## Phase 8 — Paper 검증 게이트
 
 **상태: NOT_STARTED**

@@ -1,9 +1,43 @@
 # CURRENT_STATUS
 
-마지막 갱신: 2026-07-27
+마지막 갱신: 2026-07-28
 
 ## 현재 Phase
-**CODEX-034~038 최종 수정 사이클 — 전부 RESOLVED (2026-07-27).**
+**Stage 11 — Account/Risk/Sizing/Execution Engine 계층 분리 (2026-07-28 완료).**
+CODEX-034~038 수정에 이어, 사용자 지시에 따라 주문 경로를 `Market Data → Strategy Engine →
+Signal → Risk Engine → Account Engine → Sizing Engine → Execution Engine → Broker` 계층으로
+분리했다. `docs/autonomous/PROJECT_CONSTITUTION.md`에 "계층 분리 원칙"을 신설(Strategy는 신호/
+진입가/손절가만 결정, 계좌·비율·수량은 절대 결정하지 않음 — `strategy/interface.py::
+EvaluationResult`에 애초에 그런 필드가 없어 코드 구조로 강제됨).
+
+- **`live_readiness/trusted_operator_config.py`**(신규): `cash_usage_percent` 트러스트 상한
+  (50%)과 `MAX_CONCURRENT_LIVE_POSITIONS`/`MAX_DAILY_LIVE_ENTRIES`의 단일 소스. `account_cash.py`/
+  `order_gateway.py`가 이제 여기서 값을 가져온다(하위 호환을 위해 기존 이름으로 재노출).
+- **`live_readiness/account_engine.py`**(신규): `AccountSnapshot`(immutable) — 실제
+  `broker.get_account()` + `entry_reservation_ledger.build_snapshot()` 기반.
+  `effective_cash = min(broker_cash, non_margin_available_cash)`(margin 미사용, buying_power는
+  상한으로 절대 사용 안 함). broker 조회 실패/cash 누락·음수·NaN/Paper-Live 모호/계좌 ID 불일치
+  시 fail-closed 차단.
+- **`live_readiness/risk_engine.py`**(신규): `compute_risk_decision()` — 전략이 전달한 수량을
+  절대 사용하지 않고 진입가/손절가/일일 손실 잔여 한도로 risk_based_qty를 독자 계산. 모든 숫자
+  finite 검증, 하나라도 무효면 전체 차단.
+- **`live_readiness/sizing_engine.py`**(신규): `compute_sizing_decision()` —
+  `actual_qty = min(balance_based_qty, risk_based_qty, strategy_max_qty)`, 세 값 모두 명시적으로
+  유효할 때만 계산. `apply_entry_price_buffer()`로 슬리피지/가격상승 버퍼 적용.
+- **`live_readiness/execution_engine.py`**(신규): `ValidatedOrderCommand` + broker 호출 유일
+  경로. 만료된 command, qty*price 불일치(변조 의심), symbol 불일치, SQLite 기존 예약과의 불일치는
+  broker 호출 0회로 차단. 다른 모듈의 `broker.submit_order(` 직접 호출을 금지하는 정적 grep 테스트
+  (`tests/test_execution_engine.py`)로 강제 — `paper_strategy_order.py`의 기존 호출은
+  legacy compat으로 명시적으로 유지(삭제 없음).
+- **`live_readiness/watchlist_affordability.py`**: `STALE_ACCOUNT_STATE`(존재하지만 만료된 계좌
+  스냅샷, `UNKNOWN_ACCOUNT_STATE`와 구분) + `buffered_entry_price`/`account_snapshot_at` 필드
+  추가.
+
+전체 회귀 **1,299 passed, 0 failed**(직전 1,125에서 174건 신규). `approved: false`, `live_enabled:
+false` 유지, **Live trading: DO_NOT_ENABLE**. 다음 작업은 새 `FINAL_VALIDATION_PACKAGE.md`(새
+SHA-256 포함) 작성 후 상태를 `READY_FOR_FINAL_CODEX_REVALIDATION`으로 종료하는 것.
+
+## CODEX-034~038 최종 수정 사이클 (2026-07-27)
 Codex 독립 검증(`CODEX_REVIEW.md`, 커밋 `5da6662`/`5316cd1`/`72bbb6c` 포함 범위, overall verdict
 `FAIL`)이 CODEX-034를 `PARTIALLY_RESOLVED`로 재확인하고 신규 CODEX-035(HIGH, HTTP 5xx/408/425/429를
 definitive rejection으로 오분류)·CODEX-036(HIGH, 잔고/사용비율이 authoritative source 없이 caller

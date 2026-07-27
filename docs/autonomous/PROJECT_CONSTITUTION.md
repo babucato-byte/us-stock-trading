@@ -19,6 +19,36 @@
 - 롱 포지션 우선, 오버나이트 보유 금지, 보유 기간은 수분~당일.
 - 시장 전체 스캔은 저빈도로, 실시간 감시는 선별된 관심종목에만 적용한다.
 
+## 계층 분리 원칙 (2026-07-28, CODEX-034~038 이후 추가)
+
+주문 실행 경로는 다음 계층으로 분리하며, 각 계층은 자신의 책임 범위를 넘는 값을 신뢰하지 않는다:
+
+```
+Market Data → Strategy Engine → Signal → Risk Engine →
+Account Engine → Sizing Engine → Execution Engine → Broker
+```
+
+- **Strategy Engine**은 매수·매도 신호와 전략 조건(진입가/손절가/목표가/신뢰도 등)만 결정한다.
+  계좌 잔고, 사용 비율, 최종 주문 수량, 주문 가능 금액을 결정하거나 신뢰 기준으로 전달할 수
+  없다. `strategy/interface.py::EvaluationResult`에는 애초에 이런 필드가 존재하지 않는다 —
+  이 제약은 코드 구조 자체로 강제된다.
+- **Account Engine**(`live_readiness/account_engine.py`)만이 authoritative 계좌 상태(broker
+  cash, non-margin available cash, 진행 중인 예약/노출)를 산출한다. margin은 사용하지 않으며
+  `effective_cash = min(broker_cash, non_margin_available_cash)`다.
+- `cash_usage_percent`와 동시 포지션/일일 진입 한도는 오직
+  `live_readiness/trusted_operator_config.py`에서만 읽으며, caller/Strategy가 전달한 값은
+  절대 신뢰하지 않는다(min()으로만 낮출 수 있음).
+- **Risk Engine**(`live_readiness/risk_engine.py`)은 전략의 최종 수량을 사용하지 않고, 진입가·
+  손절가·일일 손실 잔여 한도로부터 독자적으로 risk_based_qty를 계산한다.
+- **Sizing Engine**(`live_readiness/sizing_engine.py`)만이 최종 주문 수량을 계산한다:
+  `actual_qty = min(balance_based_qty, risk_based_qty, strategy_max_qty)`.
+- **Execution Engine**(`live_readiness/execution_engine.py`)만이 broker의 주문 제출 메서드를
+  호출할 수 있다. 다른 모듈이 broker를 직접 호출하는 것은 금지되며, 이는 정적 grep 기반 테스트
+  (`tests/test_execution_engine.py`)로 강제된다. 기존 `paper_strategy_order.py`의 broker 호출은
+  삭제하지 않고 호환 계층(legacy compat)으로 유지한다.
+
+이 원칙은 이후 모든 Phase/사이클의 코드 변경에 우선 적용되며, 다른 문서와 상충할 수 없다.
+
 ## 절대 금지사항 (모든 Phase에서 우선 적용)
 
 1. Live Trading을 활성화하지 않는다.
