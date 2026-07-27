@@ -244,3 +244,12 @@ Stage 3~10에 대한 Codex 독립/통합 재검증은 반복적으로 **`FAIL`**
 분리 원칙" 및 `FINAL_VALIDATION_PACKAGE.md` 참고. 이 계층은 순수 building block이며 실제 운영
 스캔·주문 파이프라인에는 아직 배선되지 않았다 — 이 절의 `BLOCKED` 상태와 위 승격 조건에는 영향을
 주지 않는다.
+
+**추가 갱신(2026-07-28, CODEX-039/040/041, 커밋 `ae2b0fd`)**: Codex 통합 재검증이 위 Stage 11
+계층이 실제 `paper_strategy_order.main()` 주문 경로에 배선되지 않았음을 CODEX-040(HIGH)으로
+지적했다. 이번 사이클에서 신규 `live_readiness/live_entry_pipeline.py`를 통해 live-mode 진입
+(`side="buy" AND broker.config.is_live_mode`)이 Account→Risk→Sizing→Affordability→Execution
+Engine 순서로 실제 배선됐다(상세는 `FINAL_VALIDATION_PACKAGE.md` §4/§5.10). Paper 모드 주문
+경로는 이번 배선과 무관하게 완전히 미변경이다. 이 배선은 아직 Codex 재검증을 거치지 않았으므로
+이 절의 `BLOCKED` 상태와 위 승격 조건에는 여전히 영향을 주지 않는다 — 승격 여부는 다음 Codex
+재검증 결과에 따른다.

@@ -3,7 +3,37 @@
 마지막 갱신: 2026-07-28
 
 ## 현재 Phase
-**Stage 11 — Account/Risk/Sizing/Execution Engine 계층 분리 (2026-07-28 완료).**
+**CODEX-039/040/041 실제 운영 경로 배선 사이클 — 전부 RESOLVED (2026-07-28).**
+Codex 독립 검증(`CODEX_REVIEW.md`, 커밋 `9d294e3`/`40abc58`/`06a77c8`/`3494fe3`/`14f7a13` 포함 범위,
+overall verdict `FAIL`)이 CODEX-036을 `PARTIALLY_RESOLVED`로 재확인하고 신규 CODEX-039(MEDIUM,
+trusted 50%가 default가 아니라 강제 maximum)·CODEX-040(HIGH, 실제 `main()` 주문 흐름이 Stage 11
+Execution Engine 전체를 우회)·CODEX-041(MEDIUM, affordability가 실제 후보/주문 차단에 미배선)을
+제기했다. 3건 전부 로컬 브랜치에서 수정·테스트했다(커밋 `ae2b0fd`).
+
+- **CODEX-039**: `trusted_operator_config.get_cash_usage_percent()` 신설 — 인자를 전혀 받지 않고
+  트러스트 값을 그대로 반환한다(caller percent와 결합하지 않음). 기존 `get_cash_usage_percent_
+  ceiling()`은 `order_gateway.py`의 레거시 `LiveEntryContext.cash_usage_percent` 계약 전용으로
+  이름/문서만 명시적으로 분리해 유지(값 자체는 변경 없음, 여전히 50%).
+- **CODEX-040**: 신규 `live_readiness/live_entry_pipeline.py` — Account Engine → Risk Engine →
+  Sizing Engine → Affordability Filter → Execution Engine을 실제로 orchestrate한다.
+  `paper_strategy_order.main()`이 `broker.config.is_live_mode`인 `side="buy"` 진입에 대해 레거시
+  `submit_order()`/직접 broker 호출 대신 이 파이프라인을 호출하도록 배선됐다. Paper 모드는 완전히
+  미변경(기존 400건 이상 테스트 그대로 통과). `execution_engine.submit_validated_command()`가
+  신규 optional `account_cash_snapshot`을 `broker.submit_order()`로 전달해 CODEX-036의 잔여 위험도
+  이 새 경로에서는 닫힘.
+- **CODEX-041**: `live_entry_pipeline.py`가 watchlist 후보 선별과 동일한 `evaluate_affordability()`
+  함수를 Execution Engine 직전 최종 검사로 재실행 — 주문 불가능한 candidate가 broker 호출 0회로
+  차단된다.
+- **런타임 통합 테스트**(`tests/test_main_live_entry_wiring.py`): live 모드 정상 경로에서 4개
+  엔진(Account/Risk/Sizing/Execution) + affordability가 정확히 1회씩 호출됨을 확인, 각 단계
+  실패 시 broker 호출 0회 확인, 레거시 `submit_order()` wrapper가 live 진입에서 절대 호출되지
+  않음을 확인, Paper 모드 `main()` 동작이 완전히 동일함을 확인(신규 엔진 호출 0회).
+
+전체 회귀 **1,331 passed, 0 failed**(직전 1,299에서 32건 신규). `approved: false`, `live_enabled:
+false` 유지, **Live trading: DO_NOT_ENABLE**. 다음 작업은 새 `FINAL_VALIDATION_PACKAGE.md`(새
+SHA-256 포함) 작성 후 상태를 `READY_FOR_FINAL_CODEX_REVALIDATION`으로 종료하는 것.
+
+## Stage 11 — Account/Risk/Sizing/Execution Engine 계층 분리 (2026-07-28 완료).
 CODEX-034~038 수정에 이어, 사용자 지시에 따라 주문 경로를 `Market Data → Strategy Engine →
 Signal → Risk Engine → Account Engine → Sizing Engine → Execution Engine → Broker` 계층으로
 분리했다. `docs/autonomous/PROJECT_CONSTITUTION.md`에 "계층 분리 원칙"을 신설(Strategy는 신호/

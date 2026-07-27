@@ -1,13 +1,15 @@
-# FINAL_VALIDATION_PACKAGE — Stage 3~11 + CODEX-023~038 (2026-07-28)
+# FINAL_VALIDATION_PACKAGE — Stage 3~11 + CODEX-023~041 (2026-07-28)
 
-이 문서는 일곱 사이클의 최종 산출물이다: (1) Stage 3~10 연속 구현, (2)~(5) Codex 1~4차 독립
-검증(CODEX-023~034, 매 사이클 상세는 이전 버전 참고, git 이력에 보존됨)에 대한 통합 수정, (6)
-Codex 5차 통합 재검증(overall verdict `FAIL`, CODEX-034 PARTIALLY_RESOLVED + 신규
-CODEX-035/036/037 HIGH, CODEX-038 LOW)에 대한 최종 수정 사이클, (7) 그 직후 사용자가 별도로
-지시한 **Stage 11 — Account/Risk/Sizing/Execution Engine 계층 분리**. Stage 11은 Codex
-재검증에 대한 응답이 아니라 사용자가 명시적으로 요청한 아키텍처 리팩터링이며, CODEX-034~038의
-수정 내용을 대체하지 않고 그 위에 새 계층을 추가한다. 이 문서 자체는 다음 Codex 재검증 요청 전
-최종 스냅샷이며, **실거래 승인이나 활성화를 의미하지 않는다.**
+이 문서는 여덟 사이클의 최종 산출물이다: (1) Stage 3~10 연속 구현, (2)~(6) Codex 1~5차 독립
+검증(CODEX-023~038, 매 사이클 상세는 이전 버전 참고, git 이력에 보존됨)에 대한 통합 수정, (7)
+사용자가 Codex 재검증과 별도로 지시한 **Stage 11 — Account/Risk/Sizing/Execution Engine
+계층 분리**(building block으로 추가, 운영 경로 미배선), (8) 그 직후 Codex 6차 통합 재검증
+(overall verdict `FAIL`, CODEX-036 PARTIALLY_RESOLVED + 신규 CODEX-039 MEDIUM/CODEX-040
+HIGH/CODEX-041 MEDIUM)에 대한 **실제 운영 주문 경로 배선 완료 사이클**. 이 여덟 번째 사이클이
+이 문서의 실제 검증 대상이며, Stage 11에서 building block으로만 존재하던 신규 엔진들을
+`paper_strategy_order.main()`의 실제 live-mode 주문 경로에 배선해 CODEX-040의 legacy-bypass
+문제를 해소했다. 이 문서 자체는 다음 Codex 재검증 요청 전 최종 스냅샷이며, **실거래 승인이나
+활성화를 의미하지 않는다.**
 
 ## 0. 최종 상태
 
@@ -26,23 +28,24 @@ CODEX-035/036/037 HIGH, CODEX-038 LOW)에 대한 최종 수정 사이클, (7) �
 
 브랜치: `orchestrator/20260725-013740-us-stock-trading`.
 
-### 1a~1f. Stage 3~10 ~ CODEX-035/036/037/038 (커밋 `415c129`~`06a77c8`)
+### 1a~1g. Stage 3~10 ~ Stage 11 계층 분리 (커밋 `415c129`~`14f7a13`)
 
-이전 `FINAL_VALIDATION_PACKAGE.md`(§1a~§1f, 커밋 `06a77c8` 시점)에서 이미 다섯 차례 Codex 검증을
-거친 46개 커밋. 상세는 이전 버전 참고(git 이력에 보존됨).
+이전 `FINAL_VALIDATION_PACKAGE.md`(§1a~§1g, 커밋 `14f7a13` 시점)에서 이미 다섯 차례 Codex 검증을
+거친 47개 커밋. 상세는 이전 버전 참고(git 이력에 보존됨).
 
-### 1g. Stage 11 — Account/Risk/Sizing/Execution Engine 계층 분리 (신규, 이번 패키지의 실제 검증 대상)
+### 1h. Codex 6차 독립 검증 + CODEX-039/040/041 실제 운영 경로 배선 사이클 (신규, 이번 패키지의 실제 검증 대상)
 
 | # | 커밋 | 내용 |
 |---|---|---|
-| 42 | `3494fe3` | Layer Account/Risk/Sizing/Execution Engines per architecture requirement (최신, `HEAD`) |
+| 43 | `fff8007` | Record Codex independent review: FAIL, CODEX-036 PARTIALLY_RESOLVED, CODEX-039/041 MEDIUM, CODEX-040 HIGH |
+| 44 | `ae2b0fd` | CODEX-039/040/041: wire live-mode main() through Account/Risk/Sizing/Affordability/Execution Engine (최신, `HEAD`) |
 
-이 커밋은 **Codex 재검증에 대한 응답이 아니라 사용자가 직접 지시한 아키텍처 리팩터링**이다 —
-CODEX-034~038 각각에 대한 회귀 테스트는 그대로 유지된다(§2). 이 범위 이전(CODEX-001~022 원격
-수정 사이클)은 이미 별도로 Codex 최종 독립 검증을 거쳐 `PASS_WITH_CONDITIONS`로 종결됨
-(`docs/autonomous/CODEX_REVIEW.md`의 해당 이력, 커밋 `d38cb95`). 이번 문서는 §1a~§1g 전체(47개
-커밋)를 검증 대상으로 제출하되, 실질적으로 새로 검증이 필요한 것은 §1g(Stage 11 계층 분리)다 —
-§1a~§1f는 이미 다섯 차례 Codex의 눈을 거쳤고 그 결과가 바로 이번 리팩터링의 근거이기 때문이다.
+`fff8007`는 Codex 자신의 통합 재검증 결과(`CODEX_REVIEW.md`)를 그대로 기록한 커밋이며, 이
+저장소는 그 파일을 손으로 편집한 적이 없다. `ae2b0fd`이 실제 코드/테스트 수정 커밋이다(문서
+갱신은 이 문서와 같은 후속 커밋에서 처리). 이 범위 이전(CODEX-001~022 원격 수정 사이클)은 이미
+별도로 Codex 최종 독립 검증을 거쳐 `PASS_WITH_CONDITIONS`로 종결됨(`docs/autonomous/
+CODEX_REVIEW.md`의 해당 이력, 커밋 `d38cb95`). 이번 문서는 §1a~§1h 전체(49개 커밋)를 검증
+대상으로 제출하되, 실질적으로 새로 검증이 필요한 것은 §1h(CODEX-039/040/041 배선)다.
 
 ## 2. Stage/사이클별 변경 파일 및 테스트 결과
 
@@ -54,194 +57,171 @@ CODEX-034~038 각각에 대한 회귀 테스트는 그대로 유지된다(§2). 
 | CODEX-024/026/028/031/032/033(3차 통합 수정 사이클) | 13건 | 통과 |
 | CODEX-034 + 잔고 비율 사이징(4차 수정 사이클, watchlist affordability 포함) | 108건 | 통과 |
 | CODEX-035/036/037/038(5차 수정 사이클) | 81건 | 통과 |
-| **Stage 11**(trusted_operator_config/account_engine/risk_engine/sizing_engine/execution_engine + watchlist affordability 확장) | 174건 | 통과 |
-| **합계(§1g만)** | **174건 신규**(직전 1,125 → 1,299) | **통과** |
+| Stage 11(엔진 5종 building block + watchlist affordability 확장) | 174건 | 통과 |
+| **CODEX-039/040/041**(실제 운영 경로 배선) | `test_trusted_operator_config.py`(+9)/`test_execution_engine.py`(+2)/`test_live_entry_pipeline.py`(신설 11)/`test_main_live_entry_wiring.py`(신설 9) | 통과 |
+| **합계(§1h만)** | **32건 신규**(직전 1,299 → 1,331) | **통과** |
 
 ## 3. 전체 테스트 결과
 
 ```
 $ venv/bin/python -m pytest -q
-1299 passed, 2 warnings
+1331 passed, 2 warnings
 ```
 
 - 이 문서 작성 직전 최종 실행 결과(2026-07-28). 실패 0건.
 - Stage 3~10 착수 시점 베이스라인 613 passed → Stage 3~10 완료 시점 820 passed → CODEX-023~027
   수정 완료 시점 923 passed → CODEX-024/026/028/029/030 수정 완료 시점 973 passed →
   CODEX-024/026/028/031/032/033 수정 완료 시점 986 passed → CODEX-034/잔고 비율 사이징 수정 완료
-  시점 1,044 passed → CODEX-035/036/037/038 수정 완료 시점 1,125 passed → 이번 Stage 11 완료
-  시점 **1,299 passed**.
+  시점 1,044 passed → CODEX-035/036/037/038 수정 완료 시점 1,125 passed → Stage 11 완료 시점
+  1,299 passed → 이번 CODEX-039/040/041 배선 완료 시점 **1,331 passed**.
 - 두 warning은 기존 urllib3(LibreSSL) 경고와 `test_scanner.py`의 의도된 unknown-field 경고로,
   이번 범위와 무관한 기존 항목이다.
 
-## 4. 아키텍처 요약
+## 4. 아키텍처 요약 — 실제 운영 경로 (CODEX-040 배선 이후)
 
 ```
-Market Data
+Market Scanner (daily_candidate_scanner.py / paper_strategy_order.load_watchlist())
     ▼
-Strategy Engine (strategy/interface.py::EvaluationResult)
-    │  strategy_id/signal/entry_price/stop_price/target/confidence만 산출
-    │  계좌 잔고·비율·최종 수량·주문 가능 금액은 절대 산출/신뢰하지 않음 (구조적으로 강제)
+Strategy Engine (paper_strategy_order.analyze_stock() 점수 산출)
+    │  entry_price/score만 산출 — 계좌 잔고·비율·최종 수량은 절대 산출하지 않음
     ▼
-Signal
-    ▼
-Risk Engine (live_readiness/risk_engine.py) — 신규
-    │  전략의 수량을 사용하지 않고 entry/stop price + daily-loss-remaining으로
-    │  risk_based_qty를 독자 계산. 모든 숫자 finite 검증, 하나라도 무효면 전체 차단.
-    ▼
-Account Engine (live_readiness/account_engine.py) — 신규
-    │  AccountSnapshot: broker.get_account() + entry_reservation_ledger 기반
-    │  effective_cash = min(broker_cash, non_margin_available_cash) (margin 미사용)
-    │  cash_usage_percent/포지션·진입 한도는 trusted_operator_config.py에서만
-    ▼
-(신규 building block, 미배선) 관심종목 잔고 affordability 필터 (live_readiness/watchlist_affordability.py)
-    │  STALE_ACCOUNT_STATE 신설, fractionable 종목은 1주 가격이 잔고 초과해도
-    │  최소주문금액 충족 시 후보 유지
-    ▼
-Sizing Engine (live_readiness/sizing_engine.py) — 신규
-    │  actual_qty = min(balance_based_qty, risk_based_qty, strategy_max_qty)
-    │  세 값 모두 명시적으로 유효할 때만 계산, apply_entry_price_buffer()로 슬리피지 반영
-    ▼
-Execution Engine (live_readiness/execution_engine.py) — 신규
-    │  ValidatedOrderCommand + broker 호출 유일 경로 (정적 grep 테스트로 강제)
-    │  만료/변조/symbol 불일치/기존 예약 불일치 시 broker 호출 0회
-    ▼
-포지션 생명주기 (positions/) ──── SQLite canonical (state_store/, positions/position_events)
-    │  (Stage 3~10과 동일, 이번 사이클 미변경)
+[live_readiness/live_entry_pipeline.py::run_live_entry_pipeline() -- side="buy" AND
+ broker.config.is_live_mode 인 진입에만 적용. Paper 모드는 아래 경로를 타지 않고
+ 기존 try_reserve_order()+submit_order() 흐름을 그대로 사용(완전 미변경).]
+    │
+    ▼ 1. Account Engine (live_readiness/account_engine.py)
+    │     broker.get_account() 기반 AccountSnapshot, effective_cash=min(cash, non_margin)
+    ▼ 2. 신뢰 가능한 cash_usage_percent (trusted_operator_config.get_cash_usage_percent(),
+    │     인자 없음 — caller percent와 절대 결합하지 않음, CODEX-039)
+    ▼ 3. Risk Engine (live_readiness/risk_engine.py)
+    │     entry/stop price + daily-loss-remaining으로 risk_based_qty 독자 계산
+    ▼ 4. Sizing Engine (live_readiness/sizing_engine.py)
+    │     actual_qty = min(balance_based_qty, risk_based_qty, strategy_max_qty)
+    ▼ 5. Affordability Filter (live_readiness/watchlist_affordability.evaluate_affordability(),
+    │     watchlist 후보 선별과 동일한 함수, CODEX-041)
+    ▼ 6. Execution Engine (live_readiness/execution_engine.submit_validated_command())
+    │     ValidatedOrderCommand 검증(만료/변조/symbol/기존 예약 불일치, 5종 실패 시 broker 0회),
+    │     account_cash_snapshot을 broker에 전달(CODEX-036 잔여 위험 해소)
     ▼
 Broker (broker/alpaca_client.py::AlpacaBroker.submit_order())
-    │  live_entry_context 게이트, 예산 authoritative 산출, 정의된 rejection만 release,
-    │  ambiguous 실패는 SUBMISSION_UNKNOWN 유지 (CODEX-026~037, 이번 사이클 미변경)
+    │  live_entry_context 게이트(order_gateway.py, CODEX-026~037, 이번 사이클 미변경)
     ▼
-운영 관제 (ops_dashboard/)
+포지션 생명주기 (positions/) / 운영 관제 (ops_dashboard/)
 ```
 
-`paper_strategy_order.py`(기존 Paper 주문 흐름, `AlpacaBroker.submit_order()`로의 기존 직접
-호출 포함)는 **legacy compat 경로로 명시적으로 유지**되며, 동작을 전혀 바꾸지 않았다 —
-`docs/autonomous/PROJECT_CONSTITUTION.md`의 "계층 분리 원칙" 참고.
+각 단계 실패는 `LiveEntryPipelineError`로 즉시 전파되며 broker 호출은 0회다 — 런타임 통합
+테스트(`tests/test_main_live_entry_wiring.py`)가 정상 경로에서 4개 엔진 + affordability가
+각각 정확히 1회 호출됨과, 각 단계 실패 시 broker 호출 0회를 확인한다.
 
 ## 5. 각 구성요소 상세
 
-### 5.1~5.8
+### 5.1~5.9
 
-이전 `FINAL_VALIDATION_PACKAGE.md`(커밋 `06a77c8`) §5.1~§5.8과 동일, 이번 사이클에서 미변경
-(broker/alpaca_client.py, live_readiness/order_gateway.py의 핵심 게이트 로직은 건드리지 않음 —
-`order_gateway.py`는 `trusted_operator_config.py`에서 상수를 가져오도록 import만 변경).
+이전 `FINAL_VALIDATION_PACKAGE.md`(커밋 `14f7a13`) §5.1~§5.9와 동일, 이번 사이클에서 미변경
+(Stage 11에서 만든 5개 엔진 모듈 자체의 내부 로직은 건드리지 않음 — 이번 사이클은 "배선"만
+추가했다).
 
-### 5.9 Stage 11 — Account/Risk/Sizing/Execution Engine 계층 분리 (신규)
+### 5.10 CODEX-039/040/041 — 실제 운영 경로 배선 (신규)
 
-- **`live_readiness/trusted_operator_config.py`**: `cash_usage_percent` 트러스트 상한(50%)과
-  `MAX_CONCURRENT_LIVE_POSITIONS`/`MAX_DAILY_LIVE_ENTRIES`의 단일 소스, 매 호출 재검증
-  (`get_*()` 함수 형태, 손상된 값은 fail-closed).
-- **`live_readiness/account_engine.py`**: `AccountSnapshot`(frozen dataclass) —
-  `effective_cash_krw = min(broker_cash_krw, non_margin_available_cash_krw)`, pending/unknown/
-  reconciliation-required/open-position 노출은 `entry_reservation_ledger`의 durable SQLite
-  집계. broker 조회 실패/cash 무효/Paper-Live 모호/계좌 ID 불일치 시
-  `AccountEngineError`(fail-closed).
-- **`live_readiness/risk_engine.py`**: `compute_risk_decision()`이 전략의 진입가/손절가와
-  daily-loss-remaining으로 risk_based_qty를 독자 계산 — 전략이 수량을 선언할 방법 자체가 없다
-  (`EvaluationResult`에 그런 필드가 없음). 모든 숫자 finite 검증.
-- **`live_readiness/sizing_engine.py`**: `compute_sizing_decision()`이
-  `actual_qty = min(balance_based_qty, risk_based_qty, strategy_max_qty)`를 계산. 세 후보 모두
-  None/NaN/Infinity/bool/문자열/음수 검증을 통과해야 함. `strategy_max_qty=0`은 무효 입력(캡
-  없음은 `None`으로 표현) — CODEX-037의 optional cap 규약과 동일.
-- **`live_readiness/execution_engine.py`**: `ValidatedOrderCommand`(frozen) + broker 호출의
-  유일한 사전 검증 지점. `submit_validated_command()`가 broker 호출 전에 (1) 타입 검증 (2) 만료
-  검증 (3) qty×price==estimated_notional 검증 (4) symbol 일치 검증 (5) `client_order_id`의 기존
-  SQLite 예약과의 symbol 불일치 검증을 수행 — 5개 중 하나라도 실패하면 broker 호출 0회.
-  `reservation_id`는 command가 아니라 반환되는 `ExecutionResult`에 담긴다(이 저장소의 유일한
-  예약 지점이 여전히 `broker.submit_order()` 내부이므로 — `DECISION_LOG.md` Stage 11 결정 2).
-- **아키텍처 경계 강제**: `tests/test_execution_engine.py`의 정적 grep 테스트가 저장소 전체에서
-  `broker.submit_order(`/`self.broker.submit_order(` 패턴의 실제 호출부(변수명 기준)를 찾아
-  허용 목록(`execution_engine.py`, `broker/alpaca_client.py`, `paper_strategy_order.py`) 밖에
-  있으면 실패시킨다.
-- **`live_readiness/watchlist_affordability.py`**: `STATUS_STALE_ACCOUNT_STATE`(존재하지만 만료된
-  스냅샷, `UNKNOWN_ACCOUNT_STATE`와 별도) + `buffered_entry_price`/`account_snapshot_at` 필드.
+- **CODEX-039**: `trusted_operator_config.get_cash_usage_percent()` 신설(인자 없음, 트러스트
+  값을 그대로 반환). `get_cash_usage_percent_ceiling()`(레거시 `order_gateway.py` 전용,
+  `min(caller, trusted)` 계약)과 이름/문서를 명시적으로 분리, 값 자체(50%)는 변경 없음.
+- **CODEX-040**: 신규 `live_readiness/live_entry_pipeline.py::run_live_entry_pipeline()`이
+  Account → Risk → Sizing → Affordability → Execution Engine을 실제로 orchestrate.
+  `paper_strategy_order.main()`이 `side="buy" AND broker.config.is_live_mode`인 진입에 대해
+  이 파이프라인을 호출하도록 배선 — Paper 모드는 코드 한 줄도 바뀌지 않음(기존 400건 이상 테스트
+  그대로 통과). `LIVE_FX_RATE_KRW_PER_USD`/`LIVE_ENTRY_ALLOW_LIST` 환경변수를 fail-closed로
+  읽는 헬퍼 2개 추가(TBD_OPERATOR: 실제 FX provider/allow-list 연동은 여전히 미구현).
+  `execution_engine.submit_validated_command()`가 신규 optional `account_cash_snapshot`을
+  `broker.submit_order()`로 전달(공급 시에만, 구형 테스트 더블 호환 유지).
+- **CODEX-041**: `live_entry_pipeline.py`가 Sizing Engine 직후·Execution Engine 직전에
+  `evaluate_affordability()`를 재실행(watchlist 후보 선별과 동일 함수) — non-affordable이면
+  broker 호출 0회로 차단. watchlist 단계의 사전 일괄 필터링(scanner 전체 대상, 효율성 목적)은
+  이번 사이클에서 배선하지 않음(`DECISION_LOG.md` 결정 4 참고 — `main()` 구조상 일괄 필터 단계가
+  애초에 없고, 실행 직전 재검증이 실제 안전 반례를 정확히 차단한다).
+- **런타임 통합 테스트**: `tests/test_main_live_entry_wiring.py` — live 모드 정상 경로에서
+  Account/Risk/Sizing/Execution Engine + affordability가 각각 정확히 1회 호출, 레거시
+  `submit_order()` wrapper 미호출, Account Engine 실패/FX rate 미설정/allow-list 불일치/잔고
+  부족/예약 충돌이 각각 broker 호출 0회로 차단, Paper 모드는 신규 엔진 호출 0회로 완전히
+  미변경임을 확인(9건). `tests/test_live_entry_pipeline.py`(11건)는 파이프라인 자체의 순수
+  유닛/통합 테스트.
 
 ## 6. 외부 API 호출 현황
 
-일곱 사이클 전체 구현·테스트 과정에서 실제 Alpaca API, 실제 Slack Webhook, 실제 Yahoo/기타 외부
+여덟 사이클 전체 구현·테스트 과정에서 실제 Alpaca API, 실제 Slack Webhook, 실제 Yahoo/기타 외부
 데이터 API를 호출한 적이 **0회**다. 모든 테스트는 fake/sequenced broker, 실제 `AlpacaBroker` +
-네트워크 호출 시 예외를 던지는 세션 더블, tmp_path 격리 파일로만 동작한다. 신규 Account/Execution
-Engine 테스트도 전부 fake broker 객체(duck-typed `get_account()`/`submit_order()`)만 사용한다.
+네트워크 호출 시 예외를 던지는 세션 더블, tmp_path 격리 파일로만 동작한다.
 
 ## 7. 운영 파일 변경 현황
 
-`order_history.csv`, `universe.csv`, `strategy_performance.csv`는 일곱 사이클 내내 **바이트
-단위 및 mtime까지 불변**(md5/mtime 동일, §12 참고). 신규 SQLite 관련 테스트(`test_account_
-engine.py`, `test_execution_engine.py`)는 `STATE_STORE_DB_FILE`/`POSITION_STORE_FILE`을
-`tmp_path`로 격리하고 `entry_reservation_ledger._LOCK_FILE`을 monkeypatch — 전체 회귀 실행
-전후 실제 저장소 루트 `TRADING_STATE.db*`/`LIVE_ENTRY_RESERVATION.lock`이 생성되지 않음을
-확인했다.
+`order_history.csv`, `universe.csv`, `strategy_performance.csv`는 여덟 사이클 내내 **바이트
+단위 및 mtime까지 불변**(md5/mtime 동일, §12 참고). 신규 테스트는 `STATE_STORE_DB_FILE`/
+`POSITION_STORE_FILE`/`ORDER_HISTORY_FILE`/`NOTIFICATION_HEALTH_STATE_FILE` 등을 `tmp_path`로
+격리하고 `entry_reservation_ledger._LOCK_FILE`을 monkeypatch — 전체 회귀 실행 전후 실제 저장소
+루트 `TRADING_STATE.db*`/`LIVE_ENTRY_RESERVATION.lock`/`NOTIFICATION_HEALTH_STATE.json`이
+생성되지 않음을 확인했다.
 
 ## 8. main/origin 및 approved/live_enabled 현황
 
-- `main`은 일곱 사이클 내내 전혀 이동하지 않았다.
+- `main`은 여덟 사이클 내내 전혀 이동하지 않았다.
 - `origin`으로 push한 적 없음.
 - `approved: false`, `live_enabled: false`는 변경하지 않았다.
 - Kill Switch 해제, Live API Key 입력, 실제 주문 실행, 테스트 삭제/완화, 기존 리스크 한도 완화
-  등 금지된 행위는 수행하지 않았다 — Stage 11은 기존 게이트(order_gateway.py/alpaca_client.py의
-  CODEX-034~037 로직)를 대체하지 않고 그 위에 신규 계층을 추가했을 뿐이며, 기존 회귀 테스트
-  1,125건은 단 하나도 수정되지 않았다(단, `test_watchlist_affordability.py`의 헬퍼가 신규
-  STALE_ACCOUNT_STATE 검증을 통과하도록 `as_of`/`now` 인자를 추가로 받게 됐다 — 기존 assertion은
-  그대로 유지).
+  등 금지된 행위는 수행하지 않았다 — 이번 사이클은 기존 게이트(order_gateway.py/alpaca_client.py
+  의 CODEX-026~037 로직)를 대체하지 않고 그 앞단에 Account/Risk/Sizing/Affordability 검증을
+  추가했을 뿐이며, Paper 모드 주문 흐름 및 관련 기존 테스트는 단 하나도 수정하지 않았다.
 
 ## 9. 남은 TBD_OPERATOR 항목
 
 `docs/live_review/TBD_REVIEW_RECOMMENDATIONS.md` + `docs/live_review/LIMITED_LIVE_30K_KRW_
-PLAYBOOK.md` §7: 실계좌, 실환율(FX rate provider 연동 자체가 미구현), Live API Key,
-`cash_usage_percent`/`TRUSTED_CASH_USAGE_PERCENT_CEILING`의 실제 배포값(50%가 최종 승인값인지
+PLAYBOOK.md` §7: 실계좌, 실환율(FX rate provider 연동 자체가 미구현 — `LIVE_FX_RATE_KRW_PER_USD`
+환경변수로 임시 소싱), Live API Key, `cash_usage_percent`의 실제 배포값(50%가 최종 승인값인지
 운영자 확인 필요), 실 승인자, 배포 시각, 롤백 담당자, 실제 Alpaca 최소 주문 금액, 실제 파일럿
-종목 allow-list 내용. 어느 항목도 추정하여 확정하지 않았다.
+종목 allow-list 내용(`LIVE_ENTRY_ALLOW_LIST` 환경변수로 임시 소싱). 어느 항목도 추정하여 확정하지
+않았다.
 
 ## 10. 알려진 위험 (Codex 재검증 시 특히 확인 필요)
 
 1. **SQLite canonical 범위가 orders/fills까지 포함하지 않음**: 진입 주문 이력은 여전히 CSV
    기반(`DECISION_LOG.md` 결정 1).
 2. **`ENTRY_DISABLED` 자동 배선 미완료**: `NEEDS_USER_DECISION`으로 유지.
-3. **CODEX-026/029 게이트가 `AlpacaBroker`의 향후 신규 메서드를 자동으로 보호하지 않음**:
-   `submit_order()`에만 배선.
-4. **entry 경로의 crash-safe reconciliation이 여전히 수동 트리거**: `reconcile_by_client_order_id()`
+3. **entry 경로의 crash-safe reconciliation이 여전히 수동 트리거**: `reconcile_by_client_order_id()`
    는 단위 테스트로만 검증됐고, 재시작/크래시 복구 경로에 자동 배선되지 않았다.
-5. **`account_cash_snapshot` 전달이 opt-in이며 production 배선이 아직 없음**: 실제 broker 잔고를
-   조회해 `LiveEntryContext`에 채워 넣는 production caller가 아직 존재하지 않는다.
-6. **watchlist affordability + Stage 11 신규 엔진 5종이 실제 스캔·주문 파이프라인에 미배선**
-   (신규 초점): `trusted_operator_config.py`/`account_engine.py`/`risk_engine.py`/
-   `sizing_engine.py`/`execution_engine.py`는 전부 순수 building block으로만 존재 — 실제
-   `daily_candidate_scanner.py`/`paper_strategy_order.py::main()`과의 통합은 이번 사이클 범위
-   밖이며, 별도의 명시적 배선 결정이 필요하다.
-7. **`ValidatedOrderCommand.reservation_id`가 command 생성 시점이 아니라 broker 호출 이후에만
-   확정됨**(신규): 사용자 지시서의 "필수 필드" 문구와 완전히 일치하지 않는 설계 결정
-   (`DECISION_LOG.md` Stage 11 결정 2) — 이 저장소의 기존 단일-예약-지점 아키텍처와의 충돌을
-   피하기 위함.
-8. **비용/정책 ASSUMPTION 다수**: 백테스트 비용 가정, 선택 엔진 가중치, 사이징 최소 주문 금액 등.
-9. **미검증 YouTube 전략 후보 4건**: 어떤 주문 경로와도 연결되어 있지 않다.
-10. **Phase 3(1분봉 실시간 수집/폴링 인프라) 미착수**.
-11. **동시성 경쟁 조건 발견 이력**: 이전 사이클(CODEX-029/030)에서 1건을 발견·수정했고, 유사한
+4. **watchlist 사전 일괄 affordability 필터가 scanner에 미배선**(신규 재확인): 실행 직전
+   재검증(이번 사이클에서 구현)이 안전 측면에서는 동등하지만, `daily_candidate_scanner.py` 자체의
+   효율성 개선(불필요한 analyze_stock 호출 방지)은 여전히 미해결.
+5. **실제 FX rate/allow-list provider 연동이 환경변수 임시 소싱 수준**(신규): `LIVE_FX_RATE_
+   KRW_PER_USD`/`LIVE_ENTRY_ALLOW_LIST` 둘 다 fail-closed지만 실제 운영급 provider 연동은
+   별도 TBD_OPERATOR로 남아있다.
+6. **`ValidatedOrderCommand.reservation_id`가 command 생성 시점이 아니라 broker 호출 이후에만
+   확정됨**: 이번 사이클에서도 변경하지 않음(Stage 11 결정 2, 단일-예약-지점 아키텍처 유지).
+7. **비용/정책 ASSUMPTION 다수**: 백테스트 비용 가정, 선택 엔진 가중치, 사이징 최소 주문 금액 등.
+8. **미검증 YouTube 전략 후보 4건**: 어떤 주문 경로와도 연결되어 있지 않다.
+9. **Phase 3(1분봉 실시간 수집/폴링 인프라) 미착수**.
+10. **동시성 경쟁 조건 발견 이력**: 이전 사이클(CODEX-029/030)에서 1건을 발견·수정했고, 유사한
     패턴이 코드베이스 다른 곳에 더 있는지는 아직 전수 조사하지 않았다.
 
 ## 11. 검증 중점 영역 (Codex에게 요청)
 
-1. Stage 11이 기존 CODEX-034~037의 안전장치(HTTP status 분류, authoritative 예산/비율, NaN cap
-   차단)를 실질적으로 대체하거나 우회하지 않는지 — `order_gateway.py`/`alpaca_client.py`의 핵심
-   로직이 전혀 수정되지 않았음을 diff로 재확인.
-2. `live_readiness/execution_engine.py`의 정적 grep 아키텍처 가드가 실제로 신뢰할 수 있는지(우회
-   가능한 패턴이 있는지), 그리고 이 가드가 "Strategy가 직접 Broker를 호출할 수 없다"는 요구사항의
-   충분한 강제 수단인지, 아니면 런타임 강제가 추가로 필요한지 판단 요청.
-3. `account_engine.py`의 `effective_cash = min(broker_cash, non_margin_available_cash)` 계산이
-   실제 Alpaca 계좌 응답 스키마(margin 계좌 포함)에서도 안전한지 — `non_marginable_buying_power`
-   필드가 없는 계좌 유형에서의 폴백 동작(같은 cash 값 사용) 검증.
-4. `sizing_engine.py`의 `actual_qty = min(balance/risk/strategy)`가 세 후보 중 하나라도 무효일 때
-   반드시 예외를 던지고 부분 결과를 절대 반환하지 않는지 fault-injection으로 재확인.
-5. §10.7의 `reservation_id` 설계 결정이 실거래 승인 시점에 실제 문제가 되는지, 아니면 현재
-   구조(broker 호출 결과에 실림)로 충분한지 평가 요청.
-6. 전체 테스트(1,299건)가 실제 네트워크/운영 파일 변경 없이 격리되어 있는지 임의 표본 재확인.
-7. 이전 사이클에서 RESOLVED/PARTIALLY_RESOLVED였던 항목들이 Stage 11의 코드 변경(상수 이전,
-   신규 모듈 추가)으로 인해 실질적으로 재발/회귀하지 않았는지.
+1. `paper_strategy_order.main()`의 live-mode 분기가 실제로 Account/Risk/Sizing/Affordability/
+   Execution Engine을 정확한 순서로, 정확히 1회씩 호출하는지 (a) 정상 경로 (b) 각 단계 실패
+   경로 모두에서 broker 호출 횟수를 계측해 재확인.
+2. Paper 모드 `main()`이 이번 사이클로 인해 단 하나도 달라지지 않았는지 — 기존 400건 이상의
+   Paper 테스트가 문자 그대로 동일한 assertion으로 계속 통과하는지, 신규 엔진 모듈에 대한
+   import/호출이 Paper 경로에 전혀 없는지 재확인.
+3. CODEX-039의 `get_cash_usage_percent()`가 실제로 어떤 경로로도 caller-declared 값과 결합되지
+   않는지 — `live_entry_pipeline.py`의 함수 시그니처 자체에 percent 파라미터가 없음을 코드로
+   재확인.
+4. CODEX-041의 affordability 재검증이 Sizing Engine의 `actual_qty`와 독립적으로 계산되어 두
+   결과가 실제로 일치하는지, 불일치 시 어느 쪽이 최종 결정권을 갖는지 명확한지 평가.
+5. `LIVE_FX_RATE_KRW_PER_USD`/`LIVE_ENTRY_ALLOW_LIST` 환경변수 fail-closed 처리(미설정/잘못된
+   값 시 반드시 차단, 절대 기본값을 조작해내지 않음)를 fault-injection으로 재확인.
+6. 전체 테스트(1,331건)가 실제 네트워크/운영 파일 변경 없이 격리되어 있는지 임의 표본 재확인.
 
-## 12. SHA-256 (주요 안전 크리티컬 파일, 일곱 사이클 내내 미변경 확인용)
+## 12. SHA-256 (주요 안전 크리티컬 파일, 여덟 사이클 내내 미변경 확인용)
 
 ```
-8b8c358fe87634ef74bed0699a6ba0f8e1ebe345cd58aa238c795fd88b179514  docs/autonomous/CODEX_REVIEW.md
+40014f7979ee9b3b25387303a9c3c2e782b5656a3d55972b448675f3369571bf  docs/autonomous/CODEX_REVIEW.md
 27e640537c41334859eb8ad89eb3d013b17b0c95b8abf7b5385e2b76adbd5bfe  docs/live_review/LIVE_APPROVAL_RECORD.md
 043a30a5dc9751c062a36a82d4d75fdbb47903a040fb7b9ab86509f047843d84  risk_config.py
 34411cf9ff530e850e8de5700a19c47aa71369528f6f541c8edd0e553b9df65e  broker/broker_config.py
@@ -250,15 +230,12 @@ d06ef475cc0fa721faedd986f1eaaab6b4ac0e0192ed4bedd3b0d4d009e6c991  order_intent_l
 1194ccc44ebd2fafd98f1fb07d56f5823fadbdaad29a0ef9e2e8aadd63b7e1e3  broker/alpaca_client.py
 ```
 
-(`CODEX_REVIEW.md`의 SHA-256은 CODEX-035/036/037/038 사이클(커밋 `9d294e3`) 이후 변경되지 않았다
-— Stage 11은 Codex 재검증에 대한 응답이 아니므로 이 파일을 건드리지 않았다. 나머지 6개 파일은
-이전 패키지와 SHA-256이 완전히 동일 — 일곱 사이클 내내 전혀 건드리지 않았음을 재확인한다.
-`broker/alpaca_client.py`도 이번 목록에 추가했지만 이번 Stage 11 사이클에서는 변경되지 않았다
-— CODEX-035/036/037 사이클(커밋 `40abc58`) 이후의 값과 동일함을 재확인한 것뿐이다.
-`live_readiness/order_gateway.py`, `live_readiness/account_cash.py`,
-`live_readiness/watchlist_affordability.py`, `paper_strategy_order.py`는 이번 사이클에서
-변경됐으나 이 목록의 "안전 크리티컬 파일"에는 원래 포함되지 않았다 — 변경 내용은 §5.9에 상세
-기술.)
+(`CODEX_REVIEW.md`의 SHA-256은 이번 사이클에서 Codex 자신의 최신 통합 재검증 결과가 그 파일에
+기록됐기 때문에 변경됨 — 파일 손상이나 수동 편집이 아니다. 나머지 6개 파일은 이전 패키지와
+SHA-256이 완전히 동일 — 여덟 사이클 내내 전혀 건드리지 않았음을 재확인한다. `paper_strategy_
+order.py`, `live_readiness/execution_engine.py`, `live_readiness/trusted_operator_config.py`는
+이번 사이클에서 변경됐고 신규 `live_readiness/live_entry_pipeline.py`가 추가됐으나, 이 목록의
+"안전 크리티컬 파일"에는 원래 포함되지 않았다 — 변경 내용은 §5.10에 상세 기술.)
 
 운영 파일(md5, §7 근거):
 ```
@@ -267,7 +244,7 @@ a61104cf03499860ae89d4e194dc8c07  order_history.csv
 9054d0158cf10c47d0e01e8394daaeca  strategy_performance.csv
 ```
 
-이 문서 작성 시점 `HEAD`: `3494fe3270322b6d649c2e2bb34ece33a5dcea8c`
+이 문서 작성 시점 `HEAD`: `ae2b0fd61f0032611fefabe57b8c38c630a80532`
 
 ## 13. 다음 단계
 

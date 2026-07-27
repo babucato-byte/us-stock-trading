@@ -1096,3 +1096,76 @@ order`가 저장소 전체를 grep해 `broker.submit_order(`/`self.broker.submit
 - 신규 모듈은 전부 building block(순수 계산/검증 함수)이며, 실제 운영 스캔·주문 파이프라인
   (`daily_candidate_scanner.py`, `paper_strategy_order.py::main()`)에는 아직 배선하지 않았다 —
   Stage 10/CODEX-034 watchlist affordability와 동일한 선례.
+
+## CODEX-039/040/041 실제 운영 경로 배선 사이클 (2026-07-28)
+
+### CODEX-039(MEDIUM, 50%가 default가 아니라 강제 maximum이며 caller percent도 무시되지 않음)
+
+- 재현(`CODEX_REVIEW.md` 기록): trusted 100%/90%/50% 어느 값을 선택해도 코드 상수
+  `CASH_USAGE_PERCENT_CEILING=50`에 막혀 15,000원으로 축소됨. caller가 더 작은 percent를
+  전달하면 그 값이 그대로 반영되어(예: caller 40% → 12,000원) caller percent가 완전히
+  무시되지도 않음.
+- 수정: `trusted_operator_config.get_cash_usage_percent()` 신설 — 인자 없이 트러스트 값을 그대로
+  반환. `live_entry_pipeline.py`가 이 함수만 사용하며 caller/전략 쪽에서 percent를 넘길 방법 자체가
+  없다(파이프라인 함수 시그니처에 그런 파라미터가 없음). 기존 `get_cash_usage_percent_ceiling()`
+  (`min(caller, trusted)` 계약)은 `order_gateway.py`의 레거시 `LiveEntryContext.cash_usage_percent`
+  필드 전용으로 이름을 분리해 유지 — 값 자체(50)는 변경하지 않음.
+- 신규 테스트: `tests/test_trusted_operator_config.py`에 `get_cash_usage_percent()`가 인자를
+  받지 않음, ceiling 함수와 동일한 값을 반환함, 손상된 설정에서 fail-closed됨을 확인(9건).
+- 처리 상태: RESOLVED
+
+### CODEX-040(HIGH, 실제 main 주문 흐름이 Execution Engine 전체를 우회)
+
+- 재현(`CODEX_REVIEW.md` 기록): `paper_strategy_order.main()` 런타임 계측에서 legacy broker
+  `submit_order` 1회, Execution Engine 0회, Account/Risk/Sizing Engine 미사용으로 실제 주문이
+  제출됨.
+- 수정: 신규 `live_readiness/live_entry_pipeline.py::run_live_entry_pipeline()` — Account Engine
+  (`build_account_snapshot`, broker.get_account() 기반) → 트러스트 cash_usage_percent → Risk
+  Engine(`compute_risk_decision`, `risk_config.STOP_LOSS_RATE` 기반 기본 손절가) → Sizing Engine
+  (`compute_sizing_decision`) → Affordability Filter(`evaluate_affordability`) → Execution
+  Engine(`submit_validated_command`)을 순서대로 호출, 각 단계 실패 시 `LiveEntryPipelineError`로
+  즉시 차단(broker 호출 0회). `paper_strategy_order.main()`의 주문 제출 블록이
+  `broker.config.is_live_mode`일 때 이 파이프라인을, 아닐 때(Paper) 기존 `submit_order()`를
+  호출하도록 분기됐다 — Paper 경로는 코드 한 줄도 바뀌지 않음.
+- 신규 헬퍼: `_get_current_fx_rate_krw_per_usd()`/`_get_live_entry_allow_list()` —
+  `LIVE_FX_RATE_KRW_PER_USD`/`LIVE_ENTRY_ALLOW_LIST` 환경변수를 fail-closed로 읽음(TBD_OPERATOR,
+  실제 FX provider/allow-list 연동은 여전히 미구현 상태로 남김).
+- `execution_engine.submit_validated_command()`에 optional `account_cash_snapshot` 파라미터 추가
+  — 공급되면 `broker.submit_order()`로 전달(older 테스트 더블이 이 kwarg를 몰라도 깨지지 않도록
+  공급됐을 때만 전달).
+- 신규 테스트: `tests/test_live_entry_pipeline.py`(11건, 순수 유닛/통합) — 정상 경로 broker
+  1회 호출, 각 엔진 실패 시 broker 0회, client_order_id 재사용 시 기존 예약과의 symbol 불일치
+  차단, strategy_max_qty가 잔고 기준 상한을 넘길 수 없음 확인.
+  `tests/test_main_live_entry_wiring.py`(9건, `paper_strategy_order.main()` 런타임 통합) —
+  live 모드 정상 경로에서 Account/Risk/Sizing/Execution Engine이 각각 정확히 1회 호출됨, 레거시
+  `submit_order()` wrapper가 절대 호출되지 않음, Account Engine 실패/FX rate 미설정/allow-list
+  불일치/잔고 부족/예약 충돌이 각각 broker 호출 0회로 차단됨, Paper 모드 `main()`은 신규 엔진을
+  전혀 호출하지 않고 기존 동작 그대로임(기존 `FakeBroker` 재사용).
+- 처리 상태: RESOLVED
+
+### CODEX-041(MEDIUM, affordability가 실제 후보/주문 차단에 미배선)
+
+- 재현(`CODEX_REVIEW.md` 기록): 30,000원 계좌 모사에서 50,000원 non-fractionable candidate가
+  `evaluate_affordability()` 호출 0회, Execution Engine 호출 0회로 legacy broker에 제출됨.
+- 수정: `live_entry_pipeline.py`가 Sizing Engine 직후, Execution Engine 호출 직전에
+  `watchlist_affordability.evaluate_affordability()`를 재실행 — watchlist 후보 선별 단계와
+  **동일한 함수**를 사용해 두 단계가 서로 다른 결론에 도달할 수 없게 했다. non-affordable이면
+  `LiveEntryPipelineError`로 broker 호출 0회 차단.
+- 범위 결정(`DECISION_LOG.md` 결정 4): watchlist 단계의 "사전" 일괄 필터링(scanner 전체 후보군에서
+  미리 걸러내는 것, 효율성 목적)은 이번 사이클에서 배선하지 않았다 — `paper_strategy_order.main()`
+  자체가 종목을 하나씩 순회하는 구조라 "watchlist 일괄 필터" 단계가 애초에 존재하지 않는다. Codex의
+  실제 반례(50,000원 non-fractionable candidate가 broker까지 제출됨)를 정확히 재현·차단하는
+  지점은 실행 직전 재검증이며, 이 지점을 구현한 것으로 실제 안전 위험은 해소됐다.
+- 처리 상태: RESOLVED
+
+### 검증 결과 (CODEX-039/040/041 전체)
+
+- 전체 회귀: `venv/bin/python -m pytest -q` **1,331 passed, 0 failed, 2 warnings**. 이전 사이클
+  종료 시점 1,299 passed 대비 32건 신규.
+- 실제 Alpaca/Slack/Yahoo 호출 0회. 실제 저장소 루트 `TRADING_STATE.db*`/
+  `LIVE_ENTRY_RESERVATION.lock`이 회귀 실행 전후 존재하지 않음을 확인.
+- `order_history.csv`/`universe.csv`/`strategy_performance.csv` content 및 mtime 모두 불변.
+- `git diff --check` 통과.
+- main 병합, origin push, 운영 배포, 실거래 활성화, `approved`/`live_enabled` 변경 없음.
+- Paper 모드 `main()` 동작은 코드 diff 및 런타임 통합 테스트(신규 엔진 호출 0회 확인) 양쪽에서
+  완전히 미변경임을 재확인했다 — 기존 테스트 400건 이상 단 하나도 수정하지 않았다.

@@ -1,5 +1,50 @@
 # VALIDATION_REPORT
 
+## 2026-07-28 — CODEX-039/040/041 실제 운영 경로 배선 사이클
+
+Codex 독립 검증(`CODEX_REVIEW.md`, 커밋 `9d294e3`/`40abc58`/`06a77c8`/`3494fe3`/`14f7a13` 포함
+범위, overall verdict **FAIL**)이 CODEX-036을 `PARTIALLY_RESOLVED`로 재확인하고 신규
+CODEX-039(MEDIUM)·CODEX-040(HIGH)·CODEX-041(MEDIUM)을 제기했다. 상세는
+`REMEDIATION_PLAN.md`/`DECISION_LOG.md`의 동일 날짜 섹션 참고.
+
+- **CODEX-039**(MEDIUM, trusted 50%가 강제 maximum이며 caller percent 미무시):
+  `trusted_operator_config.get_cash_usage_percent()` 신설 — 인자 없이 트러스트 값을 그대로
+  반환, caller percent와 결합하지 않음.
+- **CODEX-040**(HIGH, 실제 main 흐름이 Execution Engine 우회): 신규
+  `live_readiness/live_entry_pipeline.py`가 Account → Risk → Sizing → Affordability →
+  Execution Engine을 실제로 orchestrate. `paper_strategy_order.main()`이 `is_live_mode`인
+  `side="buy"` 진입에 대해 이 파이프라인을 호출하도록 배선(Paper 모드는 완전히 미변경).
+- **CODEX-041**(MEDIUM, affordability 미배선): `live_entry_pipeline.py`가 Execution Engine
+  직전 `evaluate_affordability()`를 재실행 — non-affordable candidate가 broker 호출 0회로 차단.
+
+### 테스트 결과
+
+```
+venv/bin/python -m pytest -q                              1,331 passed, 0 failed, 2 warnings
+```
+
+이전 사이클 종료 시점(1,299 passed) 대비 32건 신규.
+
+### 코드 변경 검증
+
+- `live_readiness/trusted_operator_config.py`(신규 함수), `live_readiness/live_entry_pipeline.py`
+  (신규), `live_readiness/execution_engine.py`(account_cash_snapshot 전달), `paper_strategy_order.py`
+  (live-mode 분기 + FX rate/allow-list 헬퍼) — 모두 커밋 diff로 직접 확인.
+- 안전 크리티컬 파일(`risk_config.py`, `broker/broker_config.py`, `kill_switch_state.py`,
+  `order_intent_ledger.py`, `broker/alpaca_client.py`)는 SHA-256이 이전 사이클과 완전히 동일 —
+  이번 사이클은 그 파일들을 전혀 건드리지 않았다.
+- `order_gateway.py`의 기존 게이트 로직(CODEX-026~037)도 미변경 — 새 파이프라인은 그 게이트를
+  대체하지 않고 그 위에서 broker.submit_order()를 호출한다.
+
+### 미검증 영역
+
+- watchlist 단계의 "사전" 일괄 affordability 필터(scanner 전체 후보군 대상)는 여전히
+  `daily_candidate_scanner.py`에 배선되지 않았다 — 실행 직전 재검증(이번 사이클에서 구현)이
+  안전 측면에서는 동등하지만, 효율성 측면(불필요한 analyze_stock() 호출 방지)은 여전히 미해결.
+- 실제 FX rate provider 연동은 여전히 미구현(TBD_OPERATOR) — `LIVE_FX_RATE_KRW_PER_USD` 환경변수
+  임시 소싱으로 파이프라인 배선만 완료했다.
+- Limited live review(제한적 실거래 검토)는 여전히 BLOCKED, 실거래 없음.
+
 ## 2026-07-28 — Stage 11: Account/Risk/Sizing/Execution Engine 계층 분리
 
 사용자 지시에 따라 주문 경로를 `Market Data → Strategy Engine → Signal → Risk Engine →

@@ -617,3 +617,46 @@
   바꾸지 않고 모듈 docstring에 "legacy compat" 지위만 명시했다. 실제 Paper 모드 주문 흐름과 관련
   기존 테스트 전부(400건 이상)는 이번 사이클에서 단 하나도 수정하지 않았다.
 - 승인 필요 여부: 아니오(코드 구현·테스트 추가·문서화 범위, 실거래/승인/main/push와 무관).
+
+## CODEX-039/040/041 실제 운영 경로 배선 사이클 (2026-07-28)
+
+- 결정 1(CODEX-040, Paper 모드는 새 파이프라인을 통과하지 않는다) — Codex의 요구사항 문구
+  ("operational main()의 모든 buy entry를 Account Engine → ... → Execution Engine으로 배선")를
+  문자 그대로 해석하면 Paper 모드도 포함되지만, 실제로 그렇게 하려면 Paper 주문 경로(USD/equity
+  비율 기반 sizing, `order_qty=1` 고정, `risk_config.MAX_POSITION_RATE` 등)를 KRW 기반 잔고 비율
+  파일럿 모델로 강제 변환해야 한다 — 두 모델은 통화 단위부터 다르고, Paper 경로는 이미 400건
+  이상의 테스트로 광범위하게 검증된 안전 크리티컬 경로다. CODEX-026부터 CODEX-037까지 이
+  저장소의 모든 live-entry 게이트가 예외 없이 "`side=='buy' AND is_live_mode`"로 스코프된 기존
+  선례와 일치하도록, 새 파이프라인도 동일한 스코프로 제한했다. Paper 모드에 KRW 파이프라인을
+  강제하는 것은 이번 사이클의 안전 목표(운영 경로 배선 완료)보다 훨씬 위험도가 높은 별개의
+  변경이라고 판단했다.
+- 결정 2(CODEX-039, 두 함수를 분리 유지한 이유) — `get_cash_usage_percent()`(신규, 인자 없음)와
+  `get_cash_usage_percent_ceiling()`(기존, `order_gateway.py` 전용)을 하나로 합치지 않았다 —
+  `order_gateway.py`의 `LiveEntryContext.cash_usage_percent`는 여전히 존재하는 필드이고, 그
+  필드를 없애거나 그 필드가 있는 `LiveEntryContext`의 계약을 바꾸면 `test_live_order_gateway.py`
+  137건과 관련 legacy caller들에 영향을 준다. 새 파이프라인은 애초에 그 필드를 채울 caller
+  percent가 없으므로(strategy_id/signal_id만 있고 percent는 없음), 새 함수를 별도로 만들어
+  "여기엔 결합할 caller 값이 없다"는 계약 자체를 이름으로 표현하는 쪽을 택했다.
+- 결정 3(CODEX-040, FX rate/allow-list를 env var로 임시 소싱) — 이 저장소에는 아직 실시간 FX rate
+  provider가 연동돼 있지 않다(TBD_OPERATOR). 파이프라인 배선을 완료하려면 어떤 형태로든 FX rate가
+  필요했으므로, `LIVE_FX_RATE_KRW_PER_USD`/`LIVE_ENTRY_ALLOW_LIST` 환경변수를 fail-closed로 읽는
+  최소 헬퍼 두 개를 `paper_strategy_order.py`에 추가했다 — 값을 조작해내지 않고, 미설정 시 그냥
+  차단한다(FX rate 없으면 entry 자체를 시도하지 않고, allow-list 비어 있으면
+  `is_symbol_allowed()`가 이미 fail-closed로 전부 차단). 실제 FX 제공자 연동은 여전히 별도
+  TBD_OPERATOR 항목으로 남긴다.
+- 결정 4(CODEX-041, watchlist 사전 필터가 아니라 실행 직전 재검증) — Codex의 요구사항은 "실제
+  scanner/watchlist/main 후보 흐름에서 non-affordable result를 제거"와 "Execution Engine
+  직전에도 affordability/sizing 결과를 재검증" 두 가지를 모두 언급했다. `paper_strategy_order.
+  main()`은 종목을 하나씩 순회하며 `analyze_stock()`을 호출하는 구조라, 별도의 "watchlist
+  일괄 필터링" 단계 자체가 존재하지 않는다(Stage 10/CODEX-034 당시 이미 확인된 구조). 그래서
+  이번 사이클은 "Execution Engine 직전 재검증"만 구현했다 — Codex의 실제 반례("50,000원
+  non-fractionable candidate가 30,000원 계좌에서도 broker까지 제출됨")를 정확히 재현·차단하는
+  지점이며, watchlist 단계의 "사전" 필터링(효율성 목적, 안전 목적 아님)은 여전히 별도
+  building block(`watchlist_affordability.py`)으로 남겨둔다 — daily_candidate_scanner.py에
+  실제로 배선하는 것은 이전 사이클들과 동일하게 범위 밖으로 명시적으로 남긴다.
+- 결정 5(reservation_id 잔여 위험 재확인) — Stage 11에서 이미 기록한 `ValidatedOrderCommand.
+  reservation_id`가 command 생성 시점에 존재하지 않는다는 설계상 제약은 이번 사이클에서도
+  변경하지 않았다 — `execution_engine.submit_validated_command()`는 여전히 유일한 예약 지점인
+  `broker.submit_order()`를 그대로 사용하고, `live_entry_pipeline.py`도 별도의 선-예약을 만들지
+  않는다(이중 예약 방지, Stage 11 결정 1과 동일한 근거).
+- 승인 필요 여부: 아니오(코드 구현·테스트 추가·문서화 범위, 실거래/승인/main/push와 무관).
