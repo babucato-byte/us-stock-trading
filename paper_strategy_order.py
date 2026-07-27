@@ -21,6 +21,7 @@ gains a new direct broker call.
 """
 
 import fcntl
+import math
 import os
 import re
 import tempfile
@@ -28,6 +29,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime as _datetime
+from datetime import timezone
 from pathlib import Path
 
 import pandas as pd
@@ -40,8 +42,10 @@ from account_risk import check_account_exposure_limits, check_daily_loss_limit
 from broker import AlpacaBroker, BrokerResponse
 from kill_switch import is_trading_halted
 from kill_switch_state import is_entry_allowed, is_liquidation_allowed
+from live_readiness import live_entry_pipeline
 from market_hours import eastern_now, get_us_market_session
 from order_safety import check_daily_trade_count, run_order_safety_check
+from state_store import db as state_db
 from slack_utils import send_slack_alert
 
 
@@ -1062,6 +1066,38 @@ def _notify_order_rejected(symbol, response):
     )
 
 
+def _get_current_fx_rate_krw_per_usd():
+    """CODEX-040: the live-entry pipeline needs a KRW/USD FX rate, and
+    this codebase has no live FX rate provider integrated yet (TBD_OPERATOR,
+    see docs/live_review/TBD_REVIEW_RECOMMENDATIONS.md). Reads
+    LIVE_FX_RATE_KRW_PER_USD from the environment; returns (rate, as_of_iso)
+    on a valid positive finite value, or (None, None) if unset/invalid --
+    callers must fail closed (block the live entry) rather than fabricate
+    a rate. Read fresh on every call, never cached, so a stale value isn't
+    silently reused."""
+    raw = os.environ.get("LIVE_FX_RATE_KRW_PER_USD")
+    if raw is None:
+        return None, None
+    try:
+        rate = float(raw)
+    except ValueError:
+        return None, None
+    if not math.isfinite(rate) or rate <= 0:
+        return None, None
+    return rate, eastern_now().astimezone(timezone.utc).isoformat()
+
+
+def _get_live_entry_allow_list():
+    """CODEX-040: TBD_OPERATOR (see docs/live_review/TBD_REVIEW_RECOMMENDATIONS.md
+    #4) -- the actual pilot allow-list content is not yet decided. Reads a
+    comma-separated LIVE_ENTRY_ALLOW_LIST env var; an unset/empty value
+    yields an empty list, which live_readiness.allowlist.is_symbol_allowed()
+    already treats as fail-closed (nothing allowed) -- never a silent
+    "allow everything" default."""
+    raw = os.environ.get("LIVE_ENTRY_ALLOW_LIST", "")
+    return [s.strip().upper() for s in raw.split(",") if s.strip()]
+
+
 def main(broker=None):
     if is_trading_halted():
         print("Kill switch engaged: trading halted, no orders will be submitted.")
@@ -1178,8 +1214,37 @@ def main(broker=None):
         today_trade_count = count_orders_for_date(order_history, today)
 
         ledger_path, ledger_lock_path = _intent_ledger_paths()
+        is_live_entry = getattr(broker.config, "is_live_mode", False)
         try:
-            response = submit_order(symbol, qty=order_qty, broker=broker, client_order_id=client_order_id, side="buy")
+            if is_live_entry:
+                # CODEX-040: live-mode entries go through Account Engine ->
+                # Risk Engine -> Sizing Engine -> Affordability Filter ->
+                # Execution Engine -- never the legacy submit_order() call
+                # below (Paper mode is entirely unchanged, per the same
+                # side="buy" AND is_live_mode scope every other live-entry
+                # gate in this codebase already uses).
+                fx_rate_krw_per_usd, fx_rate_as_of = _get_current_fx_rate_krw_per_usd()
+                if fx_rate_krw_per_usd is None:
+                    raise live_entry_pipeline.LiveEntryPipelineError(
+                        "no live FX rate configured (LIVE_FX_RATE_KRW_PER_USD)"
+                    )
+                pipeline_conn = state_db.open_db()
+                try:
+                    pipeline_result = live_entry_pipeline.run_live_entry_pipeline(
+                        symbol=symbol, strategy_id="PAPER_STRATEGY_ORDER_SCORE_V1",
+                        signal_id=client_order_id, entry_price_usd=result["price"],
+                        broker=broker, conn=pipeline_conn,
+                        fx_rate_krw_per_usd=fx_rate_krw_per_usd, fx_rate_as_of=fx_rate_as_of,
+                        allow_list=_get_live_entry_allow_list(), client_order_id=client_order_id,
+                    )
+                finally:
+                    pipeline_conn.close()
+                response = pipeline_result.broker_response
+                order_qty = pipeline_result.command.qty
+            else:
+                response = submit_order(
+                    symbol, qty=order_qty, broker=broker, client_order_id=client_order_id, side="buy",
+                )
         except requests.exceptions.RequestException as exc:
             update_order_status(symbol, today, "SUBMISSION_FAILED")
             try:
@@ -1201,6 +1266,20 @@ def main(broker=None):
                 f"*Order failed*\n- Symbol: {symbol}\n- Reason: {exc}"
             )
             results["failed"].append(symbol)
+            continue
+        except live_entry_pipeline.LiveEntryPipelineError as exc:
+            # Every stage of the new pipeline raises this BEFORE ever
+            # reaching the broker -- no HTTP call was attempted, so this
+            # is a block, not a failed submission attempt. Abort the CSV/
+            # order_intent_ledger reservation the same way a duplicate
+            # would (no broker record exists for client_order_id).
+            try:
+                order_intent_ledger.abort(ledger_path, ledger_lock_path, client_order_id)
+            except Exception as ledger_exc:
+                print(f"Order intent ledger abort failed for {client_order_id}: {ledger_exc}")
+            update_order_status(symbol, today, "SUBMISSION_FAILED")
+            _notify_order_blocked(symbol, f"Live entry pipeline blocked: {exc}")
+            results["blocked"].append(symbol)
             continue
 
         # The broker gave a definitive response (accepted or rejected) --

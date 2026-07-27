@@ -37,12 +37,27 @@ class _StubResponse:
 
 
 class _FakeBroker:
+    """No account_cash_snapshot parameter at all -- proves
+    submit_validated_command() never breaks an older duck-typed broker
+    double when account_cash_snapshot is omitted."""
+
     def __init__(self, response=None):
         self.calls = []
         self.response = response or _StubResponse(200, {"live_entry_reservation_id": "resv-1"})
 
     def submit_order(self, symbol, *, qty, side, client_order_id, live_entry_context=None):
         self.calls.append((symbol, qty, side, client_order_id))
+        return self.response
+
+
+class _FakeBrokerWithSnapshotSupport:
+    def __init__(self, response=None):
+        self.calls = []
+        self.response = response or _StubResponse(200, {"live_entry_reservation_id": "resv-1"})
+
+    def submit_order(self, symbol, *, qty, side, client_order_id, live_entry_context=None,
+                      account_cash_snapshot=None):
+        self.calls.append((symbol, qty, side, client_order_id, account_cash_snapshot))
         return self.response
 
 
@@ -152,6 +167,29 @@ def test_no_existing_reservation_allows_submission():
     command = _command(client_order_id="coid-brand-new")
     ee.submit_validated_command(command, broker, _ctx(), now=NOW)
     assert len(broker.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# CODEX-036/040: account_cash_snapshot forwarding.
+# ---------------------------------------------------------------------------
+
+def test_account_cash_snapshot_forwarded_when_supplied():
+    broker = _FakeBrokerWithSnapshotSupport()
+    command = _command(client_order_id="coid-snap-1")
+    snapshot = object()  # opaque sentinel -- forwarding is structural, not type-specific here
+    ee.submit_validated_command(command, broker, _ctx(), now=NOW, account_cash_snapshot=snapshot)
+    assert broker.calls[0][4] is snapshot
+
+
+def test_no_account_cash_snapshot_supplied_does_not_break_older_broker_double():
+    # _FakeBroker's submit_order() has no account_cash_snapshot parameter
+    # at all -- omitting it (the default) must never pass it through and
+    # raise a TypeError.
+    broker = _FakeBroker()
+    command = _command(client_order_id="coid-snap-2")
+    result = ee.submit_validated_command(command, broker, _ctx(), now=NOW)
+    assert len(broker.calls) == 1
+    assert result.reservation_id == "resv-1"
 
 
 # ---------------------------------------------------------------------------

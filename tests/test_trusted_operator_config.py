@@ -9,6 +9,33 @@ def test_cash_usage_percent_ceiling_is_valid():
     assert 0 < value <= 100
 
 
+def test_get_cash_usage_percent_is_valid():
+    value = toc.get_cash_usage_percent()
+    assert 0 < value <= 100
+
+
+def test_get_cash_usage_percent_matches_ceiling_value():
+    # CODEX-039: both currently return the same underlying trusted
+    # constant -- get_cash_usage_percent() takes no caller input at all
+    # (nothing to combine), while get_cash_usage_percent_ceiling() is the
+    # legacy min()-with-caller-value contract. Same number, distinct
+    # names/contracts.
+    assert toc.get_cash_usage_percent() == toc.get_cash_usage_percent_ceiling()
+
+
+def test_get_cash_usage_percent_takes_no_arguments():
+    import inspect
+    sig = inspect.signature(toc.get_cash_usage_percent)
+    assert len(sig.parameters) == 0
+
+
+@pytest.mark.parametrize("bad_value", [0, -1, 101, None, "50", True, float("inf")])
+def test_get_cash_usage_percent_blocks_on_corrupted_config(monkeypatch, bad_value):
+    monkeypatch.setattr(toc, "CASH_USAGE_PERCENT_CEILING", bad_value)
+    with pytest.raises(toc.TrustedConfigError):
+        toc.get_cash_usage_percent()
+
+
 def test_max_concurrent_live_positions_is_valid():
     assert toc.get_max_concurrent_live_positions() >= 1
 

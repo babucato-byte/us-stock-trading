@@ -165,7 +165,9 @@ def _validate_against_existing_reservation(command, conn):
         )
 
 
-def submit_validated_command(command, broker, live_entry_context, *, conn=None, now=None):
+def submit_validated_command(
+    command, broker, live_entry_context, *, conn=None, now=None, account_cash_snapshot=None,
+):
     """The SOLE sanctioned path to `broker.submit_order()`. Raises
     `ExecutionEngineError` -- with ZERO calls to the broker -- if the
     command is not a `ValidatedOrderCommand`, is expired, has been
@@ -177,6 +179,14 @@ def submit_validated_command(command, broker, live_entry_context, *, conn=None, 
     `command` -- this engine does not construct one itself (that
     requires an Account Engine snapshot + operator config the caller
     already has), it only enforces the command contract around the call.
+
+    CODEX-036/040: `account_cash_snapshot`, if supplied, is forwarded
+    to `broker.submit_order()` so the final network boundary caps
+    `live_entry_context.available_cash_krw` against a real broker
+    balance rather than trusting it outright (see `live_readiness/
+    account_cash.py`'s module docstring). Only passed through when
+    given -- a duck-typed broker double that doesn't accept this keyword
+    (older test doubles) is never broken by omitting it.
     """
     current = now or datetime.now(timezone.utc)
     _validate_command_shape(command, current)
@@ -192,13 +202,16 @@ def submit_validated_command(command, broker, live_entry_context, *, conn=None, 
                 f"command.symbol {command.symbol!r}"
             )
 
-        response = broker.submit_order(
-            command.symbol,
+        submit_kwargs = dict(
             qty=command.qty,
             side=command.side,
             client_order_id=command.client_order_id,
             live_entry_context=live_entry_context,
         )
+        if account_cash_snapshot is not None:
+            submit_kwargs["account_cash_snapshot"] = account_cash_snapshot
+
+        response = broker.submit_order(command.symbol, **submit_kwargs)
     finally:
         if own_conn:
             active_conn.close()

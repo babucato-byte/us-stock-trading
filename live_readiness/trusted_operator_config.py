@@ -14,6 +14,21 @@ All three values are validated on every read (`get_*()` functions, not
 bare module attributes) so a corrupted/edited-into-invalid-state config
 fails closed (blocks all new entries) rather than silently using a
 garbage number.
+
+CODEX-039: `get_cash_usage_percent()` -- the function the new Account/
+Risk/Sizing/Execution Engine pipeline (`live_readiness/
+live_entry_pipeline.py`) actually calls -- takes NO arguments and returns
+this trusted value VERBATIM. There is no caller-supplied percent to
+combine it with in that pipeline at all (Strategy/caller code never
+constructs a percent in the first place -- see PROJECT_CONSTITUTION.md's
+계층 분리 원칙). `get_cash_usage_percent_ceiling()` is kept, unchanged,
+for `order_gateway.py`'s pre-existing `LiveEntryContext.cash_usage_percent`
+contract (the grandfathered legacy compat path, where a caller-declared
+percent field still exists for backward compatibility and is only ever
+tightened via `min()`, never loosened) -- the two functions currently
+return the identical number, but they are named and documented
+separately so a future change to one is never mistaken for a change to
+the other's contract.
 """
 
 import math
@@ -56,10 +71,24 @@ def _validate_positive_int(value, name):
         raise TrustedConfigError(f"{name} must be >= 1, got {value!r}")
 
 
+def get_cash_usage_percent():
+    """CODEX-039: the ACTUAL percent the new engine pipeline applies --
+    no caller value is combined with it, ever. Renaming this from
+    "ceiling" to the plain trusted value itself: a caller/Strategy has no
+    percent field to submit in the new pipeline's contract at all, so
+    there is nothing left to cap -- this IS the number used."""
+    _validate_percent(CASH_USAGE_PERCENT_CEILING, "CASH_USAGE_PERCENT_CEILING")
+    return CASH_USAGE_PERCENT_CEILING
+
+
 def get_cash_usage_percent_ceiling():
-    """The trusted upper bound on cash_usage_percent. A caller's own
+    """The trusted upper bound on cash_usage_percent for the LEGACY
+    `order_gateway.py` contract only (`LiveEntryContext.cash_usage_percent`
+    still exists there for backward compatibility) -- a caller's own
     cash_usage_percent can only ever be tightened against this via
-    min() -- never loosened."""
+    min(), never loosened. New code should call `get_cash_usage_percent()`
+    instead; this function is kept solely so `order_gateway.py`'s
+    existing behavior/tests are unaffected."""
     _validate_percent(CASH_USAGE_PERCENT_CEILING, "CASH_USAGE_PERCENT_CEILING")
     return CASH_USAGE_PERCENT_CEILING
 
