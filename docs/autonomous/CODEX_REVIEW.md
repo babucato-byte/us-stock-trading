@@ -1,33 +1,34 @@
 # CODEX_REVIEW
 
-Review target: CODEX-034 remediation + balance-percent live-entry sizing independent revalidation
+Review target: Stage 11 Account/Risk/Sizing/Execution Engine + CODEX-034~038 focused revalidation
 
-Commits: `5da6662`, `5316cd1`, `72bbb6c`
+Commits: `9d294e3`, `40abc58`, `06a77c8`, `3494fe3`, `14f7a13`
 
-Validation package SHA-256: `c56617668745161e5196c85fd196e964c621b67390ac204817125122289e48fb`
+Validation package SHA-256: `8c325b7b4e65616019f6086fc7fc2c8517cc46841f3534cbe246c6fa598c8a4b`
 
 Branch: `orchestrator/20260725-013740-us-stock-trading`
 
-Date: 2026-07-27
+Date: 2026-07-28
 
 Overall verdict: **FAIL**
 
-Stage 3~10: **KEEP_IN_PROGRESS**
+Stage 3~11: **KEEP_IN_PROGRESS**
 
 Limited live review: **BLOCKED**
 
 Live trading: **DO_NOT_ENABLE**
 
-requests timeout/connection-loss 경로는 `SUBMISSION_UNKNOWN`을 유지하고 재시도 주문을 차단하며
-client order ID reconciliation까지 가능해져 CODEX-034의 원래 반례는 해결됐다. 전체 1,044개
-테스트도 네 실행 형태에서 모두 통과했다.
+CODEX-034/035의 timeout·HTTP 5xx ambiguous submission 처리는 `SUBMISSION_UNKNOWN`을 유지하고
+재시도 broker call을 차단하며 client order ID reconciliation까지 정상 동작한다. CODEX-037의
+NaN sizing 후보도 fail-closed이고, CODEX-038의 운영 CSV mtime 오염도 재발하지 않았다.
 
-그러나 모든 `HTTPError`에 response가 있다는 이유만으로 definitive rejection으로 분류한다.
-HTTP 500 fault injection에서 첫 27,000원 reservation이 `RELEASED`되고 두 번째 27,000원 주문이
-실제 session에 도달해 broker call 2회로 재현됐다. 또한 잔고와 사용 비율은 trusted config/broker
-account가 아니라 caller context만 신뢰해 30,000원 계정 가정에서 caller가 3,000,000원을 선언하면
-2,997,000원 주문을 승인한다. NaN optional risk/order/strategy caps도 fractional 경로에서 무시되어
-주문이 승인된다. 신규 HIGH Finding 3건이므로 진행할 수 없다.
+그러나 trusted cash usage percent는 현재 50% 강제 상한이다. trusted 90%/100% 정책을 선택해도
+각각 27,000원/30,000원을 사용할 수 없고 15,000원으로 축소된다. 더 중요하게 Stage 11의
+Account/Risk/Sizing/Execution Engine과 affordability는 실제 `paper_strategy_order.main()`에
+전혀 배선되지 않았다. 런타임 계측에서 Execution Engine 호출 0회, affordability 호출 0회,
+legacy `broker.submit_order()` 1회로 실제 주문이 제출됐다. direct Alpaca broker 경계에서도
+authoritative account snapshot은 optional이어서 caller가 cash 3,000,000원을 선언하면 account
+GET 없이 1,500,000원 POST가 가능했다. 미해결 HIGH Finding이 있으므로 진행할 수 없다.
 
 ## Finding summary
 
@@ -41,402 +42,320 @@ account가 아니라 caller context만 신뢰해 30,000원 계정 가정에서 c
 | CODEX-031 | PARTIALLY_RESOLVED |
 | CODEX-032 | RESOLVED |
 | CODEX-033 | RESOLVED |
-| CODEX-034 HIGH — ambiguous broker outcome durable reconciliation | PARTIALLY_RESOLVED |
-| CODEX-035 HIGH — HTTP 5xx/ambiguous HTTP response를 definitive rejection으로 오분류 | UNRESOLVED |
-| CODEX-036 HIGH — available cash와 cash usage percent가 caller assertion에 의존 | UNRESOLVED |
-| CODEX-037 HIGH — NaN optional sizing/risk caps가 fail-open | UNRESOLVED |
-| CODEX-038 LOW — 테스트가 운영 CSV mtime 변경 | UNRESOLVED |
+| CODEX-034 | RESOLVED |
+| CODEX-035 | RESOLVED |
+| CODEX-036 | PARTIALLY_RESOLVED |
+| CODEX-037 | RESOLVED |
+| CODEX-038 | RESOLVED |
+| CODEX-039 MEDIUM — 50%가 기본값이 아니라 강제 최대값이며 caller percent도 무시되지 않음 | UNRESOLVED |
+| CODEX-040 HIGH — 실제 main 주문 흐름이 Stage 11 Execution Engine 전체를 우회 | UNRESOLVED |
+| CODEX-041 MEDIUM — affordability가 실제 후보/주문 차단에 미배선 | UNRESOLVED |
 
-## Previous findings verification
+## Focused verification
 
-### [CODEX-024]
+### 1. cash_usage_percent policy
 
-Status: **RESOLVED**
+Status: **FAIL**
 
 Evidence:
 
-- exit intent와 position submitted transition은 broker 호출 전 같은 SQLite transaction으로 저장된다.
-- timeout 후 exit 재시도는 client order ID로 broker를 조회하고 sell을 재제출하지 않는다.
-- explicit rejection의 intent `ABORTED`와 position `MANUAL_REVIEW`도 한 transaction으로 commit된다.
-- accepted/new는 fill로 처리되지 않으며 remaining quantity와 PnL을 유지한다.
-- 관련 exit/reconciliation 집중 회귀가 통과했다.
+- `trusted_operator_config._validate_percent()`는 정확히 `(0, 100]`, 즉 1~100 범위를 허용한다.
+- trusted value 0, 101, NaN, Infinity, bool, 문자열은 모두 `TrustedConfigError`로 차단됐다.
+- trusted operator 값별 런타임 계산, broker cash 30,000원:
+  - trusted 100%, caller 100% → 30,000원.
+  - trusted 90%, caller 100% → 27,000원.
+  - trusted 50%, caller 100% → 15,000원.
+- 저장소의 실제 `CASH_USAGE_PERCENT_CEILING`은 **50**이다.
+- 현재 설정에서는 caller 100%, 90%, 50%가 모두 15,000원으로 강제 축소된다.
+- caller percent는 무시되지 않는다. trusted 100%에서도 caller 50%를 전달하면 15,000원이고,
+  현재 trusted 50%에서 caller 40%를 전달하면 12,000원이다.
 
-Remaining risk: 없음.
+Conclusion:
 
-### [CODEX-026]
+- 50%는 단순 default가 아니라 코드 변경 전까지 적용되는 강제 maximum이다.
+- 사용자 요구사항의 trusted 90%/100% 동작과 “caller percent 무시”를 만족하지 않는다
+  (CODEX-039).
+
+### 2. actual operational order path
+
+Status: **FAIL — HIGH**
+
+Runtime trace:
+
+1. isolated `paper_strategy_order.main()`에 regular session, AAPL high-score candidate, fake broker를 주입했다.
+2. `live_readiness.execution_engine.submit_validated_command()`에는 call spy를 설치했다.
+3. 결과:
+   - `main_result={"submitted": ["AAPL"], ...}`
+   - legacy broker `submit_order` calls: `[("AAPL", 1)]`
+   - Execution Engine calls: **0**
+4. `main()`은 고정 `order_qty=1`을 만든 뒤 `try_reserve_order()`와 legacy
+   `paper_strategy_order.submit_order()`를 거쳐 broker를 직접 호출한다.
+5. Account Engine, Risk Engine, Sizing Engine, ValidatedOrderCommand를 생성하거나 검증하는 runtime
+   단계가 없다.
+
+Additional evidence:
+
+- `execution_engine.py`의 static guard는 `paper_strategy_order.py`를 명시적으로 allowlist한다.
+- 따라서 guard는 actual operating legacy bypass를 탐지하도록 설계되지 않았다.
+- validation package도 Stage 11 엔진이 `paper_strategy_order.py::main()`에 미배선이라고 명시한다.
+
+Conclusion:
+
+- 모든 신규 진입이 Account/Risk/Sizing/Execution Engine을 통과하지 않는다.
+- 요청 판정 기준에 따라 **CODEX-040 HIGH**다.
+
+### 3. CODEX-034/035
+
+Status: **RESOLVED**
+
+Direct fault injection:
+
+| Failure | First reservation | Retry status | Broker calls | Reconciliation |
+|---|---|---:|---:|---|
+| requests timeout | SUBMISSION_UNKNOWN | 423 | 1 | COMMITTED |
+| HTTP 500 | SUBMISSION_UNKNOWN | 423 | 1 | COMMITTED |
+| HTTP 502 | SUBMISSION_UNKNOWN | 423 | 1 | COMMITTED |
+| HTTP 503 | SUBMISSION_UNKNOWN | 423 | 1 | COMMITTED |
+| HTTP 504 | SUBMISSION_UNKNOWN | 423 | 1 | COMMITTED |
+
+Evidence:
+
+- 408/425/429/5xx/unrecognized HTTP status는 ambiguous allowlist 정책으로 release되지 않는다.
+- definitive rejection은 제한된 status allowlist와 JSON object body를 모두 요구한다.
+- timeout/5xx 이후 동일 조건의 재주문은 active reservation/position count에서 차단되어 session에
+  두 번째로 도달하지 않는다.
+- `reconcile_by_client_order_id()`가 accepted broker record를 `COMMITTED`로 전환한다.
+
+Remaining risk:
+
+- reconciliation은 restart orchestration에 자동 배선되지 않아 수동 실행이 필요하다. reservation이
+  계속 cash를 차감하므로 중복 주문보다 availability block으로 귀결되는 MEDIUM operational risk다.
+
+### 4. CODEX-036
 
 Status: **PARTIALLY_RESOLVED**
 
-Evidence:
+Resolved portion:
 
-- allow-list, symbol identity, fresh FX/cash timestamp, daily entry 및 concurrent position은 final
-  `AlpacaBroker.submit_order()` 경계에서 검사된다.
-- RESERVED, SUBMISSION_UNKNOWN, open COMMITTED reservation은 SQLite snapshot에서 차감된다.
-- caller가 요청한 qty는 gateway가 계산한 `actual_qty`로 대체된다.
+- `fetch_account_cash_snapshot()`은 broker `get_account()`의 cash를 KRW로 변환하고 invalid/missing
+  response를 fail-closed 처리한다.
+- supplied `AccountCashSnapshot`이 있으면 sizing은
+  `min(caller_cash, broker_cash_snapshot)`을 사용한다.
+- Account Engine은 `min(broker_cash, non_marginable_buying_power)`를 사용해 margin/leverage를
+  상한으로 사용하지 않는다.
 
-Remaining risk:
+Unresolved direct reproduction:
 
-- 새 정책에서 주문 예산의 유일한 상한인 `available_cash_krw × cash_usage_percent`의 두 값 모두
-  caller가 전달하며 broker account/trusted operator config와 대조되지 않는다.
-- optional 주문·risk cap의 NaN도 차단되지 않는다(CODEX-036/037).
+1. 실제 broker cash를 30,000원으로 가정하고 caller context cash를 3,000,000원으로 설정했다.
+2. `account_cash_snapshot`을 생략한 direct `AlpacaBroker.submit_order()`를 실행했다.
+3. final boundary는 account GET을 수행하지 않았고 POST 한 번만 실행했다.
+4. current trusted 50% ceiling만 적용되어 qty 1,500, notional **1,500,000원**이 payload에 실렸다.
 
-### [CODEX-028]
+Cause:
 
-Status: **RESOLVED**
+- `account_cash_snapshot`은 broker와 wrapper 모두 optional이다.
+- 생략 시 `LiveEntryContext.available_cash_krw`를 그대로 사용한다.
+- production `main()`은 Account Engine/snapshot을 구성하지 않는다.
+- caller cash와 caller percentage가 actual sizing에 영향을 준다.
 
-Evidence:
+Conclusion:
 
-- position, position events 및 exit intent/fill progress는 SQLite canonical state를 사용한다.
-- JSON projection failure는 canonical state를 왜곡하지 않는다.
-- partial 4 → projection failure → cumulative 10 회귀는 CLOSED, remaining 0, 전체 10주 PnL로 통과한다.
-- transaction failure와 repeated/out-of-order reconciliation 회귀가 통과했다.
+- authoritative snapshot 기능은 존재하지만 실제 final/operational 경계에서 필수가 아니므로
+  CODEX-036은 계속 **PARTIALLY_RESOLVED**이며 HIGH 위험이 남는다.
 
-Remaining risk:
-
-- entry reservation/reconciliation은 같은 SQLite DB에 있으나 entry order/fill lifecycle 전체와 자동
-  recovery orchestration까지 통합되지는 않았다. CODEX-034의 timeout 경로는 cash를 계속 차감하므로
-  즉시 fail-open은 아니며 수동 reconciliation 잔여 위험으로 별도 기록한다.
-
-### [CODEX-029]
+### 5. CODEX-037
 
 Status: **RESOLVED**
 
-Evidence:
+Direct reproduction:
 
-- context, sizing, reservation, order argument 및 payload symbol은 byte-exact 일치를 요구한다.
-- AAPL context와 TSLA order/payload는 wrapper와 direct broker 경로 모두 session 호출 0회로 차단된다.
-- 현재 실제 live order network method인 `AlpacaBroker.submit_order()`가 final gate를 직접 실행한다.
+- `balance_based_qty` 입력을 NaN으로 만드는 available cash → `SizingEngineError`.
+- `risk_based_qty=NaN` → `SizingEngineError`.
+- `strategy_max_qty=NaN` → `SizingEngineError`.
+- 세 시나리오 모두 broker/HTTP 호출 0회.
+- legacy `order_gateway`도 optional order/daily-loss/per-trade-risk/strategy/stop cap을 reservation 전에
+  type/finite/positive 검증한다.
+- invalid cap을 unset으로 간주하거나 나머지 후보만으로 주문하지 않는다.
 
-Remaining risk:
+### 6. affordability wiring
 
-- 향후 별도 주문 method가 추가되면 gate를 구조적으로 상속하지 않는다. 현재 우회 method가 없으므로
-  LOW future-maintenance risk다.
+Status: **PARTIALLY_IMPLEMENTED — NOT WIRED**
 
-### [CODEX-030]
+Pure calculation:
 
-Status: **RESOLVED**
+- cash 30,000원, usage 90% → `available_for_new_order_krw=27,000`.
+- 50,000원 종목, `fractionable=false` → `NOT_FRACTIONABLE`, 최종 affordability candidate 제외.
+- 같은 종목, `fractionable=true`, minimum order 충족 → `AFFORDABLE_FRACTIONAL`, candidate 유지.
 
-Evidence:
+Runtime operational trace:
 
-- lifecycle/EOD 판단은 injected Clock/timezone-aware now를 사용한다.
-- FrozenClock 기반 정규장, premarket, EOD 전후 및 DST 회귀가 통과했다.
-- 실제 실행 시간이 다른 네 전체 suite 결과가 모두 1,044개로 동일했다.
+1. `paper_strategy_order.main()`에 cash 30,000원 account, 50,000원 non-fractionable 성격의 candidate를
+   모사했다.
+2. `evaluate_affordability()` call spy와 Execution Engine spy를 설치했다.
+3. 결과:
+   - affordability calls: **0**
+   - Execution Engine calls: **0**
+   - legacy broker submit calls: `[("EXP", 1)]`
+   - main result: `submitted`.
 
-Remaining risk: 없음.
+Conclusion:
 
-### [CODEX-031]
+- affordability 결과는 실제 scanner/main/order boundary의 차단 조건이 아니다.
+- 90% 계산 자체도 trusted 50% operator ceiling과 연결되지 않아 actual order budget 정책과 다르다.
+- 표시용 building block만 존재하고 운영 후보 필터는 완료되지 않았다(CODEX-041).
 
-Status: **PARTIALLY_RESOLVED**
-
-Evidence:
-
-- durable SQLite ledger의 snapshot-read/reserve는 file lock 아래 원자화된다.
-- pending, unknown submission, open position cost, daily entry count 및 active position count는 caller
-  counters가 아니라 SQLite에서 산출된다.
-- concurrent reservation 회귀는 한 entry만 허용한다.
-
-Remaining risk:
-
-- ledger deduction은 authoritative하지만 그 기준 금액인 current cash와 사용 비율은 authoritative하지
-  않다. caller가 실제보다 큰 cash/percent를 전달하면 최종 broker boundary가 그대로 승인한다
-  (CODEX-036).
-- HTTP 5xx에서 reservation이 release되어 ledger가 실제 잠재 exposure를 다시 과소계상한다
-  (CODEX-035).
-
-### [CODEX-032]
+### 7. operational-file isolation
 
 Status: **RESOLVED**
 
-Evidence:
+Full-suite before/after:
 
-- rejected exit의 abort와 position transition은 shared SQLite transaction이다.
-- intent-side 및 position/event-side failure injection에서 양쪽 mutation이 함께 rollback된다.
+| File | SHA-256 | Size | mtime |
+|---|---|---:|---:|
+| `order_history.csv` | `153feb31c2539c19cd60f63e3f90d0d0f734ba7a209ed1800af7c0070a0a91c7` | 31 | 1784558966 |
+| `universe.csv` | `9fdaf3ac0ba7d94e24b6276fc603709a0c79c6842cf8143b8a242acdd16188b3` | 833518 | 1784558966 |
+| `strategy_performance.csv` | `ca012439cb2ba6a8f285b3f95493f9b17d22abb5b01a924ef2bd4cfe96f66da8` | 69 | 1785083284 |
 
-Remaining risk: 없음.
-
-### [CODEX-033]
-
-Status: **RESOLVED**
-
-Evidence:
-
-- `LIMITED_LIVE_REVIEW_CHECKLIST.md` 최종 상태는 계속 `BLOCKED`다.
-- `FINAL_VALIDATION_PACKAGE.md` 및 `CURRENT_STATUS.md`의 재검증 대기 상태와 일치한다.
-
-Remaining risk: 없음.
-
-### [CODEX-034]
-
-Status: **PARTIALLY_RESOLVED**
-
-Evidence:
-
-- migration 5가 `live_entry_reservations.client_order_id`와 unique index를 추가한다.
-- reservation은 broker 호출 전에 client order ID와 함께 durable하게 저장된다.
-- `requests.exceptions.Timeout` 직접 재현:
-  - 첫 broker session call 후 reservation `SUBMISSION_UNKNOWN`.
-  - 같은 크기 retry는 status 423, session call 총 1회.
-  - broker가 client order ID를 accepted로 반환하면 reconciliation 결과 `COMMITTED`.
-- broker lookup failure/None은 reservation을 unknown 상태로 유지하며 새 주문을 제출하지 않는다.
-- accepted/new/partial/filled 계열은 release하지 않고 committed exposure로 유지한다.
-
-Remaining risk:
-
-- ambiguous outcome 판정이 “HTTP response 존재 여부”에만 의존한다. HTTP 5xx, 408 또는 gateway/proxy
-  오류는 response가 있어도 주문 미수신을 증명하지 않는데 definitive rejection으로 처리된다.
-- reconciliation은 restart lifecycle에 자동 배선되지 않아 운영자가 수동 실행해야 한다. 현금이 계속
-  차감되어 중복 주문보다는 availability block으로 귀결되므로 이 부분만은 MEDIUM operational risk다.
+- 세 파일 모두 hash, size, mtime 전후 동일.
+- root `TRADING_STATE.db*`, `POSITION_STORE.json`, `LIVE_ENTRY_RESERVATION.lock`, `.env` 생성 없음.
+- CODEX-038은 재발하지 않아 RESOLVED.
 
 ## New findings
 
-### [CODEX-035] HIGH — HTTP 5xx/ambiguous HTTP response를 definitive rejection으로 오분류
+### [CODEX-039] MEDIUM — 50%가 default가 아니라 강제 maximum이며 caller percent도 무시되지 않음
 
 Status: **UNRESOLVED**
 
 Evidence:
 
-- `_is_ambiguous_broker_failure()`과 wrapper 복사본은 `HTTPError`에 `.response`가 있으면 항상 False를
-  반환한다.
-- `submit_order()` exception handler는 False 결과에서 reservation을 `RELEASED`한다.
-- HTTP status나 Alpaca의 명시적 rejected/canceled 상태를 확인하지 않는다.
-
-Direct reproduction:
-
-1. isolated SQLite/kill-switch 환경과 fake session을 사용했다.
-2. 첫 POST가 broker 수신 후 upstream HTTP 500을 반환한 상황을 모사했다.
-3. `raise_for_status()`가 response를 가진 `HTTPError`를 발생시켰다.
-4. 첫 27,000원 reservation이 `RELEASED`.
-5. 같은 조건의 두 번째 27,000원 주문이 status 200으로 session에 도달.
-6. session call 총 2회; ledger는 첫 잠재 exposure를 차감하지 않았다.
+- `CASH_USAGE_PERCENT_CEILING = 50`.
+- `effective_percent=min(caller_percent, trusted_ceiling)`.
+- trusted 90/100 정책을 runtime input/config로 선택할 수 없고 코드 상수를 변경해야 한다.
+- caller가 더 작은 percent를 전달하면 sizing이 달라지므로 caller percent는 무시되지 않는다.
 
 Impact:
 
-- broker/API gateway의 5xx, 408 또는 일부 proxy failure에서 첫 주문이 실제 수신됐어도 재시도 주문이
-  허용된다.
-- 중복 entry와 account cash/position limit 우회가 가능한 현재 final-boundary HIGH 결함이다.
+- 실제 현금 이상을 쓰게 하는 fail-open은 아니지만, 사용자가 요구한 1~100 trusted policy와
+  90%/100% 운용 선택을 막는 기능·정책 불일치다.
 
 Required behavior:
 
-- 명시적으로 주문 미생성이 확정되는 broker rejection만 RELEASED 처리한다.
-- timeout 계열, 408, 425, 429, 5xx 및 의미가 불명확한 HTTP body는 SUBMISSION_UNKNOWN으로 유지한다.
-- HTTP status뿐 아니라 Alpaca order/rejection contract에 근거한 allowlist 방식으로 definitive outcome을
-  분류한다.
-- HTTP 500/502/503/504 response-loss fault injection에서 retry session call 총 1회를 검증한다.
+- trusted operator value 자체를 1~100 범위의 단일 source로 사용한다.
+- 50은 승인 전 보수적 default일 수 있지만 별도의 immutable maximum이어서는 안 된다.
+- final sizing에서 caller percent를 완전히 무시하거나 trusted value보다 낮추는 별도 명시적 cap으로
+  이름/계약을 분리한다.
 
-### [CODEX-036] HIGH — actual cash와 cash usage percent가 caller assertion에 의존
+### [CODEX-040] HIGH — 실제 main 주문 흐름이 Execution Engine 전체를 우회
 
 Status: **UNRESOLVED**
 
 Evidence:
 
-- `LiveEntryContext.available_cash_krw`와 `cash_usage_percent`는 final broker boundary의 caller argument다.
-- timestamp는 caller가 함께 제공한 `cash_as_of`가 최근인지만 검사하며 cash 값의 출처/서명/계좌
-  snapshot identity는 확인하지 않는다.
-- `cash_usage_percent`를 operator setting이라고 설명하지만 trusted runtime config나 approval record에서
-  읽거나 caller 값과 교차 검증하는 production code가 없다.
-- tests 밖에서 `LiveEntryContext`를 구성해 broker account balance와 operator percentage를 주입하는
-  production call site도 없다.
-
-Direct reproduction:
-
-- available cash 30,000원, operator 의도값 10%에서는 $10 한 주를 살 수 없어 차단됐다.
-- 동일 caller가 `cash_usage_percent=100`으로 바꾸면 qty 2, 27,000원 승인.
-- caller가 `available_cash_krw=3,000,000`, percent 100을 선언하면 qty 222,
-  **2,997,000원** 승인.
-- 어떤 경우에도 broker account/cash endpoint 조회는 0회였다.
+- runtime `main()`에서 Account/Risk/Sizing/Execution Engine call 0회.
+- legacy wrapper가 broker `submit_order()`를 직접 호출해 order를 submitted로 기록했다.
+- static architecture test가 legacy module을 allowlist해 이 우회를 정상으로 간주한다.
+- validation package도 Stage 11을 production pipeline 미배선 building block으로 기록한다.
 
 Impact:
 
-- stale/buggy/조작된 context가 실제 계좌 현금 또는 승인된 운영 비율보다 큰 주문을 final network
-  boundary에서 허용한다.
-- 고정 trusted ceiling을 제거한 현재 설계에서는 이 caller assertion이 유일한 금액 상한이므로 HIGH다.
+- strategy/main이 `ValidatedOrderCommand`, authoritative AccountSnapshot, risk decision, sizing decision,
+  command TTL/mutation 검사를 거치지 않고 broker에 도달한다.
+- 새 계층의 안전 보장은 실제 운영 신규 진입에 적용되지 않는다.
 
 Required behavior:
 
-- cash usage percent는 caller가 올릴 수 없는 trusted deployment config/approval record에서 읽고 final
-  boundary에서 강제한다.
-- available cash는 동일 broker/account의 fresh authoritative snapshot 또는 검증 가능한 snapshot
-  object로 전달하고, arbitrary numeric context만으로 승인하지 않는다.
-- caller는 trusted percentage/cash를 오직 더 낮추는 추가 cap만 제공할 수 있어야 한다.
-- 실제 30,000원 account snapshot + caller 3,000,000원/100% 반례가 HTTP 0회로 차단되는 테스트를 추가한다.
+- operational `main()`의 모든 buy entry를
+  Account Engine → Risk Engine → Sizing Engine → Execution Engine으로 배선한다.
+- legacy compat wrapper는 외부 호환 facade로만 남기고 운영 main에서는 호출하지 않는다.
+- runtime integration test가 valid path에서 네 engine을 순서대로 정확히 1회 호출하고,
+  각 engine failure에서 broker call 0회를 확인해야 한다.
+- architecture guard에서 operational legacy bypass를 허용하지 않는다.
 
-### [CODEX-037] HIGH — NaN optional sizing/risk caps가 fail-open
+### [CODEX-041] MEDIUM — affordability가 실제 후보/주문 차단에 미배선
 
 Status: **UNRESOLVED**
 
 Evidence:
 
-- `max_order_notional_krw`, `max_daily_loss_krw`, `max_risk_per_trade_krw`,
-  `strategy_max_quantity`, `stop_price_usd`의 공통 finite/type validation이 없다.
-- Python `min(valid_value, float("nan"))` 비교는 NaN cap을 안정적인 제한으로 적용하지 않는다.
-- whole-share 일부 경로는 `math.floor(nan)`의 raw `ValueError`로 우연히 차단되지만 fractional 경로에서는
-  NaN이 그대로 무시된다.
-
-Direct reproduction:
-
-- fractional entry + `max_risk_per_trade_krw=NaN` → qty `0.222222...`, 3,000원 주문 승인.
-- fractional entry + `strategy_max_quantity=NaN` → 동일 qty/금액 승인.
-- whole-share entry + `max_order_notional_krw=NaN` → qty 2, 27,000원 주문 승인.
+- calculation module과 단위 테스트만 존재한다.
+- runtime main trace에서 affordability call 0회.
+- 50,000원 non-fractionable candidate가 cash 30,000원 account 모사에서도 broker까지 제출됐다.
+- pure affordability의 percent는 trusted operator config가 아닌 caller field다.
 
 Impact:
 
-- malformed market/config/strategy 값이 “불명확하면 차단”되지 않고 risk, strategy 또는 per-order cap을
-  제거한다.
-- risk control을 우회해 실제 주문 수량을 키울 수 있는 final sizing HIGH 결함이다.
+- 구매 불가능 candidate가 전략 감시 및 legacy broker 제출 단계까지 남는다.
+- broker rejection에 의존하며 watchlist 단계의 의도된 fail-closed 필터가 작동하지 않는다.
 
 Required behavior:
 
-- 모든 numeric input에 bool 제외, finite, 허용 부호/범위 검사를 reservation 이전에 적용한다.
-- optional cap이 제공됐는데 invalid하면 unset으로 취급하지 말고 `LiveOrderBlockedError`로 차단한다.
-- NaN, ±Infinity, bool, string, zero, negative 조합을 whole/fractional 양쪽에서 검증하고 reservation/HTTP
-  호출 0회를 확인한다.
-
-### [CODEX-038] LOW — 테스트가 운영 CSV mtime 변경
-
-Status: **UNRESOLVED**
-
-Evidence:
-
-- 전체 테스트 전후 `strategy_performance.csv` content SHA-256과 크기는 동일했다.
-- mtime은 `1785082147`에서 `1785083284`로 변경됐다.
-- git working tree에는 content diff가 없어 나타나지 않지만 filesystem metadata는 변경됐다.
-
-Impact:
-
-- 데이터 내용 손상은 없으나 mtime 기반 운영 모니터링/증분 작업에 불필요한 변화를 만들 수 있다.
-
-Required behavior:
-
-- 해당 테스트를 tmp_path로 완전 격리하거나 원본 mtime까지 복원한다.
+- authoritative AccountSnapshot과 trusted percentage로 affordability account state를 구성한다.
+- 실제 scanner/watchlist/main 후보 흐름에서 non-affordable result를 제거한다.
+- Execution Engine 직전에도 affordability/sizing 결과를 재검증해 표시용 필드로만 남지 않게 한다.
 
 ## Regression
 
-### CODEX-016~023, CODEX-025, CODEX-027
+### CODEX-016~035, CODEX-037~038
 
 Status: **RESOLVED — no observed regression**
 
 Evidence:
 
-- mode/endpoint/credential revalidation, RequestPurpose, purpose-side-payload identity,
-  binary/4-state Kill Switch, notification health, entry intent, strict fill validation,
-  accepted-vs-filled 및 corrupted SQLite fail-closed 회귀가 통과했다.
-
-## Balance-percent sizing verification
-
-- `cash_usage_percent`의 None/string/bool/NaN/Infinity/0/음수/>100은 차단된다.
-- fresh cash timestamp와 fresh FX timestamp가 모두 필요하다.
-- pending, unknown submission 및 open-position cost는 SQLite snapshot에서 각각 차감된다.
-- `actual_qty=min(balance,risk,strategy)` 정상 finite 입력은 올바르게 축소되고 실제 resized notional만
-  reservation에 저장된다.
-- risk/strategy resizing 후 0 또는 minimum order 미만이면 reservation 전에 차단된다.
-- caller-independent daily entry 2건 및 concurrent position 1건 ceiling은 유지된다.
-- authoritative balance/percent 출처 부재와 optional cap NaN fail-open은 CODEX-036/037로 남는다.
-
-## Watchlist affordability verification
-
-- pure calculation 모듈은 missing/nonfinite/negative account deductions를 fail-closed 결과로 반환한다.
-- whole share 비구매 가능 + fractionable=true + minimum order 충족 시 fractional candidate를 유지한다.
-- non-fractionable과 minimum-order 미충족은 구분된 상태로 제외한다.
-- `estimated_entry_price_usd`는 finite/positive 검증된다.
-- `estimated_slippage_usd=NaN`은 `max(nan, 0)` 비교 특성상 명시적 invalid 상태로 차단되지 않을 수
-  있으나, 이 모듈은 현재 실제 scanner/watchlist pipeline에 미배선이고 final broker gate가 별도로
-  동작하므로 MEDIUM implementation-completeness risk로 기록한다.
-- 실제 pipeline 미배선 상태에서 “관심종목 필터 완료”로 판정하지 않는다.
+- mode/endpoint/credential, RequestPurpose, symbol/payload identity, Kill Switch, notification health,
+  exit/entry intent, SQLite consistency, Clock determinism, ambiguous submission 및 NaN cap 회귀가 통과했다.
 
 ## Executed tests
 
-- live gateway/watchlist/broker/order/exit 집중 8개 파일:
-  **345 passed, 0 failed, 1 warning**
+- trusted config/account/risk/sizing/execution/live gateway/affordability/main 집중 8개 파일:
+  **427 passed, 0 failed, 1 warning**
 - 저장소 루트 `venv/bin/python -m pytest -q`:
-  **1044 passed, 0 failed, 2 warnings**
-- 저장소 루트 `venv/bin/pytest -q`:
-  **1044 passed, 0 failed, 2 warnings**
-- 저장소 상위 `us-stock-trading/venv/bin/python -m pytest us-stock-trading -q`:
-  **1044 passed, 0 failed, 2 warnings**
-- 저장소 상위 `us-stock-trading/venv/bin/pytest us-stock-trading -q`:
-  **1044 passed, 0 failed, 2 warnings**
-- direct timeout/retry/reconciliation, HTTP 500/retry, inflated cash/percent 및 NaN cap scripts 실행.
+  **1299 passed, 0 failed, 2 warnings**
+- direct runtime scripts:
+  - trusted 100/90/50 percentage calculation and invalid trusted values.
+  - `paper_strategy_order.main()` Execution Engine/affordability call trace.
+  - direct broker inflated-cash/no-snapshot submission.
+  - timeout and HTTP 500/502/503/504 retry/reconciliation.
+  - NaN balance/risk/strategy sizing.
+  - 50,000원 fractional/non-fractional affordability.
 - `git diff --check`: 통과.
 
 Warnings review:
 
-- urllib3의 macOS LibreSSL `NotOpenSSLWarning`은 환경 호환 경고이며 주문 판정과 무관하다.
-- unknown scanner field를 의도적으로 skip하는 회귀의 `RuntimeWarning`은 기대된 경고다.
-- safety-related warning은 없지만 CODEX-035~037 반례는 warning 없이 fail-open한다.
-
-## Concurrency verification
-
-- reservation snapshot-read-write lock과 concurrent live-entry 회귀가 통과했다.
-- SUBMISSION_UNKNOWN은 active position/budget deduction에 포함된다.
-- timeout 후 순차 retry는 broker session에 도달하지 않는다.
-- HTTP 5xx 후 reservation이 release되므로 lock/concurrency 보호와 무관하게 retry가 허용된다.
-
-## SQLite consistency verification
-
-- migration 5의 client order ID column/unique index와 existing database migration 회귀가 통과했다.
-- RESERVED → SUBMISSION_UNKNOWN → COMMITTED/RELEASED transition 및 terminal-state protection이 동작한다.
-- timeout/lookup failure에서 reservation은 durable하게 남는다.
-- HTTP 500 경로는 DB 실패가 아니라 application이 명시적으로 RELEASED를 기록하므로 consistency
-  checker로 탐지되지 않는다.
-
-## Order boundary verification
-
-- missing context, allow-list, stale cash/FX, symbol mismatch 및 active reservation은 final
-  `AlpacaBroker.submit_order()`에서 HTTP 전에 차단된다.
-- direct broker 정상 entry는 gateway가 계산한 qty/client order ID를 payload에 사용한다.
-- HTTP 5xx, untrusted cash/percent 및 nonfinite optional cap은 final boundary에서 차단되지 않는다.
+- urllib3 macOS LibreSSL 경고와 intentional unknown scanner field 경고뿐이다.
+- safety-related warning은 없다.
 
 ## Network safety
 
-- 실제 Alpaca, Slack, Yahoo 또는 기타 외부 API를 호출하지 않았다.
-- 모든 broker 검증은 fake/recording/network-forbidden session을 사용했다.
-- HTTP 500 및 timeout 재현도 local session double에서만 수행했다.
+- 실제 Alpaca, Slack, Yahoo 또는 기타 외부 API 호출 없음.
+- account/broker/HTTP 검증은 fake broker와 local recording session만 사용했다.
 
-## Operational file safety
+## Operational safety
 
-- `order_history.csv`: SHA-256
-  `153feb31c2539c19cd60f63e3f90d0d0f734ba7a209ed1800af7c0070a0a91c7`,
-  31 bytes, mtime `1784558966`, 전후 불변.
-- `universe.csv`: SHA-256
-  `9fdaf3ac0ba7d94e24b6276fc603709a0c79c6842cf8143b8a242acdd16188b3`,
-  833518 bytes, mtime `1784558966`, 전후 불변.
-- `strategy_performance.csv`: SHA-256
-  `ca012439cb2ba6a8f285b3f95493f9b17d22abb5b01a924ef2bd4cfe96f66da8`,
-  69 bytes로 content는 불변이나 mtime은 `1785082147` → `1785083284`로 변경(CODEX-038).
-- root `TRADING_STATE.db*`, `POSITION_STORE.json`, `LIVE_ENTRY_RESERVATION.lock`, `.env`는 생성되지 않았다.
-- `LIVE_APPROVAL_RECORD.md`: SHA-256
-  `27e640537c41334859eb8ad89eb3d013b17b0c95b8abf7b5385e2b76adbd5bfe`,
-  `approved: false`, `live_enabled: false` 불변.
-- `risk_config.py`, `broker/broker_config.py`, `kill_switch_state.py`, `order_intent_ledger.py`의 package
-  SHA-256과 실제 SHA-256이 일치한다.
-- main `158671e`, 검증 branch HEAD `72bbb6c`; merge/push/deploy 없음.
-- 검증 전 working tree는 clean이었으며 구현 코드는 수정하지 않았다.
+- `approved: false`, `live_enabled: false` 불변.
+- `LIVE_APPROVAL_RECORD.md` SHA-256:
+  `27e640537c41334859eb8ad89eb3d013b17b0c95b8abf7b5385e2b76adbd5bfe`.
+- main `158671e`, validation branch HEAD `14f7a13`; merge/push/deploy 없음.
+- 검증 중 생성된 notification-health 계측 산출물 2개는 즉시 정확한 대상만 `/private/tmp`로 이동해
+  검증 시작 전 clean 상태를 복원했다.
+- 구현 코드는 수정하지 않았다.
 
 ## Residual risks
 
-1. HTTP error ambiguity가 중복 주문과 cash/position limit 우회로 직접 이어짐:
-   **HIGH (CODEX-035)**.
-2. actual cash 및 operator percentage에 authoritative source가 없어 caller가 금액 상한을 완화 가능:
-   **HIGH (CODEX-036)**.
-3. NaN sizing/risk cap이 fractional/whole 경로에서 제한을 제거:
-   **HIGH (CODEX-037)**.
-4. reconciliation은 수동 trigger이며 restart recovery에 미배선:
-   **MEDIUM operational availability risk**.
-5. watchlist affordability는 실제 scanner/pipeline에 미배선:
-   **MEDIUM implementation-completeness risk**.
-6. 향후 별도 broker order method의 gate 자동 상속 부재:
-   **LOW future-maintenance risk**.
-7. 테스트의 운영 CSV mtime 변경:
-   **LOW (CODEX-038)**.
-8. 실제 FX/cash provider, Alpaca fractional/minimum policy 및 live account behavior는 미검증이다.
+1. operational Execution Engine bypass: **HIGH (CODEX-040)**.
+2. authoritative cash snapshot optional/unwired: **HIGH (CODEX-036 remainder)**.
+3. trusted percent 50% forced maximum/policy mismatch: **MEDIUM (CODEX-039)**.
+4. affordability operational pipeline unbound: **MEDIUM (CODEX-041)**.
+5. SUBMISSION_UNKNOWN reconciliation manual trigger: **MEDIUM operational availability risk**.
+6. future broker order method gate inheritance: **LOW maintenance risk**.
 
 ## Required next action
 
-1. CODEX-035: HTTP status/body 기반의 conservative ambiguous classification으로 408/5xx 등에서
-   SUBMISSION_UNKNOWN을 유지하고 retry broker call을 차단한다.
-2. CODEX-036: broker/account-derived fresh cash snapshot과 trusted operator percentage를 final
-   boundary에 연결한다. caller context는 이를 늘릴 수 없어야 한다.
-3. CODEX-037: 모든 optional numeric cap의 type/finite/range를 reservation 이전에 fail-closed 검증한다.
-4. CODEX-038: strategy performance 관련 테스트를 tmp_path로 격리해 mtime도 변경하지 않는다.
-5. 재검증 전 Stage 3~10 `KEEP_IN_PROGRESS`, limited live review `BLOCKED`,
+1. `paper_strategy_order.main()`의 실제 신규 진입을 Account/Risk/Sizing/Execution Engine에 배선하고
+   runtime bypass를 제거한다.
+2. AccountSnapshot을 live entry의 필수 input으로 만들어 caller cash만으로 final broker POST가
+   불가능하게 한다.
+3. 50%를 강제 maximum이 아닌 trusted operator default로 바꾸고 1~100 trusted value를 그대로
+   적용하며 caller percent는 sizing 정책에서 제거한다.
+4. affordability를 실제 candidate/main 흐름에 배선한다.
+5. 재검증 전 Stage 3~11 `KEEP_IN_PROGRESS`, limited live review `BLOCKED`,
    live trading `DO_NOT_ENABLE`을 유지한다.
