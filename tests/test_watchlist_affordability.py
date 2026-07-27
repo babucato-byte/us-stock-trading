@@ -3,6 +3,8 @@
 Pure unit tests -- no SQLite, no network, no broker. See
 live_readiness/watchlist_affordability.py's module docstring for scope.
 """
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from live_readiness.watchlist_affordability import (
@@ -11,6 +13,7 @@ from live_readiness.watchlist_affordability import (
     STATUS_BELOW_MINIMUM_ORDER,
     STATUS_INSUFFICIENT_BALANCE,
     STATUS_NOT_FRACTIONABLE,
+    STATUS_STALE_ACCOUNT_STATE,
     STATUS_UNKNOWN_ACCOUNT_STATE,
     AccountState,
     WatchlistCandidate,
@@ -18,12 +21,15 @@ from live_readiness.watchlist_affordability import (
     filter_watchlist,
 )
 
+NOW = datetime.now(timezone.utc)  # real time -- evaluate_affordability() defaults `now` the same way
+
 
 def _account(**overrides):
     defaults = dict(
         available_cash_krw=30_000,
         cash_usage_percent=100,
         fx_rate_krw_per_usd=1_350.0,
+        as_of=NOW,
     )
     defaults.update(overrides)
     return AccountState(**defaults)
@@ -197,3 +203,55 @@ def test_affordable_only_convenience_filtering():
     results = filter_watchlist(candidates, account)
     affordable = [r for r in results if r.is_affordable]
     assert [r.symbol for r in affordable] == ["A"]
+
+
+# ---------------------------------------------------------------------------
+# STALE_ACCOUNT_STATE: a present-but-expired account snapshot is a
+# distinct status from UNKNOWN_ACCOUNT_STATE (missing/invalid snapshot).
+# ---------------------------------------------------------------------------
+
+def test_missing_as_of_is_stale_not_unknown():
+    account = _account(as_of=None)
+    result = evaluate_affordability(_candidate(), account)
+    assert result.affordability_status == STATUS_STALE_ACCOUNT_STATE
+    assert not result.is_affordable
+
+
+def test_expired_as_of_is_stale():
+    old = NOW - timedelta(hours=1)
+    account = _account(as_of=old, max_age_seconds=300)
+    result = evaluate_affordability(_candidate(), account, now=NOW)
+    assert result.affordability_status == STATUS_STALE_ACCOUNT_STATE
+
+
+def test_fresh_as_of_within_max_age_not_stale():
+    recent = NOW - timedelta(seconds=100)
+    account = _account(as_of=recent, max_age_seconds=300)
+    result = evaluate_affordability(_candidate(), account, now=NOW)
+    assert result.affordability_status != STATUS_STALE_ACCOUNT_STATE
+
+
+def test_stale_account_state_blocks_entire_scan_zero_network_implied():
+    old = NOW - timedelta(hours=2)
+    account = _account(as_of=old)
+    candidates = [_candidate(symbol="AAPL"), _candidate(symbol="MSFT")]
+    results = filter_watchlist(candidates, account, now=NOW)
+    assert all(r.affordability_status == STATUS_STALE_ACCOUNT_STATE for r in results)
+    assert all(not r.is_affordable for r in results)
+
+
+# ---------------------------------------------------------------------------
+# New fields: buffered_entry_price, account_snapshot_at.
+# ---------------------------------------------------------------------------
+
+def test_buffered_entry_price_reflects_slippage_on_affordable_result():
+    account = _account(available_cash_krw=30_000, cash_usage_percent=100, fx_rate_krw_per_usd=1_000.0)
+    candidate = _candidate(estimated_entry_price_usd=10.0, estimated_slippage_usd=0.5, fractionable=False)
+    result = evaluate_affordability(candidate, account)
+    assert result.buffered_entry_price == pytest.approx(10.5)
+
+
+def test_account_snapshot_at_matches_account_as_of():
+    account = _account()
+    result = evaluate_affordability(_candidate(), account)
+    assert result.account_snapshot_at == account.as_of

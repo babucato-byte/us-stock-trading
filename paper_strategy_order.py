@@ -1,3 +1,25 @@
+"""Paper trading order execution -- and, for the `broker.submit_order()`
+call inside `submit_order()` below, this codebase's GRANDFATHERED LEGACY
+COMPAT path to the broker.
+
+Per the Account/Risk/Sizing/Execution Engine layered architecture (see
+`docs/autonomous/PROJECT_CONSTITUTION.md`), the sanctioned path for a NEW
+live entry is:
+
+    Market Data -> Strategy Engine -> Signal -> Risk Engine ->
+    Account Engine -> Sizing Engine -> Execution Engine -> Broker
+
+`live_readiness/execution_engine.py::submit_validated_command()` is now
+the only module meant to call `broker.submit_order()` for new work. This
+module's own `submit_order()` wrapper is kept, unmodified in behavior,
+so existing Paper-mode order flow (`main()`, tests) keeps working exactly
+as before -- deleting it outright was explicitly out of scope for this
+cycle ("호환 계층을 두되[...] 운영 주문 경로에서는 새 Execution Engine만
+사용"). `tests/test_execution_engine.py::test_only_execution_engine_and_
+legacy_compat_call_broker_submit_order` enforces that no OTHER module
+gains a new direct broker call.
+"""
+
 import fcntl
 import os
 import re

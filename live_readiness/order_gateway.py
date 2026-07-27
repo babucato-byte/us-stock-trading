@@ -119,6 +119,10 @@ from live_readiness.sizing import (
     STATUS_OK,
     calculate_micro_order_quantity,
 )
+from live_readiness.trusted_operator_config import (
+    get_max_concurrent_live_positions,
+    get_max_daily_live_entries,
+)
 from state_store import db as state_db
 
 # Trusted, code-level ceilings that a caller's context can only ever
@@ -128,8 +132,12 @@ from state_store import db as state_db
 # caller-independent safety rail regardless of account size. Matches
 # docs/live_review/LIMITED_LIVE_30K_KRW_PLAYBOOK.md's recommended initial
 # limits (§3): 1 concurrent position, up to 2 daily entries.
-MAX_CONCURRENT_LIVE_POSITIONS = 1
-MAX_DAILY_LIVE_ENTRIES = 2
+#
+# Sourced from live_readiness/trusted_operator_config.py (the SOLE source
+# for operator policy constants) -- re-exported here under their original
+# names for backward compatibility with existing imports/tests.
+MAX_CONCURRENT_LIVE_POSITIONS = get_max_concurrent_live_positions()
+MAX_DAILY_LIVE_ENTRIES = get_max_daily_live_entries()
 
 
 class LiveOrderBlockedError(Exception):

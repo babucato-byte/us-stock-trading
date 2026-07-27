@@ -40,13 +40,18 @@ supply one.
 `cash_usage_percent`: unlike `available_cash_krw` (a market/account fact
 this codebase cannot independently know without asking the broker),
 `cash_usage_percent` is a pure OPERATOR policy setting -- there is no
-external system to query for it. Instead it follows the exact same
-trusted-code-constant pattern already used for
-`MAX_CONCURRENT_LIVE_POSITIONS`/`MAX_DAILY_LIVE_ENTRIES` in
-`order_gateway.py`: a conservative ceiling baked into code, that a
-caller's `cash_usage_percent` can only ever tighten via `min()`, never
-loosen. Raising the deployed ceiling is an explicit code-review decision,
-never a per-call caller choice.
+external system to query for it.
+
+**Account/Risk/Sizing/Execution Engine layering (this codebase's
+architecture doc terminology)**: the actual value now lives in
+`live_readiness/trusted_operator_config.py` -- the SOLE source for every
+operator policy constant (`cash_usage_percent` ceiling,
+`MAX_CONCURRENT_LIVE_POSITIONS`, `MAX_DAILY_LIVE_ENTRIES`), read only via
+its validated `get_*()` functions. `TRUSTED_CASH_USAGE_PERCENT_CEILING`
+is re-exported here for backward compatibility with existing imports
+(`live_readiness/order_gateway.py`, its test suite) -- new code should
+prefer `trusted_operator_config.get_cash_usage_percent_ceiling()`
+directly.
 """
 
 import math
@@ -54,13 +59,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
-# CODEX-036 required behavior: "기본값은 보수적으로 설정, 운영자 승인 전 변경
-# 금지" (conservative default, no change without operator approval) --
-# 50% is a deliberately conservative starting ceiling for a brand-new
-# limited-live pilot, not a market/technical constant. Raising it is an
-# operator decision that must be made by editing this constant under
-# review, never something a caller can request per-order.
-TRUSTED_CASH_USAGE_PERCENT_CEILING = 50
+from live_readiness.trusted_operator_config import get_cash_usage_percent_ceiling
+
+TRUSTED_CASH_USAGE_PERCENT_CEILING = get_cash_usage_percent_ceiling()
 
 
 class AccountCashSnapshotError(Exception):

@@ -38,6 +38,7 @@ specific illiquid-fractional symbol can't be split").
 
 import math
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from live_readiness.sizing import (
@@ -53,6 +54,7 @@ STATUS_INSUFFICIENT_BALANCE = "INSUFFICIENT_BALANCE"
 STATUS_NOT_FRACTIONABLE = "NOT_FRACTIONABLE"
 STATUS_BELOW_MINIMUM_ORDER = "BELOW_MINIMUM_ORDER"
 STATUS_UNKNOWN_ACCOUNT_STATE = "UNKNOWN_ACCOUNT_STATE"
+STATUS_STALE_ACCOUNT_STATE = "STALE_ACCOUNT_STATE"
 
 AFFORDABLE_STATUSES = {STATUS_AFFORDABLE_WHOLE_SHARE, STATUS_AFFORDABLE_FRACTIONAL}
 
@@ -76,6 +78,24 @@ class AccountState:
     pending_buy_reservations_krw: float = 0.0
     unknown_submission_reservations_krw: float = 0.0
     current_open_position_cost_krw: float = 0.0
+    as_of: Optional[datetime] = None
+    max_age_seconds: int = 300
+
+    def staleness_error(self, *, now=None):
+        """Returns a human-readable reason string if `as_of` is missing
+        or older than `max_age_seconds`, else None. Checked SEPARATELY
+        from `validation_error()` so a present-but-expired account
+        snapshot maps to STATUS_STALE_ACCOUNT_STATE, distinct from
+        STATUS_UNKNOWN_ACCOUNT_STATE (no/invalid snapshot at all) --
+        callers can tell "the account was fine a while ago" apart from
+        "the account was never even queryable"."""
+        if self.as_of is None:
+            return "account snapshot has no timestamp -- cannot confirm it isn't stale"
+        current = now or datetime.now(timezone.utc)
+        age_seconds = (current - self.as_of).total_seconds()
+        if age_seconds < 0 or age_seconds > self.max_age_seconds:
+            return f"account snapshot is stale (age={age_seconds:.0f}s, max={self.max_age_seconds}s)"
+        return None
 
     def validation_error(self):
         """Returns a human-readable reason string if this account state is
@@ -141,20 +161,22 @@ class AffordabilityResult:
     estimated_order_quantity: float
     affordability_status: str
     affordability_reason: str
+    buffered_entry_price: Optional[float] = None
+    account_snapshot_at: Optional[datetime] = None
 
     @property
     def is_affordable(self):
         return self.affordability_status in AFFORDABLE_STATUSES
 
 
-def evaluate_affordability(candidate: WatchlistCandidate, account: AccountState) -> AffordabilityResult:
+def evaluate_affordability(candidate: WatchlistCandidate, account: AccountState, *, now=None) -> AffordabilityResult:
     """Never raises -- every input problem is reported as
     STATUS_UNKNOWN_ACCOUNT_STATE / a specific exclusion status rather than
     an exception, since this runs per-candidate over a whole scan and one
     bad account snapshot must not crash the rest of the scan."""
 
     def _blocked(status, reason, *, whole=False, fractional=False, qty=0.0,
-                 max_cash=None, avail=None):
+                 max_cash=None, avail=None, buffered_price=None):
         return AffordabilityResult(
             symbol=candidate.symbol,
             available_cash_krw=account.available_cash_krw,
@@ -168,11 +190,17 @@ def evaluate_affordability(candidate: WatchlistCandidate, account: AccountState)
             estimated_order_quantity=qty,
             affordability_status=status,
             affordability_reason=reason,
+            buffered_entry_price=buffered_price,
+            account_snapshot_at=account.as_of,
         )
 
     account_error = account.validation_error()
     if account_error is not None:
         return _blocked(STATUS_UNKNOWN_ACCOUNT_STATE, account_error)
+
+    staleness_error = account.staleness_error(now=now)
+    if staleness_error is not None:
+        return _blocked(STATUS_STALE_ACCOUNT_STATE, staleness_error)
 
     if not _is_finite_number(candidate.estimated_entry_price_usd) or candidate.estimated_entry_price_usd <= 0:
         return _blocked(
@@ -191,7 +219,7 @@ def evaluate_affordability(candidate: WatchlistCandidate, account: AccountState)
             STATUS_INSUFFICIENT_BALANCE,
             f"no cash available for a new order (allocatable={max_cash:.0f} KRW, "
             f"already committed={max_cash - available_krw:.0f} KRW)",
-            max_cash=max_cash, avail=available_krw,
+            max_cash=max_cash, avail=available_krw, buffered_price=effective_price_usd,
         )
 
     whole_sizing = calculate_micro_order_quantity(
@@ -212,12 +240,14 @@ def evaluate_affordability(candidate: WatchlistCandidate, account: AccountState)
             estimated_order_quantity=whole_sizing.quantity,
             affordability_status=STATUS_AFFORDABLE_WHOLE_SHARE,
             affordability_reason=f"{whole_sizing.quantity} whole share(s) at ${effective_price_usd:.2f}",
+            buffered_entry_price=effective_price_usd,
+            account_snapshot_at=account.as_of,
         )
 
     if whole_sizing.status == STATUS_BELOW_MINIMUM_ORDER_AMOUNT:
         return _blocked(
             STATUS_BELOW_MINIMUM_ORDER, whole_sizing.reason,
-            max_cash=max_cash, avail=available_krw,
+            max_cash=max_cash, avail=available_krw, buffered_price=effective_price_usd,
         )
 
     # whole_sizing.status == STATUS_INSUFFICIENT_FUNDS: 1 whole share costs
@@ -228,7 +258,7 @@ def evaluate_affordability(candidate: WatchlistCandidate, account: AccountState)
             STATUS_NOT_FRACTIONABLE,
             f"1 whole share costs more than available budget (${available_krw / account.fx_rate_krw_per_usd:.2f} "
             f"< ${effective_price_usd:.2f}) and this symbol does not support fractional orders",
-            max_cash=max_cash, avail=available_krw,
+            max_cash=max_cash, avail=available_krw, buffered_price=effective_price_usd,
         )
 
     fractional_sizing = calculate_micro_order_quantity(
@@ -249,20 +279,24 @@ def evaluate_affordability(candidate: WatchlistCandidate, account: AccountState)
             estimated_order_quantity=fractional_sizing.quantity,
             affordability_status=STATUS_AFFORDABLE_FRACTIONAL,
             affordability_reason=f"{fractional_sizing.quantity:.4f} fractional share(s) at ${effective_price_usd:.2f}",
+            buffered_entry_price=effective_price_usd,
+            account_snapshot_at=account.as_of,
         )
 
     # fractional_sizing.status == STATUS_BELOW_MINIMUM_ORDER_AMOUNT
     return _blocked(
         STATUS_BELOW_MINIMUM_ORDER, fractional_sizing.reason,
-        max_cash=max_cash, avail=available_krw,
+        max_cash=max_cash, avail=available_krw, buffered_price=effective_price_usd,
     )
 
 
-def filter_watchlist(candidates: List[WatchlistCandidate], account: AccountState) -> List[AffordabilityResult]:
+def filter_watchlist(
+    candidates: List[WatchlistCandidate], account: AccountState, *, now=None,
+) -> List[AffordabilityResult]:
     """Evaluates every candidate against the SAME account snapshot (the
     caller must compute `account` once per scan, not re-derive it per
     symbol -- see AccountState's docstring) and returns ALL results, not
     just the affordable ones, so a caller can log/audit why any given
     symbol was excluded. Use `[r for r in results if r.is_affordable]` to
     get the final buyable watchlist."""
-    return [evaluate_affordability(c, account) for c in candidates]
+    return [evaluate_affordability(c, account, now=now) for c in candidates]
