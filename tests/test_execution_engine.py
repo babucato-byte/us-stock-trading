@@ -202,6 +202,12 @@ _ALLOWED_SUBMIT_ORDER_CALLERS = {
     "broker/alpaca_client.py",       # broker's own internal definition/self-reference
     "paper_strategy_order.py",       # grandfathered legacy compat path (see its docstring)
     "live_readiness/execution_engine.py",
+    # KIS migration: execution/execution_engine.py is the equivalent sole
+    # call site for KISBroker.submit_order() -- a different broker/module
+    # than the Alpaca path above, but the same "only one Execution Engine
+    # may call .submit_order()" invariant applies to it independently
+    # (see brokers/kis_broker.py's KISBroker.submit_order() docstring).
+    "execution/execution_engine.py",
 }
 
 
