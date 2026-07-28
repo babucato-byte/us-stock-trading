@@ -1,5 +1,32 @@
 # VALIDATION_REPORT
 
+## 2026-07-28 — Codex 독립 재검증 PASS_WITH_CONDITIONS + 자동 운영 구조 전환 착수 (진행 중)
+
+**Codex 독립 재검증**(`CODEX_REVIEW.md`, 커밋 `ebce9d0`, 검증 대상 커밋 `ae2b0fd`/`fc20574`):
+overall verdict `PASS_WITH_CONDITIONS`, Stage 3~11 `VALIDATED`, Limited live review `BLOCKED` →
+`READY_FOR_LIMITED_LIVE_REVIEW`로 상승. CODEX-034~041 전 항목 `RESOLVED`, 신규 CRITICAL/HIGH
+없음. `paper_strategy_order.main()` 런타임 계측(Codex가 독립 재현): Account/Risk/Sizing/
+Execution Engine 각 1회, legacy `submit_order()` 0회. trusted 50/90/100% 세 값 모두 caller
+입력과 무관하게 정확히 반영됨을 확인(caller가 `available_cash_krw`/`cash_usage_percent` 키워드를
+직접 주입해도 `TypeError`). timeout/HTTP 500/502/503/504 fault-injection에서 reservation이
+`SUBMISSION_UNKNOWN`으로 유지되고 재시도 POST가 발생하지 않음을 재확인. 전체 회귀
+`1331 passed, 0 failed`(Codex 독자 실행). **Live trading은 여전히 `DO_NOT_ENABLE`**,
+`approved`/`live_enabled`도 `false` 그대로 — Codex는 "제한적 live review를 사람이 시작할 준비가
+코드 수준에서 됐다"고만 평가했으며, 실거래 승인이 아니다. 잔여 조건(운영/미래 확장 리스크로
+분류, CRITICAL/HIGH 아님): (1) `SUBMISSION_UNKNOWN` reconciliation 자동 실행이 운영 재시작
+경로에 아직 배선되지 않음, (2) 저수준 `AlpacaBroker.submit_order()`가 여전히 공개 API라 향후
+신규 entrypoint가 pipeline을 우회하지 않도록 architecture guard 유지 필요, (3) 실계좌/실제
+provider 응답은 검증 대상이 아니었음. **필수 후속 조건**(Codex 명시, 사람이 수행): 제한적 live
+review 전에 operator TBD(`TBD_REVIEW_RECOMMENDATIONS.md`) · kill-switch 절차 ·
+reconciliation runbook을 사람이 검토.
+
+**같은 날 사용자 추가 지시**(자동 운영 구조 전환, 진행 중): `cash_usage_percent` 기본값
+50→90(완료, 커밋 `a0f0ae2`), 소수점 주문 금지/최소 1주 이상 요구사항이 이미 충족돼 있음을 확인·
+회귀 테스트 고정(같은 커밋), 전체 회귀 `1333 passed, 0 failed`. 수동 allow-list 등 TBD 항목
+제거는 실제 자동 종목 선별 기능 구현 전까지 보류. 전략 lifecycle 자동화 지시는 메시지가 도중에
+잘려 사용자에게 나머지 내용을 재요청한 상태(미착수). 상세는 `REMEDIATION_PLAN.md`/
+`DECISION_LOG.md`의 동일 날짜 섹션 참고.
+
 ## 2026-07-28 — CODEX-039/040/041 실제 운영 경로 배선 사이클
 
 Codex 독립 검증(`CODEX_REVIEW.md`, 커밋 `9d294e3`/`40abc58`/`06a77c8`/`3494fe3`/`14f7a13` 포함

@@ -3,6 +3,50 @@
 마지막 갱신: 2026-07-28
 
 ## 현재 Phase
+**Codex 독립 재검증 PASS_WITH_CONDITIONS + 자동 운영 구조 전환 착수 (2026-07-28, 진행 중).**
+
+Codex가 `CODEX-039/040/041 실제 운영 경로 배선 사이클`(커밋 `ae2b0fd`/`fc20574`)을 독립적으로
+재검증했다(`CODEX_REVIEW.md`, 커밋 `ebce9d0`로 그대로 기록). **결과: overall verdict
+`PASS_WITH_CONDITIONS`, Stage 3~11 `VALIDATED`, Limited live review `READY_FOR_LIMITED_LIVE_
+REVIEW`로 상승**(직전 `BLOCKED`). CODEX-034~041 전 항목 `RESOLVED`, 신규 CRITICAL/HIGH Finding
+없음. **Live trading은 여전히 `DO_NOT_ENABLE`, `approved`/`live_enabled`도 여전히 `false`** —
+"제한적 실거래 검토를 시작할 준비가 코드/테스트 수준에서 됐다"는 뜻이지 실거래 활성화가 아니다.
+Codex가 명시한 필수 후속 조건: 제한적 live review 전에 operator TBD(`TBD_REVIEW_RECOMMENDATIONS.md`)
+· kill-switch 절차 · reconciliation runbook을 **사람이** 검토해야 한다.
+
+이 검증 직후, 사용자가 별도로 "운영자 제한값 없는 자동 운영 구조로 변경"(현금 사용률 등 일일
+수동 입력 제거) 및 "전략 기반 자동 매수·매도 + 현금주문 전용 정책"(활성 전략이 손절/익절/분할
+익절/트레일링 스탑/무효화/시간 손절/EOD 청산까지 전부 정의, 소수점 주문 금지, 최소 1주 이상
+매수 가능한 종목만 탐색) 두 건을 추가로 지시했다. 두 번째 지시는 메시지가 전략 인터페이스 필드
+목록 도중 잘렸고(파일이 아닌 채팅 원문이라 CODEX_REVIEW.md처럼 다시 읽어올 수 없음), 손절/익절
+로직을 다루는 안전 크리티컬 영역이라 임의로 채우지 않고 사용자에게 나머지 내용을 재전송해
+달라고 요청한 상태다(사용자가 "이어서 붙여주기"를 선택함, 아직 미수신).
+
+이번 사이클에서 지금까지 완료한 것(로컬 커밋 `a0f0ae2`):
+- `trusted_operator_config.CASH_USAGE_PERCENT_CEILING` 기본값 **50 → 90**(운영자가 매일 별도
+  입력하지 않아도 시스템이 사용하는 자동 기본값; 여전히 (0,100] 검증, margin/leverage와 무관하게
+  non-margin cash만 사용, 여전히 코드 리뷰를 거치는 운영자 결정이지 caller 선택이 아님).
+- "소수점 주문 금지" / "최소 1주 이상 매수 가능한 종목만 주문" 요구사항이 **이미** 배선돼 있음을
+  확인·문서화·회귀 테스트로 고정: `run_live_entry_pipeline()`의 `fractionable` 파라미터는
+  기본값 `False`이고 유일한 호출부(`paper_strategy_order.main()`)가 이를 절대 override하지
+  않으므로, 모든 live 진입은 이미 whole-share-only이며 1주 미만만 감당 가능한 종목은 차단된다
+  (신규 회귀 테스트로 고정, `sizing_engine`/`account_engine`은 코드 변경 없음).
+- 90% 기본값 변경으로 기존 50% 가정 테스트 4건(`test_account_engine.py` 2건,
+  `test_live_entry_pipeline.py` 1건, `test_live_order_gateway.py` 1건)의 기대값을 갱신.
+- 전체 회귀 **1,333 passed, 0 failed**.
+
+**아직 미착수**(사용자 지시 §16 요구사항 중 나머지): 운영자 일일 수동 입력이 필요 없다는 사실을
+반영해 `TBD_REVIEW_RECOMMENDATIONS.md`/`LIMITED_LIVE_REVIEW_CHECKLIST.md`의 "일일 진입 횟수/
+종목별 주문금액/수동 allow-list/최대 동시 포지션/거래시간 수동 입력"을 실거래 시작 필수 TBD에서
+제외하는 것(코드가 실제로 "시장 전체 후보 자동 스캔 → allow-list 없이도 안전하게 종목 자동 선별"을
+구현하기 전까지는 문서만 앞서가면 안 되므로, 이 자동 선별 자체를 먼저 구현해야 함 — 아직
+미구현), 전략 기반 손절/익절/분할익절/트레일링스탑/무효화/시간손절/EOD청산 자동 생명주기(사용자
+메시지 §1 이어지는 부분 수신 대기 중), 9종 거버넌스 문서 전체 갱신 및 `FINAL_VALIDATION_PACKAGE.md`
+재생성(사용자 지시가 아직 진행 중이므로 이번 사이클 완료 시 한 번에 처리 예정).
+
+---
+
+## 2026-07-28 — CODEX-039/040/041 실제 운영 경로 배선 사이클 (커밋 `fc20574`까지, 종료)
 **CODEX-039/040/041 실제 운영 경로 배선 사이클 — 전부 RESOLVED (2026-07-28).**
 Codex 독립 검증(`CODEX_REVIEW.md`, 커밋 `9d294e3`/`40abc58`/`06a77c8`/`3494fe3`/`14f7a13` 포함 범위,
 overall verdict `FAIL`)이 CODEX-036을 `PARTIALLY_RESOLVED`로 재확인하고 신규 CODEX-039(MEDIUM,

@@ -1169,3 +1169,30 @@ order`가 저장소 전체를 grep해 `broker.submit_order(`/`self.broker.submit
 - main 병합, origin push, 운영 배포, 실거래 활성화, `approved`/`live_enabled` 변경 없음.
 - Paper 모드 `main()` 동작은 코드 diff 및 런타임 통합 테스트(신규 엔진 호출 0회 확인) 양쪽에서
   완전히 미변경임을 재확인했다 — 기존 테스트 400건 이상 단 하나도 수정하지 않았다.
+
+## 자동 운영 구조 전환 착수 (2026-07-28, 진행 중)
+
+**Codex 독립 재검증 결과 반영**: `CODEX_REVIEW.md`(커밋 `ebce9d0`)가 CODEX-039/040/041 배선
+사이클(커밋 `ae2b0fd`/`fc20574`)을 독립 재검증해 `PASS_WITH_CONDITIONS`를 부여했다. CODEX-034~041
+전 항목 RESOLVED, 신규 CRITICAL/HIGH 없음. Limited live review 상태가 `BLOCKED` →
+`READY_FOR_LIMITED_LIVE_REVIEW`로 상승했으나 Live trading은 `DO_NOT_ENABLE` 그대로다. Codex가
+명시한 필수 후속 조건(사람이 수행): operator TBD 검토, kill-switch 절차 검토, reconciliation
+runbook 검토 — 셋 다 아직 수행되지 않았다.
+
+**사용자 신규 지시 처리 현황**:
+1. `cash_usage_percent` 기본값 50 → 90 — 완료(커밋 `a0f0ae2`), 4개 기존 테스트 기대값 갱신,
+   전체 회귀 1,333 passed.
+2. "소수점 주문 금지"/"최소 1주 이상 매수 가능한 종목만 주문" — 이미 코드에 배선돼 있음을
+   확인하고 회귀 테스트로 고정(같은 커밋).
+3. 수동 allow-list/일일 진입 횟수/최대 동시 포지션 등을 TBD 필수 조건에서 제거 — **보류**.
+   실제 "시장 전체 후보 자동 선별" 기능이 구현되기 전까지 문서만 앞서 갱신하지 않기로 결정
+   (`DECISION_LOG.md` 결정 4).
+4. 전략 기반 자동 매수·매도·손절·익절·분할익절·트레일링스탑·무효화·시간손절·EOD청산 —
+   사용자 지시 메시지가 도중에 잘려 나머지 내용을 재요청한 상태(`DECISION_LOG.md` 결정 5),
+   미착수.
+
+**다음 단계**: 사용자로부터 전략 lifecycle 지시의 나머지 부분을 수신하는 대로, (a) 시장 전체
+후보 자동 선별 구현, (b) 전략 인터페이스에 entry/stop/take-profit/partial-exit/trailing-stop/
+invalidation/time-exit/EOD-exit 필드 확장, (c) 두 기능이 실제로 배선된 뒤에야
+`TBD_REVIEW_RECOMMENDATIONS.md`/`LIMITED_LIVE_REVIEW_CHECKLIST.md`의 관련 TBD 항목 갱신,
+(d) 9종 거버넌스 문서 전체 갱신 및 `FINAL_VALIDATION_PACKAGE.md` 재생성을 한 번에 진행한다.

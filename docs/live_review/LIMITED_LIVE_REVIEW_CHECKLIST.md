@@ -253,3 +253,15 @@ Engine 순서로 실제 배선됐다(상세는 `FINAL_VALIDATION_PACKAGE.md` §4
 경로는 이번 배선과 무관하게 완전히 미변경이다. 이 배선은 아직 Codex 재검증을 거치지 않았으므로
 이 절의 `BLOCKED` 상태와 위 승격 조건에는 여전히 영향을 주지 않는다 — 승격 여부는 다음 Codex
 재검증 결과에 따른다.
+
+**추가 갱신(2026-07-28, Codex 독립 재검증 `PASS_WITH_CONDITIONS`, 커밋 `ebce9d0`)**: 위 CODEX-040
+배선이 Codex의 독립 재검증을 통과했다 — overall verdict `PASS_WITH_CONDITIONS`, CODEX-034~041
+전 항목 `RESOLVED`, 신규 CRITICAL/HIGH 없음(`docs/autonomous/CODEX_REVIEW.md`). Codex는 이
+결과를 근거로 "Limited live review: `READY_FOR_LIMITED_LIVE_REVIEW`"라고 자체 판정했지만, 이는
+**코드/테스트 수준**의 판정이며 이 문서 §8의 승격 조건(6~7절 운영자 기입 항목 — 실제 계좌, 현재
+포지션·미체결 주문·reconciliation, 허용 종목·거래시간·주문당 절대 한도, 승인자·검토 시각·롤백
+담당자 — 전부 채워짐)까지 충족한 것은 아니다. 6~7절은 여전히 전부 `TBD`이므로 **이 절의 최종
+상태는 계속 `BLOCKED`로 유지한다.** Codex도 "제한적 live review 전에 operator TBD·kill-switch
+절차·reconciliation runbook을 사람이 검토해야 한다"를 필수 후속 조건으로 명시했다 —
+`TBD_REVIEW_RECOMMENDATIONS.md`의 동일 날짜 갱신 참고. **Live trading: DO_NOT_ENABLE**,
+`approved`/`live_enabled` 변경 없음.
