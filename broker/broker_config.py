@@ -54,6 +54,26 @@ def _default_secret_key():
     return os.getenv("ALPACA_SECRET_KEY")
 
 
+def _default_alpaca_order_enabled():
+    # KIS migration (see docs/autonomous/DECISION_LOG.md's "Alpaca
+    # data-only / KIS live broker" section): Alpaca is being repositioned
+    # as a market-data-only provider. Both flags below default to False
+    # per the migration spec's own recommended env block (ALPACA_ORDER_
+    # ENABLED=false / ALPACA_PAPER_ORDER_ENABLED=false) -- unset means
+    # disabled, never enabled. Neither flag is wired into
+    # AlpacaBroker.submit_order() yet (a deliberate, documented sequencing
+    # decision -- flipping this on today's still-live Alpaca-paper
+    # operational path before brokers/kis_broker.py exists to replace it
+    # would leave the whole system with no working order path at all);
+    # validate_alpaca_order_permitted() below is the call site the KIS
+    # cutover step wires in once it's ready to take over.
+    return env_bool(os.environ, "ALPACA_ORDER_ENABLED", False)
+
+
+def _default_alpaca_paper_order_enabled():
+    return env_bool(os.environ, "ALPACA_PAPER_ORDER_ENABLED", False)
+
+
 @dataclass(frozen=True)
 class BrokerConfig:
     trading_mode: str = field(default_factory=_default_trading_mode)
@@ -63,6 +83,8 @@ class BrokerConfig:
     live_base_url: str = field(default_factory=_default_live_base_url)
     api_key: Optional[str] = field(default_factory=_default_api_key)
     secret_key: Optional[str] = field(default_factory=_default_secret_key)
+    alpaca_order_enabled: bool = field(default_factory=_default_alpaca_order_enabled)
+    alpaca_paper_order_enabled: bool = field(default_factory=_default_alpaca_paper_order_enabled)
 
     @classmethod
     def from_env(cls, env=None):
@@ -81,6 +103,8 @@ class BrokerConfig:
             live_base_url=mapping.get("ALPACA_LIVE_BASE_URL", LIVE_BASE_URL),
             api_key=mapping.get("ALPACA_API_KEY"),
             secret_key=mapping.get("ALPACA_SECRET_KEY"),
+            alpaca_order_enabled=env_bool(mapping, "ALPACA_ORDER_ENABLED", False),
+            alpaca_paper_order_enabled=env_bool(mapping, "ALPACA_PAPER_ORDER_ENABLED", False),
         )
 
     @property
@@ -124,6 +148,35 @@ class BrokerConfig:
             raise RuntimeError("Real live trading is disabled in this pre-live PR. Use live dry-run only.")
         raise RuntimeError(
             "Order blocked. TRADING_MODE must be exactly 'paper'; live and unknown modes are disabled."
+        )
+
+
+    def validate_alpaca_order_permitted(self):
+        """KIS migration fail-closed gate: raises RuntimeError unless the
+        flag matching the CURRENT trading_mode is explicitly True. This is
+        independent of (and stricter than) validate_order_allowed() above
+        -- that method governs Paper-vs-Live safety within "Alpaca is
+        allowed to place orders"; this one governs whether Alpaca is
+        allowed to place ANY order at all, live or paper, now that KIS is
+        the sole live-order broker. Not yet called from
+        AlpacaBroker.submit_order() -- see _default_alpaca_order_enabled()'s
+        docstring for why."""
+        if self.is_live_mode:
+            if not self.alpaca_order_enabled:
+                raise RuntimeError(
+                    "Alpaca live orders are disabled (ALPACA_ORDER_ENABLED is not set to true). "
+                    "Alpaca is data-only in this deployment; KIS is the sole live-order broker."
+                )
+            return True
+        if self.is_paper_mode:
+            if not self.alpaca_paper_order_enabled:
+                raise RuntimeError(
+                    "Alpaca paper orders are disabled (ALPACA_PAPER_ORDER_ENABLED is not set to "
+                    "true). Alpaca is data-only in this deployment."
+                )
+            return True
+        raise RuntimeError(
+            f"Alpaca order blocked: unrecognized trading_mode {self.trading_mode!r}."
         )
 
 
