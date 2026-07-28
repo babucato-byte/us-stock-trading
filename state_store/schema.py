@@ -261,10 +261,45 @@ MIGRATION_5_STATEMENTS = [
     LIVE_ENTRY_RESERVATIONS_CLIENT_ORDER_ID_INDEX,
 ]
 
+# ---------------------------------------------------------------------------
+# Migration 6 (KIS migration, spec §17): durable idempotency record for
+# every KIS order submission attempt, keyed by internal_order_id (this
+# codebase's own id, generated BEFORE the broker call -- never the
+# broker's own order id, which doesn't exist yet at insert time). The
+# UNIQUE constraint on internal_order_id is what makes a duplicate
+# submission attempt (process restart, retried caller, etc.) a plain
+# INSERT failure execution/idempotency.py catches and turns into "this
+# order was already attempted" rather than a second real KIS order.
+# ---------------------------------------------------------------------------
+
+KIS_ORDER_IDEMPOTENCY_TABLE = """
+CREATE TABLE kis_order_idempotency (
+    internal_order_id TEXT PRIMARY KEY,
+    signal_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    trading_date TEXT NOT NULL,
+    broker_order_id TEXT,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (signal_id, symbol, side, trading_date)
+)
+"""
+
+KIS_ORDER_IDEMPOTENCY_SYMBOL_DATE_INDEX = """
+CREATE INDEX idx_kis_order_idempotency_symbol_date ON kis_order_idempotency (symbol, trading_date)
+"""
+
+MIGRATION_6_STATEMENTS = [
+    KIS_ORDER_IDEMPOTENCY_TABLE,
+    KIS_ORDER_IDEMPOTENCY_SYMBOL_DATE_INDEX,
+]
+
 # Every table this schema version creates -- used by export.py's
 # export_all() and by tests asserting the full table set exists.
 ALL_TABLES = [
     "orders", "fills", "positions", "position_events",
     "strategy_runs", "risk_events", "kill_switch_events",
-    "exit_intents", "live_entry_reservations",
+    "exit_intents", "live_entry_reservations", "kis_order_idempotency",
 ]

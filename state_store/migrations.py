@@ -11,7 +11,7 @@ own append-only design).
 
 from state_store.schema import (
     MIGRATION_1_STATEMENTS, MIGRATION_2_STATEMENTS, MIGRATION_3_STATEMENTS, MIGRATION_4_STATEMENTS,
-    MIGRATION_5_STATEMENTS,
+    MIGRATION_5_STATEMENTS, MIGRATION_6_STATEMENTS,
 )
 
 MIGRATIONS = [
@@ -24,6 +24,8 @@ MIGRATIONS = [
      MIGRATION_4_STATEMENTS),
     (5, "CODEX-034: live_entry_reservations.client_order_id for ambiguous-failure reconciliation",
      MIGRATION_5_STATEMENTS),
+    (6, "KIS migration: kis_order_idempotency table for spec §17 duplicate-order prevention",
+     MIGRATION_6_STATEMENTS),
 ]
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1][0]
