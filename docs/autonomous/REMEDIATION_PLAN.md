@@ -1196,3 +1196,31 @@ runbook 검토 — 셋 다 아직 수행되지 않았다.
 invalidation/time-exit/EOD-exit 필드 확장, (c) 두 기능이 실제로 배선된 뒤에야
 `TBD_REVIEW_RECOMMENDATIONS.md`/`LIMITED_LIVE_REVIEW_CHECKLIST.md`의 관련 TBD 항목 갱신,
 (d) 9종 거버넌스 문서 전체 갱신 및 `FINAL_VALIDATION_PACKAGE.md` 재생성을 한 번에 진행한다.
+
+## Alpaca 데이터 전용 / KIS 실거래 브로커 전환 (2026-07-29, feature/kis-live-broker)
+
+**범위**: 사용자 지시에 따른 최종 아키텍처 전환(§1 참고). Alpaca를 데이터 전용으로 고정하고
+KIS Open API를 유일한 실주문 브로커로 만드는 12개 커밋 사이클. 상세 설계 결정은
+`DECISION_LOG.md`의 동일 섹션 참고.
+
+**구현 완료**: domain 모델, Alpaca 주문 차단 게이트(미배선), KISBroker 어댑터, 주문
+상태머신, 멱등성, 중앙 order_gate(매수 17항목/매도 5항목), execution_engine, reconciliation
+3종, operations(ENTRY_OFF/HALT/EMERGENCY_LIQUIDATE), market_data 추상화, live_rollout
+정책, `kis_live_trading.py` 매수 진입 파이프라인, spec §22 필수 부정 테스트.
+
+**미구현(명시)**: 매도 자동화(손절/익절/분할익절/트레일링스탑/무효화/시간손절/EOD청산) —
+사용자 지시 메시지가 도중에 끊겨 재요청한 상태. Shadow Mode의 구조화된 기록(signal_id/
+alpaca_signal_price/kis_validation_price/... CSV 로그)은 미구현 — 현재는
+`KIS_LIVE_ORDER_ENABLED=false`가 기능적으로 동등한 안전성(broker 호출 0회)을 제공하지만
+spec이 요구하는 별도 기록 산출물은 아직 없다. 레버리지/인버스/OTC 자동 분류기 없음(운영자
+allow-list에 의존, 잔여 위험으로 문서화).
+
+**검증 결과**: 전체 회귀 `1,575 passed, 0 failed`(신규 테스트 약 480건). 운영 파일
+(`order_history.csv`/`universe.csv`/`strategy_performance.csv`) md5 불변 확인.
+`git diff --check` 통과. `main` 병합·origin push·Oracle 배포·KIS_LIVE_ORDER_ENABLED 활성화
+전부 수행하지 않음.
+
+**다음 단계**: (1) 사용자로부터 매도 lifecycle 지시의 나머지 부분 수신, (2) 매도 자동화
+구현·배선, (3) Codex 독립 검증 요청, (4) 검증 통과 시에만 동일 커밋을 main 병합·origin
+push, (5) Oracle 서버 접근 권한이 있는 운영자가 `docs/deployment/ORACLE_KIS_MIGRATION_
+RUNBOOK.md` 절차를 실행.

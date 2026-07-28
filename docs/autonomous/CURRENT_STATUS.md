@@ -1,8 +1,76 @@
 # CURRENT_STATUS
 
-마지막 갱신: 2026-07-28
+마지막 갱신: 2026-07-29
 
 ## 현재 Phase
+**Alpaca 데이터 전용 / KIS 실거래 브로커 전환 — 매수 경로 구현 완료, 매도 자동화 대기 중
+(2026-07-29, `feature/kis-live-broker` 브랜치, `BLOCKED`).**
+
+사용자가 최종 아키텍처 전환을 지시했다: Alpaca는 시장 데이터·종목 탐색 전용으로 고정(Paper/Live
+주문 완전 차단), 한국투자증권(KIS) Open API가 유일한 실주문 브로커. 기준 태그
+`pre-kis-integration`, 작업 브랜치 `feature/kis-live-broker`(HEAD 이전 `orchestrator/...`
+브랜치의 `2014104`에서 분기)를 생성했다. 12개 커밋으로 다음을 구현·테스트했다(전체 회귀
+**1,575 passed, 0 failed**, 신규 테스트 약 480건):
+
+- `domain/`: Instrument/Signal/OrderIntent/ExecutionRecord/Position/AccountSnapshot —
+  브로커 중립 공통 모델(construction-time fail-closed 검증).
+- `broker/broker_config.py`: `ALPACA_ORDER_ENABLED`/`ALPACA_PAPER_ORDER_ENABLED`(둘 다
+  기본값 `false`) fail-closed 게이트 추가 — **아직 `AlpacaBroker.submit_order()`에 실제
+  배선하지는 않음**(현재도 운영 중인 Alpaca paper 주문 경로를 KIS가 완전히 대체하기 전에
+  끊으면 시스템 전체가 무주문 상태가 되므로, 배선은 §89 후속 사이클로 명시적으로 미룸).
+- `brokers/kis_broker.py` + `kis_config.py`: KIS Open API 어댑터(OAuth 토큰 발급/갱신,
+  실전·모의 분리, 현재가/잔고/주문가능금액/지정가매수/지정가매도/취소/미체결/체결내역).
+  TR_ID·엔드포인트는 공식 GitHub 예제(`koreainvestment/open-trading-api`)에서 실제로
+  확인했다 — 취소 TR_ID 1건과 현재가 응답 필드명 1건은 확인 소스가 간접적이라
+  `TBD_VERIFY_LIVE_DOCS`로 코드에 명시(실거래 전 재확인 필요, `ORACLE_KIS_MIGRATION_
+  RUNBOOK.md` §11 참고).
+- `execution/`: `order_state_machine.py`(11개 상태, UNKNOWN은 오직 사람이 확인한
+  reconciliation을 통해서만 벗어남, 절대 자동 재제출 없음), `idempotency.py`(SQLite
+  migration 6, `internal_order_id` + `(signal_id, symbol, side, trading_date)` 이중
+  유일성 제약 + 단일 실행 파일 잠금), `order_gate.py`(spec 매수 17항목·매도 5항목 안전
+  검사, 순서대로 fail-fast), `execution_engine.py`(idempotency → gate → KISBroker의 유일한
+  호출 경로 — `tests/test_execution_engine.py`의 기존 아키텍처 가드에 추가).
+- `reconciliation/`: position/order/account 3종 — KIS가 항상 최종 원장, 불일치는 차단만
+  하고 자동 보정하지 않음.
+- `operations/`: 기존 `kill_switch_state.py`/`notification_health.py`/`slack_utils.py`를
+  감싸는 얇은 파사드 + spec의 ENTRY_OFF/HALT/EMERGENCY_LIQUIDATE 3분류(기존 2상태
+  kill switch에는 없던 개념, 새 파일 기반 HALT 플래그로 추가 — `kill_switch_state.py`
+  자체는 변경하지 않음).
+- `market_data/`: `alpaca_provider.py`(기존 yfinance 기반 데이터 경로 재사용 — 이 저장소의
+  "Alpaca 데이터"는 원래부터 yfinance였다는 사실을 문서화), `kis_validation_provider.py`
+  (KIS 현재가 재검증).
+- `config/live_rollout_config.py`: spec §19 정책(수량/포지션/일일진입 한도는 config로
+  확대 가능하지만, 소수점·시장가·연장거래·레버리지·인버스·공매도·마진은 이번 파일럿에서
+  절대 허용하지 않는 하드 블록으로 구현).
+- `kis_live_trading.py`(신규 최상위 모듈, `paper_strategy_order.py` 미변경): Alpaca/yfinance
+  후보 발굴(기존 `load_watchlist()`/`analyze_stock()` 재사용) → KIS 가격 재검증 → KIS 계좌
+  조회 → 사이징 → `OrderIntent` → `execution_engine.submit_buy_order()`. 구조적 사전조건
+  (`live_rollout.enabled`, HALT, ENTRY_OFF, 검증·배포 커밋 일치, 허용 계좌번호 설정) 확인 후
+  진행.
+- `tests/test_kis_negative_suite.py`: spec §22 필수 부정 테스트를 한곳에 정리 — "Alpaca
+  운영 주문 호출 0회"는 KIS 경로 12개 모듈이 `broker.alpaca_client`를 아예 import하지 않음을
+  AST로 구조적으로 증명(단순 호출부 검사보다 강함).
+
+**명시적으로 미구현 — 임의로 채우지 않고 사용자에게 나머지 지시 재요청한 상태**: 매도 자동화
+(손절/익절/50% 분할익절/트레일링스탑/전략무효화매도/시간손절/EOD청산) — 사용자의 두 번째
+지시 메시지가 전략 인터페이스 필드 목록(`entry_rules`~`end_of_day_exit_rules`) 도중 끊겨
+나머지 내용을 받지 못했다. `execution_engine.submit_sell_order()`/`order_gate.evaluate_
+sell_gate()`는 이미 완성·테스트됐으므로, "언제 팔지" 전략 로직과 그 배선만 남았다.
+
+**Claude Code가 실행할 수 없는 것(도구 접근 한계, 사용자에게 명시)**: Oracle 서버 SSH 접근
+없음(§91 `ORACLE_KIS_MIGRATION_RUNBOOK.md`는 절차서만 작성, 실행은 서버 접근 권한이 있는
+사람/세션이 수행), 실제 KIS API 자격증명 없음(모든 KIS 코드는 fake session 기반 테스트만
+검증됨, 실계좌 조회는 미수행), Codex 독립 검증은 외부 비동기 프로세스라 직접 트리거 불가
+(이전 사이클처럼 `CODEX_REVIEW.md`가 갱신되면 처리).
+
+**Live trading: DO_NOT_ENABLE.** `KIS_LIVE_ORDER_ENABLED`/`ENTRY_DISABLED`/`LIVE_ROLLOUT_
+ENABLED`/`ALPACA_ORDER_ENABLED`/`ALPACA_PAPER_ORDER_ENABLED` 코드 기본값 전부 안전측(주문
+차단) 유지. `approved`/`live_enabled`는 여전히 `false`. `main` 병합·origin push는 수행하지
+않았다(사용자 지시 §끝: Codex 검증 통과 후에만 병합).
+
+---
+
+## 2026-07-28 — Codex 독립 재검증 PASS_WITH_CONDITIONS + 자동 운영 구조 전환 착수 (종료)
 **Codex 독립 재검증 PASS_WITH_CONDITIONS + 자동 운영 구조 전환 착수 (2026-07-28, 진행 중).**
 
 Codex가 `CODEX-039/040/041 실제 운영 경로 배선 사이클`(커밋 `ae2b0fd`/`fc20574`)을 독립적으로

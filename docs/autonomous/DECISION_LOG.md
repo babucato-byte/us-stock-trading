@@ -700,3 +700,52 @@
   사용자가 "이어서 붙여주기" 선택) — 아직 수신 대기 중이며, 그동안 확실하게 특정 가능한 §2의
   하위 항목(소수점 금지 등)만 결정 3에서 별도로 처리했다.
 - 승인 필요 여부: 아니오(코드 구현·테스트 추가·문서화 범위, 실거래/승인/main/push와 무관).
+
+## Alpaca 데이터 전용 / KIS 실거래 브로커 전환 (2026-07-29, feature/kis-live-broker)
+
+- 결정 1(Alpaca 주문 차단 게이트를 만들되 즉시 배선하지 않음) — 사용자 지시는 "Alpaca Paper·
+  Live 주문 기능 완전 차단"을 확정 방향으로 못박았다. `broker/broker_config.py`에
+  `validate_alpaca_order_permitted()`(기본값 완전 차단)를 추가했지만, `AlpacaBroker.
+  submit_order()`에는 아직 호출하지 않았다 — 현재도 실제 운영 중인 것으로 보이는 Alpaca
+  paper 주문 경로(Oracle systemd `order-monitor.service`가 참조)를 KIS가 아직 대체하지
+  못한 상태에서 끊으면, 이 배포 사이클이 완료되기 전까지 시스템 전체가 무주문 상태가 된다.
+  이 판단은 spec §2("현재 Oracle 서버의 기존 운영본을 바로 덮어쓰지 않는다")의 정신과 일치한다
+  고 보았다. 배선 시점은 KIS 매도 자동화까지 완성되어 실제 cutover를 할 준비가 됐을 때로
+  미룬다.
+- 결정 2(KIS TR_ID/엔드포인트를 실제 공식 소스에서 확인) — KIS Open API 지식을 추정으로
+  채우지 않고, WebFetch로 `github.com/koreainvestment/open-trading-api`(한국투자증권
+  공식 저장소) 예제 코드를 실제로 조회해 TR_ID·엔드포인트·필드명을 확인했다. 2건(일반 주문
+  취소 TR_ID, 현재가 응답의 정확한 필드명)은 간접 확인만 가능했으므로 코드에
+  `TBD_VERIFY_LIVE_DOCS` 주석으로 명시하고 실거래 전 재확인을 요구하는 채로 남겼다 —
+  불확실한 값을 확실한 것처럼 구현하지 않았다.
+- 결정 3(매수 경로만 구현, 매도 자동화는 명시적으로 미룸) — 사용자의 두 번째 지시(전략
+  lifecycle 자동화: 손절/익절/분할익절/트레일링스탑/무효화/시간손절/EOD청산)가 필드 목록
+  도중 끊겨 나머지를 받지 못했다. 손절가/익절 조건은 실거래 자금 손실과 직결되므로 추정으로
+  채우지 않았다 — `execution_engine.submit_sell_order()`/`order_gate.evaluate_sell_gate()`
+  는 완성했지만, "언제 팔지" 전략 로직과 `kis_live_trading.py`로의 배선은 남겨뒀다.
+- 결정 4(레버리지·인버스·OTC 자동 분류기 미구현, 운영자 allow-list에 의존) — spec은
+  "레버리지·인버스·OTC가 아닌지" 검사를 요구하지만, 이 저장소의 `universe.csv`에는 그런
+  분류 필드가 없다. 심볼 패턴 추정(예: 티커에 "3X" 포함 여부)으로 분류기를 만드는 것은
+  거짓 안전감을 줄 수 있어 하지 않았다 — 대신 `kis_live_trading.py`는 `live_rollout.
+  allowed_symbols`(운영자가 직접 큐레이션하는 소규모 목록)에 있는 심볼만 처리하며, 이
+  목록의 큐레이션 자체가 레버리지/인버스 배제의 유일한 방어선임을 문서화했다(잔여 위험,
+  `docs/live_review/TBD_REVIEW_RECOMMENDATIONS.md` 참고 대상).
+- 결정 5(HALT를 새 파일로 추가, 기존 kill_switch_state.py는 변경하지 않음) — spec §20의
+  ENTRY_OFF/HALT/EMERGENCY_LIQUIDATE 3분류 중 ENTRY_OFF는 기존 `kill_switch_state.
+  ENTRY_DISABLED`와 정확히 대응하지만, HALT(매도 포함 전체 자동 주문 중지)는 기존 2상태
+  모델에 없는 개념이다. 이미 광범위하게 테스트된 `kill_switch_state.py`를 수정하는 대신
+  `operations/kill_switch.py`에 별도 파일 기반 플래그(`OPERATIONS_HALT_STATE.json`)를
+  추가했다 — 기존 안전 경로에 회귀를 만들지 않기 위함.
+- 결정 6(EMERGENCY_LIQUIDATE는 승인만 기록, 실제 청산 주문은 절대 자동 실행하지 않음) —
+  spec §29는 "긴급 전량 청산"을 사용자 승인이 필요한 4개 항목 중 하나로 명시했다.
+  `operations/commands.request_emergency_liquidation()`은 확인 토큰이 정확히 일치할 때만
+  승인 객체를 반환하며, 그 자체로 어떤 주문도 제출하지 않는다 — 실제 청산은 이 코드베이스의
+  자동 주문 경로 밖에서 사람이 직접 수행해야 한다.
+- 결정 7(Oracle 배포·Codex 검증 실행 불가를 사전에 명시) — Claude Code는 이 환경에서 Oracle
+  서버 SSH 접근 도구도, 실제 KIS API 자격증명도 갖고 있지 않다. `docs/deployment/ORACLE_
+  KIS_MIGRATION_RUNBOOK.md`는 절차서만 작성했고 어떤 단계도 실행하지 않았다. Codex 검증은
+  이 프로젝트에서 항상 외부 비동기 프로세스로 도착해왔으므로(과거 사이클들과 동일), 이번에도
+  직접 트리거하지 않고 `CODEX_REVIEW.md` 갱신을 기다린다.
+- 승인 필요 여부: 아니오(코드 구현·테스트 추가·문서화 범위). 단, `KIS_LIVE_ORDER_ENABLED`/
+  `LIVE_ROLLOUT_ENABLED`를 실제로 켜는 것, Oracle 서버 배포 실행, main 병합/origin push는
+  전부 이 사이클에서 수행하지 않았고 별도 승인이 필요하다.
