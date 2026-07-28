@@ -1,0 +1,342 @@
+"""Unit/integration tests for brokers/kis_broker.py -- all network calls
+go through a fake requests.Session double (never a real HTTP call), per
+this project's established pattern (see tests/test_broker_safety.py for
+the Alpaca equivalent).
+"""
+from datetime import datetime, timedelta, timezone
+
+import pytest
+import requests
+
+from brokers.kis_broker import (
+    KISAmbiguousResponseError,
+    KISBroker,
+    KISBrokerError,
+)
+from brokers.kis_config import KISConfig, KISConfigError
+from domain.instrument import build_instrument
+from domain.order_intent import OrderIntent
+
+NOW = datetime(2026, 7, 29, 14, 30, tzinfo=timezone.utc)
+
+
+class _StubResponse:
+    def __init__(self, status_code=200, json_body=None, text="ok"):
+        self.status_code = status_code
+        self._json_body = json_body if json_body is not None else {}
+        self.text = text
+
+    def json(self):
+        return self._json_body
+
+
+class _FakeSession:
+    """Routes on (method, path suffix) -> queued response(s). `requests`
+    is keyed by (method, url) tuples so tests can assert call counts and
+    payload contents."""
+
+    def __init__(self):
+        self.responses = {}  # path -> _StubResponse or Exception
+        self.requests = []
+
+    def queue(self, path, response):
+        self.responses[path] = response
+
+    def request(self, method, url, **kwargs):
+        self.requests.append((method, url, kwargs))
+        for path, response in self.responses.items():
+            if url.endswith(path):
+                if isinstance(response, Exception):
+                    raise response
+                return response
+        raise AssertionError(f"no stubbed response for {method} {url}")
+
+
+TOKEN_OK = _StubResponse(200, {"access_token": "tok-1", "expires_in": 3600})
+
+
+def _config(**overrides):
+    kwargs = dict(
+        kis_env="paper", app_key="key", app_secret="secret", account_no="12345678",
+        account_product_cd="01", account_read_enabled=True, live_order_enabled=False,
+    )
+    kwargs.update(overrides)
+    return KISConfig(**kwargs)
+
+
+def _broker(config=None, session=None, now=NOW):
+    return KISBroker(config=config or _config(), session=session or _FakeSession(), now_fn=lambda: now)
+
+
+def _instrument(**overrides):
+    kwargs = dict(exchange="NASDAQ")
+    kwargs.update(overrides)
+    return build_instrument("AAPL", **kwargs)
+
+
+def _order_intent(**overrides):
+    kwargs = dict(
+        internal_order_id="ord-1", signal_id="sig-1", strategy_id="strat-1",
+        symbol="AAPL", exchange="NASDAQ", side="buy", quantity=1, order_type="limit",
+        limit_price=100.0, stop_price=None, target_price=None, created_at=NOW,
+    )
+    kwargs.update(overrides)
+    return OrderIntent(**kwargs)
+
+
+class TestAuth:
+    def test_token_issued_and_cached(self):
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", TOKEN_OK)
+        session.queue(
+            "/uapi/overseas-price/v1/quotations/price",
+            _StubResponse(200, {"output": {"last": "150.00"}}),
+        )
+        broker = _broker(session=session)
+        broker.get_current_price(_instrument())
+        broker.get_current_price(_instrument())
+        token_calls = [r for r in session.requests if r[1].endswith("/oauth2/tokenP")]
+        assert len(token_calls) == 1  # cached across two reads
+
+    def test_token_refreshed_after_expiry(self):
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", _StubResponse(200, {"access_token": "tok-1", "expires_in": 60}))
+        session.queue(
+            "/uapi/overseas-price/v1/quotations/price",
+            _StubResponse(200, {"output": {"last": "150.00"}}),
+        )
+        clock = {"t": NOW}
+        broker = KISBroker(config=_config(), session=session, now_fn=lambda: clock["t"])
+        broker.get_current_price(_instrument())
+        clock["t"] = NOW + timedelta(hours=2)
+        broker.get_current_price(_instrument())
+        token_calls = [r for r in session.requests if r[1].endswith("/oauth2/tokenP")]
+        assert len(token_calls) == 2
+
+    def test_missing_credentials_blocks_before_network(self):
+        session = _FakeSession()
+        broker = _broker(config=_config(app_key=None), session=session)
+        with pytest.raises(KISConfigError):
+            broker.get_current_price(_instrument())
+        assert session.requests == []
+
+    def test_malformed_token_response_raises(self):
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", _StubResponse(200, {"no_token_here": True}))
+        broker = _broker(session=session)
+        with pytest.raises(KISBrokerError):
+            broker.get_current_price(_instrument())
+
+    def test_token_network_error_raises(self):
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", requests.exceptions.ConnectionError("boom"))
+        broker = _broker(session=session)
+        with pytest.raises(KISBrokerError):
+            broker.get_current_price(_instrument())
+
+
+class TestReadGate:
+    def test_read_disabled_blocks_before_network(self):
+        session = _FakeSession()
+        broker = _broker(config=_config(account_read_enabled=False), session=session)
+        with pytest.raises(KISConfigError):
+            broker.get_current_price(_instrument())
+        assert session.requests == []
+
+
+class TestGetCurrentPrice:
+    def test_success(self):
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", TOKEN_OK)
+        session.queue(
+            "/uapi/overseas-price/v1/quotations/price",
+            _StubResponse(200, {"output": {"last": "212.34"}}),
+        )
+        assert _broker(session=session).get_current_price(_instrument()) == pytest.approx(212.34)
+
+    def test_missing_last_field_raises(self):
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", TOKEN_OK)
+        session.queue("/uapi/overseas-price/v1/quotations/price", _StubResponse(200, {"output": {}}))
+        with pytest.raises(KISBrokerError):
+            _broker(session=session).get_current_price(_instrument())
+
+    def test_non_positive_price_raises(self):
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", TOKEN_OK)
+        session.queue(
+            "/uapi/overseas-price/v1/quotations/price",
+            _StubResponse(200, {"output": {"last": "0"}}),
+        )
+        with pytest.raises(KISBrokerError):
+            _broker(session=session).get_current_price(_instrument())
+
+    def test_unmapped_exchange_raises_before_network(self):
+        session = _FakeSession()
+        with pytest.raises(KISBrokerError):
+            _broker(session=session).get_current_price(_instrument(exchange="LSE"))
+        assert session.requests == []
+
+
+class TestAccountAndPositions:
+    def test_get_account_snapshot(self):
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", TOKEN_OK)
+        session.queue(
+            "/uapi/overseas-stock/v1/trading/inquire-balance",
+            _StubResponse(200, {"output1": [], "output2": {"frcr_dncl_amt1": "1000.50", "frcr_use_psbl_amt": "900.25"}}),
+        )
+        snap = _broker(session=session).get_account_snapshot()
+        assert snap.usd_cash == pytest.approx(1000.50)
+        assert snap.usd_orderable_cash == pytest.approx(900.25)
+        assert snap.source == "kis_balance"
+
+    def test_get_positions_filters_zero_quantity(self):
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", TOKEN_OK)
+        session.queue(
+            "/uapi/overseas-stock/v1/trading/inquire-balance",
+            _StubResponse(200, {"output1": [
+                {"ovrs_pdno": "AAPL", "ovrs_cblc_qty": "2", "pchs_avg_pric": "150.0", "evlu_pfls_amt": "10.0"},
+                {"ovrs_pdno": "MSFT", "ovrs_cblc_qty": "0", "pchs_avg_pric": "0", "evlu_pfls_amt": "0"},
+            ], "output2": {}}),
+        )
+        positions = _broker(session=session).get_positions()
+        assert len(positions) == 1
+        assert positions[0].symbol == "AAPL"
+        assert positions[0].quantity == 2
+
+    def test_get_orderable_usd(self):
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", TOKEN_OK)
+        session.queue(
+            "/uapi/overseas-stock/v1/trading/inquire-psamount",
+            _StubResponse(200, {"output": {"ord_psbl_frcr_amt": "543.21"}}),
+        )
+        amount = _broker(session=session).get_orderable_usd(_instrument(), 100.0)
+        assert amount == pytest.approx(543.21)
+
+    def test_get_open_orders(self):
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", TOKEN_OK)
+        session.queue(
+            "/uapi/overseas-stock/v1/trading/inquire-nccs",
+            _StubResponse(200, {"output": [{"odno": "1"}]}),
+        )
+        assert _broker(session=session).get_open_orders() == [{"odno": "1"}]
+
+    def test_get_fills(self):
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", TOKEN_OK)
+        session.queue(
+            "/uapi/overseas-stock/v1/trading/inquire-ccnl",
+            _StubResponse(200, {"output": [{"odno": "2"}]}),
+        )
+        assert _broker(session=session).get_fills(start_date="20260701", end_date="20260729") == [{"odno": "2"}]
+
+
+class TestSubmitOrderGate:
+    def test_blocked_when_live_order_disabled(self):
+        session = _FakeSession()
+        broker = _broker(config=_config(live_order_enabled=False), session=session)
+        with pytest.raises(KISConfigError):
+            broker.submit_order(_order_intent(), _instrument())
+        assert session.requests == []
+
+    def test_market_order_rejected_before_network(self):
+        # OrderIntent itself already rejects order_type != "limit" at
+        # construction -- this proves the broker layer has its own
+        # independent belt-and-suspenders check by constructing an
+        # OrderIntent and monkeypatching order_type after the fact is not
+        # possible (frozen dataclass validated at construction), so this
+        # test instead confirms construction itself fails closed.
+        with pytest.raises(Exception):
+            _order_intent(order_type="market")
+
+
+class TestSubmitOrderSuccessAndFailure:
+    def test_success_returns_accepted(self):
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", TOKEN_OK)
+        session.queue(
+            "/uapi/overseas-stock/v1/trading/order",
+            _StubResponse(200, {"rt_cd": "0", "output": {"ODNO": "kis-999"}}),
+        )
+        broker = _broker(config=_config(live_order_enabled=True), session=session)
+        record = broker.submit_order(_order_intent(), _instrument())
+        assert record.status == "ACCEPTED"
+        assert record.broker_order_id == "kis-999"
+        assert record.broker == "kis"
+
+    def test_rejected_rt_cd_returns_rejected_status(self):
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", TOKEN_OK)
+        session.queue(
+            "/uapi/overseas-stock/v1/trading/order",
+            _StubResponse(200, {"rt_cd": "1", "msg_cd": "E001", "msg1": "insufficient funds", "output": {}}),
+        )
+        broker = _broker(config=_config(live_order_enabled=True), session=session)
+        record = broker.submit_order(_order_intent(), _instrument())
+        assert record.status == "REJECTED"
+        assert record.error_code == "E001"
+
+    def test_network_error_raises_ambiguous_not_rejected(self):
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", TOKEN_OK)
+        session.queue("/uapi/overseas-stock/v1/trading/order", requests.exceptions.Timeout("boom"))
+        broker = _broker(config=_config(live_order_enabled=True), session=session)
+        with pytest.raises(KISAmbiguousResponseError):
+            broker.submit_order(_order_intent(), _instrument())
+
+    @pytest.mark.parametrize("status_code", [500, 502, 503, 504, 408, 429])
+    def test_5xx_and_ambiguous_statuses_raise_ambiguous(self, status_code):
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", TOKEN_OK)
+        session.queue(
+            "/uapi/overseas-stock/v1/trading/order",
+            _StubResponse(status_code, {}, text="server error"),
+        )
+        broker = _broker(config=_config(live_order_enabled=True), session=session)
+        with pytest.raises(KISAmbiguousResponseError):
+            broker.submit_order(_order_intent(), _instrument())
+
+    def test_malformed_json_raises_ambiguous(self):
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", TOKEN_OK)
+
+        class _BadJSON(_StubResponse):
+            def json(self):
+                raise ValueError("not json")
+
+        session.queue("/uapi/overseas-stock/v1/trading/order", _BadJSON(200))
+        broker = _broker(config=_config(live_order_enabled=True), session=session)
+        with pytest.raises(KISAmbiguousResponseError):
+            broker.submit_order(_order_intent(), _instrument())
+
+
+class TestCancelOrder:
+    def test_blocked_when_live_order_disabled(self):
+        session = _FakeSession()
+        broker = _broker(config=_config(live_order_enabled=False), session=session)
+        with pytest.raises(KISConfigError):
+            broker.cancel_order(_order_intent(), _instrument(), "kis-999")
+        assert session.requests == []
+
+    def test_success_returns_cancelled(self):
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", TOKEN_OK)
+        session.queue(
+            "/uapi/overseas-stock/v1/trading/order-rvsecncl",
+            _StubResponse(200, {"rt_cd": "0", "output": {}}),
+        )
+        broker = _broker(config=_config(live_order_enabled=True), session=session)
+        record = broker.cancel_order(_order_intent(), _instrument(), "kis-999")
+        assert record.status == "CANCELLED"
+
+    def test_network_error_raises_ambiguous(self):
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", TOKEN_OK)
+        session.queue("/uapi/overseas-stock/v1/trading/order-rvsecncl", requests.exceptions.Timeout("boom"))
+        broker = _broker(config=_config(live_order_enabled=True), session=session)
+        with pytest.raises(KISAmbiguousResponseError):
+            broker.cancel_order(_order_intent(), _instrument(), "kis-999")
