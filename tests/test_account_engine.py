@@ -147,7 +147,7 @@ def test_max_allocatable_cash_capped_by_trusted_ceiling():
     # cash is already in "KRW-equivalent" terms via fx_rate=1 for simplicity
     snapshot = ae.build_account_snapshot(broker, 1.0, _conn(), now=NOW)
     max_allocatable = ae.compute_max_allocatable_cash_krw(snapshot, 100)  # caller requests 100%
-    assert max_allocatable == pytest.approx(15_000.0)  # capped at trusted 50%
+    assert max_allocatable == pytest.approx(27_000.0)  # capped at trusted 90%
 
 
 def test_available_for_new_order_deducts_committed():
@@ -156,4 +156,4 @@ def test_available_for_new_order_deducts_committed():
     broker = _FakeBroker({"cash": "30000.00", "non_marginable_buying_power": "30000.00"})
     snapshot = ae.build_account_snapshot(broker, 1.0, conn, now=NOW)
     available = ae.compute_available_for_new_order_krw(snapshot, 100)
-    assert available == pytest.approx(15_000.0 - 5_000.0)
+    assert available == pytest.approx(27_000.0 - 5_000.0)

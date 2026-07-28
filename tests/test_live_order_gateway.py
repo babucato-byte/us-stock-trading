@@ -204,9 +204,9 @@ def test_codex036_repro_inflated_cash_capped_by_real_account_snapshot():
     )
     conn = state_db.open_db()
     row = ledger.get_by_id(conn, approval.reservation_id)
-    # capped at the trusted ceiling (50%) of the REAL 30,000 balance, not
+    # capped at the trusted ceiling (90%) of the REAL 30,000 balance, not
     # the caller's declared 3,000,000 -- nowhere near 2,997,000 KRW.
-    assert row["notional_krw"] <= 15_000
+    assert row["notional_krw"] <= 27_000
 
 
 def test_account_snapshot_can_only_lower_never_raise_caller_cash():

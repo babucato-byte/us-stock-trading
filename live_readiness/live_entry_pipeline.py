@@ -24,6 +24,14 @@ Every stage's authoritative inputs (account snapshot, trusted
 cash_usage_percent, durable exposure) come from the SAME
 `account_engine.AccountSnapshot` built once at the top of this function
 -- never re-derived or re-declared by a later stage.
+
+2026-07-28: `fractionable` defaults to `False` and this module's sole
+caller (`paper_strategy_order.main()`) never overrides it -- every live
+entry is whole-share-only ("소수점 주문 금지"), and Sizing Engine already
+floors/blocks accordingly (`sizing_engine.compute_sizing_decision()`
+raising below `sizing_decision.actual_qty <= 0` is exactly "this symbol
+is not currently affordable for even one whole share", which this
+function treats as a hard block, not a fractional fallback).
 """
 
 import uuid

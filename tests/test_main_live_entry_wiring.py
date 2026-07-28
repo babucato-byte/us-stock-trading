@@ -237,6 +237,21 @@ def test_conflicting_reservation_blocks_zero_broker_calls(monkeypatch, tmp_path)
     assert result["blocked"] == ["AAPL"]
 
 
+def test_less_than_one_whole_share_affordable_blocks_zero_broker_calls(monkeypatch, tmp_path):
+    # 2026-07-28 "소수점 주문 금지" / "최소 1주 이상 매수 가능한 종목만 주문":
+    # run_live_entry_pipeline()'s `fractionable` parameter defaults to
+    # False (never passed as True by this call site), so when the
+    # affordable budget covers less than one whole share at the strategy's
+    # entry price, Sizing Engine must produce actual_qty=0 and the entry
+    # must be blocked -- never a fractional-share order.
+    broker = LiveFakeBroker(cash_usd="50.00")  # price is $100.0 (_high_score_result)
+    _patch_live_common(monkeypatch, tmp_path, ["AAPL"], broker)
+
+    result = pso.main(broker=broker)
+    assert broker.submit_calls == []
+    assert result["blocked"] == ["AAPL"]
+
+
 def test_paper_mode_main_completely_unaffected_by_live_wiring(monkeypatch, tmp_path):
     # Regression guard: Paper mode (no is_live_mode attribute, matching
     # every existing test_paper_order_execution.py FakeBroker) must never

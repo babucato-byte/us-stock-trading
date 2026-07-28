@@ -177,9 +177,9 @@ def test_conflicting_existing_reservation_blocks_zero_broker_calls():
 
 
 def test_strategy_max_qty_cannot_widen_beyond_balance():
-    # cash $27 * 1,350 KRW/$ = 36,450 KRW effective cash; trusted 50% ->
+    # cash $15 * 1,350 KRW/$ = 20,250 KRW effective cash; trusted 90% ->
     # 18,225 KRW allocatable -> $13.50 budget -> floor($13.50/$10) = 1 share.
-    broker = _FakeBroker({"cash": "27.00", "non_marginable_buying_power": "27.00"})
+    broker = _FakeBroker({"cash": "15.00", "non_marginable_buying_power": "15.00"})
     conn = state_db.open_db()
     result = lep.run_live_entry_pipeline(
         broker=broker,

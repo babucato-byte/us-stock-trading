@@ -14,6 +14,13 @@ def test_get_cash_usage_percent_is_valid():
     assert 0 < value <= 100
 
 
+def test_default_cash_usage_percent_is_90():
+    # 2026-07-28 자동 운영 구조: 운영자 입력이 없으면 90을 사용한다는 요구사항의
+    # 회귀 테스트 -- 이 상수가 실수로 다시 낮아지거나 바뀌면 즉시 실패해야 한다.
+    assert toc.CASH_USAGE_PERCENT_CEILING == 90
+    assert toc.get_cash_usage_percent() == 90
+
+
 def test_get_cash_usage_percent_matches_ceiling_value():
     # CODEX-039: both currently return the same underlying trusted
     # constant -- get_cash_usage_percent() takes no caller input at all

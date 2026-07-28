@@ -33,13 +33,13 @@ the other's contract.
 
 import math
 
-# CODEX-036 required behavior: "기본값은 보수적으로 설정, 운영자 승인 전 변경
-# 금지" (conservative default, no change without operator approval) -- 50%
-# is a deliberately conservative starting ceiling for a brand-new
-# limited-live pilot, not a market/technical constant. Raising it is an
-# operator decision made by editing this constant under code review, never
-# a per-call caller choice.
-CASH_USAGE_PERCENT_CEILING = 50
+# 2026-07-28 자동 운영 구조 변경: 운영자가 매일 별도로 값을 입력하지 않아도
+# 시스템이 그대로 사용하는 자동 기본값. 90은 "운영자 입력이 없으면 90 사용"
+# 이라는 명시적 요구사항에 따른 값이며, 1~100 사이에서만 유효(margin/leverage는
+# 이 비율과 무관하게 항상 금지 -- account_engine.py의 effective_cash_krw가
+# non-margin cash로만 산정됨). 이 값을 바꾸는 것은 여전히 코드 리뷰를 거치는
+# 운영자 결정이며, per-call caller 선택이 아니다.
+CASH_USAGE_PERCENT_CEILING = 90
 
 # Matches docs/live_review/LIMITED_LIVE_30K_KRW_PLAYBOOK.md §3's recommended
 # initial limits: 1 concurrent position, up to 2 daily entries. Trusted
