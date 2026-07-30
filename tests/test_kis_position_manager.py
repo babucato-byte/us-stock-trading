@@ -121,6 +121,27 @@ class TestSyncKisFillsAndManageExits:
         assert broker.submit_calls[0][0].quantity == 10  # full exit on stop-loss
         assert "AAPL" in summary["managed"]
 
+    def test_target_2_take_profit_triggers_exactly_one_full_sell(self):
+        # "익절"/"일반 전략 매도": target_2 uses the SAME _force_full_exit()
+        # code path as STOP_LOSS (just a different reason string), so
+        # this proves the identical KISBrokerAdapter wiring a second,
+        # independent way -- via a position already past target_1.
+        record = _create_filled_position(None, avg_price=100.0)
+        target_2 = record["target_2_price"]
+        with store.locked_position(record["position_id"]) as locked:
+            states.validate_transition(locked["state"], states.TARGET_1_ACTIVE)
+            locked["state"] = states.TARGET_1_ACTIVE
+        broker = _FakeKISBroker(
+            price=target_2 + 0.5,
+            positions=[Position(symbol="AAPL", quantity=10, average_fill_price=100.0,
+                                 unrealized_pnl=0.0, realized_pnl=0.0, as_of=NOW, source="kis_balance")],
+        )
+        adapter = KISBrokerAdapter(broker, now_fn=lambda: NOW)
+        summary = kpm.sync_kis_fills_and_manage_exits(kis_broker=broker, broker_adapter=adapter, now=NOW)
+        assert len(broker.submit_calls) == 1
+        assert broker.submit_calls[0][0].quantity == 10
+        assert "AAPL" in summary["managed"]
+
     def test_target_1_triggers_exactly_one_partial_sell(self):
         record = _create_filled_position(None, avg_price=100.0)
         target_1 = record["target_1_price"]

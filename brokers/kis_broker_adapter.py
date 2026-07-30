@@ -41,9 +41,8 @@ exit`/`recover_on_restart`).
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Union
 
-from broker.alpaca_client import BrokerResponse
 from brokers.kis_broker import KISAmbiguousResponseError, KISBroker, KISBrokerError
 from domain.instrument import build_instrument
 from domain.order_intent import OrderIntent, OrderIntentError
@@ -51,6 +50,21 @@ from execution import execution_engine, idempotency, order_gate
 from execution.execution_engine import ExecutionEngineError
 from market_data.kis_validation_provider import KISValidationProvider
 from state_store import db as state_db
+
+
+@dataclass
+class BrokerResponse:
+    """Deliberately NOT imported from broker/alpaca_client.py -- same
+    field shape (status_code/text/data/dry_run), defined locally here so
+    this adapter has zero import-time dependency on the Alpaca order-
+    client module (tests/test_kis_negative_suite.py structurally
+    verifies this). positions/order_status.extract_order_info() and
+    positions/lifecycle.py only ever duck-type this object (`.status_
+    code`, `.data`), never isinstance-check it against Alpaca's class."""
+    status_code: int
+    text: str
+    data: Optional[Union[dict, list]] = None
+    dry_run: bool = False
 
 
 class KISBrokerAdapterError(Exception):

@@ -162,6 +162,17 @@ def sync_kis_fills_and_manage_exits(*, kis_broker, broker_adapter, now=None):
     for position_id, record in open_positions.items():
         symbol = record["symbol"]
 
+        if record["state"] in (states.PARTIAL_EXIT_SUBMITTED, states.EXIT_SUBMITTED):
+            # A prior exit (partial or full) was submitted to KIS but not
+            # yet confirmed filled -- reconcile against KIS's own order/
+            # fill history (via broker_adapter.get_order_by_client_
+            # order_id(), reused verbatim, never a new order attempt).
+            try:
+                record = lifecycle.reconcile_pending_exit(position_id, broker=broker_adapter) or record
+            except Exception as exc:
+                summary["skipped"].append((symbol, f"reconcile_pending_exit failed: {exc}"))
+                continue
+
         if record["state"] in _FILL_PENDING_STATES:
             fill = _find_kis_fill_for_order(kis_broker, record.get("broker_order_id"), now=current)
             if fill is not None:

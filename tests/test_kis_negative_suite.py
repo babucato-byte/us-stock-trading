@@ -30,8 +30,11 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # methods, so this is a stronger guarantee than a regex over call sites.
 _KIS_PATH_MODULES = [
     "kis_live_trading.py",
+    "kis_position_manager.py",
+    "shadow_mode.py",
     "brokers/kis_broker.py",
     "brokers/kis_config.py",
+    "brokers/kis_broker_adapter.py",
     "execution/execution_engine.py",
     "execution/order_gate.py",
     "execution/order_state_machine.py",
