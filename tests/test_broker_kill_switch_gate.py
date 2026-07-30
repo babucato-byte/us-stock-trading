@@ -67,7 +67,13 @@ def _matching_env_credentials(monkeypatch):
 
 
 def _make_broker(session=None):
-    config = BrokerConfig(trading_mode="paper", api_key="key", secret_key="secret")
+    # KIS migration: this file tests kill-switch gate agreement between
+    # the wrapper and direct broker paths specifically, not the new
+    # Alpaca-order-disabled gate -- alpaca_paper_order_enabled=True keeps
+    # every test here exercising exactly what it was designed to test.
+    config = BrokerConfig(
+        trading_mode="paper", api_key="key", secret_key="secret", alpaca_paper_order_enabled=True,
+    )
     return AlpacaBroker(config=config, session=session or RecordingSession())
 
 

@@ -259,6 +259,33 @@ def submit_order(symbol, qty=1, broker=None, client_order_id=None, *, side, live
 
     broker = broker or AlpacaBroker()
 
+    # KIS migration (docs/autonomous/DECISION_LOG.md's "Alpaca 데이터
+    # 전용 / KIS 실거래 브로커 전환" section): Alpaca is now
+    # market-data-only. A real AlpacaBroker instance reaching this
+    # OPERATIONAL wrapper (this function is what main() and positions/
+    # lifecycle.py's exit path both call) is fail-closed blocked unless
+    # ALPACA_ORDER_ENABLED/ALPACA_PAPER_ORDER_ENABLED is explicitly set
+    # true for the broker's own trading_mode -- see broker/broker_config.
+    # py::BrokerConfig.validate_alpaca_order_permitted(). Test doubles
+    # (FakeBroker, etc., used throughout tests/test_paper_order_
+    # execution.py and elsewhere) are NOT AlpacaBroker instances and are
+    # completely unaffected -- this only blocks a REAL Alpaca order
+    # attempt. KIS being disabled (KIS_LIVE_ORDER_ENABLED=false) never
+    # falls back to this path either -- there is no fallback broker in
+    # this codebase (spec: "장애 시 Alpaca나 다른 증권사로 자동 우회
+    # 주문하지 않는다").
+    if isinstance(broker, AlpacaBroker):
+        try:
+            broker.config.validate_alpaca_order_permitted()
+        except RuntimeError as exc:
+            print(f"Alpaca order client is disabled for the operational path: {exc}")
+            return BrokerResponse(
+                status_code=423,
+                text=f"Alpaca order client disabled: {exc}",
+                data={"blocked_reason": "ALPACA_ORDER_CLIENT_DISABLED"},
+                dry_run=False,
+            )
+
     # getattr(broker, "config", None) first, not getattr(broker.config, ...):
     # test doubles (FakeBroker in many existing tests) commonly have no
     # .config attribute at all, and `broker.config` would raise

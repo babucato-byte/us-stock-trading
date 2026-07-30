@@ -711,9 +711,14 @@ class _NetworkForbiddenSession:
 
 
 def _live_broker():
+    # KIS migration: this file tests the legacy CODEX-026+ Alpaca-KRW
+    # live-entry-context gate specifically (allow-list/FX/symbol-match/
+    # budget checks), not the new Alpaca-order-disabled gate --
+    # alpaca_order_enabled=True keeps these tests exercising exactly
+    # what they were designed to test.
     return AlpacaBroker(
         config=BrokerConfig(trading_mode="live", enable_real_trading=True, live_dry_run=False,
-                             api_key="key", secret_key="secret"),
+                             api_key="key", secret_key="secret", alpaca_order_enabled=True),
         session=_NetworkForbiddenSession(),
     )
 
@@ -746,7 +751,7 @@ def test_live_buy_symbol_not_allowed_blocked_zero_network_calls():
 def test_live_sell_never_gated_by_live_entry_context():
     broker = AlpacaBroker(
         config=BrokerConfig(trading_mode="live", enable_real_trading=False, live_dry_run=True,
-                             api_key="key", secret_key="secret"),
+                             api_key="key", secret_key="secret", alpaca_order_enabled=True),
         session=_NetworkForbiddenSession(),
     )
     response = pso.submit_order("AAPL", qty=1, broker=broker, client_order_id="c-3", side="sell")
@@ -756,7 +761,8 @@ def test_live_sell_never_gated_by_live_entry_context():
 def test_paper_mode_buy_unaffected_by_missing_live_entry_context():
     session = _NetworkForbiddenSession()
     broker = AlpacaBroker(
-        config=BrokerConfig(trading_mode="paper", api_key="key", secret_key="secret"),
+        config=BrokerConfig(trading_mode="paper", api_key="key", secret_key="secret",
+                             alpaca_paper_order_enabled=True),
         session=session,
     )
     with pytest.raises(RuntimeError, match="Credential revalidation failed"):
