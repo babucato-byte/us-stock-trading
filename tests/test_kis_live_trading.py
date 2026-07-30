@@ -15,6 +15,7 @@ NOW = datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc)
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
     monkeypatch.setenv("STATE_STORE_DB_FILE", str(tmp_path / "TEST_STATE.db"))
+    monkeypatch.setenv("POSITION_STORE_FILE", str(tmp_path / "POSITION_STORE.json"))
     monkeypatch.setenv("KILL_SWITCH_STATE_FILE", str(tmp_path / "KILL_SWITCH.json"))
     monkeypatch.setenv("OPERATIONS_HALT_STATE_FILE", str(tmp_path / "OPS_HALT.json"))
     from execution import idempotency

@@ -40,6 +40,7 @@ import os
 import uuid
 from datetime import datetime, timezone
 
+import kis_position_manager
 import paper_strategy_order as pso
 from brokers.kis_broker import KISAmbiguousResponseError, KISBrokerError
 from config.live_rollout_config import LiveRolloutConfig, LiveRolloutConfigError
@@ -214,6 +215,24 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None):
                     conn=conn, broker=broker, instrument=instrument, now=current,
                 )
                 results["submitted"].append(symbol)
+                # spec: "매수 체결 이후 포지션 관리는 KIS 실제 보유수량과
+                # 평균체결가를 기준으로 한다" -- create the positions/
+                # lifecycle.py row now so kis_position_manager.py's sync
+                # cycle can pick up the fill and start managing stop/
+                # target/time/EOD exits (see kis_position_manager.py's
+                # module docstring for the full rationale).
+                try:
+                    kis_position_manager.create_kis_position_after_buy(
+                        strategy_id=order_intent.strategy_id, strategy_version="v1", symbol=symbol,
+                        quantity=order_intent.quantity, client_order_id=order_intent.internal_order_id,
+                        broker_order_id=result.execution_record.broker_order_id, now=current,
+                    )
+                except Exception as exc:
+                    # Position tracking failure must never be treated as
+                    # order failure -- the KIS order already succeeded.
+                    # Surfaced via results["blocked"] as a warning entry so
+                    # it's visible, but the symbol stays in "submitted".
+                    results["blocked"].append((symbol, f"WARNING: position tracking failed after successful buy: {exc}"))
             except ExecutionEngineError as exc:
                 results["blocked"].append((symbol, str(exc)))
             except KISAmbiguousResponseError as exc:

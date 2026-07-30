@@ -1,0 +1,221 @@
+"""KIS position management -- the "existing 매도·손절·익절 정책을 KIS
+실제 포지션 실행 경로에 연결" piece. This module does NOT define any new
+sell rule. Every price-trigger decision (stop-loss, take-profit,
+partial-exit, trailing/breakeven, time-stop, EOD forced close) is made
+by `positions.lifecycle.check_and_manage()`, called here VERBATIM,
+unmodified. This module's only two jobs are:
+
+1. `create_kis_position_after_buy()` -- after a KIS buy order is
+   ACCEPTED (kis_live_trading.py), create the position row
+   (`positions.store.create_position()` + the ARMED/ENTRY_RESERVED/
+   ENTRY_SUBMITTED transitions `positions.lifecycle.enter_position()`
+   already performs for the Alpaca path, replicated here because this
+   pipeline's candidate/signal source is the existing score-based
+   `paper_strategy_order.analyze_stock()` -- not a `strategy/plugins/`
+   Strategy object -- so `enter_position()` itself cannot be called
+   directly; it requires a `strategy.generate_entry()` call this
+   pipeline's entry signal was never built to produce). stop_price/
+   target_1_price/target_2_price are deliberately left unset here and
+   finalized in step 2, once KIS's REAL average fill price is known
+   (spec: "entry_price = KIS 실제 평균체결가" -- not the signal/limit
+   price).
+
+2. `sync_kis_fills_and_manage_exits()` -- the periodic tick: KIS
+   position/fill read -> reconciliation against the internal positions
+   table (block, never auto-correct, on mismatch) -> apply new fills via
+   `positions.lifecycle.record_fill()` (verbatim) -> on first full fill,
+   finalize stop/target from the ACTUAL average_fill_price using the
+   SAME formula already used elsewhere in this codebase for a live-pilot
+   stop (`risk_config.STOP_LOSS_RATE`, reused verbatim by
+   `live_readiness/live_entry_pipeline.py` for the analogous Alpaca-KRW
+   pilot) and the SAME R-multiple target formula
+   `strategy/plugins/vwap_micro_pullback_v1.calculate_targets()` already
+   implements (inlined here as the identical formula, not reinvented,
+   since instantiating that plugin class purely to call one stateless
+   method would be a heavier and more fragile dependency than copying
+   its two-line arithmetic verbatim) -> `positions.lifecycle.
+   check_and_manage()` (verbatim) for every exit-eligible position.
+
+SCOPE NOTE (documented, not silently omitted): `positions.lifecycle.
+check_invalidation()` -- the strategy-invalidation exit reason -- is
+NOT called here. It requires a `strategy` object with an `.invalidate()`
+method; this pipeline's score-based entries have no such object, and
+fabricating one would be exactly the "새로운 매도 전략을 추가" this
+task was explicitly told not to do. `check_and_manage()`'s other five
+exit reasons (STOP_LOSS, TARGET_2 full exit, TARGET_1 partial exit,
+TIME_STOP, EOD_FORCED_CLOSE) are all reused, unmodified.
+"""
+
+from datetime import datetime, timezone
+
+import risk_config
+from config import scalping_strategy_v1_config as strat_cfg
+from positions import lifecycle, states, store
+
+
+class KISPositionManagerError(Exception):
+    """Raised for a structural failure (e.g. KIS reads failing outright).
+    Per-position failures are recorded on that position or simply skip
+    that position for this tick -- they never raise, so one bad symbol
+    can't stop the whole sync cycle from servicing every other position."""
+
+
+def create_kis_position_after_buy(*, strategy_id, strategy_version, symbol, quantity,
+                                   client_order_id, broker_order_id, now=None):
+    """Mirrors positions.lifecycle.enter_position()'s SETUP_DETECTED ->
+    ARMED -> ENTRY_RESERVED -> ENTRY_SUBMITTED transitions exactly (same
+    state names, same states.validate_transition() calls) -- only the
+    entry-signal source differs (already-submitted KIS order, not a
+    strategy.generate_entry() call). stop_price/target_1_price/
+    target_2_price stay None until finalize_stop_and_targets_from_fill()
+    runs. Returns the created position record."""
+    current = now or datetime.now(timezone.utc)
+    record = store.create_position(
+        strategy_id, strategy_version, symbol, client_order_id=client_order_id,
+        requested_qty=quantity,
+    )
+    position_id = record["position_id"]
+    with store.locked_position(position_id) as locked:
+        states.validate_transition(locked["state"], states.ARMED)
+        locked["state"] = states.ARMED
+        locked["state_history"].append(
+            {"state": states.ARMED, "at": current.isoformat(), "reason": "KIS buy order accepted"}
+        )
+        states.validate_transition(locked["state"], states.ENTRY_RESERVED)
+        locked["state"] = states.ENTRY_RESERVED
+        locked["state_history"].append(
+            {"state": states.ENTRY_RESERVED, "at": current.isoformat(), "reason": "KIS order id known"}
+        )
+        states.validate_transition(locked["state"], states.ENTRY_SUBMITTED)
+        locked["state"] = states.ENTRY_SUBMITTED
+        locked["broker_order_id"] = broker_order_id
+        locked["entry_time"] = current.isoformat()
+        locked["state_history"].append(
+            {"state": states.ENTRY_SUBMITTED, "at": current.isoformat(),
+             "reason": f"KIS broker_order_id={broker_order_id}"}
+        )
+    return store.load_position(position_id)
+
+
+def finalize_stop_and_targets_from_fill(position_id, average_fill_price):
+    """Called once a position reaches STOP_ACTIVE (i.e. record_fill()
+    just fully filled it). Computes stop_price from risk_config.
+    STOP_LOSS_RATE and target_1_price/target_2_price from the same
+    R-multiple formula strategy/plugins/vwap_micro_pullback_v1.
+    calculate_targets() implements -- both existing, already-deployed-
+    elsewhere constants/formulas, applied here to KIS's REAL average
+    fill price rather than the signal/limit price (spec requirement)."""
+    stop_price = average_fill_price * (1 + risk_config.STOP_LOSS_RATE)
+    risk_per_share = average_fill_price - stop_price
+    target_1_price = average_fill_price + risk_per_share * strat_cfg.TARGET_1_R_MULTIPLE
+    target_2_price = average_fill_price + risk_per_share * strat_cfg.TARGET_2_R_MULTIPLE
+    with store.locked_position(position_id) as locked:
+        if locked["state"] != states.STOP_ACTIVE or locked["stop_price"] is not None:
+            # Already finalized (idempotent re-entry) or the position has
+            # moved on since -- never clobber a later state's data.
+            return store.load_position(position_id)
+        locked["stop_price"] = stop_price
+        locked["target_1_price"] = target_1_price
+        locked["target_2_price"] = target_2_price
+    return store.load_position(position_id)
+
+
+_EXIT_ELIGIBLE_STATES = (states.STOP_ACTIVE, states.TARGET_1_ACTIVE, states.PARTIAL_EXITED, states.TRAILING)
+_FILL_PENDING_STATES = (states.ENTRY_SUBMITTED, states.PARTIALLY_FILLED)
+
+
+def _find_kis_fill_for_order(kis_broker, broker_order_id, *, now):
+    if not broker_order_id:
+        return None
+    try:
+        fills = kis_broker.get_fills(start_date=now.strftime("%Y%m%d"), end_date=now.strftime("%Y%m%d"))
+    except Exception:
+        return None
+    for fill in fills:
+        if fill.get("ODNO") == broker_order_id or fill.get("odno") == broker_order_id:
+            try:
+                qty = float(fill.get("ft_ccld_qty") or fill.get("FT_CCLD_QTY") or 0)
+                price = float(fill.get("ft_ccld_unpr3") or fill.get("FT_CCLD_UNPR3") or 0)
+            except (TypeError, ValueError):
+                return None
+            if qty <= 0 or price <= 0:
+                return None
+            return {"filled_qty": qty, "average_fill_price": price}
+    return None
+
+
+def sync_kis_fills_and_manage_exits(*, kis_broker, broker_adapter, now=None):
+    """One tick of the sell/exit monitoring cycle. Never raises for a
+    single-position failure -- returns a summary dict instead so a
+    scheduler can log/alert without the whole cycle aborting."""
+    current = now or datetime.now(timezone.utc)
+    summary = {"synced_fills": [], "managed": [], "reconciliation_blocked": [], "skipped": []}
+
+    try:
+        kis_positions = kis_broker.get_positions()
+    except Exception as exc:
+        raise KISPositionManagerError(f"KIS position read failed, aborting this tick: {exc}") from exc
+
+    kis_qty_by_symbol = {p.symbol: p.quantity for p in kis_positions}
+    open_positions = store.load_non_terminal()
+
+    for position_id, record in open_positions.items():
+        symbol = record["symbol"]
+
+        if record["state"] in _FILL_PENDING_STATES:
+            fill = _find_kis_fill_for_order(kis_broker, record.get("broker_order_id"), now=current)
+            if fill is not None:
+                try:
+                    updated = lifecycle.record_fill(
+                        position_id, fill["filled_qty"], fill["average_fill_price"],
+                    )
+                except Exception as exc:
+                    summary["skipped"].append((symbol, f"record_fill failed: {exc}"))
+                    continue
+                summary["synced_fills"].append(symbol)
+                if updated["state"] == states.STOP_ACTIVE:
+                    record = finalize_stop_and_targets_from_fill(position_id, fill["average_fill_price"])
+                else:
+                    record = updated
+            else:
+                summary["skipped"].append((symbol, "no KIS fill yet"))
+                continue
+
+        if record["state"] not in _EXIT_ELIGIBLE_STATES:
+            continue
+
+        # Reconciliation gate (spec §16/§3): internal remaining_qty must
+        # match KIS's actual reported quantity for this symbol before any
+        # exit management runs for it -- never auto-correct, never
+        # auto-sell to "fix" a mismatch.
+        kis_qty = kis_qty_by_symbol.get(symbol, 0)
+        if kis_qty != record["remaining_qty"]:
+            summary["reconciliation_blocked"].append(
+                (symbol, f"internal remaining_qty={record['remaining_qty']!r} != KIS quantity={kis_qty!r}")
+            )
+            continue
+
+        if record["stop_price"] is None:
+            # Defensive: should be unreachable (finalize_stop_and_targets_
+            # from_fill() runs synchronously above the instant STOP_ACTIVE
+            # is reached), but check_and_manage() requires a real
+            # stop_price to compare against -- never call it with None.
+            summary["skipped"].append((symbol, "stop_price not yet finalized"))
+            continue
+
+        try:
+            current_price = broker_adapter.kis_broker.get_current_price(broker_adapter._instrument(symbol))
+        except Exception as exc:
+            summary["skipped"].append((symbol, f"KIS price read failed: {exc}"))
+            continue
+
+        try:
+            lifecycle.check_and_manage(
+                position_id, current_price=current_price, broker=broker_adapter, now=current,
+                order_date=current.date().isoformat(),
+            )
+            summary["managed"].append(symbol)
+        except Exception as exc:
+            summary["skipped"].append((symbol, f"check_and_manage failed: {exc}"))
+
+    return summary
