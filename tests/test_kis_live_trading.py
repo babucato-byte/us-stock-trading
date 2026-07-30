@@ -7,6 +7,7 @@ from config.live_rollout_config import LiveRolloutConfig
 from domain.account_snapshot import AccountSnapshot
 from domain.execution_event import ExecutionRecord
 import kis_live_trading as klt
+import shadow_mode
 from operations import kill_switch as ops_kill_switch
 
 NOW = datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc)
@@ -18,6 +19,7 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.setenv("POSITION_STORE_FILE", str(tmp_path / "POSITION_STORE.json"))
     monkeypatch.setenv("KILL_SWITCH_STATE_FILE", str(tmp_path / "KILL_SWITCH.json"))
     monkeypatch.setenv("OPERATIONS_HALT_STATE_FILE", str(tmp_path / "OPS_HALT.json"))
+    monkeypatch.setenv("SHADOW_MODE_LOG_FILE", str(tmp_path / "SHADOW_MODE_LOG.jsonl"))
     from execution import idempotency
     monkeypatch.setattr(idempotency, "_LOCK_FILE", tmp_path / "KIS_ORDER_IDEMPOTENCY.lock")
     monkeypatch.setenv("VALIDATED_COMMIT", "c1")
@@ -67,6 +69,9 @@ class _FakeBroker:
 
     def get_open_orders(self):
         return self.open_orders
+
+    def get_positions(self):
+        return []
 
     def submit_order(self, order_intent, instrument):
         self.submit_calls.append((order_intent, instrument))
@@ -136,6 +141,26 @@ class TestPerSymbolOutcomes:
         results = klt.run_live_buy_entry_cycle(broker=broker, live_rollout=_rollout(), now=NOW)
         assert results["submitted"] == ["AAPL"]
         assert len(broker.submit_calls) == 1
+
+    def test_success_persists_shadow_mode_record(self, monkeypatch):
+        _patch_common(monkeypatch)
+        broker = _FakeBroker()
+        klt.run_live_buy_entry_cycle(broker=broker, live_rollout=_rollout(), now=NOW)
+        rows = shadow_mode.read_all()
+        assert len(rows) == 1
+        assert rows[0]["symbol"] == "AAPL"
+        assert rows[0]["risk_gate_result"] == "APPROVED"
+        assert rows[0]["kis_validation_price"] is not None
+        assert rows[0]["price_difference_percent"] is not None
+
+    def test_price_deviation_blocked_persists_shadow_mode_record(self, monkeypatch):
+        _patch_common(monkeypatch)
+        broker = _FakeBroker(price=105.0)  # 5% > 0.30% limit
+        klt.run_live_buy_entry_cycle(broker=broker, live_rollout=_rollout(), now=NOW)
+        rows = shadow_mode.read_all()
+        assert len(rows) == 1
+        assert rows[0]["risk_gate_result"] == "BLOCKED"
+        assert rows[0]["rejection_reason"] is not None
 
     def test_symbol_not_on_allow_list_skipped(self, monkeypatch):
         _patch_common(monkeypatch, tickers=("MSFT",))

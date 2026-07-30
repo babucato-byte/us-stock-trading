@@ -42,7 +42,10 @@ from datetime import datetime, timezone
 
 import kis_position_manager
 import paper_strategy_order as pso
+import risk_config
+import shadow_mode
 from brokers.kis_broker import KISAmbiguousResponseError, KISBrokerError
+from config import scalping_strategy_v1_config as strat_cfg
 from config.live_rollout_config import LiveRolloutConfig, LiveRolloutConfigError
 from domain.instrument import Instrument, InstrumentError, build_instrument
 from domain.order_intent import OrderIntent, OrderIntentError
@@ -192,6 +195,18 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None):
                 (o.get("pdno") or o.get("PDNO")) == symbol for o in open_orders
             )
 
+            try:
+                existing_positions = broker.get_positions()
+            except KISBrokerError:
+                existing_positions = []
+            existing_position_qty = next(
+                (p.quantity for p in existing_positions if p.symbol == symbol), 0
+            )
+            planned_stop_price = buffered_price * (1 + risk_config.STOP_LOSS_RATE)
+            planned_risk_per_share = buffered_price - planned_stop_price
+            planned_target_price = buffered_price + planned_risk_per_share * strat_cfg.TARGET_1_R_MULTIPLE
+            price_diff_percent = compute_price_deviation_percent(signal.signal_price, kis_quote.price_usd)
+
             def _buy_ctx_builder(
                 signal=signal, instrument=instrument, order_intent=order_intent,
                 kis_price=kis_quote.price_usd, available_usd=available_usd,
@@ -209,12 +224,26 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None):
                     reconciliation_ok=True, has_unknown_order=False, now=current,
                 )
 
+            def _shadow_record(risk_gate_result, rejection_reason=None):
+                return shadow_mode.build_record(
+                    signal_id=signal.signal_id, strategy_id=signal.strategy_id,
+                    strategy_version="v1", code_commit=deployed_commit, symbol=symbol, side="buy",
+                    alpaca_signal_price=signal.signal_price, kis_validation_price=kis_quote.price_usd,
+                    price_difference_percent=price_diff_percent, planned_quantity=order_intent.quantity,
+                    planned_limit_price=order_intent.limit_price, stop_price=planned_stop_price,
+                    target_price=planned_target_price, risk_gate_result=risk_gate_result,
+                    rejection_reason=rejection_reason, account_available_usd=available_usd,
+                    existing_position_quantity=existing_position_qty,
+                    existing_open_order=has_open_order_for_symbol, now=current,
+                )
+
             try:
                 result = execution_engine.submit_buy_order(
                     order_intent=order_intent, buy_gate_context_builder=_buy_ctx_builder,
                     conn=conn, broker=broker, instrument=instrument, now=current,
                 )
                 results["submitted"].append(symbol)
+                shadow_mode.persist(_shadow_record("APPROVED"))
                 # spec: "매수 체결 이후 포지션 관리는 KIS 실제 보유수량과
                 # 평균체결가를 기준으로 한다" -- create the positions/
                 # lifecycle.py row now so kis_position_manager.py's sync
@@ -235,10 +264,13 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None):
                     results["blocked"].append((symbol, f"WARNING: position tracking failed after successful buy: {exc}"))
             except ExecutionEngineError as exc:
                 results["blocked"].append((symbol, str(exc)))
+                shadow_mode.persist(_shadow_record("BLOCKED", str(exc)))
             except KISAmbiguousResponseError as exc:
                 results["blocked"].append((symbol, f"ambiguous KIS response, order status UNKNOWN: {exc}"))
+                shadow_mode.persist(_shadow_record("AMBIGUOUS", str(exc)))
             except KISBrokerError as exc:
                 results["blocked"].append((symbol, f"KIS order rejected: {exc}"))
+                shadow_mode.persist(_shadow_record("REJECTED", str(exc)))
     finally:
         conn.close()
 
