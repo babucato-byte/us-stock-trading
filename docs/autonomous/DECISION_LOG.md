@@ -749,3 +749,47 @@
 - 승인 필요 여부: 아니오(코드 구현·테스트 추가·문서화 범위). 단, `KIS_LIVE_ORDER_ENABLED`/
   `LIVE_ROLLOUT_ENABLED`를 실제로 켜는 것, Oracle 서버 배포 실행, main 병합/origin push는
   전부 이 사이클에서 수행하지 않았고 별도 승인이 필요하다.
+
+## KIS 매도 라이프사이클 연결 + Alpaca 운영 경로 최종 차단 (2026-07-29~31, feature/kis-live-broker)
+
+- 결정 8(기존 positions/lifecycle.py 매도 엔진에 KIS 연결, 새 매도 규칙 없음) —
+  `positions/lifecycle.py::check_and_manage()`(손절/익절/분할익절/트레일링(breakeven)/시간손절/
+  EOD강제청산)는 이미 완전히 구현·테스트됐지만 실제로는 어떤 운영 경로에서도 호출되지 않는
+  휴면 서브시스템이었다(확인됨: `paper_strategy_order.main()`은 이 엔진을 전혀 사용하지 않고
+  자체 매수 로직만 가짐). `brokers/kis_broker_adapter.py` + `kis_position_manager.py`가 이
+  엔진을 KIS에 그대로("연결"만, 정책 미변경) 연결한다. `check_invalidation()`(전략 무효화
+  매도)만 명시적으로 제외했다 — score 기반 진입에는 `.invalidate()`를 가진 Strategy 플러그인
+  객체가 없고, 이를 임의로 만들어내는 것은 "새로운 매도 전략 추가"에 해당하기 때문이다.
+- 결정 9(손절/익절 기준 가격 = KIS 실제 평균체결가, 계산 공식은 기존 것 재사용) —
+  `positions/lifecycle.py::enter_position()`은 원래 신호 시점 가격으로 stop/target을 설정하지만,
+  사용자 지시(§4)는 KIS 실제 체결가 기준을 명시적으로 요구했다. `kis_position_manager.
+  finalize_stop_and_targets_from_fill()`이 체결 확인 직후(record_fill 이후) 별도로 계산하도록
+  분리했다 — 공식 자체는 `risk_config.STOP_LOSS_RATE`(이미 `live_readiness/
+  live_entry_pipeline.py`가 Alpaca-KRW 파일럿에 재사용 중인 동일 상수)와
+  `strategy/plugins/vwap_micro_pullback_v1.calculate_targets()`의 R-multiple 공식(그대로
+  인라인 재사용, 플러그인 객체를 생성하지 않은 이유는 그 메서드가 상태 없는 순수 계산이라
+  무거운 의존성을 새로 만들 필요가 없었기 때문)을 그대로 가져다 썼다 — 새 공식을 만들지 않았다.
+- 결정 10(Shadow Mode는 KIS_LIVE_ORDER_ENABLED=false와 별개로 구조화 기록) — 사용자가
+  "`KIS_LIVE_ORDER_ENABLED=false`만으로 Shadow Mode를 대체하지 않는다"고 명시했으므로,
+  `shadow_mode.py`가 매 매수 시도마다(승인/차단 불문) signal_id·가격차이·계획 수량 등 요구된
+  전 필드를 JSONL로 영속 기록한다. 초기 단계 실패(가격조회 자체 실패 등, 필수 필드 대부분이
+  아직 없는 시점)는 로깅 범위에서 제외했다 — 문서화된 의도적 축소, 은폐 아님.
+- 결정 11(Alpaca 운영 경로 최종 차단 — `paper_strategy_order.submit_order()` 래퍼에 배선,
+  `AlpacaBroker` 클래스 자체에는 배선하지 않음) — 사용자 지시 §6("운영 진입점에서 Alpaca
+  주문 클라이언트 사용 제거")을 문자 그대로 `AlpacaBroker.submit_order()` 클래스 메서드에
+  배선했다면, 그 클래스를 직접 단위 테스트하는 기존 테스트 수십 건(broker/alpaca_client.py
+  자체의 안전 로직을 검증하는, "운영 진입점"이 아닌 순수 단위 테스트)까지 전부 깨졌을 것이다.
+  대신 `paper_strategy_order.submit_order()`(실제 `main()`과 `positions/lifecycle.py`의 매도
+  경로 둘 다가 호출하는 유일한 "운영 진입점" 래퍼) 안에 `isinstance(broker, AlpacaBroker)`
+  조건으로 `broker.config.validate_alpaca_order_permitted()`를 호출하도록 배선했다 — 실제
+  영향받은 기존 테스트는 정확히 2개 파일, 8개 테스트 함수뿐이었다(사전에 Explore로 확인).
+  전부 "CODEX-026+ Alpaca-KRW live-entry-context 게이트 자체의 동작"을 검증하는 legacy 테스트로
+  식별되어, 삭제/완화가 아니라 `alpaca_order_enabled=True`/`alpaca_paper_order_enabled=True`를
+  명시적으로 켜서 원래 의도대로 그 게이트를 계속 검증하도록 수정했다(사용자 지시의 "기존 Paper
+  주문 코드는 필요하면 별도 테스트·레거시 모듈로 격리"와 정확히 일치하는 처리). FakeBroker 등
+  테스트 더블은 `isinstance` 검사에 걸리지 않아 전혀 영향받지 않았다. 신규
+  `tests/test_alpaca_operational_path_disabled.py`가 기본값(플래그 미설정)에서 paper/live ×
+  buy/sell 4가지 조합 모두 broker 호출 0회로 차단됨을, 그리고 명시적으로 켰을 때는 여전히
+  기존 자격증명/kill-switch 게이트를 그대로 통과해야 함을 회귀 테스트로 고정했다.
+- 승인 필요 여부: 아니오(코드 구현·테스트 추가·문서화 범위). `main` 병합/origin push는
+  수행하지 않았다.

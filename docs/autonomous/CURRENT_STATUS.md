@@ -1,10 +1,38 @@
 # CURRENT_STATUS
 
-마지막 갱신: 2026-07-29
+마지막 갱신: 2026-07-31
 
 ## 현재 Phase
-**Alpaca 데이터 전용 / KIS 실거래 브로커 전환 — 매수 경로 구현 완료, 매도 자동화 대기 중
-(2026-07-29, `feature/kis-live-broker` 브랜치, `BLOCKED`).**
+**Alpaca 데이터 전용 / KIS 실거래 브로커 전환 — 매수·매도 전체 경로 구현 완료
+(2026-07-31, `feature/kis-live-broker` 브랜치, HEAD `ad50311`, `BLOCKED`).**
+
+이전 사이클(매수 경로만 완료)에 이어, 사용자가 "매도 자동화는 새 전략 설계가 아니라 기존
+`positions/lifecycle.py` 매도·손절·익절 정책을 KIS에 연결하는 작업"이라고 명확히 하며 계속
+진행을 지시했다. 5개 신규 커밋으로 다음을 완료했다(전체 회귀 **1,613 passed, 0 failed**):
+
+- `brokers/kis_broker_adapter.py`: `positions/lifecycle.py`의 이미 완성·검증된 매도 엔진
+  (`check_and_manage()` — 손절/익절/분할익절/트레일링/시간손절/EOD강제청산, 정책 미변경)이
+  KIS로 실제 매도 주문을 낼 수 있게 하는 브로커 어댑터.
+- `kis_position_manager.py`: KIS 매수 체결 후 포지션 레코드 생성, **KIS 실제 평균체결가
+  기준**(신호가 아님)으로 손절/익절가 확정(`risk_config.STOP_LOSS_RATE` + 기존 R-multiple
+  공식 재사용), 매 tick마다 KIS 체결/포지션 조회 → 리콘실리에이션(불일치 시 차단, 자동 보정
+  없음) → `check_and_manage()` 재사용. `check_invalidation()`(전략 무효화 매도)는 의도적으로
+  제외 — score 기반 진입에는 대응하는 Strategy 플러그인 객체가 없어 임의로 만들면 "새 매도
+  전략 추가"가 되기 때문(문서화된 잔여 범위).
+- `shadow_mode.py`: 요구된 전 필드를 JSONL로 영속 기록 — `KIS_LIVE_ORDER_ENABLED=false`와
+  별개의 산출물.
+- `paper_strategy_order.submit_order()`(실제 `main()`/매도 경로가 호출하는 유일한 운영
+  진입점)에 Alpaca 주문 차단을 **실제로 배선**했다 — 이제 실 `AlpacaBroker` 인스턴스가 이
+  경로에 도달하면 기본값(플래그 미설정)에서 broker 호출 0회로 차단된다. `AlpacaBroker` 클래스
+  자체가 아니라 이 운영 래퍼에만 배선해, 그 클래스를 직접 단위 테스트하는 기존 테스트들은
+  전혀 건드리지 않았다. 영향받은 기존 테스트 정확히 8개(2개 파일)는 삭제/완화 없이 명시적
+  플래그 활성화로 원래 의도(레거시 게이트 자체 검증)를 유지했다.
+
+**남은 것**: Codex 독립 검증(외부 비동기 프로세스, 직접 트리거 불가), Oracle 서버 배포·KIS
+실계좌 조회·실제 KIS 대상 Shadow Mode 실행(전부 이 환경의 도구 접근 한계로 미실시, 코드/문서는
+완료), main 병합·origin push(사용자 지시대로 검증 전 보류).
+
+**Live trading: DO_NOT_ENABLE.** `approved`/`live_enabled`는 여전히 `false`.
 
 사용자가 최종 아키텍처 전환을 지시했다: Alpaca는 시장 데이터·종목 탐색 전용으로 고정(Paper/Live
 주문 완전 차단), 한국투자증권(KIS) Open API가 유일한 실주문 브로커. 기준 태그
