@@ -170,6 +170,8 @@ def test_submit_order_payload_preserves_explicit_side(monkeypatch, side):
     monkeypatch.setenv("TRADING_MODE", "paper")
     monkeypatch.setenv("ALPACA_API_KEY", "key")
     monkeypatch.setenv("ALPACA_SECRET_KEY", "secret")
+    monkeypatch.setenv("ALPACA_PAPER_ORDER_ENABLED", "true")
+    monkeypatch.setenv("EXECUTION_BROKER", "alpaca")
     session = RecordingSession()
     broker = AlpacaBroker(config=BrokerConfig.from_env(), session=session)
 
@@ -282,6 +284,8 @@ def test_cancel_delete_uses_common_runtime_gate(monkeypatch):
     monkeypatch.setenv("TRADING_MODE", "paper")
     monkeypatch.setenv("ALPACA_API_KEY", "key")
     monkeypatch.setenv("ALPACA_SECRET_KEY", "secret")
+    monkeypatch.setenv("ALPACA_PAPER_ORDER_ENABLED", "true")
+    monkeypatch.setenv("EXECUTION_BROKER", "alpaca")
     session = RecordingSession()
     broker = AlpacaBroker(config=BrokerConfig.from_env(), session=session)
 
@@ -322,6 +326,8 @@ def _make_broker_with_captured_env(monkeypatch):
     monkeypatch.setenv("TRADING_MODE", "paper")
     monkeypatch.setenv("ALPACA_API_KEY", _ORIG_API_KEY)
     monkeypatch.setenv("ALPACA_SECRET_KEY", _ORIG_SECRET_KEY)
+    monkeypatch.setenv("ALPACA_PAPER_ORDER_ENABLED", "true")
+    monkeypatch.setenv("EXECUTION_BROKER", "alpaca")
     config = BrokerConfig.from_env()
     session = RecordingSession()
     broker = AlpacaBroker(config=config, session=session)

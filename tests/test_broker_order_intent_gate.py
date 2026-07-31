@@ -79,7 +79,13 @@ def _matching_env_credentials(monkeypatch):
 
 
 def _make_broker(session=None, api_key="key", secret_key="secret"):
-    config = BrokerConfig(trading_mode="paper", api_key=api_key, secret_key=secret_key)
+    # KIS migration (CODEX-042): this file tests the order-intent
+    # (purpose/side/payload 3-way match) gate specifically, not the
+    # Alpaca-order-disabled gate.
+    config = BrokerConfig(
+        trading_mode="paper", api_key=api_key, secret_key=secret_key,
+        execution_broker="alpaca", alpaca_paper_order_enabled=True,
+    )
     return AlpacaBroker(config=config, session=session or RecordingSession())
 
 

@@ -229,6 +229,10 @@ def test_paper_mode_passes_trading_mode_check(monkeypatch):
 
 
 def test_unknown_trading_mode_is_blocked():
+    # KIS migration: with execution_broker left at its "kis" default,
+    # CODEX-042's gate blocks this order before validate_order_allowed()
+    # is ever reached -- still a hard block either way (RuntimeError,
+    # zero network calls), just an earlier and more fundamental one.
     config = BrokerConfig(
         trading_mode="papre",
         api_key="key",
@@ -236,8 +240,22 @@ def test_unknown_trading_mode_is_blocked():
     )
     broker = AlpacaBroker(config=config, session=DummySession())
 
-    with pytest.raises(RuntimeError, match="must be exactly 'paper'"):
+    with pytest.raises(RuntimeError, match="Alpaca order blocked"):
         broker.submit_order("AAPL", qty=1, side="buy")
+
+
+def test_unknown_trading_mode_is_blocked_by_validate_order_allowed_when_alpaca_authorized():
+    # The original, more specific check this test used to exercise
+    # directly -- still reachable and still correct once Alpaca is
+    # explicitly authorized as the execution broker (an "unrecognized
+    # trading_mode" can't satisfy is_live_mode/is_paper_mode, so no
+    # order-enabled flag applies, but CODEX-042's own gate raises first
+    # with its own "unrecognized trading_mode" message in that case --
+    # this test isolates validate_order_allowed()'s pre-existing message
+    # by calling it directly).
+    config = BrokerConfig(trading_mode="papre", api_key="key", secret_key="secret")
+    with pytest.raises(RuntimeError, match="must be exactly 'paper'"):
+        config.validate_order_allowed()
 
 
 def test_paper_mode_with_live_endpoint_is_blocked():
@@ -246,6 +264,8 @@ def test_paper_mode_with_live_endpoint_is_blocked():
         paper_base_url="https://api.alpaca.markets",
         api_key="key",
         secret_key="secret",
+        execution_broker="alpaca",
+        alpaca_paper_order_enabled=True,
     )
     broker = AlpacaBroker(config=config, session=DummySession())
 

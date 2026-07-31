@@ -271,6 +271,18 @@ class AlpacaBroker:
         # regardless of what the kill switch state would otherwise allow.
         validate_order_intent(purpose, order_side, kwargs.get("json"))
 
+        # CODEX-042: Alpaca is market-data-only in this deployment -- any
+        # ORDER-shaped purpose (submit/cancel, never a read-only/
+        # reconciliation call) must pass validate_alpaca_order_permitted()
+        # before self.session.request() is ever reached, regardless of
+        # which method/call path got here (submit_order(), cancel_order(),
+        # a direct AlpacaBroker() instantiation bypassing every wrapper, a
+        # dynamic import/alias -- all of them funnel through this single
+        # _request() method, so this is the one place a check here closes
+        # every path at once).
+        if purpose in (RequestPurpose.ENTRY_ORDER, RequestPurpose.EXIT_ORDER, RequestPurpose.CANCEL_ORDER):
+            self.config.validate_alpaca_order_permitted()
+
         self._validate_runtime_safety()
         self._check_kill_switch(purpose, order_side)
         url = f"{self.config.base_url}{path}"

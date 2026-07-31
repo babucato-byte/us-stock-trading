@@ -60,11 +60,71 @@ class TestAlpacaOperationalPathDisabledByDefault:
         session = _NetworkForbiddenSession()
         broker = AlpacaBroker(
             config=BrokerConfig(trading_mode="paper", api_key="key", secret_key="secret",
-                                 alpaca_paper_order_enabled=True),
+                                 alpaca_paper_order_enabled=True, execution_broker="alpaca"),
             session=session,
         )
         with pytest.raises(RuntimeError, match="Credential revalidation failed"):
             pso.submit_order("AAPL", qty=1, broker=broker, client_order_id="c-3", side="buy")
+
+    def test_alpaca_order_enabled_true_alone_does_not_bypass_execution_broker_check(self):
+        # CODEX-042 required test: "ALPACA_ORDER_ENABLED=true,
+        # EXECUTION_BROKER=kis -> HTTP 호출 0회" -- a single flag can
+        # never alone re-enable Alpaca; execution_broker must ALSO be
+        # explicitly "alpaca".
+        session = _NetworkForbiddenSession()
+        broker = AlpacaBroker(
+            config=BrokerConfig(trading_mode="live", enable_real_trading=True, live_dry_run=False,
+                                 api_key="key", secret_key="secret", alpaca_order_enabled=True,
+                                 execution_broker="kis"),
+            session=session,
+        )
+        response = pso.submit_order("AAPL", qty=1, broker=broker, client_order_id="c-5", side="buy")
+        assert response.status_code == 423
+        assert session.requests == []
+
+    def test_direct_broker_submit_order_call_zero_http_calls(self):
+        # CODEX-042 required test: "직접 broker.submit_order 호출 -> HTTP
+        # 호출 0회" -- bypassing paper_strategy_order.submit_order()
+        # entirely and calling AlpacaBroker.submit_order() directly must
+        # still be blocked, since the real gate lives at the true final
+        # network boundary (_request()), not just the wrapper.
+        session = _NetworkForbiddenSession()
+        broker = AlpacaBroker(
+            config=BrokerConfig(trading_mode="paper", api_key="key", secret_key="secret"),
+            session=session,
+        )
+        with pytest.raises(RuntimeError, match="Alpaca order blocked"):
+            broker.submit_order("AAPL", qty=1, side="buy")
+        assert session.requests == []
+
+    def test_direct_broker_cancel_order_call_zero_http_calls(self):
+        # CODEX-042 required test: "직접 broker.cancel_order 호출 -> HTTP
+        # 호출 0회".
+        session = _NetworkForbiddenSession()
+        broker = AlpacaBroker(
+            config=BrokerConfig(trading_mode="paper", api_key="key", secret_key="secret"),
+            session=session,
+        )
+        with pytest.raises(RuntimeError, match="Alpaca order blocked"):
+            broker.cancel_order("order-1")
+        assert session.requests == []
+
+    def test_dynamic_import_alias_call_zero_http_calls(self):
+        # CODEX-042 required test: "동적 import 또는 별칭 호출 -> HTTP
+        # 호출 0회" -- however AlpacaBroker is imported/aliased, it is the
+        # same class with the same _request() gate; there is no separate
+        # "fast path" a dynamic import could reach instead.
+        import importlib
+        session = _NetworkForbiddenSession()
+        alpaca_module = importlib.import_module("broker.alpaca_client")
+        AliasedBroker = getattr(alpaca_module, "AlpacaBroker")
+        broker = AliasedBroker(
+            config=BrokerConfig(trading_mode="paper", api_key="key", secret_key="secret"),
+            session=session,
+        )
+        with pytest.raises(RuntimeError, match="Alpaca order blocked"):
+            broker.submit_order("AAPL", qty=1, side="sell")
+        assert session.requests == []
 
     def test_fake_broker_double_unaffected(self):
         class _FakeBroker:

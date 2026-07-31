@@ -73,7 +73,14 @@ def _matching_env_credentials(monkeypatch):
 
 
 def _make_broker(session=None, api_key="key", secret_key="secret"):
-    config = BrokerConfig(trading_mode="paper", api_key=api_key, secret_key=secret_key)
+    # KIS migration (CODEX-042): this file tests the RequestPurpose gate
+    # specifically, not the Alpaca-order-disabled gate -- explicitly
+    # authorize Alpaca paper orders so these tests keep exercising exactly
+    # what they were designed to test.
+    config = BrokerConfig(
+        trading_mode="paper", api_key=api_key, secret_key=secret_key,
+        execution_broker="alpaca", alpaca_paper_order_enabled=True,
+    )
     return AlpacaBroker(config=config, session=session or RecordingSession())
 
 

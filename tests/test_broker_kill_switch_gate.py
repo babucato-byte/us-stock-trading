@@ -72,7 +72,8 @@ def _make_broker(session=None):
     # Alpaca-order-disabled gate -- alpaca_paper_order_enabled=True keeps
     # every test here exercising exactly what it was designed to test.
     config = BrokerConfig(
-        trading_mode="paper", api_key="key", secret_key="secret", alpaca_paper_order_enabled=True,
+        trading_mode="paper", api_key="key", secret_key="secret",
+        execution_broker="alpaca", alpaca_paper_order_enabled=True,
     )
     return AlpacaBroker(config=config, session=session or RecordingSession())
 

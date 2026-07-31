@@ -74,6 +74,14 @@ def _default_alpaca_paper_order_enabled():
     return env_bool(os.environ, "ALPACA_PAPER_ORDER_ENABLED", False)
 
 
+def _default_execution_broker():
+    # CODEX-042: the confirmed architecture has exactly one execution
+    # broker (KIS) -- "kis" is the fail-safe default so a bare
+    # BrokerConfig()/missing env var never accidentally reads as "this
+    # deployment's execution broker is alpaca".
+    return os.getenv("EXECUTION_BROKER", "kis").strip().lower()
+
+
 @dataclass(frozen=True)
 class BrokerConfig:
     trading_mode: str = field(default_factory=_default_trading_mode)
@@ -85,6 +93,7 @@ class BrokerConfig:
     secret_key: Optional[str] = field(default_factory=_default_secret_key)
     alpaca_order_enabled: bool = field(default_factory=_default_alpaca_order_enabled)
     alpaca_paper_order_enabled: bool = field(default_factory=_default_alpaca_paper_order_enabled)
+    execution_broker: str = field(default_factory=_default_execution_broker)
 
     @classmethod
     def from_env(cls, env=None):
@@ -105,6 +114,7 @@ class BrokerConfig:
             secret_key=mapping.get("ALPACA_SECRET_KEY"),
             alpaca_order_enabled=env_bool(mapping, "ALPACA_ORDER_ENABLED", False),
             alpaca_paper_order_enabled=env_bool(mapping, "ALPACA_PAPER_ORDER_ENABLED", False),
+            execution_broker=mapping.get("EXECUTION_BROKER", "kis").strip().lower(),
         )
 
     @property
@@ -152,15 +162,34 @@ class BrokerConfig:
 
 
     def validate_alpaca_order_permitted(self):
-        """KIS migration fail-closed gate: raises RuntimeError unless the
-        flag matching the CURRENT trading_mode is explicitly True. This is
-        independent of (and stricter than) validate_order_allowed() above
-        -- that method governs Paper-vs-Live safety within "Alpaca is
+        """KIS migration fail-closed gate (CODEX-042): raises RuntimeError
+        unless ALL THREE of the following hold --
+
+            1. the order-enabled flag matching the CURRENT trading_mode is
+               explicitly True (ALPACA_ORDER_ENABLED for live,
+               ALPACA_PAPER_ORDER_ENABLED for paper)
+            2. execution_broker == "alpaca" (the confirmed architecture's
+               execution_broker is "kis" by default -- see
+               _default_execution_broker())
+            3. trading_mode is recognized (paper or live)
+
+        This is independent of (and stricter than) validate_order_allowed()
+        above -- that method governs Paper-vs-Live safety within "Alpaca is
         allowed to place orders"; this one governs whether Alpaca is
-        allowed to place ANY order at all, live or paper, now that KIS is
-        the sole live-order broker. Not yet called from
-        AlpacaBroker.submit_order() -- see _default_alpaca_order_enabled()'s
-        docstring for why."""
+        allowed to place ANY order at all. Called from AlpacaBroker.
+        _request() itself (broker/alpaca_client.py) for every order-shaped
+        purpose (ENTRY_ORDER/EXIT_ORDER/CANCEL_ORDER) -- the true final
+        network boundary shared by submit_order()/cancel_order() and any
+        future order method -- so no call path (direct instantiation,
+        dynamic import, alias) can reach the fake/real HTTP layer while
+        bypassing this check. A single ALPACA_ORDER_ENABLED=true can never
+        alone re-enable Alpaca orders; execution_broker must also be
+        explicitly "alpaca"."""
+        if self.execution_broker != "alpaca":
+            raise RuntimeError(
+                f"Alpaca order blocked: execution_broker={self.execution_broker!r}, not 'alpaca' -- "
+                "Alpaca is configured as market-data-only in this deployment."
+            )
         if self.is_live_mode:
             if not self.alpaca_order_enabled:
                 raise RuntimeError(

@@ -718,7 +718,8 @@ def _live_broker():
     # what they were designed to test.
     return AlpacaBroker(
         config=BrokerConfig(trading_mode="live", enable_real_trading=True, live_dry_run=False,
-                             api_key="key", secret_key="secret", alpaca_order_enabled=True),
+                             api_key="key", secret_key="secret", alpaca_order_enabled=True,
+                             execution_broker="alpaca"),
         session=_NetworkForbiddenSession(),
     )
 
@@ -751,7 +752,8 @@ def test_live_buy_symbol_not_allowed_blocked_zero_network_calls():
 def test_live_sell_never_gated_by_live_entry_context():
     broker = AlpacaBroker(
         config=BrokerConfig(trading_mode="live", enable_real_trading=False, live_dry_run=True,
-                             api_key="key", secret_key="secret", alpaca_order_enabled=True),
+                             api_key="key", secret_key="secret", alpaca_order_enabled=True,
+                             execution_broker="alpaca"),
         session=_NetworkForbiddenSession(),
     )
     response = pso.submit_order("AAPL", qty=1, broker=broker, client_order_id="c-3", side="sell")
@@ -762,7 +764,7 @@ def test_paper_mode_buy_unaffected_by_missing_live_entry_context():
     session = _NetworkForbiddenSession()
     broker = AlpacaBroker(
         config=BrokerConfig(trading_mode="paper", api_key="key", secret_key="secret",
-                             alpaca_paper_order_enabled=True),
+                             alpaca_paper_order_enabled=True, execution_broker="alpaca"),
         session=session,
     )
     with pytest.raises(RuntimeError, match="Credential revalidation failed"):
@@ -956,7 +958,8 @@ def _live_broker_for_fault_injection(session, monkeypatch):
 
     broker = AlpacaBroker(
         config=_BC(trading_mode="live", enable_real_trading=True, live_dry_run=False,
-                   api_key="key", secret_key="secret"),
+                   api_key="key", secret_key="secret", alpaca_order_enabled=True,
+                   execution_broker="alpaca"),
         session=session,
     )
     monkeypatch.setattr(_BC, "validate_order_allowed", lambda self: True)
@@ -1045,7 +1048,8 @@ def test_ambiguous_broker_failure_marks_submission_unknown_not_released(monkeypa
     session = _TimeoutThenOkSession()
     broker = AlpacaBroker(
         config=_BC(trading_mode="live", enable_real_trading=True, live_dry_run=False,
-                   api_key="key", secret_key="secret"),
+                   api_key="key", secret_key="secret", alpaca_order_enabled=True,
+                   execution_broker="alpaca"),
         session=session,
     )
     # bypass the "real live trading is disabled" hard pre-live block so we

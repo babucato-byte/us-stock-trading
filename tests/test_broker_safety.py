@@ -87,6 +87,10 @@ def test_live_dry_run_order_not_submitted():
 
 
 def test_live_real_order_disabled_even_with_flags():
+    # KIS migration: this test targets validate_order_allowed()'s own
+    # "live real trading disabled in this pre-live PR" block
+    # specifically -- authorize Alpaca live orders so the check under
+    # test is reached, not CODEX-042's earlier execution_broker gate.
     broker = AlpacaBroker(
         config=BrokerConfig(
             trading_mode="live",
@@ -94,6 +98,8 @@ def test_live_real_order_disabled_even_with_flags():
             live_dry_run=False,
             api_key="key",
             secret_key="secret",
+            alpaca_order_enabled=True,
+            execution_broker="alpaca",
         ),
         session=DummySession(),
     )

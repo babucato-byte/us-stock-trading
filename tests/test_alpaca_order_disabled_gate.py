@@ -2,9 +2,15 @@
 (BrokerConfig.validate_alpaca_order_permitted()). Alpaca is being
 repositioned as market-data-only; these flags default to disabled for
 both paper and live modes per the migration spec's recommended env
-block. Not yet wired into AlpacaBroker.submit_order() (see
-_default_alpaca_order_enabled()'s docstring in broker_config.py) -- these
-tests cover the gate function itself in isolation.
+block. Wired into AlpacaBroker._request() (CODEX-042) for every
+order-shaped purpose -- see tests/test_alpaca_operational_path_
+disabled.py for the end-to-end proof; these tests cover the gate
+function itself in isolation.
+
+`_config()`'s default execution_broker="alpaca" isolates the flag-
+specific tests below from CODEX-042's execution_broker check (covered
+separately by TestExecutionBrokerGate) -- each class here tests exactly
+one of the gate's three conditions.
 """
 import pytest
 
@@ -13,7 +19,7 @@ from broker import BrokerConfig
 
 def _config(**overrides):
     kwargs = dict(trading_mode="paper", enable_real_trading=False, live_dry_run=True,
-                  api_key="k", secret_key="s")
+                  api_key="k", secret_key="s", execution_broker="alpaca")
     kwargs.update(overrides)
     return BrokerConfig(**kwargs)
 
@@ -70,3 +76,38 @@ class TestValidateAlpacaOrderPermitted:
     def test_unrecognized_mode_blocked(self):
         with pytest.raises(RuntimeError, match="unrecognized trading_mode"):
             _config(trading_mode="sandbox").validate_alpaca_order_permitted()
+
+
+class TestExecutionBrokerGate:
+    """CODEX-042: execution_broker != 'alpaca' blocks regardless of the
+    order-enabled flags -- a single ALPACA_ORDER_ENABLED=true can never
+    alone re-enable Alpaca orders."""
+
+    def test_execution_broker_defaults_to_kis(self):
+        cfg = BrokerConfig(api_key="k", secret_key="s")
+        assert cfg.execution_broker == "kis"
+
+    def test_from_env_defaults_execution_broker_to_kis(self, monkeypatch):
+        monkeypatch.delenv("EXECUTION_BROKER", raising=False)
+        assert BrokerConfig.from_env().execution_broker == "kis"
+
+    def test_from_env_reads_explicit_execution_broker(self, monkeypatch):
+        monkeypatch.setenv("EXECUTION_BROKER", "Alpaca")
+        assert BrokerConfig.from_env().execution_broker == "alpaca"
+
+    def test_default_execution_broker_blocks_even_with_flags_true(self):
+        with pytest.raises(RuntimeError, match="execution_broker"):
+            _config(
+                trading_mode="paper", alpaca_paper_order_enabled=True, execution_broker="kis",
+            ).validate_alpaca_order_permitted()
+
+    def test_live_default_execution_broker_blocks_even_with_flag_true(self):
+        with pytest.raises(RuntimeError, match="execution_broker"):
+            _config(
+                trading_mode="live", alpaca_order_enabled=True, execution_broker="kis",
+            ).validate_alpaca_order_permitted()
+
+    def test_alpaca_execution_broker_plus_flag_permits(self):
+        assert _config(
+            trading_mode="paper", alpaca_paper_order_enabled=True, execution_broker="alpaca",
+        ).validate_alpaca_order_permitted() is True
