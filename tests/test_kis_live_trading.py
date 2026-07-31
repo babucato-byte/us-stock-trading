@@ -9,6 +9,7 @@ from domain.execution_event import ExecutionRecord
 import kis_live_trading as klt
 import shadow_mode
 from operations import kill_switch as ops_kill_switch
+from reconciliation import reconciliation_state
 
 NOW = datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc)
 
@@ -20,11 +21,18 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.setenv("KILL_SWITCH_STATE_FILE", str(tmp_path / "KILL_SWITCH.json"))
     monkeypatch.setenv("OPERATIONS_HALT_STATE_FILE", str(tmp_path / "OPS_HALT.json"))
     monkeypatch.setenv("SHADOW_MODE_LOG_FILE", str(tmp_path / "SHADOW_MODE_LOG.jsonl"))
+    monkeypatch.setenv("RECONCILIATION_STATE_FILE", str(tmp_path / "RECONCILIATION_STATE.json"))
     from execution import idempotency
     monkeypatch.setattr(idempotency, "_LOCK_FILE", tmp_path / "KIS_ORDER_IDEMPOTENCY.lock")
     monkeypatch.setenv("VALIDATED_COMMIT", "c1")
     monkeypatch.setenv("DEPLOYED_COMMIT", "c1")
     monkeypatch.setenv("KIS_ALLOWED_ACCOUNT_NO", "12345678")
+    # CODEX-044: the buy gate's reconciliation_ok now reads a real,
+    # periodically-refreshed result (normally kept fresh by
+    # kis_position_manager.sync_kis_fills_and_manage_exits()'s tick) --
+    # seed a clean one so these tests exercise the buy path itself, not
+    # the (separately, explicitly tested) reconciliation gate.
+    reconciliation_state.record_result(clean=True, mismatch_count=0, now=NOW)
     yield
 
 
@@ -229,3 +237,63 @@ class TestPerSymbolOutcomes:
         broker = _FakeBroker(cash_usd=10_000.0, price=100.1)  # would afford ~99 shares
         klt.run_live_buy_entry_cycle(broker=broker, live_rollout=_rollout(max_quantity_per_order=1), now=NOW)
         assert broker.submit_calls[0][0].quantity == 1
+
+    def test_no_recorded_reconciliation_blocks_zero_broker_calls(self, tmp_path, monkeypatch):
+        _patch_common(monkeypatch)
+        # Overrides _isolate's seeded clean state -- "결과 없음".
+        monkeypatch.setenv("RECONCILIATION_STATE_FILE", str(tmp_path / "NEVER_WRITTEN.json"))
+        broker = _FakeBroker()
+        results = klt.run_live_buy_entry_cycle(broker=broker, live_rollout=_rollout(), now=NOW)
+        assert results["submitted"] == []
+        assert broker.submit_calls == []
+
+    def test_stale_reconciliation_blocks_zero_broker_calls(self, monkeypatch):
+        from datetime import timedelta
+        _patch_common(monkeypatch)
+        reconciliation_state.record_result(
+            clean=True, mismatch_count=0,
+            now=NOW - timedelta(seconds=reconciliation_state.DEFAULT_MAX_AGE_SECONDS + 1),
+        )
+        broker = _FakeBroker()
+        results = klt.run_live_buy_entry_cycle(broker=broker, live_rollout=_rollout(), now=NOW)
+        assert results["submitted"] == []
+        assert broker.submit_calls == []
+
+    def test_dirty_reconciliation_blocks_zero_broker_calls(self, monkeypatch):
+        _patch_common(monkeypatch)
+        reconciliation_state.record_result(clean=False, mismatch_count=1, now=NOW)
+        broker = _FakeBroker()
+        results = klt.run_live_buy_entry_cycle(broker=broker, live_rollout=_rollout(), now=NOW)
+        assert results["submitted"] == []
+        assert broker.submit_calls == []
+
+    def test_unknown_buy_order_for_symbol_blocks_new_buy_zero_broker_calls(self, monkeypatch):
+        _patch_common(monkeypatch)
+        from execution import idempotency
+        from state_store import db as state_db
+        conn = state_db.open_db()
+        idempotency.register(
+            conn, internal_order_id="prior-buy-1", signal_id="prior-buy-1", symbol="AAPL",
+            side="buy", trading_date="2026-07-29",
+        )
+        idempotency.update_status(conn, "prior-buy-1", "UNKNOWN")
+        broker = _FakeBroker()
+        results = klt.run_live_buy_entry_cycle(broker=broker, live_rollout=_rollout(), now=NOW)
+        assert results["submitted"] == []
+        assert broker.submit_calls == []
+
+    def test_unknown_sell_order_for_symbol_does_not_block_new_buy(self, monkeypatch):
+        # has_unknown_order() is checked per (symbol, side) -- an UNKNOWN
+        # SELL for this symbol must not block a new BUY for it.
+        _patch_common(monkeypatch)
+        from execution import idempotency
+        from state_store import db as state_db
+        conn = state_db.open_db()
+        idempotency.register(
+            conn, internal_order_id="prior-sell-1", signal_id="prior-sell-1", symbol="AAPL",
+            side="sell", trading_date="2026-07-29",
+        )
+        idempotency.update_status(conn, "prior-sell-1", "UNKNOWN")
+        broker = _FakeBroker()
+        results = klt.run_live_buy_entry_cycle(broker=broker, live_rollout=_rollout(), now=NOW)
+        assert results["submitted"] == ["AAPL"]

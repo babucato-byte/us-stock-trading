@@ -132,6 +132,31 @@ def register(conn, *, internal_order_id, signal_id, symbol, side, trading_date, 
         conn.commit()
 
 
+def has_unknown_order(conn, *, symbol, side):
+    """CODEX-044: real query backing the order gate's `has_unknown_order`
+    check -- an order this system submitted but never got a definite
+    ACCEPTED/REJECTED/FILLED answer for (broker timeout, ambiguous
+    response) blocks any *new* order for the same symbol+side until a
+    human/reconciliation resolves it. Replaces the previous
+    `has_unknown_order=False` constant Codex flagged as a bypass."""
+    row = conn.execute(
+        "SELECT 1 FROM kis_order_idempotency WHERE symbol = ? AND side = ? AND status = 'UNKNOWN' LIMIT 1",
+        (symbol, side),
+    ).fetchone()
+    return row is not None
+
+
+def list_unknown_orders(conn):
+    """CODEX-044: every order attempt still sitting in UNKNOWN status --
+    the set kis_position_manager.py's periodic tick tries to resolve via
+    reconciliation.order_reconciler.reconcile_unknown_order() against
+    KIS's own open-order/fill history each pass."""
+    return conn.execute(
+        "SELECT internal_order_id, broker_order_id, symbol, side FROM kis_order_idempotency "
+        "WHERE status = 'UNKNOWN'"
+    ).fetchall()
+
+
 def update_status(conn, internal_order_id, status, *, broker_order_id=None, commit=True):
     now = datetime.now(timezone.utc).isoformat()
     if broker_order_id is not None:

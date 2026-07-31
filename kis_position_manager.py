@@ -50,7 +50,13 @@ from datetime import datetime, timezone
 
 import risk_config
 from config import scalping_strategy_v1_config as strat_cfg
+from domain.position import Position
+from execution import idempotency
 from positions import lifecycle, states, store
+from reconciliation import reconciliation_state
+from reconciliation.order_reconciler import reconcile_unknown_order
+from reconciliation.position_reconciler import reconcile_positions
+from state_store import db as state_db
 
 
 class KISPositionManagerError(Exception):
@@ -144,7 +150,44 @@ def _find_kis_fill_for_order(kis_broker, broker_order_id, *, now):
     return None
 
 
-def sync_kis_fills_and_manage_exits(*, kis_broker, broker_adapter, now=None):
+def _reconcile_account_and_orders(*, kis_broker, conn, open_positions, kis_positions, now):
+    """CODEX-044: the account-wide half of reconciliation that the Order
+    Gate's `reconciliation_ok`/`has_unknown_order` checks actually depend
+    on. Runs every tick so kis_live_trading.py's buy path and
+    kis_broker_adapter.py's sell path always have a recent
+    (reconciliation_state.DEFAULT_MAX_AGE_SECONDS-fresh) result to read --
+    never the previous `reconciliation_ok=True` constant. Never raises:
+    a KIS read failure here must leave the PREVIOUS (or absent) recorded
+    result in place, which is exactly what should make the gates fail
+    closed rather than silently pass."""
+    internal_positions = [
+        Position(
+            symbol=record["symbol"], quantity=record["remaining_qty"],
+            average_fill_price=record["average_fill_price"] or 0.0,
+            unrealized_pnl=0.0, realized_pnl=0.0, as_of=now, source="internal_store",
+        )
+        for record in open_positions.values() if record["remaining_qty"]
+    ]
+    mismatches = reconcile_positions(internal_positions, kis_positions)
+    reconciliation_state.record_result(clean=not mismatches, mismatch_count=len(mismatches), now=now)
+
+    try:
+        kis_open_orders = kis_broker.get_open_orders()
+        kis_fills = kis_broker.get_fills(start_date=now.strftime("%Y%m%d"), end_date=now.strftime("%Y%m%d"))
+    except Exception:
+        # Can't resolve any UNKNOWN order this tick -- they simply stay
+        # UNKNOWN (has_unknown_order() keeps blocking), which is the
+        # fail-closed outcome, not an exception that would abort the tick.
+        return
+    for row in idempotency.list_unknown_orders(conn):
+        outcome = reconcile_unknown_order(
+            row["internal_order_id"], row["broker_order_id"], kis_open_orders, kis_fills,
+        )
+        if outcome.resolved:
+            idempotency.update_status(conn, row["internal_order_id"], outcome.confirmed_status)
+
+
+def sync_kis_fills_and_manage_exits(*, kis_broker, broker_adapter, now=None, conn=None):
     """One tick of the sell/exit monitoring cycle. Never raises for a
     single-position failure -- returns a summary dict instead so a
     scheduler can log/alert without the whole cycle aborting."""
@@ -158,6 +201,17 @@ def sync_kis_fills_and_manage_exits(*, kis_broker, broker_adapter, now=None):
 
     kis_qty_by_symbol = {p.symbol: p.quantity for p in kis_positions}
     open_positions = store.load_non_terminal()
+
+    owns_conn = conn is None
+    conn = conn or state_db.open_db()
+    try:
+        _reconcile_account_and_orders(
+            kis_broker=kis_broker, conn=conn, open_positions=open_positions,
+            kis_positions=kis_positions, now=current,
+        )
+    finally:
+        if owns_conn:
+            conn.close()
 
     for position_id, record in open_positions.items():
         symbol = record["symbol"]

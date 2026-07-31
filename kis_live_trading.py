@@ -50,7 +50,7 @@ from config.live_rollout_config import LiveRolloutConfig, LiveRolloutConfigError
 from domain.instrument import Instrument, InstrumentError, build_instrument
 from domain.order_intent import OrderIntent, OrderIntentError
 from domain.signal import Signal, SignalError, build_signal
-from execution import execution_engine, order_gate
+from execution import execution_engine, idempotency, order_gate
 from execution.execution_engine import ExecutionEngineError
 from market_data.kis_validation_provider import (
     KISValidationProvider,
@@ -58,8 +58,7 @@ from market_data.kis_validation_provider import (
 )
 from market_data.base import MarketDataProviderError
 from operations import kill_switch as ops_kill_switch
-from reconciliation.order_reconciler import reconcile_unknown_order
-from reconciliation.position_reconciler import reconcile_positions
+from reconciliation import reconciliation_state
 from state_store import db as state_db
 
 SCORE_THRESHOLD = 70  # matches paper_strategy_order.py's existing threshold
@@ -221,7 +220,11 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None):
                     max_price_deviation_percent=rollout.max_price_deviation_percent,
                     usd_orderable_cash=available_usd, has_open_order_for_symbol=has_open_order_for_symbol,
                     has_order_for_signal_id=False, allowed_symbols=rollout.allowed_symbols,
-                    reconciliation_ok=True, has_unknown_order=False, now=current,
+                    reconciliation_ok=reconciliation_state.is_current_and_clean(
+                        max_age_seconds=reconciliation_state.DEFAULT_MAX_AGE_SECONDS, now=current,
+                    ),
+                    has_unknown_order=idempotency.has_unknown_order(conn, symbol=symbol, side="buy"),
+                    now=current,
                 )
 
             def _shadow_record(risk_gate_result, rejection_reason=None):

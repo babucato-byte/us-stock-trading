@@ -6,6 +6,7 @@ from brokers.kis_broker import KISAmbiguousResponseError, KISBrokerError
 from brokers.kis_broker_adapter import KISBrokerAdapter, KISBrokerAdapterError
 from domain.execution_event import ExecutionRecord
 from domain.position import Position
+from reconciliation import reconciliation_state
 
 NOW = datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc)
 
@@ -13,8 +14,15 @@ NOW = datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc)
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
     monkeypatch.setenv("STATE_STORE_DB_FILE", str(tmp_path / "TEST_STATE.db"))
+    monkeypatch.setenv("RECONCILIATION_STATE_FILE", str(tmp_path / "RECONCILIATION_STATE.json"))
     from execution import idempotency
     monkeypatch.setattr(idempotency, "_LOCK_FILE", tmp_path / "KIS_ORDER_IDEMPOTENCY.lock")
+    # CODEX-044: the sell gate's reconciliation_ok now reads a real,
+    # periodically-refreshed result (normally kept fresh by
+    # kis_position_manager.sync_kis_fills_and_manage_exits()'s tick) --
+    # seed a clean one so these tests exercise sell-path behavior, not
+    # the (separately, explicitly tested) reconciliation gate itself.
+    reconciliation_state.record_result(clean=True, mismatch_count=0, now=NOW)
     yield
 
 
@@ -103,6 +111,51 @@ class TestSubmitOrderSide:
         broker = _FakeKISBroker(positions=[])
         adapter = KISBrokerAdapter(broker, now_fn=lambda: NOW)
         response = adapter.submit_order("AAPL", qty=1, side="sell", client_order_id="exit-AAPL-6")
+        assert response.status_code not in (200, 201)
+        assert broker.submit_calls == []
+
+    def test_no_recorded_reconciliation_blocks_zero_broker_calls(self, tmp_path, monkeypatch):
+        # Overrides the autouse fixture's seeded clean state by pointing
+        # at a path nothing has ever written to -- "결과 없음".
+        monkeypatch.setenv("RECONCILIATION_STATE_FILE", str(tmp_path / "NEVER_WRITTEN.json"))
+        broker = _FakeKISBroker()
+        adapter = KISBrokerAdapter(broker, now_fn=lambda: NOW)
+        response = adapter.submit_order("AAPL", qty=1, side="sell", client_order_id="exit-AAPL-9")
+        assert response.status_code not in (200, 201)
+        assert broker.submit_calls == []
+
+    def test_stale_reconciliation_blocks_zero_broker_calls(self):
+        from datetime import timedelta
+        reconciliation_state.record_result(
+            clean=True, mismatch_count=0,
+            now=NOW - timedelta(seconds=reconciliation_state.DEFAULT_MAX_AGE_SECONDS + 1),
+        )
+        broker = _FakeKISBroker()
+        adapter = KISBrokerAdapter(broker, now_fn=lambda: NOW)
+        response = adapter.submit_order("AAPL", qty=1, side="sell", client_order_id="exit-AAPL-10")
+        assert response.status_code not in (200, 201)
+        assert broker.submit_calls == []
+
+    def test_dirty_reconciliation_blocks_zero_broker_calls(self):
+        reconciliation_state.record_result(clean=False, mismatch_count=1, now=NOW)
+        broker = _FakeKISBroker()
+        adapter = KISBrokerAdapter(broker, now_fn=lambda: NOW)
+        response = adapter.submit_order("AAPL", qty=1, side="sell", client_order_id="exit-AAPL-11")
+        assert response.status_code not in (200, 201)
+        assert broker.submit_calls == []
+
+    def test_unknown_sell_order_for_symbol_blocks_new_sell_zero_broker_calls(self):
+        from execution import idempotency
+        from state_store import db as state_db
+        conn = state_db.open_db()
+        idempotency.register(
+            conn, internal_order_id="prior-sell-1", signal_id="prior-sell-1", symbol="AAPL",
+            side="sell", trading_date="2026-07-29",
+        )
+        idempotency.update_status(conn, "prior-sell-1", "UNKNOWN")
+        broker = _FakeKISBroker()
+        adapter = KISBrokerAdapter(broker, now_fn=lambda: NOW)
+        response = adapter.submit_order("AAPL", qty=1, side="sell", client_order_id="exit-AAPL-12")
         assert response.status_code not in (200, 201)
         assert broker.submit_calls == []
 

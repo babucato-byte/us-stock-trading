@@ -49,6 +49,7 @@ from domain.order_intent import OrderIntent, OrderIntentError
 from execution import execution_engine, idempotency, order_gate
 from execution.execution_engine import ExecutionEngineError
 from market_data.kis_validation_provider import KISValidationProvider
+from reconciliation import reconciliation_state
 from state_store import db as state_db
 
 
@@ -160,15 +161,19 @@ class KISBrokerAdapter:
             (o.get("pdno") or o.get("PDNO")) == symbol for o in open_orders
         )
 
+        conn = state_db.open_db()
+
         def _sell_ctx_builder():
             return order_gate.SellGateContext(
                 execution_broker="kis", live_order_enabled=True, order_intent=order_intent,
                 instrument=instrument, kis_position_quantity=position_qty, position_source="kis",
                 has_existing_sell_order_for_symbol=has_existing_sell_order,
-                reconciliation_ok=True, has_unknown_order=False,
+                reconciliation_ok=reconciliation_state.is_current_and_clean(
+                    max_age_seconds=reconciliation_state.DEFAULT_MAX_AGE_SECONDS, now=current,
+                ),
+                has_unknown_order=idempotency.has_unknown_order(conn, symbol=symbol, side="sell"),
             )
 
-        conn = state_db.open_db()
         try:
             try:
                 result = execution_engine.submit_sell_order(

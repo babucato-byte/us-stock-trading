@@ -72,6 +72,48 @@ class TestUpdateStatus:
         assert row["broker_order_id"] == "kis-123"
 
 
+class TestHasUnknownOrder:
+    def test_no_rows_returns_false(self):
+        conn = _conn()
+        assert idempotency.has_unknown_order(conn, symbol="AAPL", side="buy") is False
+
+    def test_unknown_status_returns_true_for_matching_symbol_and_side(self):
+        conn = _conn()
+        _register(conn)
+        idempotency.update_status(conn, "ord-1", "UNKNOWN")
+        assert idempotency.has_unknown_order(conn, symbol="AAPL", side="buy") is True
+
+    def test_unknown_on_other_symbol_does_not_block(self):
+        conn = _conn()
+        _register(conn, internal_order_id="ord-1", symbol="AAPL")
+        idempotency.update_status(conn, "ord-1", "UNKNOWN")
+        assert idempotency.has_unknown_order(conn, symbol="MSFT", side="buy") is False
+
+    def test_unknown_on_other_side_does_not_block(self):
+        conn = _conn()
+        _register(conn, internal_order_id="ord-1", symbol="AAPL", side="buy")
+        idempotency.update_status(conn, "ord-1", "UNKNOWN")
+        assert idempotency.has_unknown_order(conn, symbol="AAPL", side="sell") is False
+
+    def test_accepted_status_does_not_block(self):
+        conn = _conn()
+        _register(conn)
+        idempotency.update_status(conn, "ord-1", "ACCEPTED")
+        assert idempotency.has_unknown_order(conn, symbol="AAPL", side="buy") is False
+
+
+class TestListUnknownOrders:
+    def test_returns_only_unknown_rows(self):
+        conn = _conn()
+        _register(conn, internal_order_id="ord-1", symbol="AAPL")
+        _register(conn, internal_order_id="ord-2", symbol="MSFT")
+        idempotency.update_status(conn, "ord-1", "UNKNOWN", broker_order_id="kis-1")
+        idempotency.update_status(conn, "ord-2", "ACCEPTED", broker_order_id="kis-2")
+        rows = idempotency.list_unknown_orders(conn)
+        assert [r["internal_order_id"] for r in rows] == ["ord-1"]
+        assert rows[0]["broker_order_id"] == "kis-1"
+
+
 class TestSingleRunLock:
     def test_lock_is_reentrant_across_sequential_uses(self):
         with idempotency.single_run_lock(timeout=1.0):
