@@ -131,23 +131,36 @@ _FILL_PENDING_STATES = (states.ENTRY_SUBMITTED, states.PARTIALLY_FILLED)
 
 
 def _find_kis_fill_for_order(kis_broker, broker_order_id, *, now):
+    """CODEX-045: `ft_ccld_qty` fill rows are per-execution-event, not
+    cumulative -- a buy order filled across two separate KIS fill rows
+    (1 share then 1 share) must sum to 2, not report the first row's
+    qty alone. positions.lifecycle.record_fill() explicitly requires
+    the *cumulative* filled quantity (CODEX-027), so this returns the
+    sum across every matching fill row and the resulting weighted
+    average price, never a single event's price."""
     if not broker_order_id:
         return None
     try:
         fills = kis_broker.get_fills(start_date=now.strftime("%Y%m%d"), end_date=now.strftime("%Y%m%d"))
     except Exception:
         return None
+    cumulative_qty = 0.0
+    weighted_price_sum = 0.0
     for fill in fills:
-        if fill.get("ODNO") == broker_order_id or fill.get("odno") == broker_order_id:
-            try:
-                qty = float(fill.get("ft_ccld_qty") or fill.get("FT_CCLD_QTY") or 0)
-                price = float(fill.get("ft_ccld_unpr3") or fill.get("FT_CCLD_UNPR3") or 0)
-            except (TypeError, ValueError):
-                return None
-            if qty <= 0 or price <= 0:
-                return None
-            return {"filled_qty": qty, "average_fill_price": price}
-    return None
+        if fill.get("ODNO") != broker_order_id and fill.get("odno") != broker_order_id:
+            continue
+        try:
+            event_qty = float(fill.get("ft_ccld_qty") or fill.get("FT_CCLD_QTY") or 0)
+            event_price = float(fill.get("ft_ccld_unpr3") or fill.get("FT_CCLD_UNPR3") or 0)
+        except (TypeError, ValueError):
+            continue
+        if event_qty <= 0 or event_price <= 0:
+            continue
+        cumulative_qty += event_qty
+        weighted_price_sum += event_qty * event_price
+    if cumulative_qty <= 0:
+        return None
+    return {"filled_qty": cumulative_qty, "average_fill_price": weighted_price_sum / cumulative_qty}
 
 
 def _reconcile_account_and_orders(*, kis_broker, conn, open_positions, kis_positions, now):

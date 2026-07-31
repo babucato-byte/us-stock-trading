@@ -221,3 +221,26 @@ class TestSyncKisFillsAndManageExits:
         updated = store.load_position(entry["position_id"])
         assert updated["state"] == states.STOP_ACTIVE
         assert updated["stop_price"] is not None
+
+    def test_two_partial_fill_rows_sum_to_cumulative_fill_not_first_row_only(self):
+        # CODEX-045: a buy filled across two separate KIS fill rows (5
+        # then 5 shares) must be treated as a cumulative fill of 10, not
+        # stuck reporting only the first row's 5.
+        entry = kpm.create_kis_position_after_buy(
+            strategy_id="TEST_STRAT", strategy_version="v1", symbol="AAPL", quantity=10,
+            client_order_id="kislive-AAPL-10", broker_order_id="kis-entry-10", now=NOW,
+        )
+        broker = _FakeKISBroker(
+            price=50.0, positions=[],
+            fills=[
+                {"ODNO": "kis-entry-10", "ft_ccld_qty": "5", "ft_ccld_unpr3": "100.0"},
+                {"ODNO": "kis-entry-10", "ft_ccld_qty": "5", "ft_ccld_unpr3": "102.0"},
+            ],
+        )
+        adapter = KISBrokerAdapter(broker, now_fn=lambda: NOW)
+        summary = kpm.sync_kis_fills_and_manage_exits(kis_broker=broker, broker_adapter=adapter, now=NOW)
+        assert "AAPL" in summary["synced_fills"]
+        updated = store.load_position(entry["position_id"])
+        assert updated["state"] == states.STOP_ACTIVE
+        assert updated["filled_qty"] == 10
+        assert updated["average_fill_price"] == pytest.approx(101.0)

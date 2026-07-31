@@ -94,11 +94,17 @@ def find_existing(conn, *, internal_order_id, signal_id, symbol, side, trading_d
     ).fetchone()
 
 
-def register(conn, *, internal_order_id, signal_id, symbol, side, trading_date, status="CREATED", commit=True):
+def register(conn, *, internal_order_id, signal_id, symbol, side, trading_date, status="CREATED",
+              requested_quantity=None, commit=True):
     """Atomically records a new order attempt. Raises
     DuplicateOrderAttemptError (via the table's UNIQUE constraints) if
     either key already exists -- callers must call this BEFORE
-    KISBroker.submit_order(), inside single_run_lock()."""
+    KISBroker.submit_order(), inside single_run_lock().
+
+    `requested_quantity` (CODEX-045) is recorded so a later broker-order-
+    status lookup can tell "fully filled" apart from "partially filled"
+    -- without it, any nonzero fill looks indistinguishable from a full
+    fill."""
     existing = find_existing(
         conn, internal_order_id=internal_order_id, signal_id=signal_id,
         symbol=symbol, side=side, trading_date=trading_date,
@@ -115,8 +121,8 @@ def register(conn, *, internal_order_id, signal_id, symbol, side, trading_date, 
         conn.execute(
             "INSERT INTO kis_order_idempotency "
             "(internal_order_id, signal_id, symbol, side, trading_date, broker_order_id, "
-            "status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)",
-            (internal_order_id, signal_id, symbol, side, trading_date, status, now, now),
+            "status, created_at, updated_at, requested_quantity) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
+            (internal_order_id, signal_id, symbol, side, trading_date, status, now, now, requested_quantity),
         )
     except sqlite3.IntegrityError as exc:
         # Race window between find_existing() and INSERT -- the UNIQUE
@@ -152,8 +158,8 @@ def list_unknown_orders(conn):
     reconciliation.order_reconciler.reconcile_unknown_order() against
     KIS's own open-order/fill history each pass."""
     return conn.execute(
-        "SELECT internal_order_id, broker_order_id, symbol, side FROM kis_order_idempotency "
-        "WHERE status = 'UNKNOWN'"
+        "SELECT internal_order_id, broker_order_id, symbol, side, requested_quantity "
+        "FROM kis_order_idempotency WHERE status = 'UNKNOWN'"
     ).fetchall()
 
 

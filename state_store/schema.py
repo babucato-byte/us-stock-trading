@@ -296,6 +296,23 @@ MIGRATION_6_STATEMENTS = [
     KIS_ORDER_IDEMPOTENCY_SYMBOL_DATE_INDEX,
 ]
 
+# ---------------------------------------------------------------------------
+# Migration 7 (CODEX-045): kis_order_idempotency.requested_quantity -- the
+# ORIGINALLY requested share count for this order, recorded at register()
+# time (before any fill is known). Without this, a broker-order-status
+# lookup has no way to tell "1 of 2 shares filled" (PARTIALLY_FILLED) apart
+# from "1 of 1 shares filled" (FILLED) -- the exact bug Codex found: a
+# 2-share sell with a 1-share fill was misclassified as fully FILLED.
+# ---------------------------------------------------------------------------
+
+KIS_ORDER_IDEMPOTENCY_ADD_REQUESTED_QUANTITY = """
+ALTER TABLE kis_order_idempotency ADD COLUMN requested_quantity REAL
+"""
+
+MIGRATION_7_STATEMENTS = [
+    KIS_ORDER_IDEMPOTENCY_ADD_REQUESTED_QUANTITY,
+]
+
 # Every table this schema version creates -- used by export.py's
 # export_all() and by tests asserting the full table set exists.
 ALL_TABLES = [

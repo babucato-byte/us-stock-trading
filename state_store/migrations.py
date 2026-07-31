@@ -11,7 +11,7 @@ own append-only design).
 
 from state_store.schema import (
     MIGRATION_1_STATEMENTS, MIGRATION_2_STATEMENTS, MIGRATION_3_STATEMENTS, MIGRATION_4_STATEMENTS,
-    MIGRATION_5_STATEMENTS, MIGRATION_6_STATEMENTS,
+    MIGRATION_5_STATEMENTS, MIGRATION_6_STATEMENTS, MIGRATION_7_STATEMENTS,
 )
 
 MIGRATIONS = [
@@ -26,6 +26,8 @@ MIGRATIONS = [
      MIGRATION_5_STATEMENTS),
     (6, "KIS migration: kis_order_idempotency table for spec §17 duplicate-order prevention",
      MIGRATION_6_STATEMENTS),
+    (7, "CODEX-045: kis_order_idempotency.requested_quantity for accurate partial-fill classification",
+     MIGRATION_7_STATEMENTS),
 ]
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1][0]

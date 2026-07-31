@@ -222,9 +222,17 @@ class KISBrokerAdapter:
         (unlike Alpaca), so this looks up our OWN durable idempotency
         table (internal_order_id == client_order_id, exactly what this
         adapter passed as internal_order_id above) to get the KIS-side
-        broker_order_id, then checks KIS's own fill/open-order history
-        for it. Returns None if nothing is found (matching the existing
-        "may return None" contract)."""
+        broker_order_id and the ORIGINALLY requested quantity, then
+        checks KIS's own fill/open-order history for it. Returns None if
+        nothing is found (matching the existing "may return None"
+        contract).
+
+        CODEX-045: `ft_ccld_qty` fill rows are per-execution-event, not
+        cumulative -- a 2-share sell that fills 1-then-1 across two
+        separate KIS fill rows must sum to 2, not report "filled" the
+        instant the first 1-share row is seen. Status is derived from
+        cumulative_filled_qty vs requested_quantity, never from
+        "any fill row exists"."""
         conn = state_db.open_db()
         try:
             row = idempotency.find_existing(
@@ -236,23 +244,53 @@ class KISBrokerAdapter:
         if row is None or not row["broker_order_id"]:
             return None
         broker_order_id = row["broker_order_id"]
+        requested_quantity = row["requested_quantity"]
         try:
             fills = self.kis_broker.get_fills(
                 start_date=self._now_fn().strftime("%Y%m%d"), end_date=self._now_fn().strftime("%Y%m%d"),
             )
         except KISBrokerError:
             fills = []
+
+        cumulative_filled_qty = 0.0
+        weighted_price_sum = 0.0
+        matched_any_fill = False
         for fill in fills:
-            if fill.get("ODNO") == broker_order_id or fill.get("odno") == broker_order_id:
-                try:
-                    filled_qty = float(fill.get("ft_ccld_qty") or fill.get("FT_CCLD_QTY") or 0)
-                    filled_price = float(fill.get("ft_ccld_unpr3") or fill.get("FT_CCLD_UNPR3") or 0) or None
-                except (TypeError, ValueError):
-                    filled_qty, filled_price = None, None
+            if fill.get("ODNO") != broker_order_id and fill.get("odno") != broker_order_id:
+                continue
+            try:
+                event_qty = float(fill.get("ft_ccld_qty") or fill.get("FT_CCLD_QTY") or 0)
+                event_price = float(fill.get("ft_ccld_unpr3") or fill.get("FT_CCLD_UNPR3") or 0)
+            except (TypeError, ValueError):
+                continue
+            if event_qty <= 0:
+                continue
+            matched_any_fill = True
+            cumulative_filled_qty += event_qty
+            weighted_price_sum += event_qty * event_price
+
+        if matched_any_fill:
+            filled_avg_price = (weighted_price_sum / cumulative_filled_qty) if cumulative_filled_qty else None
+            if requested_quantity is not None and cumulative_filled_qty > requested_quantity:
+                from operations import kill_switch as ops_kill_switch
+                reason = (
+                    f"KIS fill data integrity error: order {broker_order_id!r} "
+                    f"(internal_order_id={client_order_id!r}) shows cumulative_filled_qty="
+                    f"{cumulative_filled_qty!r} exceeding requested_quantity={requested_quantity!r}"
+                )
+                ops_kill_switch.set_halt(True, reason=reason, actor="kis_broker_adapter")
                 return {
-                    "status": "filled" if filled_qty else "accepted",
-                    "filled_qty": filled_qty, "filled_avg_price": filled_price, "id": broker_order_id,
+                    "status": "data_integrity_error", "filled_qty": cumulative_filled_qty,
+                    "filled_avg_price": filled_avg_price, "id": broker_order_id,
                 }
+            if requested_quantity is not None and cumulative_filled_qty >= requested_quantity:
+                status = "filled"
+            else:
+                status = "partially_filled"
+            return {
+                "status": status, "filled_qty": cumulative_filled_qty,
+                "filled_avg_price": filled_avg_price, "id": broker_order_id,
+            }
         try:
             open_orders = self.kis_broker.get_open_orders()
         except KISBrokerError:

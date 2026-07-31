@@ -15,6 +15,7 @@ NOW = datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc)
 def _isolate(tmp_path, monkeypatch):
     monkeypatch.setenv("STATE_STORE_DB_FILE", str(tmp_path / "TEST_STATE.db"))
     monkeypatch.setenv("RECONCILIATION_STATE_FILE", str(tmp_path / "RECONCILIATION_STATE.json"))
+    monkeypatch.setenv("OPERATIONS_HALT_STATE_FILE", str(tmp_path / "OPS_HALT.json"))
     from execution import idempotency
     monkeypatch.setattr(idempotency, "_LOCK_FILE", tmp_path / "KIS_ORDER_IDEMPOTENCY.lock")
     # CODEX-044: the sell gate's reconciliation_ok now reads a real,
@@ -174,6 +175,55 @@ class TestGetOrderByClientOrderId:
         assert info is not None
         assert info["status"] == "filled"
         assert info["filled_qty"] == 1.0
+
+    def test_two_share_order_one_share_fill_reports_partially_filled_not_filled(self):
+        # CODEX-045's exact scenario: a 2-share sell with only 1 share
+        # filled must never be reported as "filled".
+        broker = _FakeKISBroker(
+            fills=[{"ODNO": "kis-999", "ft_ccld_qty": "1", "ft_ccld_unpr3": "101.5"}],
+        )
+        adapter = KISBrokerAdapter(broker, now_fn=lambda: NOW)
+        response = adapter.submit_order("AAPL", qty=2, side="sell", client_order_id="exit-AAPL-20")
+        assert response.status_code in (200, 201)
+        info = adapter.get_order_by_client_order_id("exit-AAPL-20")
+        assert info["status"] == "partially_filled"
+        assert info["filled_qty"] == 1.0
+
+    def test_two_fill_rows_sum_to_full_quantity_reports_filled(self):
+        broker = _FakeKISBroker(fills=[
+            {"ODNO": "kis-999", "ft_ccld_qty": "1", "ft_ccld_unpr3": "100.0"},
+            {"ODNO": "kis-999", "ft_ccld_qty": "1", "ft_ccld_unpr3": "102.0"},
+        ])
+        adapter = KISBrokerAdapter(broker, now_fn=lambda: NOW)
+        response = adapter.submit_order("AAPL", qty=2, side="sell", client_order_id="exit-AAPL-21")
+        assert response.status_code in (200, 201)
+        info = adapter.get_order_by_client_order_id("exit-AAPL-21")
+        assert info["status"] == "filled"
+        assert info["filled_qty"] == 2.0
+        assert info["filled_avg_price"] == pytest.approx(101.0)  # weighted average, not the first row's price
+
+    def test_zero_qty_fill_row_treated_as_not_filled(self):
+        broker = _FakeKISBroker(fills=[{"ODNO": "kis-999", "ft_ccld_qty": "0", "ft_ccld_unpr3": "0"}])
+        adapter = KISBrokerAdapter(broker, now_fn=lambda: NOW)
+        response = adapter.submit_order("AAPL", qty=2, side="sell", client_order_id="exit-AAPL-22")
+        assert response.status_code in (200, 201)
+        broker.open_orders = [{"ODNO": "kis-999"}]
+        info = adapter.get_order_by_client_order_id("exit-AAPL-22")
+        assert info["status"] == "accepted"
+
+    def test_cumulative_fill_exceeding_requested_quantity_halts_and_reports_data_integrity_error(self):
+        from operations import kill_switch as ops_kill_switch
+        broker = _FakeKISBroker(fills=[
+            {"ODNO": "kis-999", "ft_ccld_qty": "1", "ft_ccld_unpr3": "100.0"},
+            {"ODNO": "kis-999", "ft_ccld_qty": "2", "ft_ccld_unpr3": "100.0"},  # 3 total > requested 2
+        ])
+        adapter = KISBrokerAdapter(broker, now_fn=lambda: NOW)
+        response = adapter.submit_order("AAPL", qty=2, side="sell", client_order_id="exit-AAPL-23")
+        assert response.status_code in (200, 201)
+        assert ops_kill_switch.is_halted() is False
+        info = adapter.get_order_by_client_order_id("exit-AAPL-23")
+        assert info["status"] == "data_integrity_error"
+        assert ops_kill_switch.is_halted() is True
 
     def test_known_order_matches_open_orders_when_no_fill(self):
         broker = _FakeKISBroker(open_orders=[])

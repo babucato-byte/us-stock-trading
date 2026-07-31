@@ -84,6 +84,7 @@ def submit_buy_order(*, order_intent, buy_gate_context_builder, conn, broker, in
                 conn, internal_order_id=order_intent.internal_order_id,
                 signal_id=order_intent.signal_id, symbol=order_intent.symbol,
                 side=order_intent.side, trading_date=trading_date,
+                requested_quantity=order_intent.quantity,
             )
         except idempotency.DuplicateOrderAttemptError as exc:
             raise ExecutionEngineError(f"buy order blocked by idempotency check: {exc}") from exc
@@ -129,6 +130,7 @@ def submit_sell_order(*, order_intent, sell_gate_context_builder, conn, broker, 
                 conn, internal_order_id=order_intent.internal_order_id,
                 signal_id=order_intent.signal_id, symbol=order_intent.symbol,
                 side=order_intent.side, trading_date=trading_date,
+                requested_quantity=order_intent.quantity,
             )
         except idempotency.DuplicateOrderAttemptError as exc:
             raise ExecutionEngineError(f"sell order blocked by idempotency check: {exc}") from exc
