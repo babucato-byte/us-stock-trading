@@ -7,15 +7,30 @@ broker/alpaca_client.py's existing shape (config + injectable session,
 never a bare `requests` call scattered through calling code).
 
 TR_ID/endpoint/field values below were verified against the OFFICIAL
-KIS Open API GitHub examples (github.com/koreainvestment/open-trading-
-api, examples_user/kis_auth.py + examples_user/overseas_stock/
-overseas_stock_functions.py + examples_llm/overseas_stock/price/
-price.py), not invented. Two items were NOT independently confirmed
-from that source and are flagged inline as TBD_VERIFY_LIVE_DOCS:
-general (non-daytime) order cancel TR_ID, and the exact response field
-name for last-traded price. Confirm both against the live KIS Open API
-portal (apiportal.koreainvestment.com) before KIS_LIVE_ORDER_ENABLED is
-ever set true.
+KIS Open API GitHub reference repo (github.com/koreainvestment/
+open-trading-api), cloned locally to ~/kis-open-api-reference and
+diffed against this module directly (2026-07-31) -- not invented, and
+no longer just indirectly inferred. That comparison caught and fixed
+three real bugs this module previously had:
+
+  - The general (non-daytime) cancel TR_ID pair was wrong -- this
+    module previously reused the DAYTIME-specific TTTS6038U for both
+    real and paper; the correct pair (examples_llm/overseas_stock/
+    order_rvsecncl/order_rvsecncl.py) is TTTT1004U (real) /
+    VTTT1004U (paper).
+  - `OVRS_EXCG_CD` on the order/cancel/orderable-amount endpoints uses
+    a DIFFERENT code space than `EXCD` on the price/quote endpoint
+    ("NASD"/"NYSE"/"AMEX", 4-letter, vs "NAS"/"NYS"/"AMS", 3-letter) --
+    this module was sending the quote-API 3-letter code to the
+    order-API field, which the reference repo's order.py/order_
+    rvsecncl.py/inquire_psamount docstrings confirm is wrong.
+  - Cancel requests must send `OVRS_ORD_UNPR="0"` (per order_rvsecncl.
+    py's own docstring: "취소주문 시, '0' 입력'"), not the order's
+    actual limit price -- this module was sending the real price.
+
+The response field name for last-traded price (`output.last`) WAS
+independently confirmed too (examples_llm/overseas_stock/price/
+chk_price.py's own field-name comment: `'last': '현재가'`).
 
 Every state-mutating call (submit_order/cancel_order) runs
 config.validate_live_order_allowed() FIRST, before any network call --
@@ -65,11 +80,21 @@ TR_ID_ORDER_US = {
     ("live", "buy"): "TTTT1002U", ("paper", "buy"): "VTTT1002U",
     ("live", "sell"): "TTTT1006U", ("paper", "sell"): "VTTT1001U",
 }
-# TBD_VERIFY_LIVE_DOCS: reusing the daytime cancel TR_ID pair as the
-# general-order cancel TR_ID -- confirm against live docs.
-TR_ID_CANCEL = {"live": "TTTS6038U", "paper": "TTTS6038U"}
+# Verified against the official koreainvestment/open-trading-api
+# reference repo (examples_llm/overseas_stock/order_rvsecncl/
+# order_rvsecncl.py) -- the general (non-daytime) cancel TR_ID pair is
+# TTTT1004U/VTTT1004U, NOT the daytime-specific TTTS6038U this module
+# previously (incorrectly) reused for both.
+TR_ID_CANCEL = {"live": "TTTT1004U", "paper": "VTTT1004U"}
 
+# EXCD (3-letter) is the quotations-API exchange code (price/quote
+# endpoint); OVRS_EXCG_CD (4-letter, order/balance endpoints) is a
+# DIFFERENT code space -- verified against the reference repo's order.py
+# ("NASD"/"NYSE"/"AMEX", not "NAS"/"NYS"/"AMS"). Conflating the two was a
+# real bug this comparison caught: order submission/orderable-amount
+# calls were sending the wrong-format exchange code.
 _EXCHANGE_TO_EXCD = {"NASDAQ": "NAS", "NYSE": "NYS", "AMEX": "AMS"}
+_EXCHANGE_TO_ORDER_EXCG_CD = {"NASDAQ": "NASD", "NYSE": "NYSE", "AMEX": "AMEX"}
 
 
 class KISBrokerError(Exception):
@@ -91,6 +116,13 @@ def _excd_for(exchange: str) -> str:
     if excd is None:
         raise KISBrokerError(f"no KIS exchange code mapping for exchange={exchange!r}")
     return excd
+
+
+def _order_excg_for(exchange: str) -> str:
+    excg = _EXCHANGE_TO_ORDER_EXCG_CD.get(exchange)
+    if excg is None:
+        raise KISBrokerError(f"no KIS order-exchange code mapping for exchange={exchange!r}")
+    return excg
 
 
 class KISBroker:
@@ -221,7 +253,7 @@ class KISBroker:
         tr_id = TR_ID_PSAMOUNT[self._env_key()]
         body = self._get(PSAMOUNT_PATH, tr_id, {
             "CANO": self.config.account_no, "ACNT_PRDT_CD": self.config.account_product_cd,
-            "OVRS_EXCG_CD": _excd_for(instrument.exchange) + "S",
+            "OVRS_EXCG_CD": _order_excg_for(instrument.exchange),
             "OVRS_ORD_UNPR": str(limit_price_usd), "ITEM_CD": instrument.kis_symbol,
         })
         output = body.get("output") or {}
@@ -293,10 +325,10 @@ class KISBroker:
         tr_id = TR_ID_ORDER_US.get((self._env_key(), order_intent.side))
         if tr_id is None:
             raise KISBrokerError(f"no order TR_ID for env={self._env_key()!r} side={order_intent.side!r}")
-        excd = _excd_for(order_intent.exchange)
+        excg = _order_excg_for(order_intent.exchange)
         payload = {
             "CANO": self.config.account_no, "ACNT_PRDT_CD": self.config.account_product_cd,
-            "OVRS_EXCG_CD": excd, "PDNO": instrument.kis_symbol,
+            "OVRS_EXCG_CD": excg, "PDNO": instrument.kis_symbol,
             "ORD_QTY": str(order_intent.quantity), "OVRS_ORD_UNPR": str(order_intent.limit_price),
             "ORD_SVR_DVSN_CD": "0", "ORD_DVSN": "00",
         }
@@ -340,12 +372,15 @@ class KISBroker:
     def cancel_order(self, order_intent: OrderIntent, instrument, broker_order_id: str) -> ExecutionRecord:
         self.config.validate_live_order_allowed()
         tr_id = TR_ID_CANCEL[self._env_key()]
-        excd = _excd_for(order_intent.exchange)
+        excg = _order_excg_for(order_intent.exchange)
         payload = {
             "CANO": self.config.account_no, "ACNT_PRDT_CD": self.config.account_product_cd,
-            "OVRS_EXCG_CD": excd, "PDNO": instrument.kis_symbol, "ORGN_ODNO": broker_order_id,
+            "OVRS_EXCG_CD": excg, "PDNO": instrument.kis_symbol, "ORGN_ODNO": broker_order_id,
+            # RVSE_CNCL_DVSN_CD=02 (취소): OVRS_ORD_UNPR must be "0" per the
+            # reference repo's order_rvsecncl.py docstring ("취소주문 시,
+            # '0' 입력") -- passing the actual limit price here was a bug.
             "RVSE_CNCL_DVSN_CD": "02", "ORD_QTY": str(order_intent.quantity),
-            "OVRS_ORD_UNPR": str(order_intent.limit_price), "ORD_SVR_DVSN_CD": "0",
+            "OVRS_ORD_UNPR": "0", "MGCO_APTM_ODNO": "", "ORD_SVR_DVSN_CD": "0",
         }
         current = self._now()
         try:

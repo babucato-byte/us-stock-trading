@@ -216,6 +216,19 @@ class TestAccountAndPositions:
         amount = _broker(session=session).get_orderable_usd(_instrument(), 100.0)
         assert amount == pytest.approx(543.21)
 
+    def test_get_orderable_usd_uses_4letter_order_exchange_code(self):
+        # Regression: was previously "NASS" (a botched _excd_for()+"S"),
+        # must be "NASD".
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", TOKEN_OK)
+        session.queue(
+            "/uapi/overseas-stock/v1/trading/inquire-psamount",
+            _StubResponse(200, {"output": {"ord_psbl_frcr_amt": "543.21"}}),
+        )
+        _broker(session=session).get_orderable_usd(_instrument(), 100.0)
+        call = next(r for r in session.requests if r[1].endswith("/inquire-psamount"))
+        assert call[2]["params"]["OVRS_EXCG_CD"] == "NASD"
+
     def test_get_open_orders(self):
         session = _FakeSession()
         session.queue("/oauth2/tokenP", TOKEN_OK)
@@ -267,6 +280,22 @@ class TestSubmitOrderSuccessAndFailure:
         assert record.status == "ACCEPTED"
         assert record.broker_order_id == "kis-999"
         assert record.broker == "kis"
+
+    def test_order_uses_4letter_order_exchange_code_not_quote_code(self):
+        # Regression: OVRS_EXCG_CD on the order endpoint must be "NASD"
+        # (4-letter, order-API code space), never "NAS" (3-letter,
+        # quote-API EXCD code space) -- caught by comparing against the
+        # official reference repo.
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", TOKEN_OK)
+        session.queue(
+            "/uapi/overseas-stock/v1/trading/order",
+            _StubResponse(200, {"rt_cd": "0", "output": {"ODNO": "kis-999"}}),
+        )
+        broker = _broker(config=_config(live_order_enabled=True), session=session)
+        broker.submit_order(_order_intent(), _instrument())
+        order_call = next(r for r in session.requests if r[1].endswith("/trading/order"))
+        assert order_call[2]["json"]["OVRS_EXCG_CD"] == "NASD"
 
     def test_rejected_rt_cd_returns_rejected_status(self):
         session = _FakeSession()
@@ -332,6 +361,22 @@ class TestCancelOrder:
         broker = _broker(config=_config(live_order_enabled=True), session=session)
         record = broker.cancel_order(_order_intent(), _instrument(), "kis-999")
         assert record.status == "CANCELLED"
+
+    def test_cancel_payload_sends_zero_price_and_4letter_exchange_code(self):
+        # Regression: cancel must send OVRS_ORD_UNPR="0" (per the
+        # reference repo's order_rvsecncl.py docstring), not the order's
+        # actual limit price; and OVRS_EXCG_CD must be "NASD", not "NAS".
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", TOKEN_OK)
+        session.queue(
+            "/uapi/overseas-stock/v1/trading/order-rvsecncl",
+            _StubResponse(200, {"rt_cd": "0", "output": {}}),
+        )
+        broker = _broker(config=_config(live_order_enabled=True), session=session)
+        broker.cancel_order(_order_intent(limit_price=123.45), _instrument(), "kis-999")
+        call = next(r for r in session.requests if r[1].endswith("/order-rvsecncl"))
+        assert call[2]["json"]["OVRS_ORD_UNPR"] == "0"
+        assert call[2]["json"]["OVRS_EXCG_CD"] == "NASD"
 
     def test_network_error_raises_ambiguous(self):
         session = _FakeSession()
