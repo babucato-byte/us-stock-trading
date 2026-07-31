@@ -22,6 +22,7 @@ from typing import FrozenSet, Optional
 from domain.instrument import Instrument
 from domain.order_intent import OrderIntent
 from domain.signal import Signal
+from execution.secret_redaction import mask_account_number
 
 
 class OrderGateBlockedError(Exception):
@@ -89,7 +90,8 @@ def evaluate_buy_gate(ctx: BuyGateContext) -> bool:
         )
     if ctx.kis_account_no != ctx.allowed_account_no:
         raise OrderGateBlockedError(
-            f"KIS account {ctx.kis_account_no!r} is not the allowed account {ctx.allowed_account_no!r}"
+            f"KIS account {mask_account_number(ctx.kis_account_no)!r} is not the allowed account "
+            f"{mask_account_number(ctx.allowed_account_no)!r}"
         )
     quantity = ctx.order_intent.quantity
     if isinstance(quantity, bool) or not isinstance(quantity, int):
@@ -196,7 +198,8 @@ def evaluate_cancel_gate(ctx: CancelGateContext) -> bool:
         )
     if ctx.kis_account_no != ctx.allowed_account_no:
         raise OrderGateBlockedError(
-            f"KIS account {ctx.kis_account_no!r} is not the allowed account {ctx.allowed_account_no!r}"
+            f"KIS account {mask_account_number(ctx.kis_account_no)!r} is not the allowed account "
+            f"{mask_account_number(ctx.allowed_account_no)!r}"
         )
     if ctx.has_cancel_already_in_flight:
         raise OrderGateBlockedError(

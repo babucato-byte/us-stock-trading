@@ -146,6 +146,21 @@ class TestAuth:
         with pytest.raises(KISBrokerError):
             broker.get_current_price(_instrument())
 
+    def test_token_issuance_http_error_redacts_secrets_in_response_body(self):
+        # CODEX-050: KIS's own error response body is embedded verbatim
+        # into the exception message -- if it ever echoed back the
+        # submitted appkey/appsecret, that must never reach a log unmasked.
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", _StubResponse(
+            400, {"error": "invalid"},
+            text='{"appkey": "ABCDEFG1234", "appsecret": "SECRETVALUE9", "msg": "invalid credentials"}',
+        ))
+        broker = _broker(session=session)
+        with pytest.raises(KISBrokerError) as excinfo:
+            broker.get_current_price(_instrument())
+        assert "ABCDEFG1234" not in str(excinfo.value)
+        assert "SECRETVALUE9" not in str(excinfo.value)
+
 
 class TestReadGate:
     def test_read_disabled_blocks_before_network(self):

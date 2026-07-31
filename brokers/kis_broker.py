@@ -53,6 +53,7 @@ from domain.account_snapshot import AccountSnapshot
 from domain.execution_event import ExecutionRecord
 from domain.order_intent import OrderIntent
 from domain.position import Position
+from execution.secret_redaction import redact_text
 
 TOKEN_PATH = "/oauth2/tokenP"
 PRICE_PATH = "/uapi/overseas-price/v1/quotations/price"
@@ -164,7 +165,7 @@ class KISBroker:
         except requests.exceptions.RequestException as exc:
             raise KISBrokerError(f"KIS token issuance failed (network): {exc}") from exc
         if response.status_code != 200:
-            raise KISBrokerError(f"KIS token issuance failed: HTTP {response.status_code} {response.text}")
+            raise KISBrokerError(f"KIS token issuance failed: HTTP {response.status_code} {redact_text(response.text)}")
         try:
             body = response.json()
             token = body["access_token"]
@@ -199,7 +200,7 @@ class KISBroker:
         except requests.exceptions.RequestException as exc:
             raise KISBrokerError(f"KIS GET {path} failed (network): {exc}") from exc
         if response.status_code != 200:
-            raise KISBrokerError(f"KIS GET {path} failed: HTTP {response.status_code} {response.text}")
+            raise KISBrokerError(f"KIS GET {path} failed: HTTP {response.status_code} {redact_text(response.text)}")
         try:
             return response.json()
         except ValueError as exc:
@@ -356,7 +357,7 @@ class KISBroker:
             ) from exc
         if response.status_code >= 500 or response.status_code in (408, 425, 429):
             raise KISAmbiguousResponseError(
-                f"KIS order submission ambiguous: HTTP {response.status_code} {response.text}"
+                f"KIS order submission ambiguous: HTTP {response.status_code} {redact_text(response.text)}"
             )
         try:
             body = response.json()
@@ -409,7 +410,7 @@ class KISBroker:
         except requests.exceptions.RequestException as exc:
             raise KISAmbiguousResponseError(f"KIS cancel ambiguous (network error): {exc}") from exc
         if response.status_code >= 500 or response.status_code in (408, 425, 429):
-            raise KISAmbiguousResponseError(f"KIS cancel ambiguous: HTTP {response.status_code} {response.text}")
+            raise KISAmbiguousResponseError(f"KIS cancel ambiguous: HTTP {response.status_code} {redact_text(response.text)}")
         try:
             body = response.json()
         except ValueError as exc:

@@ -83,6 +83,15 @@ class TestEvaluateBuyGate:
         with pytest.raises(OrderGateBlockedError, match="allowed account"):
             evaluate_buy_gate(_buy_ctx(kis_account_no="99999999"))
 
+    def test_account_mismatch_error_does_not_expose_full_account_number(self):
+        # CODEX-050: the full account number must never reach an
+        # exception message that could propagate into a log.
+        with pytest.raises(OrderGateBlockedError) as excinfo:
+            evaluate_buy_gate(_buy_ctx(kis_account_no="99999999"))
+        assert "99999999" not in str(excinfo.value)
+        assert "12345678" not in str(excinfo.value)
+        assert "5678" in str(excinfo.value)  # last 4 digits still shown
+
     def test_non_integer_quantity_blocked(self):
         # OrderIntent itself already rejects non-int quantities at
         # construction (domain/order_intent.py) -- this test proves the

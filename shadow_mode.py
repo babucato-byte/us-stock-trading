@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from execution.secret_redaction import redact_text, redact_value
+
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_LOG_FILE = BASE_DIR / "SHADOW_MODE_LOG.jsonl"
 
@@ -82,12 +84,23 @@ def build_record(
 
 def persist(record: ShadowModeRecord, *, path=None):
     """Appends one JSON line. Never overwrites/truncates -- a fresh
-    process restart simply appends to the same durable log."""
+    process restart simply appends to the same durable log.
+
+    CODEX-050: every field goes through redact_value() (structural,
+    key-name-based redaction -- a defense-in-depth layer in case a
+    future field is ever a dict/nested structure carrying a secret key)
+    and rejection_reason additionally through redact_text(), since it's
+    free text built from an underlying exception message (e.g. an
+    OrderGateBlockedError) that could otherwise carry an unmasked
+    account number or similar into this durable, on-disk log."""
     target = path or _resolve_log_path()
     target.parent.mkdir(parents=True, exist_ok=True)
+    payload = redact_value(asdict(record))
+    if payload.get("rejection_reason") is not None:
+        payload["rejection_reason"] = redact_text(payload["rejection_reason"])
     try:
         with open(target, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(asdict(record)) + "\n")
+            fh.write(json.dumps(payload) + "\n")
     except OSError as exc:
         raise ShadowModeError(f"failed to persist Shadow Mode record: {exc}") from exc
 

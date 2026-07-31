@@ -71,3 +71,22 @@ class TestPersistAndReadAll:
         monkeypatch.setattr("builtins.open", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
         with pytest.raises(shadow_mode.ShadowModeError):
             shadow_mode.persist(_record(), path=bad_path)
+
+
+class TestSecretRedaction:
+    def test_rejection_reason_with_embedded_account_number_is_redacted(self):
+        # CODEX-050: a rejection_reason built from an underlying
+        # OrderGateBlockedError-style message must never persist a full
+        # account number to the durable Shadow Mode log.
+        shadow_mode.persist(_record(
+            risk_gate_result="BLOCKED",
+            rejection_reason="KIS account 'cano=12345678' is not the allowed account 'cano=99999999'",
+        ))
+        rows = shadow_mode.read_all()
+        assert "12345678" not in rows[0]["rejection_reason"]
+        assert "99999999" not in rows[0]["rejection_reason"]
+
+    def test_normal_rejection_reason_unaffected(self):
+        shadow_mode.persist(_record(risk_gate_result="BLOCKED", rejection_reason="insufficient cash"))
+        rows = shadow_mode.read_all()
+        assert rows[0]["rejection_reason"] == "insufficient cash"
