@@ -90,3 +90,71 @@ class TestSecretRedaction:
         shadow_mode.persist(_record(risk_gate_result="BLOCKED", rejection_reason="insufficient cash"))
         rows = shadow_mode.read_all()
         assert rows[0]["rejection_reason"] == "insufficient cash"
+
+
+class TestRotation:
+    def test_default_path_rotates_by_calendar_day(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("SHADOW_MODE_LOG_FILE", raising=False)
+        monkeypatch.setattr(shadow_mode, "BASE_DIR", tmp_path)
+        day_1 = datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc)
+        day_2 = datetime(2026, 7, 30, 15, 0, tzinfo=timezone.utc)
+        shadow_mode.persist(_record(signal_id="sig-day1", now=day_1))
+        shadow_mode.persist(_record(signal_id="sig-day2", now=day_2))
+        assert (tmp_path / "shadow-2026-07-29.jsonl").exists()
+        assert (tmp_path / "shadow-2026-07-30.jsonl").exists()
+
+    def test_read_all_without_override_reads_across_all_rotated_files(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("SHADOW_MODE_LOG_FILE", raising=False)
+        monkeypatch.setattr(shadow_mode, "BASE_DIR", tmp_path)
+        day_1 = datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc)
+        day_2 = datetime(2026, 7, 30, 15, 0, tzinfo=timezone.utc)
+        shadow_mode.persist(_record(signal_id="sig-day1", now=day_1))
+        shadow_mode.persist(_record(signal_id="sig-day2", now=day_2))
+        rows = shadow_mode.read_all()
+        assert {r["signal_id"] for r in rows} == {"sig-day1", "sig-day2"}
+
+    def test_read_all_with_date_reads_only_that_day(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("SHADOW_MODE_LOG_FILE", raising=False)
+        monkeypatch.setattr(shadow_mode, "BASE_DIR", tmp_path)
+        day_1 = datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc)
+        day_2 = datetime(2026, 7, 30, 15, 0, tzinfo=timezone.utc)
+        shadow_mode.persist(_record(signal_id="sig-day1", now=day_1))
+        shadow_mode.persist(_record(signal_id="sig-day2", now=day_2))
+        rows = shadow_mode.read_all(date=day_1.date())
+        assert [r["signal_id"] for r in rows] == ["sig-day1"]
+
+    def test_explicit_env_override_disables_rotation(self, tmp_path, monkeypatch):
+        # The SHADOW_MODE_LOG_FILE override (test isolation's normal
+        # mode) must always win over date-based rotation.
+        single_file = tmp_path / "SHADOW_MODE_LOG.jsonl"
+        monkeypatch.setenv("SHADOW_MODE_LOG_FILE", str(single_file))
+        day_1 = datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc)
+        day_2 = datetime(2026, 7, 30, 15, 0, tzinfo=timezone.utc)
+        shadow_mode.persist(_record(signal_id="sig-day1", now=day_1))
+        shadow_mode.persist(_record(signal_id="sig-day2", now=day_2))
+        assert single_file.exists()
+        rows = shadow_mode.read_all()
+        assert len(rows) == 2
+
+
+class TestLocking:
+    def test_lock_file_created_alongside_target(self, tmp_path, monkeypatch):
+        target = tmp_path / "SHADOW_MODE_LOG.jsonl"
+        monkeypatch.setenv("SHADOW_MODE_LOG_FILE", str(target))
+        shadow_mode.persist(_record())
+        assert (tmp_path / "SHADOW_MODE_LOG.jsonl.lock").exists()
+
+    def test_held_lock_blocks_concurrent_writer(self, tmp_path, monkeypatch):
+        import fcntl
+        target = tmp_path / "SHADOW_MODE_LOG.jsonl"
+        monkeypatch.setenv("SHADOW_MODE_LOG_FILE", str(target))
+        lock_path = tmp_path / "SHADOW_MODE_LOG.jsonl.lock"
+        holder = open(lock_path, "a+")
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        try:
+            with pytest.raises(BlockingIOError):
+                with open(lock_path, "a+") as second:
+                    fcntl.flock(second, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            holder.close()

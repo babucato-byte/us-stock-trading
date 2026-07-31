@@ -115,12 +115,19 @@ class TestStructuralBlocks:
         _patch_common(monkeypatch)
         with pytest.raises(klt.KISLiveTradingError, match="enabled is False"):
             klt.run_live_buy_entry_cycle(broker=_FakeBroker(), live_rollout=_rollout(enabled=False), now=NOW)
+        rows = shadow_mode.read_all()
+        assert len(rows) == 1
+        assert rows[0]["risk_gate_result"] == "BLOCKED"
+        assert rows[0]["symbol"] == "__CYCLE__"
 
     def test_halted_raises(self, monkeypatch):
         _patch_common(monkeypatch)
         ops_kill_switch.set_halt(True, reason="test", actor="tester")
         with pytest.raises(klt.KISLiveTradingError, match="HALT"):
             klt.run_live_buy_entry_cycle(broker=_FakeBroker(), live_rollout=_rollout(), now=NOW)
+        rows = shadow_mode.read_all()
+        assert len(rows) == 1
+        assert rows[0]["risk_gate_result"] == "HALT"
 
     def test_entry_off_raises(self, monkeypatch):
         _patch_common(monkeypatch)
@@ -128,18 +135,25 @@ class TestStructuralBlocks:
         kill_switch_state.activate(kill_switch_state.ENTRY_DISABLED, "test", "tester")
         with pytest.raises(klt.KISLiveTradingError, match="ENTRY_OFF"):
             klt.run_live_buy_entry_cycle(broker=_FakeBroker(), live_rollout=_rollout(), now=NOW)
+        rows = shadow_mode.read_all()
+        assert len(rows) == 1
+        assert rows[0]["risk_gate_result"] == "BLOCKED"
 
     def test_commit_mismatch_raises(self, monkeypatch):
         _patch_common(monkeypatch)
         monkeypatch.setenv("DEPLOYED_COMMIT", "different")
         with pytest.raises(klt.KISLiveTradingError, match="commit"):
             klt.run_live_buy_entry_cycle(broker=_FakeBroker(), live_rollout=_rollout(), now=NOW)
+        rows = shadow_mode.read_all()
+        assert len(rows) == 1
 
     def test_missing_allowed_account_raises(self, monkeypatch):
         _patch_common(monkeypatch)
         monkeypatch.delenv("KIS_ALLOWED_ACCOUNT_NO", raising=False)
         with pytest.raises(klt.KISLiveTradingError, match="KIS_ALLOWED_ACCOUNT_NO"):
             klt.run_live_buy_entry_cycle(broker=_FakeBroker(), live_rollout=_rollout(), now=NOW)
+        rows = shadow_mode.read_all()
+        assert len(rows) == 1
 
 
 class TestPerSymbolOutcomes:
@@ -177,6 +191,10 @@ class TestPerSymbolOutcomes:
         assert results["submitted"] == []
         assert any(s == "MSFT" for s, _ in results["skipped"])
         assert broker.submit_calls == []
+        rows = shadow_mode.read_all()
+        assert len(rows) == 1
+        assert rows[0]["symbol"] == "MSFT"
+        assert rows[0]["risk_gate_result"] == "BLOCKED"
 
     def test_low_score_skipped(self, monkeypatch):
         _patch_common(monkeypatch, analyze=_low_score_result)
@@ -202,6 +220,9 @@ class TestPerSymbolOutcomes:
         assert results["submitted"] == []
         assert broker.submit_calls == []
         assert any(s == "AAPL" for s, _ in results["blocked"])
+        rows = shadow_mode.read_all()
+        assert len(rows) == 1
+        assert rows[0]["risk_gate_result"] == "BLOCKED"
 
     def test_insufficient_cash_blocked(self, monkeypatch):
         _patch_common(monkeypatch)
@@ -209,6 +230,9 @@ class TestPerSymbolOutcomes:
         results = klt.run_live_buy_entry_cycle(broker=broker, live_rollout=_rollout(), now=NOW)
         assert results["submitted"] == []
         assert broker.submit_calls == []
+        rows = shadow_mode.read_all()
+        assert len(rows) == 1
+        assert rows[0]["risk_gate_result"] == "BLOCKED"
 
     def test_price_deviation_exceeded_blocked_zero_broker_submit(self, monkeypatch):
         _patch_common(monkeypatch)

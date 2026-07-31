@@ -70,6 +70,39 @@ class KISLiveTradingError(Exception):
     invalid before any per-symbol processing even begins."""
 
 
+_CYCLE_LEVEL_SYMBOL = "__CYCLE__"
+
+
+def _persist_blocked_record(*, symbol, side="buy", strategy_id="PAPER_STRATEGY_ORDER_SCORE_V1",
+                             signal_price=None, kis_price=None, price_diff_percent=None,
+                             planned_quantity=None, planned_limit_price=None, stop_price=None,
+                             target_price=None, risk_gate_result, rejection_reason,
+                             account_available_usd=None, existing_position_quantity=None,
+                             existing_open_order=False, now):
+    """Shadow Mode completeness (CODEX-review MEDIUM finding): every
+    category the pipeline can block/skip on -- config block, signal
+    expiry, symbol block, price deviation, insufficient balance,
+    reconciliation failure, UNKNOWN present, duplicate order, HALT,
+    Order Gate rejection -- must produce a durable Shadow Mode record,
+    not just the subset that happened to already have a fully-built
+    signal/order_intent in scope. This helper is deliberately tolerant
+    of missing data (every non-required field defaults to None) so it
+    can be called from the earliest possible point in the pipeline --
+    including cycle-level structural blocks (HALT, config invalid, ...)
+    that occur before any symbol/signal is ever built."""
+    shadow_mode.persist(shadow_mode.build_record(
+        signal_id=f"{symbol}-{now.isoformat()}", strategy_id=strategy_id, strategy_version="v1",
+        code_commit=os.environ.get("DEPLOYED_COMMIT") or "", symbol=symbol, side=side,
+        alpaca_signal_price=signal_price, kis_validation_price=kis_price,
+        price_difference_percent=price_diff_percent, planned_quantity=planned_quantity,
+        planned_limit_price=planned_limit_price, stop_price=stop_price, target_price=target_price,
+        risk_gate_result=risk_gate_result, rejection_reason=rejection_reason,
+        account_available_usd=account_available_usd,
+        existing_position_quantity=existing_position_quantity,
+        existing_open_order=existing_open_order, now=now,
+    ))
+
+
 def _build_instrument(symbol, allowed_symbols):
     """See module docstring's RESIDUAL RISK note. `symbol` must already
     be on `allowed_symbols` (checked by the caller before this is
@@ -102,27 +135,51 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None):
     try:
         rollout.validate()
     except LiveRolloutConfigError as exc:
-        raise KISLiveTradingError(f"live_rollout config invalid, refusing to run: {exc}") from exc
+        reason = f"live_rollout config invalid, refusing to run: {exc}"
+        _persist_blocked_record(
+            symbol=_CYCLE_LEVEL_SYMBOL, risk_gate_result="BLOCKED", rejection_reason=reason, now=current,
+        )
+        raise KISLiveTradingError(reason) from exc
 
     if not rollout.enabled:
-        raise KISLiveTradingError("live_rollout.enabled is False -- KIS live entries are not active")
+        reason = "live_rollout.enabled is False -- KIS live entries are not active"
+        _persist_blocked_record(
+            symbol=_CYCLE_LEVEL_SYMBOL, risk_gate_result="BLOCKED", rejection_reason=reason, now=current,
+        )
+        raise KISLiveTradingError(reason)
 
     if ops_kill_switch.is_halted():
-        raise KISLiveTradingError("operations HALT is set -- no automatic order attempts permitted")
+        reason = "operations HALT is set -- no automatic order attempts permitted"
+        _persist_blocked_record(
+            symbol=_CYCLE_LEVEL_SYMBOL, risk_gate_result="HALT", rejection_reason=reason, now=current,
+        )
+        raise KISLiveTradingError(reason)
     if not ops_kill_switch.is_entry_allowed():
-        raise KISLiveTradingError("ENTRY_OFF (kill_switch_state) is set -- new entries blocked")
+        reason = "ENTRY_OFF (kill_switch_state) is set -- new entries blocked"
+        _persist_blocked_record(
+            symbol=_CYCLE_LEVEL_SYMBOL, risk_gate_result="BLOCKED", rejection_reason=reason, now=current,
+        )
+        raise KISLiveTradingError(reason)
 
     validated_commit = _get_validated_commit()
     deployed_commit = _get_deployed_commit()
     if not validated_commit or validated_commit != deployed_commit:
-        raise KISLiveTradingError(
+        reason = (
             f"validated commit {validated_commit!r} does not match deployed commit "
             f"{deployed_commit!r} -- refusing to run an unvalidated deployment"
         )
+        _persist_blocked_record(
+            symbol=_CYCLE_LEVEL_SYMBOL, risk_gate_result="BLOCKED", rejection_reason=reason, now=current,
+        )
+        raise KISLiveTradingError(reason)
 
     allowed_account_no = _get_allowed_account_no()
     if not allowed_account_no:
-        raise KISLiveTradingError("KIS_ALLOWED_ACCOUNT_NO is not configured -- refusing to run")
+        reason = "KIS_ALLOWED_ACCOUNT_NO is not configured -- refusing to run"
+        _persist_blocked_record(
+            symbol=_CYCLE_LEVEL_SYMBOL, risk_gate_result="BLOCKED", rejection_reason=reason, now=current,
+        )
+        raise KISLiveTradingError(reason)
 
     is_regular_session = pso.get_us_market_session() == "regular" if rollout.regular_session_only else True
 
@@ -134,6 +191,10 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None):
         for symbol in watchlist:
             if symbol not in rollout.allowed_symbols:
                 results["skipped"].append((symbol, "not in live_rollout.allowed_symbols"))
+                _persist_blocked_record(
+                    symbol=symbol, risk_gate_result="BLOCKED",
+                    rejection_reason="symbol not in live_rollout.allowed_symbols", now=current,
+                )
                 continue
 
             analysis = pso.analyze_stock(symbol)
@@ -151,19 +212,34 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None):
                     valid_for_seconds=SIGNAL_VALID_SECONDS, now=current,
                 )
             except (InstrumentError, SignalError) as exc:
-                results["blocked"].append((symbol, f"signal/instrument construction failed: {exc}"))
+                reason = f"signal/instrument construction failed: {exc}"
+                results["blocked"].append((symbol, reason))
+                _persist_blocked_record(
+                    symbol=symbol, signal_price=analysis["price"], risk_gate_result="BLOCKED",
+                    rejection_reason=reason, now=current,
+                )
                 continue
 
             try:
                 kis_quote = kis_validation.get_price_quote(symbol)
             except MarketDataProviderError as exc:
-                results["blocked"].append((symbol, f"KIS price re-check failed: {exc}"))
+                reason = f"KIS price re-check failed: {exc}"
+                results["blocked"].append((symbol, reason))
+                _persist_blocked_record(
+                    symbol=symbol, signal_price=signal.signal_price, risk_gate_result="BLOCKED",
+                    rejection_reason=reason, now=current,
+                )
                 continue
 
             try:
                 account_snapshot = broker.get_account_snapshot()
             except KISBrokerError as exc:
-                results["blocked"].append((symbol, f"KIS account read failed: {exc}"))
+                reason = f"KIS account read failed: {exc}"
+                results["blocked"].append((symbol, reason))
+                _persist_blocked_record(
+                    symbol=symbol, signal_price=signal.signal_price, kis_price=kis_quote.price_usd,
+                    risk_gate_result="BLOCKED", rejection_reason=reason, now=current,
+                )
                 continue
 
             available_usd = account_snapshot.usd_available_for_new_order
@@ -171,7 +247,13 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None):
             balance_qty = int(available_usd // buffered_price) if buffered_price > 0 else 0
             quantity = min(balance_qty, rollout.max_quantity_per_order)
             if quantity < 1:
-                results["blocked"].append((symbol, "insufficient KIS orderable cash for even 1 share"))
+                reason = "insufficient KIS orderable cash for even 1 share"
+                results["blocked"].append((symbol, reason))
+                _persist_blocked_record(
+                    symbol=symbol, signal_price=signal.signal_price, kis_price=kis_quote.price_usd,
+                    account_available_usd=available_usd, risk_gate_result="BLOCKED",
+                    rejection_reason=reason, now=current,
+                )
                 continue
 
             try:
@@ -182,13 +264,26 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None):
                     limit_price=buffered_price, stop_price=None, target_price=None, created_at=current,
                 )
             except OrderIntentError as exc:
-                results["blocked"].append((symbol, f"order intent construction failed: {exc}"))
+                reason = f"order intent construction failed: {exc}"
+                results["blocked"].append((symbol, reason))
+                _persist_blocked_record(
+                    symbol=symbol, signal_price=signal.signal_price, kis_price=buffered_price,
+                    account_available_usd=available_usd, risk_gate_result="BLOCKED",
+                    rejection_reason=reason, now=current,
+                )
                 continue
 
             try:
                 open_orders = broker.get_open_orders()
             except KISBrokerError as exc:
-                results["blocked"].append((symbol, f"KIS open-orders read failed: {exc}"))
+                reason = f"KIS open-orders read failed: {exc}"
+                results["blocked"].append((symbol, reason))
+                _persist_blocked_record(
+                    symbol=symbol, signal_price=signal.signal_price, kis_price=buffered_price,
+                    planned_quantity=order_intent.quantity, planned_limit_price=order_intent.limit_price,
+                    account_available_usd=available_usd, risk_gate_result="BLOCKED",
+                    rejection_reason=reason, now=current,
+                )
                 continue
             has_open_order_for_symbol = any(
                 (o.get("pdno") or o.get("PDNO")) == symbol for o in open_orders

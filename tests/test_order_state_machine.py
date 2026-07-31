@@ -32,6 +32,25 @@ class TestTransition:
         with pytest.raises(OrderStateTransitionError):
             transition("UNKNOWN", "FILLED")
 
+    def test_unknown_to_submitting_blocked(self):
+        # Execution Engine state-machine enforcement (MEDIUM finding):
+        # an UNKNOWN order must never be silently re-submitted -- there
+        # is no legal transition() path from UNKNOWN back to SUBMITTING.
+        with pytest.raises(OrderStateTransitionError):
+            transition("UNKNOWN", "SUBMITTING")
+
+    def test_partially_filled_to_filled_is_normal(self):
+        assert transition("PARTIALLY_FILLED", "FILLED") == "FILLED"
+
+    def test_expected_state_mismatch_rejected(self):
+        # A caller's assumed current_status that doesn't match what the
+        # transition graph allows is rejected the same as any other
+        # illegal jump -- e.g. assuming ACCEPTED when the record is
+        # actually still CREATED skips straight past VALIDATING/APPROVED/
+        # SUBMITTING/ACCEPTED, which is not a legal single transition.
+        with pytest.raises(OrderStateTransitionError):
+            transition("CREATED", "PARTIALLY_FILLED")
+
     def test_illegal_skip_rejected(self):
         with pytest.raises(OrderStateTransitionError):
             transition("CREATED", "FILLED")

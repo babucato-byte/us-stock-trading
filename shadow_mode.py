@@ -12,8 +12,20 @@ mid-write never corrupts previously-recorded rows and the file can be
 tailed/appended incrementally -- the same shape convention
 `order_intent_ledger.py`/`exit_intent_ledger.py` already use for their
 own append-only records in this codebase.
+
+CODEX-review MEDIUM finding: locking + rotation. persist() takes an
+flock (mirroring execution/idempotency.py's single_run_lock() pattern)
+around the append so two concurrent writers (this pipeline's buy cycle
+and kis_position_manager.py's sell/exit tick both call shadow_mode.
+persist()) can never interleave partial writes into the same line.
+Without an explicit SHADOW_MODE_LOG_FILE override (the escape hatch
+every test in this suite uses to isolate its own file), the default
+path rotates to one file PER CALENDAR DAY (`shadow-YYYY-MM-DD.jsonl`)
+so the log never grows into a single unbounded file across the life of
+a deployment.
 """
 
+import fcntl
 import json
 import os
 from dataclasses import asdict, dataclass, field
@@ -27,9 +39,21 @@ BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_LOG_FILE = BASE_DIR / "SHADOW_MODE_LOG.jsonl"
 
 
-def _resolve_log_path():
+def _resolve_log_path(*, for_date=None):
+    """Explicit SHADOW_MODE_LOG_FILE always wins (test isolation and any
+    operator override use this) -- no rotation applied to it, matching
+    the "an explicit path override means exactly that path" convention
+    already used throughout this codebase's env-driven state files.
+    Without an override, rotates to a per-calendar-day file."""
     override = os.environ.get("SHADOW_MODE_LOG_FILE")
-    return Path(override) if override else DEFAULT_LOG_FILE
+    if override:
+        return Path(override)
+    day = for_date or datetime.now(timezone.utc).date()
+    return BASE_DIR / f"shadow-{day.isoformat()}.jsonl"
+
+
+def _lock_path_for(target):
+    return target.with_name(target.name + ".lock")
 
 
 class ShadowModeError(Exception):
@@ -84,7 +108,10 @@ def build_record(
 
 def persist(record: ShadowModeRecord, *, path=None):
     """Appends one JSON line. Never overwrites/truncates -- a fresh
-    process restart simply appends to the same durable log.
+    process restart simply appends to the same durable log. Takes an
+    flock on a sibling `.lock` file for the duration of the append so
+    two concurrent writers (the buy pipeline and the sell/exit tick)
+    can never interleave partial lines.
 
     CODEX-050: every field goes through redact_value() (structural,
     key-name-based redaction -- a defense-in-depth layer in case a
@@ -93,23 +120,35 @@ def persist(record: ShadowModeRecord, *, path=None):
     free text built from an underlying exception message (e.g. an
     OrderGateBlockedError) that could otherwise carry an unmasked
     account number or similar into this durable, on-disk log."""
-    target = path or _resolve_log_path()
+    if path is not None:
+        target = path
+    else:
+        for_date = None
+        if record.created_at:
+            try:
+                for_date = datetime.fromisoformat(record.created_at).date()
+            except ValueError:
+                for_date = None
+        target = _resolve_log_path(for_date=for_date)
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = redact_value(asdict(record))
     if payload.get("rejection_reason") is not None:
         payload["rejection_reason"] = redact_text(payload["rejection_reason"])
+    line = json.dumps(payload) + "\n"
+    lock_path = _lock_path_for(target)
     try:
-        with open(target, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(payload) + "\n")
+        with open(lock_path, "a+") as lock_fh:
+            fcntl.flock(lock_fh, fcntl.LOCK_EX)
+            try:
+                with open(target, "a", encoding="utf-8") as fh:
+                    fh.write(line)
+            finally:
+                fcntl.flock(lock_fh, fcntl.LOCK_UN)
     except OSError as exc:
         raise ShadowModeError(f"failed to persist Shadow Mode record: {exc}") from exc
 
 
-def read_all(*, path=None):
-    """Reads every recorded record back, for audit/reproduction. Skips
-    (does not raise on) a malformed trailing line from a crash mid-write
-    -- the durable prefix of good lines is never discarded."""
-    target = path or _resolve_log_path()
+def _read_file(target):
     if not target.exists():
         return []
     records = []
@@ -122,4 +161,26 @@ def read_all(*, path=None):
                 records.append(json.loads(line))
             except ValueError:
                 continue
+    return records
+
+
+def read_all(*, path=None, date=None):
+    """Reads every recorded record back, for audit/reproduction. Skips
+    (does not raise on) a malformed trailing line from a crash mid-write
+    -- the durable prefix of good lines is never discarded.
+
+    Without `path` and without SHADOW_MODE_LOG_FILE set, reads across
+    EVERY rotated `shadow-*.jsonl` file (chronological by filename) so
+    a full audit still sees every day's records; pass `date` to read
+    just one day's file."""
+    if path is not None:
+        return _read_file(path)
+    override = os.environ.get("SHADOW_MODE_LOG_FILE")
+    if override:
+        return _read_file(Path(override))
+    if date is not None:
+        return _read_file(_resolve_log_path(for_date=date))
+    records = []
+    for rotated_file in sorted(BASE_DIR.glob("shadow-*.jsonl")):
+        records.extend(_read_file(rotated_file))
     return records
