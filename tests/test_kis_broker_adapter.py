@@ -44,7 +44,7 @@ class _FakeKISBroker:
     def get_fills(self, *, start_date, end_date):
         return self.fills
 
-    def submit_order(self, order_intent, instrument):
+    def submit_order(self, order_intent, instrument, *, authorization=None):
         self.submit_calls.append((order_intent, instrument))
         if self.submit_raise is not None:
             raise self.submit_raise

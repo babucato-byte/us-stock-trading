@@ -310,15 +310,26 @@ class KISBroker:
 
     # -- order submission ---------------------------------------------
 
-    def submit_order(self, order_intent: OrderIntent, instrument) -> ExecutionRecord:
+    def submit_order(self, order_intent: OrderIntent, instrument, *, authorization=None) -> ExecutionRecord:
         """The ONLY method in this codebase that places a real KIS order.
-        Runs the fail-closed live-order gate (config.validate_live_order_
-        allowed()) before any network call -- a caller cannot bypass it by
-        holding a KISBroker instance built before the flag was disabled,
-        since this re-reads self.config fresh (frozen dataclass, so a
-        caller must have built a *new* KISBroker/KISConfig to flip it,
-        matching AlpacaBroker's own credential-rotation-requires-new-
-        instance pattern)."""
+        CODEX-043: `authorization` MUST be a currently-valid
+        `execution.authorization.AuthorizedExecution` for this exact
+        order_intent, minted by `execution.authorization.
+        authorize_new_order()` (which itself checks HALT and runs the
+        central Order Gate) -- consumed (single-use) here before
+        anything else runs. A direct call bypassing execution/
+        execution_engine.py (no `authorization`, or a hand-built one)
+        raises UnauthorizedExecutionError before the fail-closed
+        live-order gate below is even reached, let alone the network.
+        Also still runs the fail-closed live-order gate (config.
+        validate_live_order_allowed()) before any network call -- a
+        caller cannot bypass it by holding a KISBroker instance built
+        before the flag was disabled, since this re-reads self.config
+        fresh (frozen dataclass, so a caller must have built a *new*
+        KISBroker/KISConfig to flip it, matching AlpacaBroker's own
+        credential-rotation-requires-new-instance pattern)."""
+        from execution import authorization as _authz
+        _authz.consume(authorization, order_intent, expected_action="order")
         self.config.validate_live_order_allowed()
         if order_intent.order_type != "limit":
             raise KISBrokerError("only limit orders are permitted in this pilot")
@@ -369,7 +380,14 @@ class KISBroker:
             average_fill_price=None, status="ACCEPTED", submitted_at=current, updated_at=current,
         )
 
-    def cancel_order(self, order_intent: OrderIntent, instrument, broker_order_id: str) -> ExecutionRecord:
+    def cancel_order(self, order_intent: OrderIntent, instrument, broker_order_id: str, *, authorization=None) -> ExecutionRecord:
+        """CODEX-043: `authorization` MUST be a currently-valid
+        AuthorizedExecution minted by `execution.authorization.
+        authorize_cancel()` (which does NOT check HALT -- cancels of an
+        existing unfilled order remain allowed during HALT by explicit
+        policy -- but does run order_gate.evaluate_cancel_gate())."""
+        from execution import authorization as _authz
+        _authz.consume(authorization, order_intent, expected_action="cancel")
         self.config.validate_live_order_allowed()
         tr_id = TR_ID_CANCEL[self._env_key()]
         excg = _order_excg_for(order_intent.exchange)

@@ -22,6 +22,7 @@ NOW = datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc)
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
     monkeypatch.setenv("STATE_STORE_DB_FILE", str(tmp_path / "TEST_STATE.db"))
+    monkeypatch.setenv("OPERATIONS_HALT_STATE_FILE", str(tmp_path / "OPS_HALT.json"))
     from execution import idempotency
     monkeypatch.setattr(idempotency, "_LOCK_FILE", tmp_path / "KIS_ORDER_IDEMPOTENCY.lock")
     yield
@@ -50,9 +51,16 @@ class _FakeBroker:
         self.response = response
         self.raise_exc = raise_exc
         self.calls = []
+        self.cancel_calls = []
 
-    def submit_order(self, order_intent, instrument):
+    def submit_order(self, order_intent, instrument, *, authorization=None):
         self.calls.append((order_intent, instrument))
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        return self.response
+
+    def cancel_order(self, order_intent, instrument, broker_order_id, *, authorization=None):
+        self.cancel_calls.append((order_intent, instrument, broker_order_id))
         if self.raise_exc is not None:
             raise self.raise_exc
         return self.response
@@ -99,6 +107,25 @@ def _passing_sell_ctx_builder(order_intent):
             has_existing_sell_order_for_symbol=False, reconciliation_ok=True, has_unknown_order=False,
         )
     return _build
+
+
+def _passing_cancel_ctx_builder():
+    def _build():
+        return order_gate.CancelGateContext(
+            execution_broker="kis", broker_order_id="kis-1", is_actually_open=True,
+            kis_account_no="123", allowed_account_no="123", symbol="AAPL",
+            has_cancel_already_in_flight=False,
+        )
+    return _build
+
+
+def _cancelled_record(order_intent, broker_order_id="kis-1"):
+    return ExecutionRecord(
+        internal_order_id=order_intent.internal_order_id, broker="kis", broker_order_id=broker_order_id,
+        requested_quantity=order_intent.quantity, requested_price=order_intent.limit_price,
+        filled_quantity=0.0, average_fill_price=None, status="CANCELLED",
+        submitted_at=NOW, updated_at=NOW,
+    )
 
 
 class TestSubmitBuyOrder:
@@ -201,3 +228,78 @@ class TestSubmitSellOrder:
                 conn=conn, broker=broker, instrument=_instrument(), now=NOW,
             )
         assert broker.calls == []
+
+
+class TestHaltBlocksNewOrdersButNotCancel:
+    def test_halt_blocks_new_buy_zero_broker_calls(self):
+        from operations import kill_switch
+        kill_switch.set_halt(True, reason="risk event", actor="tester")
+        conn = _conn()
+        oi = _order_intent()
+        broker = _FakeBroker(response=_accepted_record(oi))
+        with pytest.raises(ExecutionEngineError, match="HALT"):
+            execution_engine.submit_buy_order(
+                order_intent=oi, buy_gate_context_builder=_passing_buy_ctx_builder(oi),
+                conn=conn, broker=broker, instrument=_instrument(), now=NOW,
+            )
+        assert broker.calls == []
+
+    def test_halt_blocks_new_sell_zero_broker_calls(self):
+        from operations import kill_switch
+        kill_switch.set_halt(True, reason="risk event", actor="tester")
+        conn = _conn()
+        oi = _order_intent(side="sell")
+        broker = _FakeBroker(response=_accepted_record(oi))
+        with pytest.raises(ExecutionEngineError, match="HALT"):
+            execution_engine.submit_sell_order(
+                order_intent=oi, sell_gate_context_builder=_passing_sell_ctx_builder(oi),
+                conn=conn, broker=broker, instrument=_instrument(), now=NOW,
+            )
+        assert broker.calls == []
+
+    def test_halt_does_not_block_cancel(self):
+        from operations import kill_switch
+        kill_switch.set_halt(True, reason="risk event", actor="tester")
+        conn = _conn()
+        oi = _order_intent()
+        broker = _FakeBroker(response=_cancelled_record(oi))
+        result = execution_engine.submit_cancel(
+            order_intent=oi, broker_order_id="kis-1",
+            cancel_gate_context_builder=_passing_cancel_ctx_builder(),
+            conn=conn, broker=broker, instrument=_instrument(), now=NOW,
+        )
+        assert result.status == "CANCELLED"
+        assert len(broker.cancel_calls) == 1
+
+
+class TestSubmitCancel:
+    def test_success_exactly_one_transport_call(self):
+        conn = _conn()
+        oi = _order_intent()
+        broker = _FakeBroker(response=_cancelled_record(oi))
+        result = execution_engine.submit_cancel(
+            order_intent=oi, broker_order_id="kis-1",
+            cancel_gate_context_builder=_passing_cancel_ctx_builder(),
+            conn=conn, broker=broker, instrument=_instrument(), now=NOW,
+        )
+        assert result.status == "CANCELLED"
+        assert len(broker.cancel_calls) == 1
+
+    def test_cancel_gate_blocked_zero_transport_calls(self):
+        conn = _conn()
+        oi = _order_intent()
+        broker = _FakeBroker(response=_cancelled_record(oi))
+
+        def _failing_ctx():
+            return order_gate.CancelGateContext(
+                execution_broker="kis", broker_order_id="kis-1", is_actually_open=False,
+                kis_account_no="123", allowed_account_no="123", symbol="AAPL",
+                has_cancel_already_in_flight=False,
+            )
+
+        with pytest.raises(ExecutionEngineError, match="order gate"):
+            execution_engine.submit_cancel(
+                order_intent=oi, broker_order_id="kis-1", cancel_gate_context_builder=_failing_ctx,
+                conn=conn, broker=broker, instrument=_instrument(), now=NOW,
+            )
+        assert broker.cancel_calls == []

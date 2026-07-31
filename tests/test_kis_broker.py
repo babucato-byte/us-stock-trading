@@ -16,8 +16,20 @@ from brokers.kis_broker import (
 from brokers.kis_config import KISConfig, KISConfigError
 from domain.instrument import build_instrument
 from domain.order_intent import OrderIntent
+from execution import authorization as authz
 
 NOW = datetime(2026, 7, 29, 14, 30, tzinfo=timezone.utc)
+
+
+def _authorize(order_intent, action="order"):
+    """This file tests brokers/kis_broker.py's own wire-protocol
+    correctness in isolation, not execution/execution_engine.py's
+    orchestration (covered separately in tests/test_execution_engine_
+    kis.py) -- a trivially-passing gate is enough to mint a valid,
+    real AuthorizedExecution token via the same authorize_new_order()/
+    authorize_cancel() every real caller must go through."""
+    fn = authz.authorize_new_order if action == "order" else authz.authorize_cancel
+    return fn(order_intent, lambda: object(), lambda ctx: True, now=NOW)
 
 
 class _StubResponse:
@@ -253,7 +265,34 @@ class TestSubmitOrderGate:
         session = _FakeSession()
         broker = _broker(config=_config(live_order_enabled=False), session=session)
         with pytest.raises(KISConfigError):
+            oi = _order_intent()
+            broker.submit_order(oi, _instrument(), authorization=_authorize(oi))
+        assert session.requests == []
+
+    def test_missing_authorization_blocked_zero_network_calls(self):
+        # CODEX-043: submit_order() without an authorization= at all
+        # (e.g. a caller bypassing execution/execution_engine.py
+        # entirely) must be blocked before token issuance is even
+        # attempted -- session.queue() below is never even reached.
+        session = _FakeSession()
+        broker = _broker(config=_config(live_order_enabled=True), session=session)
+        with pytest.raises(authz.UnauthorizedExecutionError):
             broker.submit_order(_order_intent(), _instrument())
+        assert session.requests == []
+
+    def test_hand_built_authorization_blocked_zero_network_calls(self):
+        # Not "protection by underscore": a hand-constructed
+        # AuthorizedExecution (never minted via authorize_new_order())
+        # still fails, since its token was never registered.
+        session = _FakeSession()
+        broker = _broker(config=_config(live_order_enabled=True), session=session)
+        oi = _order_intent()
+        fake = authz.AuthorizedExecution(
+            internal_order_id=oi.internal_order_id, side=oi.side, action="order",
+            token="made-up", authorized_at=NOW,
+        )
+        with pytest.raises(authz.UnauthorizedExecutionError):
+            broker.submit_order(oi, _instrument(), authorization=fake)
         assert session.requests == []
 
     def test_market_order_rejected_before_network(self):
@@ -276,7 +315,8 @@ class TestSubmitOrderSuccessAndFailure:
             _StubResponse(200, {"rt_cd": "0", "output": {"ODNO": "kis-999"}}),
         )
         broker = _broker(config=_config(live_order_enabled=True), session=session)
-        record = broker.submit_order(_order_intent(), _instrument())
+        oi = _order_intent()
+        record = broker.submit_order(oi, _instrument(), authorization=_authorize(oi))
         assert record.status == "ACCEPTED"
         assert record.broker_order_id == "kis-999"
         assert record.broker == "kis"
@@ -293,7 +333,8 @@ class TestSubmitOrderSuccessAndFailure:
             _StubResponse(200, {"rt_cd": "0", "output": {"ODNO": "kis-999"}}),
         )
         broker = _broker(config=_config(live_order_enabled=True), session=session)
-        broker.submit_order(_order_intent(), _instrument())
+        oi = _order_intent()
+        broker.submit_order(oi, _instrument(), authorization=_authorize(oi))
         order_call = next(r for r in session.requests if r[1].endswith("/trading/order"))
         assert order_call[2]["json"]["OVRS_EXCG_CD"] == "NASD"
 
@@ -305,7 +346,8 @@ class TestSubmitOrderSuccessAndFailure:
             _StubResponse(200, {"rt_cd": "1", "msg_cd": "E001", "msg1": "insufficient funds", "output": {}}),
         )
         broker = _broker(config=_config(live_order_enabled=True), session=session)
-        record = broker.submit_order(_order_intent(), _instrument())
+        oi = _order_intent()
+        record = broker.submit_order(oi, _instrument(), authorization=_authorize(oi))
         assert record.status == "REJECTED"
         assert record.error_code == "E001"
 
@@ -315,7 +357,8 @@ class TestSubmitOrderSuccessAndFailure:
         session.queue("/uapi/overseas-stock/v1/trading/order", requests.exceptions.Timeout("boom"))
         broker = _broker(config=_config(live_order_enabled=True), session=session)
         with pytest.raises(KISAmbiguousResponseError):
-            broker.submit_order(_order_intent(), _instrument())
+            oi = _order_intent()
+            broker.submit_order(oi, _instrument(), authorization=_authorize(oi))
 
     @pytest.mark.parametrize("status_code", [500, 502, 503, 504, 408, 429])
     def test_5xx_and_ambiguous_statuses_raise_ambiguous(self, status_code):
@@ -327,7 +370,8 @@ class TestSubmitOrderSuccessAndFailure:
         )
         broker = _broker(config=_config(live_order_enabled=True), session=session)
         with pytest.raises(KISAmbiguousResponseError):
-            broker.submit_order(_order_intent(), _instrument())
+            oi = _order_intent()
+            broker.submit_order(oi, _instrument(), authorization=_authorize(oi))
 
     def test_malformed_json_raises_ambiguous(self):
         session = _FakeSession()
@@ -340,7 +384,8 @@ class TestSubmitOrderSuccessAndFailure:
         session.queue("/uapi/overseas-stock/v1/trading/order", _BadJSON(200))
         broker = _broker(config=_config(live_order_enabled=True), session=session)
         with pytest.raises(KISAmbiguousResponseError):
-            broker.submit_order(_order_intent(), _instrument())
+            oi = _order_intent()
+            broker.submit_order(oi, _instrument(), authorization=_authorize(oi))
 
 
 class TestCancelOrder:
@@ -348,7 +393,8 @@ class TestCancelOrder:
         session = _FakeSession()
         broker = _broker(config=_config(live_order_enabled=False), session=session)
         with pytest.raises(KISConfigError):
-            broker.cancel_order(_order_intent(), _instrument(), "kis-999")
+            oi = _order_intent()
+            broker.cancel_order(oi, _instrument(), "kis-999", authorization=_authorize(oi, action="cancel"))
         assert session.requests == []
 
     def test_success_returns_cancelled(self):
@@ -359,7 +405,8 @@ class TestCancelOrder:
             _StubResponse(200, {"rt_cd": "0", "output": {}}),
         )
         broker = _broker(config=_config(live_order_enabled=True), session=session)
-        record = broker.cancel_order(_order_intent(), _instrument(), "kis-999")
+        oi = _order_intent()
+        record = broker.cancel_order(oi, _instrument(), "kis-999", authorization=_authorize(oi, action="cancel"))
         assert record.status == "CANCELLED"
 
     def test_cancel_payload_sends_zero_price_and_4letter_exchange_code(self):
@@ -373,7 +420,8 @@ class TestCancelOrder:
             _StubResponse(200, {"rt_cd": "0", "output": {}}),
         )
         broker = _broker(config=_config(live_order_enabled=True), session=session)
-        broker.cancel_order(_order_intent(limit_price=123.45), _instrument(), "kis-999")
+        oi = _order_intent(limit_price=123.45)
+        broker.cancel_order(oi, _instrument(), "kis-999", authorization=_authorize(oi, action="cancel"))
         call = next(r for r in session.requests if r[1].endswith("/order-rvsecncl"))
         assert call[2]["json"]["OVRS_ORD_UNPR"] == "0"
         assert call[2]["json"]["OVRS_EXCG_CD"] == "NASD"
@@ -384,4 +432,5 @@ class TestCancelOrder:
         session.queue("/uapi/overseas-stock/v1/trading/order-rvsecncl", requests.exceptions.Timeout("boom"))
         broker = _broker(config=_config(live_order_enabled=True), session=session)
         with pytest.raises(KISAmbiguousResponseError):
-            broker.cancel_order(_order_intent(), _instrument(), "kis-999")
+            oi = _order_intent()
+            broker.cancel_order(oi, _instrument(), "kis-999", authorization=_authorize(oi, action="cancel"))

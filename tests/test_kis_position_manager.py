@@ -43,7 +43,7 @@ class _FakeKISBroker:
     def get_fills(self, *, start_date, end_date):
         return self.fills
 
-    def submit_order(self, order_intent, instrument):
+    def submit_order(self, order_intent, instrument, *, authorization=None):
         self.submit_calls.append((order_intent, instrument))
         from domain.execution_event import ExecutionRecord
         if self._submit_responses:

@@ -7,9 +7,11 @@ from domain.order_intent import OrderIntent
 from domain.signal import build_signal
 from execution.order_gate import (
     BuyGateContext,
+    CancelGateContext,
     OrderGateBlockedError,
     SellGateContext,
     evaluate_buy_gate,
+    evaluate_cancel_gate,
     evaluate_sell_gate,
 )
 
@@ -208,3 +210,38 @@ class TestEvaluateSellGate:
         assert evaluate_sell_gate(
             _sell_ctx(kis_position_quantity=1, order_intent=_order_intent(side="sell", quantity=1))
         ) is True
+
+
+def _cancel_ctx(**overrides):
+    kwargs = dict(
+        execution_broker="kis", broker_order_id="kis-999", is_actually_open=True,
+        kis_account_no="12345678", allowed_account_no="12345678", symbol="AAPL",
+        has_cancel_already_in_flight=False,
+    )
+    kwargs.update(overrides)
+    return CancelGateContext(**kwargs)
+
+
+class TestEvaluateCancelGate:
+    def test_passes_valid_context(self):
+        assert evaluate_cancel_gate(_cancel_ctx()) is True
+
+    def test_non_kis_broker_blocked(self):
+        with pytest.raises(OrderGateBlockedError, match="execution broker"):
+            evaluate_cancel_gate(_cancel_ctx(execution_broker="alpaca"))
+
+    def test_missing_broker_order_id_blocked(self):
+        with pytest.raises(OrderGateBlockedError, match="no broker_order_id"):
+            evaluate_cancel_gate(_cancel_ctx(broker_order_id=None))
+
+    def test_not_actually_open_blocked(self):
+        with pytest.raises(OrderGateBlockedError, match="not an actual open"):
+            evaluate_cancel_gate(_cancel_ctx(is_actually_open=False))
+
+    def test_account_mismatch_blocked(self):
+        with pytest.raises(OrderGateBlockedError, match="allowed account"):
+            evaluate_cancel_gate(_cancel_ctx(kis_account_no="99999999"))
+
+    def test_duplicate_cancel_in_flight_blocked(self):
+        with pytest.raises(OrderGateBlockedError, match="already in flight"):
+            evaluate_cancel_gate(_cancel_ctx(has_cancel_already_in_flight=True))

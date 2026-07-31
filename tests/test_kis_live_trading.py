@@ -73,7 +73,7 @@ class _FakeBroker:
     def get_positions(self):
         return []
 
-    def submit_order(self, order_intent, instrument):
+    def submit_order(self, order_intent, instrument, *, authorization=None):
         self.submit_calls.append((order_intent, instrument))
         if self.submit_raise is not None:
             raise self.submit_raise

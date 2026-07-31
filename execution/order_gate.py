@@ -166,3 +166,40 @@ def evaluate_sell_gate(ctx: SellGateContext) -> bool:
     if ctx.has_unknown_order:
         raise OrderGateBlockedError("an UNKNOWN-state order exists -- new sells blocked until reconciled")
     return True
+
+
+@dataclass(frozen=True)
+class CancelGateContext:
+    execution_broker: str
+    broker_order_id: Optional[str]
+    is_actually_open: bool
+    kis_account_no: str
+    allowed_account_no: str
+    symbol: str
+    has_cancel_already_in_flight: bool
+
+
+def evaluate_cancel_gate(ctx: CancelGateContext) -> bool:
+    """CODEX-043: cancels are NEVER blocked by HALT (spec §3/§20 -- an
+    existing unfilled order may always be cancelled to reduce risk), but
+    they are not unconditionally authorized either -- these checks still
+    apply. `execution/authorization.py::authorize_cancel()` is the only
+    caller; HALT itself is checked there (by deliberately NOT checking
+    it), not here."""
+    if ctx.execution_broker != "kis":
+        raise OrderGateBlockedError(f"execution broker must be 'kis', got {ctx.execution_broker!r}")
+    if not ctx.broker_order_id:
+        raise OrderGateBlockedError("no broker_order_id supplied -- cannot cancel an unknown order")
+    if not ctx.is_actually_open:
+        raise OrderGateBlockedError(
+            f"broker_order_id {ctx.broker_order_id!r} is not an actual open KIS order -- refusing to cancel"
+        )
+    if ctx.kis_account_no != ctx.allowed_account_no:
+        raise OrderGateBlockedError(
+            f"KIS account {ctx.kis_account_no!r} is not the allowed account {ctx.allowed_account_no!r}"
+        )
+    if ctx.has_cancel_already_in_flight:
+        raise OrderGateBlockedError(
+            f"a cancel is already in flight for {ctx.broker_order_id!r} -- duplicate cancel blocked"
+        )
+    return True
