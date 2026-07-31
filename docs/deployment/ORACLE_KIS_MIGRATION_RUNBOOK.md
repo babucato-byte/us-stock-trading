@@ -128,42 +128,83 @@ MARKET_ORDER_ENABLED=false
 EXTENDED_HOURS_ENABLED=false
 MAX_PRICE_DEVIATION_PERCENT=0.30
 
+# CODEX-046: independent kill-switches for the KIS position-management
+# tick's "extra" exit behaviors. All four MUST stay false at initial
+# rollout -- only stop-loss and full take-profit (target_2) are active
+# with all four off, which is the intended narrowest starting posture.
+# Enabling any of these later is itself a deliberate, reviewed config
+# change, not a code deploy.
+LIVE_ENABLE_PARTIAL_PROFIT=false
+LIVE_ENABLE_TRAILING_STOP=false
+LIVE_ENABLE_TIME_STOP=false
+LIVE_ENABLE_EOD_EXIT=false
+
 VALIDATED_COMMIT=<Codex가 검증한 정확한 커밋 해시>
 DEPLOYED_COMMIT=<위와 동일해야 함 -- order_gate.py가 이 둘의 일치를 강제로 검증한다>
 ```
 
-**`KIS_LIVE_ORDER_ENABLED=false`와 `ENTRY_DISABLED=true`, `LIVE_ROLLOUT_ENABLED=false`는
-이 단계 이후에도 계속 유지한다.** 이 셋 중 하나라도 켜는 것은 spec §29의 "최초 KIS 실주문
-기능 활성화"에 해당하며 운영자의 별도 명시적 승인이 필요하다.
+**`KIS_LIVE_ORDER_ENABLED=false`와 `ENTRY_DISABLED=true`, `LIVE_ROLLOUT_ENABLED=false`, 그리고
+네 개의 `LIVE_ENABLE_*` 플래그는 이 단계 이후에도 계속 `false`로 유지한다.** 이 중 하나라도
+켜는 것은 spec §29의 "최초 KIS 실주문 기능 활성화"(또는 그에 준하는 실거래 동작 확장)에
+해당하며 운영자의 별도 명시적 승인이 필요하다.
 
-## 8. 전체 테스트
+**주의(실제 배포에서 발견된 문제)**: 과거 배포된 Oracle `.env`에는 위 이름과 다른
+`KIS_LIVE_APP_KEY`/`KIS_LIVE_APP_SECRET`/`KIS_LIVE_ACCOUNT_NO`/`KIS_LIVE_ACCOUNT_PRODUCT_CODE`
+같은 변수명이 남아 있을 수 있다. `brokers/kis_config.py`가 실제로 읽는 이름은 위 코드
+블록에 적힌 것(`KIS_APP_KEY`/`KIS_APP_SECRET`/`KIS_ACCOUNT_NO`/`KIS_ACCOUNT_PRODUCT_CD`)뿐이다
+-- 8단계(전체 테스트)와 9단계(설정 검증)를 실행하기 전에, 실제 `.env` 파일의 변수명이
+이 코드 블록과 정확히 일치하는지 `grep -oE '^[A-Z_][A-Z0-9_]*=' .env`로 반드시 재확인한다.
+이름이 다르면 `KISConfig.from_env()`가 `app_key=None` 등으로 조용히 읽어 이후 모든 KIS
+호출이 인증 오류로 실패한다 (비밀값 자체는 여전히 출력/로그에 남기지 않는다 -- 이름만
+확인한다).
+
+## 8. 스키마 마이그레이션 적용 (읽기 전용이 아님 -- 상태 DB 스키마 변경)
 
 ```bash
 source venv/bin/activate
+python3 -c "
+from state_store import db
+conn = db.open_db()
+from state_store.migrations import CURRENT_SCHEMA_VERSION
+print('applied schema version:', db.get_schema_version(conn))
+assert db.get_schema_version(conn) == CURRENT_SCHEMA_VERSION
+"
+```
+
+`db.open_db()`가 `kis_order_idempotency` 테이블(마이그레이션 6)과 그 `requested_quantity`
+컬럼(마이그레이션 7, CODEX-045 -- 부분체결 오분류 수정에 필요)까지 자동으로 적용한다.
+이 명령이 실패하거나 버전이 `CURRENT_SCHEMA_VERSION`과 다르면 다음 단계로 진행하지 않는다.
+
+## 9. 전체 테스트
+
+```bash
 pytest -q
 ```
 
 `docs/autonomous/FINAL_VALIDATION_PACKAGE.md`(또는 이 사이클의 등가 문서)에 기록된 테스트
 수·결과와 정확히 일치해야 한다. 하나라도 실패하면 배포를 중단한다.
 
-## 9. 설정 검증
+## 10. 설정 검증
 
 ```bash
 python3 -c "
 from config.live_rollout_config import LiveRolloutConfig
+from config.live_exit_flags import LiveExitFlags
 from brokers.kis_config import KISConfig
 cfg = LiveRolloutConfig.from_env()
 cfg.validate()
 print('live_rollout OK:', cfg)
 kis = KISConfig.from_env()
 print('kis_env:', kis.kis_env, 'account_read_enabled:', kis.account_read_enabled, 'live_order_enabled:', kis.live_order_enabled)
+flags = LiveExitFlags.from_env()
+print('exit flags (all must be False at initial rollout):', flags)
 "
 ```
 
-`live_order_enabled`가 `False`인지, `LiveRolloutConfig.validate()`가 예외 없이 통과하는지
-확인한다.
+`live_order_enabled`가 `False`인지, `LiveRolloutConfig.validate()`가 예외 없이 통과하는지,
+`LiveExitFlags`의 네 필드가 모두 `False`인지 확인한다.
 
-## 10. Alpaca 데이터 조회 확인 (읽기 전용)
+## 11. Alpaca 데이터 조회 확인 (읽기 전용)
 
 ```bash
 python3 -c "
@@ -174,7 +215,7 @@ print(q)
 "
 ```
 
-## 11. KIS 실계좌 조회 (읽기 전용, 이 단계에서 최초로 실제 KIS API 호출 발생)
+## 12. KIS 실계좌 조회 (읽기 전용, 이 단계에서 최초로 실제 KIS API 호출 발생)
 
 ```bash
 python3 -c "
@@ -195,31 +236,46 @@ print('open_orders:', open_orders)
 응답의 정확한 필드명)을 이 시점에 실제 응답으로 재확인하고, 필요하면 코드를 수정 후 다시
 Codex 검증을 받는다.
 
-## 12. KIS 잔고·미체결 대조
+## 13. KIS 잔고·미체결 대조 (계정 전체 reconciliation, CODEX-044)
+
+`reconciliation_state.is_current_and_clean()`이 buy/sell Order Gate 모두가 읽는 실제
+값이다(더 이상 상수가 아니다) -- 이 값은 `kis_position_manager.sync_kis_fills_and_
+manage_exits()`가 매 tick마다 계정 전체 포지션을 대조하고 그 결과를 기록해야만 "신선한"
+상태로 유지된다(기본 유효기간 `reconciliation_state.DEFAULT_MAX_AGE_SECONDS` = 300초).
+이 서비스가 §14에서 계속 실행되지 않으면 300초 후 buy/sell 모두 "reconciliation stale"로
+자동 차단된다(안전 방향으로 fail-closed -- 오작동이 아니다).
 
 ```bash
 python3 -c "
+from datetime import datetime, timezone
 from brokers.kis_broker import KISBroker
 from reconciliation.position_reconciler import reconcile_positions
+from reconciliation import reconciliation_state
 b = KISBroker()
 kis_positions = b.get_positions()
 # internal_positions: 이 시점에는 KIS 실거래 이력이 없으므로 빈 리스트가 정상
 mismatches = reconcile_positions([], kis_positions)
 print('mismatches:', mismatches)
+now = datetime.now(timezone.utc)
+reconciliation_state.record_result(clean=not mismatches, mismatch_count=len(mismatches), now=now)
+print('reconciliation_ok:', reconciliation_state.is_current_and_clean(
+    max_age_seconds=reconciliation_state.DEFAULT_MAX_AGE_SECONDS, now=now))
 "
 ```
 
-빈 리스트가 아니면(즉 KIS에 이미 알 수 없는 포지션이 있으면) 원인을 파악하기 전까지 중단한다.
+`mismatches`가 빈 리스트가 아니면(즉 KIS에 이미 알 수 없는 포지션이 있으면) 원인을 파악하기
+전까지 중단한다. `RECONCILIATION_STATE_FILE` 환경변수로 이 상태 파일의 경로를 지정할 수
+있다(미지정 시 저장소 루트의 `RECONCILIATION_STATE.json`).
 
-## 13. Shadow Mode 실행 (spec §26)
+## 14. Shadow Mode 실행 (spec §26)
 
-**Shadow Mode 자체 구현은 이번 사이클 범위에 포함되지 않았다** — `kis_live_trading.py`의
-buy-entry pipeline은 실제로 `KIS_LIVE_ORDER_ENABLED=false`일 때 `order_gate`/`execution_
-engine`이 자연히 매 후보를 차단하므로(주문 거부, broker 호출 0회) 사실상 Shadow Mode와
-동일한 안전성을 제공하지만, spec §26이 요구하는 별도 기록 항목(signal_id, alpaca_signal_
-price, kis_validation_price, price_difference_percent, planned_quantity, planned_limit_
-price, rejection_reason 등을 구조화된 로그/CSV로 남기는 것)은 아직 별도 구현되지 않았다.
-이 단계에서는 대신 다음으로 대체 검증한다:
+Shadow Mode는 완전히 구현되어 있다 (`shadow_mode.py`) -- buy 경로(`kis_live_trading.py`)와
+sell 경로(`brokers/kis_broker_adapter.py`) 모두, config 차단/HALT/signal 만료/symbol
+차단/가격 편차/잔고 부족/reconciliation 실패/UNKNOWN 주문 존재/중복 주문/Order Gate
+거부/승인까지 모든 결과 범주를 구조화된 JSONL 레코드로 기록한다. 계좌번호·비밀정보는
+`execution/secret_redaction.py`가 기록 전에 마스킹한다. 기본 경로는 달력일 단위로 회전한다
+(`shadow-YYYY-MM-DD.jsonl`, `SHADOW_MODE_LOG_FILE` 환경변수로 고정 경로 지정 시 회전 없이
+그 경로만 사용).
 
 ```bash
 KIS_ACCOUNT_READ_ENABLED=true KIS_LIVE_ORDER_ENABLED=false LIVE_ROLLOUT_ENABLED=true \
@@ -227,22 +283,27 @@ KIS_ACCOUNT_READ_ENABLED=true KIS_LIVE_ORDER_ENABLED=false LIVE_ROLLOUT_ENABLED=
   python3 -c "
 from brokers.kis_broker import KISBroker
 import kis_live_trading as klt
+import shadow_mode
 b = KISBroker()
 results = klt.run_live_buy_entry_cycle(broker=b)
 print(results)
+print('shadow mode records this run:', len(shadow_mode.read_all()))
 "
 ```
 
 `KIS_LIVE_ORDER_ENABLED=false`이므로 `order_gate.evaluate_buy_gate()`가 `live_order_enabled`
 확인에서 매 후보를 차단하고 `results['blocked']`에 이유가 기록된다 — broker.submit_order()는
-호출되지 않는다(§9 참고: `execution_engine.py`가 gate 실패 시 broker를 호출하지 않음을
-보장). 실제 별도 Shadow Mode 기록 기능은 후속 사이클의 남은 작업이다.
+호출되지 않는다(`execution_engine.py`가 gate 실패 시 broker를 호출하지 않음을 보장). 동시에
+같은 실행에서 각 차단마다 Shadow Mode 레코드가 하나씩 남아야 한다 -- `read_all()`의 개수가
+0이면 Shadow Mode 기록 경로 자체가 깨진 것이므로 원인을 파악하기 전까지 다음 단계로
+진행하지 않는다.
 
-## 14. 서비스 경로 전환
+## 15. 서비스 경로 전환
 
 기존 `order-monitor`/`dashboard` systemd 유닛을 새 `~/trading-release` 경로를 가리키도록
 갱신하되(`WorkingDirectory=`, `ExecStart=`), **이 시점에도 `ENTRY_DISABLED=true`/
-`KIS_LIVE_ORDER_ENABLED=false`/`LIVE_ROLLOUT_ENABLED=false`를 유지한 채** 전환한다.
+`KIS_LIVE_ORDER_ENABLED=false`/`LIVE_ROLLOUT_ENABLED=false`/네 `LIVE_ENABLE_*` 플래그를
+유지한 채** 전환한다.
 
 ```bash
 sudo systemctl daemon-reload
@@ -250,17 +311,29 @@ sudo systemctl restart order-monitor dashboard
 systemctl status order-monitor dashboard
 ```
 
-## 15. 실주문 비활성 상태 최종 확인
+**신규 서비스 (CODEX-044 이후 필수)**: `kis_position_manager.sync_kis_fills_and_manage_exits()`
+를 주기적으로(예: 30~60초 간격) 실행하는 별도 systemd 타이머/서비스가 배포되어야 한다 --
+이 tick이 (1) KIS 체결을 내부 포지션에 반영하고, (2) 손절·익절·부분익절·트레일링·시간
+청산·EOD 청산을 관리하며, (3) §13의 계정 전체 reconciliation 결과를 갱신해 buy/sell Order
+Gate가 "stale"로 자동 차단되지 않도록 유지한다. 이 서비스 파일은 아직 이 저장소에 커밋된
+`systemd/` 유닛으로 존재하지 않는다 -- 배포자가 `systemd/` 디렉터리의 기존 유닛 파일 형식을
+참고해 새로 작성하고, `WorkingDirectory`/`ExecStart`/`EnvironmentFile`을 `~/trading-release`
+와 동일한 `.env`로 지정해야 한다. 이 서비스가 존재/실행되지 않으면 5분(300초) 후부터 모든
+신규 매수·매도가 "reconciliation stale"로 자동 차단된다(§13 참고, fail-closed이므로 안전하지만
+의도된 정상 운영 상태는 아니다).
+
+## 16. 실주문 비활성 상태 최종 확인
 
 ```bash
-grep -E "ENTRY_DISABLED|KIS_LIVE_ORDER_ENABLED|LIVE_ROLLOUT_ENABLED|ALPACA_ORDER_ENABLED|ALPACA_PAPER_ORDER_ENABLED" ~/trading-release/.env
+grep -E "ENTRY_DISABLED|KIS_LIVE_ORDER_ENABLED|LIVE_ROLLOUT_ENABLED|ALPACA_ORDER_ENABLED|ALPACA_PAPER_ORDER_ENABLED|LIVE_ENABLE_PARTIAL_PROFIT|LIVE_ENABLE_TRAILING_STOP|LIVE_ENABLE_TIME_STOP|LIVE_ENABLE_EOD_EXIT" ~/trading-release/.env
 ```
 
-다섯 값 모두 `false`(또는 `ENTRY_DISABLED=true`)인지 육안으로 재확인한다.
+아홉 값 모두 `false`(또는 `ENTRY_DISABLED=true`)인지 육안으로 재확인한다.
 
 ## 롤백 절차
 
-1. `sudo systemctl stop order-monitor dashboard`
+1. `sudo systemctl stop order-monitor dashboard`, 그리고 §15에서 배포했다면 KIS position-
+   manager 타이머/서비스도 함께 중지한다.
 2. systemd 유닛의 `WorkingDirectory`/`ExecStart`를 `~/trading`(기존 운영본)으로 되돌린다.
 3. `sudo systemctl daemon-reload && sudo systemctl start order-monitor dashboard`
 4. `~/trading-release`는 삭제하지 않고 보존한다(원인 분석용).
