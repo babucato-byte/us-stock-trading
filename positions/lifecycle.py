@@ -590,7 +590,9 @@ def _exit_states_reachable_from(current_state):
 
 
 def check_and_manage(position_id, *, current_price, bars=None, now=None, clock=None, broker=None,
-                      order_date=None, lock_timeout=store.LOCK_TIMEOUT_SECONDS):
+                      order_date=None, lock_timeout=store.LOCK_TIMEOUT_SECONDS,
+                      enable_partial_profit=True, enable_trailing_stop=True,
+                      enable_time_stop=True, enable_eod_exit=True):
     """The core "tick" function: given the current price (and optionally
     fresh bars for an invalidation check), decide whether this position
     needs a partial exit, a full exit (target_2/invalidation/time-stop/
@@ -602,6 +604,20 @@ def check_and_manage(position_id, *, current_price, bars=None, now=None, clock=N
     exit) > stop-loss. EOD/time-stop/invalidation/stop-loss all force a
     FULL exit of remaining_qty regardless of which target stage the
     position is in -- they are safety overrides, not another target level.
+
+    CODEX-046: `enable_partial_profit`/`enable_trailing_stop`/
+    `enable_time_stop`/`enable_eod_exit` all default to True so every
+    EXISTING caller (the Alpaca/paper live-pilot path, and every test
+    that doesn't pass them) keeps today's unmodified behavior -- these
+    are an opt-OUT a caller (kis_position_manager.py, from
+    config/live_exit_flags.py) can set False, never a change to the
+    default policy itself. Stop-loss and full take-profit at target_2
+    are NOT gated by any flag -- they stay unconditionally active
+    regardless of these four. When enable_partial_profit is False, a
+    position at target_1 skips the partial exit entirely and instead
+    takes a FULL exit the moment price reaches target_2 (never left to
+    wait forever in STOP_ACTIVE for a partial-exit path that will never
+    fire).
 
     CODEX-030: `now`, if supplied, must be an explicit timezone-aware
     Eastern-zoned moment (a naive datetime is rejected, not silently
@@ -631,11 +647,11 @@ def check_and_manage(position_id, *, current_price, bars=None, now=None, clock=N
     eod_cutoff = combine_eastern(now.date(), MARKET_REGULAR_END) - timedelta(
         minutes=cfg.EOD_FORCE_CLOSE_MINUTES_BEFORE_CLOSE
     )
-    if now >= eod_cutoff:
+    if enable_eod_exit and now >= eod_cutoff:
         return _force_full_exit(position_id, symbol, order_date, broker, "EOD_FORCED_CLOSE", lock_timeout)
 
     entry_time = record.get("entry_time")
-    if entry_time:
+    if enable_time_stop and entry_time:
         held_minutes = (now - datetime.fromisoformat(entry_time)).total_seconds() / 60.0
         if held_minutes >= cfg.MAX_POSITION_HOLD_MINUTES:
             return _force_full_exit(position_id, symbol, order_date, broker, "TIME_STOP", lock_timeout)
@@ -646,12 +662,18 @@ def check_and_manage(position_id, *, current_price, bars=None, now=None, clock=N
         return _force_full_exit(position_id, symbol, order_date, broker, "STOP_LOSS", lock_timeout)
 
     if record["state"] == states.STOP_ACTIVE and current_price >= record["target_1_price"]:
-        return _partial_exit_at_target_1(position_id, symbol, order_date, broker, lock_timeout)
+        if enable_partial_profit:
+            return _partial_exit_at_target_1(position_id, symbol, order_date, broker, lock_timeout)
+        if current_price >= record["target_2_price"]:
+            # Partial profit-taking is disabled -- never leave the
+            # position waiting in STOP_ACTIVE for a partial-exit branch
+            # that will never fire once target_2 is already reached.
+            return _force_full_exit(position_id, symbol, order_date, broker, "TARGET_2", lock_timeout)
 
     if record["state"] in (states.TARGET_1_ACTIVE, states.PARTIAL_EXITED, states.TRAILING):
         if current_price >= record["target_2_price"]:
             return _force_full_exit(position_id, symbol, order_date, broker, "TARGET_2", lock_timeout)
-        if record["state"] == states.PARTIAL_EXITED:
+        if record["state"] == states.PARTIAL_EXITED and enable_trailing_stop:
             # ASSUMPTION (DECISION_LOG.md): minimal trailing rule -- once
             # target_1 fills, move the stop to breakeven (entry price) and
             # enter TRAILING. This is a deliberately simple initial policy,

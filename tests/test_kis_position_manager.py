@@ -143,7 +143,10 @@ class TestSyncKisFillsAndManageExits:
         assert broker.submit_calls[0][0].quantity == 10
         assert "AAPL" in summary["managed"]
 
-    def test_target_1_triggers_exactly_one_partial_sell(self):
+    def test_target_1_triggers_exactly_one_partial_sell(self, monkeypatch):
+        # CODEX-046: partial profit-taking is an opt-in live-rollout flag
+        # (default off) -- must be explicitly enabled to exercise it.
+        monkeypatch.setenv("LIVE_ENABLE_PARTIAL_PROFIT", "true")
         record = _create_filled_position(None, avg_price=100.0)
         target_1 = record["target_1_price"]
         broker = _FakeKISBroker(
@@ -156,7 +159,38 @@ class TestSyncKisFillsAndManageExits:
         assert len(broker.submit_calls) == 1
         assert broker.submit_calls[0][0].quantity == int(10 * strat_cfg.PARTIAL_EXIT_FRACTION_AT_TARGET_1)
 
-    def test_no_full_resell_after_partial_fill(self):
+    def test_target_1_without_partial_profit_flag_does_not_sell(self):
+        # CODEX-046: with the flag left at its default (off), reaching
+        # target_1 (but not target_2) must not trigger any sell at all --
+        # never silently falling back to a partial exit.
+        record = _create_filled_position(None, avg_price=100.0)
+        target_1 = record["target_1_price"]
+        broker = _FakeKISBroker(
+            price=target_1 + 0.5,
+            positions=[Position(symbol="AAPL", quantity=10, average_fill_price=100.0,
+                                 unrealized_pnl=0.0, realized_pnl=0.0, as_of=NOW, source="kis_balance")],
+        )
+        adapter = KISBrokerAdapter(broker, now_fn=lambda: NOW)
+        kpm.sync_kis_fills_and_manage_exits(kis_broker=broker, broker_adapter=adapter, now=NOW)
+        assert broker.submit_calls == []
+
+    def test_target_1_without_partial_profit_flag_but_past_target_2_takes_full_exit(self):
+        # CODEX-046: with partial profit-taking disabled, a position must
+        # never be left waiting forever once price has already reached
+        # target_2 -- it takes a full exit immediately.
+        record = _create_filled_position(None, avg_price=100.0)
+        target_2 = record["target_2_price"]
+        broker = _FakeKISBroker(
+            price=target_2 + 0.5,
+            positions=[Position(symbol="AAPL", quantity=10, average_fill_price=100.0,
+                                 unrealized_pnl=0.0, realized_pnl=0.0, as_of=NOW, source="kis_balance")],
+        )
+        adapter = KISBrokerAdapter(broker, now_fn=lambda: NOW)
+        kpm.sync_kis_fills_and_manage_exits(kis_broker=broker, broker_adapter=adapter, now=NOW)
+        assert len(broker.submit_calls) == 1
+        assert broker.submit_calls[0][0].quantity == 10
+
+    def test_no_full_resell_after_partial_fill(self, monkeypatch):
         # After a target-1 partial exit is SUBMITTED, the position moves
         # to PARTIAL_EXIT_SUBMITTED -- not one of the exit-eligible states
         # (_execute_exit's own duplicate-exit-prevention lock already
@@ -164,6 +198,7 @@ class TestSyncKisFillsAndManageExits:
         # attempt on the same position sees the updated state and has
         # nothing left to do). A second tick at the same price must not
         # submit a second sell for the already-in-flight exit.
+        monkeypatch.setenv("LIVE_ENABLE_PARTIAL_PROFIT", "true")
         record = _create_filled_position(None, avg_price=100.0)
         target_1 = record["target_1_price"]
         broker = _FakeKISBroker(

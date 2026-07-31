@@ -381,6 +381,83 @@ def test_check_and_manage_no_action_when_price_between_stop_and_target_1():
 
 
 # ---------------------------------------------------------------------------
+# CODEX-046: independent live-rollout exit flags
+# ---------------------------------------------------------------------------
+
+def test_partial_profit_disabled_takes_no_action_at_target_1():
+    record, broker = _filled_position(qty=10)
+    updated = lifecycle.check_and_manage(
+        record["position_id"], current_price=105.0, now=MID_SESSION_NOW, broker=broker,
+        enable_partial_profit=False,
+    )
+    assert updated["state"] == states.STOP_ACTIVE
+    assert [c for c in broker.submit_calls if c[2] == "sell"] == []
+
+
+def test_partial_profit_disabled_but_past_target_2_takes_full_exit():
+    record, broker = _filled_position(qty=10)
+    updated = lifecycle.check_and_manage(
+        record["position_id"], current_price=110.0, now=MID_SESSION_NOW, broker=broker,
+        enable_partial_profit=False,
+    )
+    assert updated["state"] == states.CLOSED
+    assert updated["exit_reason"] == "TARGET_2"
+    assert updated["remaining_qty"] == 0
+
+
+def test_stop_loss_still_active_when_all_other_flags_disabled():
+    record, broker = _filled_position(qty=10)
+    updated = lifecycle.check_and_manage(
+        record["position_id"], current_price=94.0, now=MID_SESSION_NOW, broker=broker,
+        enable_partial_profit=False, enable_trailing_stop=False,
+        enable_time_stop=False, enable_eod_exit=False,
+    )
+    assert updated["state"] == states.CLOSED
+    assert updated["exit_reason"] == "STOP_LOSS"
+
+
+def test_trailing_stop_disabled_stays_partial_exited_without_moving_to_breakeven():
+    record, broker = _filled_position(qty=10)
+    record = lifecycle.check_and_manage(
+        record["position_id"], current_price=105.0, now=MID_SESSION_NOW, broker=broker,
+    )
+    assert record["state"] == states.PARTIAL_EXITED
+    record = lifecycle.check_and_manage(
+        record["position_id"], current_price=106.0, now=MID_SESSION_NOW, broker=broker,
+        enable_trailing_stop=False,
+    )
+    assert record["state"] == states.PARTIAL_EXITED  # never moved to TRAILING
+    assert record["stop_price"] == pytest.approx(95.0)  # unchanged, not moved to breakeven
+
+
+def test_time_stop_disabled_does_not_force_exit():
+    record, broker = _filled_position(qty=10)
+    with store.locked_position(record["position_id"]) as locked:
+        locked["entry_time"] = MID_SESSION_NOW.isoformat()
+    held_past_max = MID_SESSION_NOW + timedelta(minutes=cfg.MAX_POSITION_HOLD_MINUTES + 1)
+
+    updated = lifecycle.check_and_manage(
+        record["position_id"], current_price=100.0, now=held_past_max, broker=broker,
+        enable_time_stop=False,
+    )
+    assert updated["state"] == states.STOP_ACTIVE
+    assert [c for c in broker.submit_calls if c[2] == "sell"] == []
+
+
+def test_eod_exit_disabled_does_not_force_exit():
+    record, broker = _filled_position(qty=10)
+    from market_hours import combine_eastern, MARKET_REGULAR_END
+    near_close = combine_eastern(MID_SESSION_NOW.date(), MARKET_REGULAR_END) - timedelta(minutes=1)
+
+    updated = lifecycle.check_and_manage(
+        record["position_id"], current_price=100.0, now=near_close, broker=broker,
+        enable_eod_exit=False,
+    )
+    assert updated["state"] == states.STOP_ACTIVE
+    assert [c for c in broker.submit_calls if c[2] == "sell"] == []
+
+
+# ---------------------------------------------------------------------------
 # Time-stop / EOD forced close
 # ---------------------------------------------------------------------------
 

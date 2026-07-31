@@ -50,6 +50,7 @@ from datetime import datetime, timezone
 
 import risk_config
 from config import scalping_strategy_v1_config as strat_cfg
+from config.live_exit_flags import LiveExitFlags
 from domain.position import Position
 from execution import idempotency
 from positions import lifecycle, states, store
@@ -214,6 +215,7 @@ def sync_kis_fills_and_manage_exits(*, kis_broker, broker_adapter, now=None, con
 
     kis_qty_by_symbol = {p.symbol: p.quantity for p in kis_positions}
     open_positions = store.load_non_terminal()
+    exit_flags = LiveExitFlags.from_env()
 
     owns_conn = conn is None
     conn = conn or state_db.open_db()
@@ -291,6 +293,10 @@ def sync_kis_fills_and_manage_exits(*, kis_broker, broker_adapter, now=None, con
             lifecycle.check_and_manage(
                 position_id, current_price=current_price, broker=broker_adapter, now=current,
                 order_date=current.date().isoformat(),
+                enable_partial_profit=exit_flags.enable_partial_profit,
+                enable_trailing_stop=exit_flags.enable_trailing_stop,
+                enable_time_stop=exit_flags.enable_time_stop,
+                enable_eod_exit=exit_flags.enable_eod_exit,
             )
             summary["managed"].append(symbol)
         except Exception as exc:
