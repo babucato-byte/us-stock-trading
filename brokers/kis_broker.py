@@ -53,7 +53,7 @@ from domain.account_snapshot import AccountSnapshot
 from domain.execution_event import ExecutionRecord
 from domain.order_intent import OrderIntent
 from domain.position import Position
-from execution.secret_redaction import redact_text
+from execution.secret_redaction import redact_text, safe_repr
 
 TOKEN_PATH = "/oauth2/tokenP"
 PRICE_PATH = "/uapi/overseas-price/v1/quotations/price"
@@ -163,7 +163,9 @@ class KISBroker:
                 timeout=10,
             )
         except requests.exceptions.RequestException as exc:
-            raise KISBrokerError(f"KIS token issuance failed (network): {exc}") from exc
+            raise KISBrokerError(
+                f"KIS token issuance failed (network): {redact_text(str(exc))}"
+            ) from exc
         if response.status_code != 200:
             raise KISBrokerError(f"KIS token issuance failed: HTTP {response.status_code} {redact_text(response.text)}")
         try:
@@ -171,7 +173,7 @@ class KISBroker:
             token = body["access_token"]
             expires_in = int(body.get("expires_in", 0))
         except (ValueError, KeyError, TypeError) as exc:
-            raise KISBrokerError(f"KIS token response malformed: {exc}") from exc
+            raise KISBrokerError(f"KIS token response malformed: {redact_text(str(exc))}") from exc
         self._access_token = token
         # Refresh 60s early so a call started right at expiry never races
         # a mid-flight 401.
@@ -198,13 +200,13 @@ class KISBroker:
                 params=params, timeout=10,
             )
         except requests.exceptions.RequestException as exc:
-            raise KISBrokerError(f"KIS GET {path} failed (network): {exc}") from exc
+            raise KISBrokerError(f"KIS GET {path} failed (network): {redact_text(str(exc))}") from exc
         if response.status_code != 200:
             raise KISBrokerError(f"KIS GET {path} failed: HTTP {response.status_code} {redact_text(response.text)}")
         try:
             return response.json()
         except ValueError as exc:
-            raise KISBrokerError(f"KIS GET {path} response not JSON: {exc}") from exc
+            raise KISBrokerError(f"KIS GET {path} response not JSON: {redact_text(str(exc))}") from exc
 
     # -- read-only --------------------------------------------------------
 
@@ -222,7 +224,11 @@ class KISBroker:
         try:
             price = float(raw_price)
         except (TypeError, ValueError):
-            raise KISBrokerError(f"KIS price response missing/invalid 'last' field: {output!r}")
+            # CODEX-050: never interpolate a RAW KIS response into an
+            # error -- safe_repr() redacts the structure first.
+            raise KISBrokerError(
+                f"KIS price response missing/invalid 'last' field: {safe_repr(output)}"
+            )
         if not math.isfinite(price) or price <= 0:
             raise KISBrokerError(f"KIS price response has a non-positive/non-finite price: {price!r}")
         return price
@@ -242,7 +248,9 @@ class KISBroker:
             usd_cash = float(summary_rows.get("frcr_dncl_amt1", 0) or 0)
             usd_orderable_cash = float(summary_rows.get("frcr_use_psbl_amt", usd_cash) or usd_cash)
         except (TypeError, ValueError) as exc:
-            raise KISBrokerError(f"KIS balance response has non-numeric cash fields: {exc}") from exc
+            raise KISBrokerError(
+                f"KIS balance response has non-numeric cash fields: {redact_text(str(exc))}"
+            ) from exc
         return AccountSnapshot(
             krw_cash=0.0, usd_cash=usd_cash, usd_orderable_cash=usd_orderable_cash,
             usd_reserved_in_open_orders=0.0, as_of=self._now(), source=source_label,
@@ -261,7 +269,9 @@ class KISBroker:
         try:
             return float(output.get("ord_psbl_frcr_amt", 0) or 0)
         except (TypeError, ValueError) as exc:
-            raise KISBrokerError(f"KIS orderable-amount response malformed: {exc}") from exc
+            raise KISBrokerError(
+                f"KIS orderable-amount response malformed: {redact_text(str(exc))}"
+            ) from exc
 
     def get_positions(self) -> List[Position]:
         self.config.validate_read_allowed()
@@ -280,7 +290,9 @@ class KISBroker:
                 avg_price = float(row.get("pchs_avg_pric", 0) or 0)
                 unrealized = float(row.get("evlu_pfls_amt", 0) or 0)
             except (TypeError, ValueError) as exc:
-                raise KISBrokerError(f"KIS position row malformed: {row!r}: {exc}") from exc
+                raise KISBrokerError(
+                    f"KIS position row malformed: {safe_repr(row)}: {redact_text(str(exc))}"
+                ) from exc
             if qty <= 0:
                 continue
             positions.append(Position(
@@ -353,7 +365,7 @@ class KISBroker:
         except requests.exceptions.RequestException as exc:
             raise KISAmbiguousResponseError(
                 f"KIS order submission ambiguous (network error, order may or may not have "
-                f"reached KIS): {exc}"
+                f"reached KIS): {redact_text(str(exc))}"
             ) from exc
         if response.status_code >= 500 or response.status_code in (408, 425, 429):
             raise KISAmbiguousResponseError(
@@ -362,7 +374,9 @@ class KISBroker:
         try:
             body = response.json()
         except ValueError as exc:
-            raise KISAmbiguousResponseError(f"KIS order response not JSON (ambiguous): {exc}") from exc
+            raise KISAmbiguousResponseError(
+                f"KIS order response not JSON (ambiguous): {redact_text(str(exc))}"
+            ) from exc
         rt_cd = body.get("rt_cd")
         output = body.get("output") or {}
         broker_order_id = output.get("ODNO")
@@ -372,7 +386,7 @@ class KISBroker:
                 broker_order_id=broker_order_id, requested_quantity=order_intent.quantity,
                 requested_price=order_intent.limit_price, filled_quantity=0.0,
                 average_fill_price=None, status="REJECTED", submitted_at=current, updated_at=current,
-                error_code=body.get("msg_cd"), error_message=body.get("msg1"),
+                error_code=body.get("msg_cd"), error_message=redact_text(body.get("msg1")),
             )
         return ExecutionRecord(
             internal_order_id=order_intent.internal_order_id, broker="kis",
@@ -408,13 +422,17 @@ class KISBroker:
                 json=payload, timeout=10,
             )
         except requests.exceptions.RequestException as exc:
-            raise KISAmbiguousResponseError(f"KIS cancel ambiguous (network error): {exc}") from exc
+            raise KISAmbiguousResponseError(
+                f"KIS cancel ambiguous (network error): {redact_text(str(exc))}"
+            ) from exc
         if response.status_code >= 500 or response.status_code in (408, 425, 429):
             raise KISAmbiguousResponseError(f"KIS cancel ambiguous: HTTP {response.status_code} {redact_text(response.text)}")
         try:
             body = response.json()
         except ValueError as exc:
-            raise KISAmbiguousResponseError(f"KIS cancel response not JSON (ambiguous): {exc}") from exc
+            raise KISAmbiguousResponseError(
+                f"KIS cancel response not JSON (ambiguous): {redact_text(str(exc))}"
+            ) from exc
         rt_cd = body.get("rt_cd")
         status = "CANCELLED" if rt_cd == "0" else "REJECTED"
         return ExecutionRecord(
@@ -423,5 +441,5 @@ class KISBroker:
             requested_price=order_intent.limit_price, filled_quantity=0.0, average_fill_price=None,
             status=status, submitted_at=current, updated_at=current,
             error_code=None if rt_cd == "0" else body.get("msg_cd"),
-            error_message=None if rt_cd == "0" else body.get("msg1"),
+            error_message=None if rt_cd == "0" else redact_text(body.get("msg1")),
         )
