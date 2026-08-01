@@ -384,19 +384,23 @@ class TestCommitAndRollbackBothFail:
         with pytest.raises(OrderRepositoryPersistenceError, match="unusable"):
             order_repository.advance(conn, record, "VALIDATING", event_type="T", now=NOW)
 
-    def test_close_failing_too_preserves_the_rollback_failure(self, tmp_path, alerts):
+    def test_close_failing_too_escalates_to_a_fatal_error(self, tmp_path, alerts):
+        """CODEX-058: rollback AND close both failed, so the write lock may
+        still be held. Python cannot conclude otherwise from a thrown
+        close(), so this escalates to a process-level fault."""
         db_path = str(tmp_path / "CLOSE_FAILS.db")
         conn = state_db.open_db(db_path)
         record = _seed(conn)
         proxy = _CommitFails(conn, fail_rollback=True, fail_close=True)
 
-        with pytest.raises(OrderRepositoryRollbackError) as excinfo:
+        with pytest.raises(order_repository.FatalRepositoryConnectionError) as excinfo:
             order_repository.advance(proxy, record, "VALIDATING", event_type="T", now=NOW)
 
         assert isinstance(excinfo.value.__cause__, sqlite3.Error)
         assert proxy.close_calls == 1
         joined = "\n".join(alerts).lower()
         assert "could not be closed" in joined
+        assert "must restart" in joined
         conn.rollback()
         conn.close()
 

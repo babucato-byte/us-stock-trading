@@ -62,6 +62,35 @@ class OrderStateConflictError(OrderRepositoryError):
     (and, if it is ambiguous, to leave it UNKNOWN for reconciliation)."""
 
 
+class OrderRepositoryReadError(OrderRepositoryError):
+    """CODEX-057: a durable READ failed.
+
+    Distinct from "no such order", which is a legitimate answer returned
+    as None. A caller that cannot tell the two apart will report a
+    database fault as a policy decision -- which is exactly what the
+    cancel path did, ending a run as SHADOW_BLOCKED ("we refused") when
+    the truth was "we could not look".
+
+    Carries no SQL, no bound parameters and no row content."""
+
+
+class OrderRepositoryConnectionInvalidatedError(OrderRepositoryError):
+    """CODEX-058: this connection was invalidated by an earlier failure
+    and must never be used again. Raised BEFORE any SQL is executed."""
+
+
+class FatalRepositoryConnectionError(OrderRepositoryError):
+    """CODEX-058: a connection could neither be rolled back NOR closed.
+
+    Python cannot conclude that the native connection released SQLite's
+    write lock just because close() raised. Every other writer on this
+    file -- the Shadow audit trail and the reconciliation service
+    included -- may be blocked for as long as this process lives, so the
+    only reliable remedy is to stop the process and let the OS reclaim
+    the descriptor. HALT is set before this is raised; the service
+    entrypoint turns it into a non-zero exit."""
+
+
 class OrderRepositoryPersistenceError(OrderRepositoryError):
     """CODEX-055: the durable write failed for an infrastructural reason
     (disk, corruption, lock, constraint). Raw sqlite3 exceptions do NOT
@@ -110,34 +139,59 @@ def _row_to_record(row):
 
 
 def load(conn, order_id) -> Optional[OrderRecord]:
-    row = conn.execute(
-        "SELECT internal_order_id, status, version, broker_order_id, symbol, side, requested_quantity "
-        "FROM kis_order_idempotency WHERE internal_order_id = ?",
-        (order_id,),
-    ).fetchone()
+    """Returns the order, or None if there genuinely is no such order.
+
+    CODEX-057: a query FAILURE raises OrderRepositoryReadError -- it is
+    never reported as None. "The order does not exist" and "the database
+    could not be read" lead to opposite decisions: the first is a policy
+    block, the second is a system fault."""
+    _ensure_usable(conn)
+    try:
+        row = conn.execute(
+            "SELECT internal_order_id, status, version, broker_order_id, symbol, side, "
+            "requested_quantity FROM kis_order_idempotency WHERE internal_order_id = ?",
+            (order_id,),
+        ).fetchone()
+    except Exception as exc:  # noqa: BLE001 -- normalized, never raw
+        raise OrderRepositoryReadError("failed to read durable order state") from exc
     return _row_to_record(row) if row is not None else None
 
 
 def load_events(conn, order_id):
-    """Append-only transition history for one order, oldest first."""
-    return conn.execute(
-        "SELECT from_state, to_state, event_type, payload, version, occurred_at "
-        "FROM order_state_events WHERE internal_order_id = ? ORDER BY event_id",
-        (order_id,),
-    ).fetchall()
+    """Append-only transition history for one order, oldest first.
+
+    CODEX-057: a read failure raises rather than returning an empty list.
+    An empty history and an unreadable history are not the same fact, and
+    silently conflating them would let an integrity check pass on a
+    database it could not actually read."""
+    _ensure_usable(conn)
+    try:
+        return conn.execute(
+            "SELECT from_state, to_state, event_type, payload, version, occurred_at "
+            "FROM order_state_events WHERE internal_order_id = ? ORDER BY event_id",
+            (order_id,),
+        ).fetchall()
+    except Exception as exc:  # noqa: BLE001 -- normalized, never raw
+        raise OrderRepositoryReadError("failed to read the order state event history") from exc
 
 
 def append_creation_event(conn, *, order_id, state, event_type="ORDER_CREATED", payload=None, now=None):
     """Records the order's initial state as event version 0. Called by
     `idempotency.register()` inside the same transaction as the INSERT,
     so an order row without a creation event cannot exist."""
+    _ensure_usable(conn)
     current = now or datetime.now(timezone.utc)
-    conn.execute(
-        "INSERT INTO order_state_events "
-        "(internal_order_id, from_state, to_state, event_type, payload, version, occurred_at) "
-        "VALUES (?, NULL, ?, ?, ?, 0, ?)",
-        (order_id, state, event_type, _encode_payload(payload), current.isoformat()),
-    )
+    try:
+        conn.execute(
+            "INSERT INTO order_state_events "
+            "(internal_order_id, from_state, to_state, event_type, payload, version, occurred_at) "
+            "VALUES (?, NULL, ?, ?, ?, 0, ?)",
+            (order_id, state, event_type, _encode_payload(payload), current.isoformat()),
+        )
+    except Exception as exc:  # noqa: BLE001 -- normalized, never raw
+        raise OrderRepositoryPersistenceError(
+            "failed to record the order creation event"
+        ) from exc
 
 
 def _encode_payload(payload):
@@ -151,24 +205,83 @@ def _encode_payload(payload):
         return json.dumps({"unserializable_payload": True})
 
 
-def invalidate_connection(conn):
-    """CODEX-056: discard a connection whose transaction state can no
+# CODEX-058: connections that must never be used again.
+#
+# sqlite3.Connection is neither weak-referenceable nor able to carry an
+# attribute, so identity is the only handle available. The connection
+# object is kept as the VALUE so it stays alive: an id() can only be
+# recycled once its object is freed, and pinning it here makes that
+# impossible while the id is still marked. These entries are permanent
+# by design -- there are very few of them, and each one means the
+# process is about to fail-stop anyway.
+_INVALIDATED_CONNECTIONS = {}
+
+
+def is_invalidated(conn):
+    return id(conn) in _INVALIDATED_CONNECTIONS
+
+
+def _mark_invalidated(conn, reason):
+    _INVALIDATED_CONNECTIONS[id(conn)] = conn
+    _alert(
+        "*Order state database connection invalidated*\n"
+        f"- reason: {reason}\n"
+        "- this connection will not be reused"
+    )
+
+
+def _ensure_usable(conn):
+    """Every public entry point starts here. An invalidated connection
+    executes ZERO SQL -- it fails immediately and visibly instead of
+    being retried against a connection whose transaction state is
+    unknown."""
+    if is_invalidated(conn):
+        raise OrderRepositoryConnectionInvalidatedError(
+            "this order state connection was invalidated by an earlier failure and must not "
+            "be reused; open a new connection"
+        )
+
+
+def _halt_for_fatal_connection(reason):
+    """CODEX-058: a connection holding an unreleasable write lock is a
+    process-wide problem, not a per-order one. HALT stops every further
+    order attempt while the entrypoint winds the process down."""
+    try:
+        from operations import kill_switch
+
+        kill_switch.set_halt(True, reason=reason, actor="order_repository")
+    except Exception as exc:  # noqa: BLE001 -- HALT failure must not mask the fault
+        import logging
+
+        logging.getLogger(__name__).error("could not set HALT after a fatal DB fault: %s", exc)
+
+
+def invalidate_connection(conn, reason="an unrecoverable transaction failure"):
+    """CODEX-056/058: discard a connection whose transaction state can no
     longer be trusted. Closing is what actually releases SQLite's write
     lock, so this is the step that keeps later writers from blocking
     forever.
 
-    A failure to close is swallowed -- there is nothing further this
-    process can do about it, and masking the original rollback failure
-    would lose the more useful information -- but it is always alerted,
-    so the swallow is never silent."""
+    The connection is marked invalidated BEFORE close() is attempted, so
+    a close() that raises still leaves it unusable rather than merely
+    un-closed. A failed close is never silent: it alerts, sets HALT, and
+    the caller escalates to FatalRepositoryConnectionError."""
+    _mark_invalidated(conn, reason)
     try:
         conn.close()
         return True
     except Exception as exc:  # noqa: BLE001 -- confined to connection disposal
         _alert(
-            "*Order state connection could not be closed after a failed rollback*\n"
-            f"- error: {type(exc).__name__}\n"
-            "- the process may hold a stale SQLite write lock; restart the service"
+            "*CRITICAL: order state connection could not be closed*\n"
+            f"- reason: {reason}\n"
+            f"- close error: {type(exc).__name__}\n"
+            "- this process may still hold a SQLite write lock that blocks every other "
+            "writer\n"
+            "- action: HALT set; the service process must restart so the OS releases the "
+            "lock"
+        )
+        _halt_for_fatal_connection(
+            f"order state connection could not be closed after {reason}"
         )
         return False
 
@@ -196,7 +309,7 @@ def _abort_transaction(conn, *, stage, cause):
     try:
         conn.rollback()
     except Exception as rollback_exc:  # noqa: BLE001 -- normalized below
-        closed = invalidate_connection(conn)
+        closed = invalidate_connection(conn, reason=f"rollback failed during {stage}")
         _alert(
             "*Order state transaction rollback failed*\n"
             f"- stage: {stage}\n"
@@ -204,6 +317,14 @@ def _abort_transaction(conn, *, stage, cause):
             f"- connection closed: {closed}\n"
             "- action: connection invalidated; manual reconciliation required"
         )
+        if not closed:
+            # CODEX-058: rollback AND close both failed. The write lock
+            # may still be held by this process, and no amount of
+            # application-level care can release it -- only exiting can.
+            raise FatalRepositoryConnectionError(
+                f"transaction rollback and connection close both failed during {stage}; "
+                "the process may still hold a SQLite write lock and must restart"
+            ) from rollback_exc
         raise OrderRepositoryRollbackError(
             f"transaction rollback failed during {stage}; the database connection was "
             "invalidated and must not be reused"
@@ -227,6 +348,12 @@ def compare_and_set_state(conn, *, order_id, expected_state, next_state, event_t
     OrderRepositoryError if the caller already holds an open transaction
     on this connection (which would silently widen this function's
     atomicity guarantee to work this module did not write)."""
+    # CODEX-058: the invalidation check comes FIRST, before even the
+    # pure transition validation, so an invalidated connection produces
+    # one unambiguous error rather than whatever the stale state happens
+    # to make the state machine say.
+    _ensure_usable(conn)
+
     if via_reconciliation:
         if expected_state != "UNKNOWN":
             raise OrderStateTransitionError(
@@ -290,13 +417,21 @@ def compare_and_set_state(conn, *, order_id, expected_state, next_state, event_t
         try:
             conn.rollback()
         except Exception as rollback_exc:  # noqa: BLE001 -- normalized below
-            closed = invalidate_connection(conn)
+            closed = invalidate_connection(
+                conn, reason="rollback failed after a compare-and-set conflict",
+            )
             _alert(
                 "*Order state transaction rollback failed*\n"
                 f"- stage: compare-and-set conflict\n"
                 f"- rollback error: {type(rollback_exc).__name__}\n"
                 f"- connection closed: {closed}"
             )
+            if not closed:
+                raise FatalRepositoryConnectionError(
+                    "transaction rollback and connection close both failed after a "
+                    "compare-and-set conflict; the process may still hold a SQLite write "
+                    "lock and must restart"
+                ) from rollback_exc
             raise OrderRepositoryRollbackError(
                 "transaction rollback failed after a compare-and-set conflict; the database "
                 "connection was invalidated and must not be reused"

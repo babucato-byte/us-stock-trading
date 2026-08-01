@@ -47,7 +47,9 @@ from brokers.kis_broker import KISAmbiguousResponseError, KISBrokerError
 from execution import authorization, idempotency, order_gate, order_repository
 from execution.authorization import UnauthorizedExecutionError
 from execution.order_repository import (
+    FatalRepositoryConnectionError,
     OrderRepositoryError,
+    OrderRepositoryReadError,
     OrderRepositoryRollbackError,
 )
 from execution.order_state_machine import OrderStateTransitionError
@@ -89,6 +91,7 @@ REASON_STATE_PERSISTENCE = "STATE_PERSISTENCE"
 REASON_AUDIT_PERSISTENCE = "AUDIT_PERSISTENCE"
 REASON_AUDIT_CONTEXT_MISSING = "AUDIT_CONTEXT_MISSING"
 REASON_CANCEL_FINAL_STATE_PERSISTENCE = "CANCEL_FINAL_STATE_PERSISTENCE"
+REASON_STATE_READ_FAILURE = "STATE_READ_FAILURE"
 
 
 class CancelPreTransportBlocked(ExecutionEngineError):
@@ -531,9 +534,12 @@ def submit_cancel(*, order_intent, broker_order_id, cancel_gate_context_builder,
         )
         inner_returned = True
     except BaseException as exc:  # noqa: BLE001 -- no path may leave the run open
+        # CODEX-058: a fatal connection fault still ends the run (the
+        # audit store has its own connection), but it propagates
+        # UNCHANGED so the service entrypoint can fail-stop the process.
         terminal_written = _finalize_cancel(
             audit_run_id=audit_run_id,
-            terminal_event=_cancel_terminal_for(transport),
+            terminal_event=_cancel_terminal_for(transport, exc),
             order_intent=order_intent, broker_order_id=broker_order_id,
             reason_code=_cancel_reason_for(exc, transport), detail=str(exc), now=current,
             transport=transport, best_effort=True,
@@ -605,14 +611,70 @@ def _alert_cancel_persistence_failure(*, order_intent, unknown_persisted, error,
         logger.error("could not alert on cancel persistence failure: %s", exc)
 
 
-def _cancel_terminal_for(transport):
-    """CODEX-054, in one line: SHADOW_BLOCKED means "the execution never
-    reached the broker". Once the transport has been attempted, every
-    failure is SHADOW_ERROR."""
-    return shadow_audit.SHADOW_ERROR if transport["attempted"] else shadow_audit.SHADOW_BLOCKED
+def _alert_repository_read_failure(*, order_intent, operation, error):
+    """CODEX-057: a durable-read fault is operator-visible. Only the error
+    TYPE is reported -- a raw SQLite message can carry SQL text and bound
+    parameters, and this goes to an external channel."""
+    logger.error(
+        "order state read failed: operation=%s order=%s error=%s",
+        operation, order_intent.internal_order_id, type(error).__name__,
+    )
+    try:
+        from operations import alerts
+
+        alerts.send_alert(
+            "*Order state could not be read*\n"
+            f"- operation: {operation}\n"
+            f"- internal_order_id: {order_intent.internal_order_id}\n"
+            f"- symbol: {order_intent.symbol}\n"
+            f"- error type: {type(error).__name__}\n"
+            "- action: this is a database fault, not a policy block; manual reconciliation "
+            "is required"
+        )
+    except Exception as exc:  # noqa: BLE001 -- alerting must not mask the failure
+        logger.error("could not alert on an order state read failure: %s", exc)
+
+
+# CODEX-057: infrastructure faults that must never be reported as a
+# policy block, even though they happen before the transport.
+#
+# Deliberately narrow. A pre-transport AUDIT persistence failure stays
+# SHADOW_BLOCKED: the execution really was refused before reaching the
+# broker, which is what that terminal means, and the audit failure
+# itself is separately alerted by handle_audit_failure(). Only a failure
+# to READ the durable order state is reclassified, because that is the
+# case where "we refused" would be an outright false statement -- we
+# never got far enough to decide anything.
+_SYSTEM_FAULT_REASONS = frozenset({
+    REASON_STATE_READ_FAILURE,
+})
+
+
+def _is_system_fault(exc):
+    """A DATABASE fault, as opposed to a decision. SHADOW_BLOCKED means
+    "we refused"; reporting "we could not look" that way tells an
+    operator the opposite of the truth."""
+    if isinstance(exc, (FatalRepositoryConnectionError, OrderRepositoryReadError)):
+        return True
+    return getattr(exc, "reason_code", None) in _SYSTEM_FAULT_REASONS
+
+
+def _cancel_terminal_for(transport, exc=None):
+    """CODEX-054: SHADOW_BLOCKED means "the execution never reached the
+    broker", so once the transport has been attempted every failure is
+    SHADOW_ERROR.
+
+    CODEX-057 adds the second half: a failure BEFORE the transport is
+    only a block if it was a DECISION. A database fault is an error at
+    any point in the flow."""
+    if transport["attempted"] or _is_system_fault(exc):
+        return shadow_audit.SHADOW_ERROR
+    return shadow_audit.SHADOW_BLOCKED
 
 
 def _cancel_reason_for(exc, transport):
+    if isinstance(exc, FatalRepositoryConnectionError):
+        return REASON_STATE_PERSISTENCE
     explicit = getattr(exc, "reason_code", None)
     if explicit:
         return explicit
@@ -689,7 +751,21 @@ def _cancel_inner(*, order_intent, broker_order_id, cancel_gate_context_builder,
     surfaces as a plain ExecutionEngineError -- is classified as an
     execution error rather than as a pre-transport block (CODEX-054)."""
     with idempotency.single_run_lock():
-        record = order_repository.load(conn, order_intent.internal_order_id)
+        try:
+            record = order_repository.load(conn, order_intent.internal_order_id)
+        except OrderRepositoryReadError as exc:
+            # CODEX-057: "the order does not exist" and "the database
+            # could not be read" are opposite conclusions. Reporting a
+            # read fault as a policy block would tell an operator the
+            # cancel was refused on purpose.
+            _alert_repository_read_failure(
+                order_intent=order_intent, operation="load order for cancel", error=exc,
+            )
+            raise CancelPostTransportError(
+                "cancel could not proceed -- the durable order state could not be read; "
+                "manual reconciliation required",
+                reason_code=REASON_STATE_READ_FAILURE,
+            ) from exc
         if record is None:
             raise CancelPreTransportBlocked(
                 f"cancel blocked -- no durable order record exists for "

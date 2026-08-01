@@ -38,6 +38,9 @@ from brokers.kis_broker import KISBroker, KISBrokerError  # noqa: E402
 from clock import DEFAULT_CLOCK  # noqa: E402
 from config.live_exit_flags import LiveExitFlags  # noqa: E402
 from domain.instrument import build_instrument  # noqa: E402
+from execution.order_repository import (  # noqa: E402
+    FatalRepositoryConnectionError,
+)
 from execution.secret_redaction import install_logging_redaction  # noqa: E402
 from positions import lifecycle, store  # noqa: E402
 from reconciliation import snapshot as reconciliation_snapshot  # noqa: E402
@@ -49,6 +52,31 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_KIS_UNAVAILABLE = 2
 
+EXIT_FATAL_DB = 4
+
+
+def _fail_stop(stage, exc):
+    """Report an unrecoverable database-connection fault and let the
+    caller exit non-zero. HALT was set by the repository before this
+    exception was raised; nothing here clears it."""
+    logger.critical(
+        "FATAL: unrecoverable order-state connection fault during %s (%s) -- "
+        "HALT is set and this process must restart so the OS releases the SQLite lock",
+        stage, type(exc).__name__,
+    )
+    try:
+        from operations import alerts
+
+        alerts.send_alert(
+            "*CRITICAL: trading process fail-stop*\n"
+            f"- stage: {stage}\n"
+            f"- cause: {type(exc).__name__}\n"
+            "- HALT: set\n"
+            "- action: process exiting non-zero so systemd restarts it and the SQLite "
+            "write lock is released"
+        )
+    except Exception as alert_exc:  # noqa: BLE001 -- alerting must not mask the fault
+        logger.error("could not alert on fail-stop: %s", alert_exc)
 
 def _audit(run_id, event_type, result, *, symbol, reason_code=None, detail=None, now):
     """Fails closed, exactly like the buy path's audit helper."""
@@ -225,6 +253,15 @@ def main(argv=None):
     install_logging_redaction()
     try:
         result = run_once()
+    except FatalRepositoryConnectionError as exc:
+        # CODEX-058: the order-state connection could neither be rolled
+        # back nor closed, so this process may still hold a SQLite write
+        # lock that blocks every other writer. HALT is already set by the
+        # repository; exiting non-zero is what actually releases the lock
+        # (the OS reclaims the descriptor) and lets systemd's
+        # Restart=on-failure bring the service back cleanly.
+        _fail_stop("shadow exit evaluation", exc)
+        return EXIT_FATAL_DB
     except Exception as exc:  # noqa: BLE001 -- service entrypoint
         logger.exception("shadow exit pass failed: %s", exc)
         return EXIT_ERROR

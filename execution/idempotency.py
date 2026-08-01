@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from execution import order_repository
+from execution.order_repository import OrderRepositoryReadError
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 _LOCK_FILE = BASE_DIR / "KIS_ORDER_IDEMPOTENCY.lock"
@@ -76,6 +77,18 @@ def single_run_lock(timeout=LOCK_TIMEOUT_SECONDS):
             lock_file.close()
 
 
+def _read(conn, sql, params=(), *, fetch="all"):
+    """CODEX-057: every order-state READ is normalized here. A raw
+    sqlite3 error must not reach a caller that would then treat "the
+    database could not be read" as "there is no such order"."""
+    order_repository._ensure_usable(conn)
+    try:
+        cursor = conn.execute(sql, params)
+        return cursor.fetchone() if fetch == "one" else cursor.fetchall()
+    except Exception as exc:  # noqa: BLE001 -- normalized, never raw
+        raise OrderRepositoryReadError("failed to read durable order state") from exc
+
+
 def find_existing(conn, *, internal_order_id, signal_id, symbol, side, trading_date):
     """Read-only lookup -- returns the existing row (sqlite3.Row) if
     either uniqueness key already has an attempt recorded, else None.
@@ -83,17 +96,18 @@ def find_existing(conn, *, internal_order_id, signal_id, symbol, side, trading_d
     rather than relying on this alone (this is advisory for a clear
     caller-facing check; register()'s INSERT is the actual atomic
     guarantee)."""
-    row = conn.execute(
-        "SELECT * FROM kis_order_idempotency WHERE internal_order_id = ?",
-        (internal_order_id,),
-    ).fetchone()
+    row = _read(
+        conn, "SELECT * FROM kis_order_idempotency WHERE internal_order_id = ?",
+        (internal_order_id,), fetch="one",
+    )
     if row is not None:
         return row
-    return conn.execute(
+    return _read(
+        conn,
         "SELECT * FROM kis_order_idempotency WHERE signal_id = ? AND symbol = ? "
         "AND side = ? AND trading_date = ?",
-        (signal_id, symbol, side, trading_date),
-    ).fetchone()
+        (signal_id, symbol, side, trading_date), fetch="one",
+    )
 
 
 def register(conn, *, internal_order_id, signal_id, symbol, side, trading_date, status="CREATED",
@@ -156,9 +170,10 @@ def has_unknown_order(conn):
     account's true exposure, so scoping the block to the same symbol and
     the same side (Codex's second CODEX-044 finding) would let a new buy
     through while a sell of the same symbol sat unresolved."""
-    row = conn.execute(
-        "SELECT 1 FROM kis_order_idempotency WHERE status = 'UNKNOWN' LIMIT 1",
-    ).fetchone()
+    row = _read(
+        conn, "SELECT 1 FROM kis_order_idempotency WHERE status = 'UNKNOWN' LIMIT 1",
+        fetch="one",
+    )
     return row is not None
 
 
@@ -169,20 +184,22 @@ def list_orders_by_status(conn, statuses):
     if not statuses:
         return []
     placeholders = ",".join("?" for _ in statuses)
-    return conn.execute(
+    return _read(
+        conn,
         "SELECT internal_order_id, broker_order_id, symbol, side, status, requested_quantity "
         f"FROM kis_order_idempotency WHERE status IN ({placeholders})",
         statuses,
-    ).fetchall()
+    )
 
 
 def list_orders_with_broker_id(conn):
     """Every order attempt that has a KIS-side order id, for matching
     KIS's own fill rows back to what this codebase actually requested."""
-    return conn.execute(
+    return _read(
+        conn,
         "SELECT internal_order_id, broker_order_id, symbol, side, status, requested_quantity "
-        "FROM kis_order_idempotency WHERE broker_order_id IS NOT NULL"
-    ).fetchall()
+        "FROM kis_order_idempotency WHERE broker_order_id IS NOT NULL",
+    )
 
 
 def list_unknown_orders(conn):
@@ -190,10 +207,11 @@ def list_unknown_orders(conn):
     the set kis_position_manager.py's periodic tick tries to resolve via
     reconciliation.order_reconciler.reconcile_unknown_order() against
     KIS's own open-order/fill history each pass."""
-    return conn.execute(
+    return _read(
+        conn,
         "SELECT internal_order_id, broker_order_id, symbol, side, requested_quantity, version "
-        "FROM kis_order_idempotency WHERE status = 'UNKNOWN'"
-    ).fetchall()
+        "FROM kis_order_idempotency WHERE status = 'UNKNOWN'",
+    )
 
 
 # CODEX-047: there is deliberately NO update_status() here any more. Every

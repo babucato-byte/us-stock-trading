@@ -754,12 +754,11 @@ class TestPreTransportBlocksStayBlocked:
         run_id = shadow_audit.new_run_id()
         with pytest.raises(ExecutionEngineError):
             _cancel(conn, broker, run_id)
-        # The audit store itself is broken here, so the terminal event
-        # cannot be written either (handle_audit_failure() alerts). What
-        # must hold is that nothing reached the broker and nothing was
-        # misclassified as an execution error.
-        assert broker.cancel_calls == 0
-        assert "SHADOW_ERROR" not in _events(run_id)
+        # CODEX-057: an audit-store failure before the transport is still
+        # a BLOCK -- the execution genuinely never reached the broker.
+        # Only a failure to READ the durable order state is reclassified
+        # as a system error, because there "we refused" would be false.
+        self._assert_blocked_only(run_id, broker)
 
 
 class TestFinalizeAuditRun:
