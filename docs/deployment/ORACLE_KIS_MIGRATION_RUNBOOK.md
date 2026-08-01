@@ -238,72 +238,154 @@ Codex 검증을 받는다.
 
 ## 13. KIS 잔고·미체결 대조 (계정 전체 reconciliation, CODEX-044)
 
-`reconciliation_state.is_current_and_clean()`이 buy/sell Order Gate 모두가 읽는 실제
-값이다(더 이상 상수가 아니다) -- 이 값은 `kis_position_manager.sync_kis_fills_and_
-manage_exits()`가 매 tick마다 계정 전체 포지션을 대조하고 그 결과를 기록해야만 "신선한"
-상태로 유지된다(기본 유효기간 `reconciliation_state.DEFAULT_MAX_AGE_SECONDS` = 300초).
-이 서비스가 §14에서 계속 실행되지 않으면 300초 후 buy/sell 모두 "reconciliation stale"로
-자동 차단된다(안전 방향으로 fail-closed -- 오작동이 아니다).
+reconciliation은 두 층으로 동작한다.
+
+1. **주문 경로 내부 (CODEX-044, 강제)**: `execution/execution_engine.py`가 매 주문 직전에
+   `reconciliation/snapshot.py::build_snapshot()`으로 KIS 실제 잔고·미체결·체결과 내부
+   포지션·내부 열린 주문·UNKNOWN 주문을 직접 조회해 불변 스냅샷을 만들고,
+   `verify_snapshot()`으로 검증한다. 조회 실패, 계좌/종목 불일치, TTL 초과
+   (`RECONCILIATION_MAX_AGE_SECONDS`, 기본 30초), 포지션·미체결·체결 불일치, UNKNOWN 주문
+   존재 중 하나라도 있으면 주문은 transport 호출 0회로 차단된다. 매수와 매도에 동일하게
+   적용된다.
+2. **주기 서비스 (§15의 `us-stock-trading-reconcile`)**: 같은 대조를 주기적으로 수행하고
+   그 결과를 `RECONCILIATION_STATE.json`에 기록하며, UNKNOWN 주문을 KIS 체결 이력과 대조해
+   해소하고, Shadow 감사 보관 정책을 적용한다. KIS 조회가 실패하면 **아무것도 기록하지
+   않는다** -- 실패한 조회가 clean timestamp를 갱신할 수 없다.
+
+수동 확인(읽기 전용, 저장소의 실제 진입점을 그대로 사용한다):
 
 ```bash
-python3 -c "
-from datetime import datetime, timezone
-from brokers.kis_broker import KISBroker
-from reconciliation.position_reconciler import reconcile_positions
-from reconciliation import reconciliation_state
-b = KISBroker()
-kis_positions = b.get_positions()
-# internal_positions: 이 시점에는 KIS 실거래 이력이 없으므로 빈 리스트가 정상
-mismatches = reconcile_positions([], kis_positions)
-print('mismatches:', mismatches)
-now = datetime.now(timezone.utc)
-reconciliation_state.record_result(clean=not mismatches, mismatch_count=len(mismatches), now=now)
-print('reconciliation_ok:', reconciliation_state.is_current_and_clean(
-    max_age_seconds=reconciliation_state.DEFAULT_MAX_AGE_SECONDS, now=now))
-"
+cd ~/trading-release
+source venv/bin/activate
+python3 scripts/run_reconciliation.py --log-level INFO
+echo "exit=$?"   # 0=대조 완료, 2=KIS 조회 불가(아무것도 기록 안 함), 1=오류
+cat RECONCILIATION_STATE.json
 ```
 
-`mismatches`가 빈 리스트가 아니면(즉 KIS에 이미 알 수 없는 포지션이 있으면) 원인을 파악하기
-전까지 중단한다. `RECONCILIATION_STATE_FILE` 환경변수로 이 상태 파일의 경로를 지정할 수
-있다(미지정 시 저장소 루트의 `RECONCILIATION_STATE.json`).
+`mismatch`가 보고되면(즉 KIS에 내부가 모르는 포지션/주문이 있으면) 원인을 파악하기 전까지
+중단한다. `RECONCILIATION_STATE_FILE` 환경변수로 상태 파일 경로를 지정할 수 있다(미지정 시
+저장소 루트의 `RECONCILIATION_STATE.json`).
 
 ## 14. Shadow Mode 실행 (spec §26)
 
-Shadow Mode는 완전히 구현되어 있다 (`shadow_mode.py`) -- buy 경로(`kis_live_trading.py`)와
-sell 경로(`brokers/kis_broker_adapter.py`) 모두, config 차단/HALT/signal 만료/symbol
-차단/가격 편차/잔고 부족/reconciliation 실패/UNKNOWN 주문 존재/중복 주문/Order Gate
-거부/승인까지 모든 결과 범주를 구조화된 JSONL 레코드로 기록한다. 계좌번호·비밀정보는
-`execution/secret_redaction.py`가 기록 전에 마스킹한다. 기본 경로는 달력일 단위로 회전한다
-(`shadow-YYYY-MM-DD.jsonl`, `SHADOW_MODE_LOG_FILE` 환경변수로 고정 경로 지정 시 회전 없이
-그 경로만 사용).
+Shadow Mode 진입점은 `scripts/run_shadow_mode.py`다. 이 스크립트는
+`execution.execution_engine`을 **import조차 하지 않으며** `submit_order()`를 호출할 수 있는
+경로가 없다 -- 주문 불가가 플래그가 아니라 구조로 보장된다.
+
+한 후보당 두 번의 게이트 평가를 기록한다.
+
+- **실제 평가**: 현재 배포 플래그 그대로. 초기 자세에서는 `live order flag is not enabled` /
+  `ENTRY_DISABLED`에서 차단되며, 그것이 지금 시스템이 실제로 할 행동의 정직한 기록이다.
+- **가정 평가**: 위 두 config 플래그만 뒤집은 경우. 가격 편차·잔고·중복 주문·allow-list·
+  종목 적격성·reconciliation·UNKNOWN 등 **나머지 모든 안전 검사는 실제 KIS 조회 결과로**
+  평가된다. 운영자가 활성화 전에 실제로 알아야 하는 질문("다른 검사는 통과했겠는가")에
+  답하는 것이 이 기록이다.
+
+기록 대상은 두 곳이다.
+
+- 구조화 레코드: `shadow_mode.py` JSONL (`shadow-YYYY-MM-DD.jsonl`, 일자 회전 +
+  `SHADOW_AUDIT_MAX_FILE_MB` 크기 회전 + `SHADOW_AUDIT_RETENTION_DAYS` 보관, append마다
+  `fsync`).
+- 감사 이벤트: `shadow_audit.py` SQLite `shadow_audit_events` 테이블. 매수 경로와 **매도
+  경로 모두** 기록하며, 모든 run은 `SHADOW_COMPLETED` 또는 `SHADOW_ERROR`로 반드시
+  종료된다. 계좌번호·비밀정보는 `execution/secret_redaction.py`가 기록 직전에 마스킹한다.
 
 ```bash
-KIS_ACCOUNT_READ_ENABLED=true KIS_LIVE_ORDER_ENABLED=false LIVE_ROLLOUT_ENABLED=true \
-  LIVE_ROLLOUT_ALLOWED_SYMBOLS=AAPL \
-  python3 -c "
-from brokers.kis_broker import KISBroker
-import kis_live_trading as klt
-import shadow_mode
-b = KISBroker()
-results = klt.run_live_buy_entry_cycle(broker=b)
-print(results)
-print('shadow mode records this run:', len(shadow_mode.read_all()))
+cd ~/trading-release
+source venv/bin/activate
+python3 scripts/run_shadow_mode.py --log-level INFO
+
+# JSONL 레코드 수와 감사 이벤트 확인
+python3 -c "
+import shadow_audit, shadow_mode
+records, corruption = shadow_mode.read_all_with_integrity()
+print('shadow records:', len(records), 'corrupt lines:', corruption)
+print('audit events:', len(shadow_audit.read_events()))
+print('runs without a terminal event:', shadow_audit.runs_without_terminal_event())
 "
 ```
 
-`KIS_LIVE_ORDER_ENABLED=false`이므로 `order_gate.evaluate_buy_gate()`가 `live_order_enabled`
-확인에서 매 후보를 차단하고 `results['blocked']`에 이유가 기록된다 — broker.submit_order()는
-호출되지 않는다(`execution_engine.py`가 gate 실패 시 broker를 호출하지 않음을 보장). 동시에
-같은 실행에서 각 차단마다 Shadow Mode 레코드가 하나씩 남아야 한다 -- `read_all()`의 개수가
-0이면 Shadow Mode 기록 경로 자체가 깨진 것이므로 원인을 파악하기 전까지 다음 단계로
-진행하지 않는다.
+`corrupt lines`가 비어 있지 않거나 `runs without a terminal event`가 비어 있지 않으면 감사
+기록 경로 자체가 깨진 것이므로 원인을 파악하기 전까지 다음 단계로 진행하지 않는다.
 
-## 15. 서비스 경로 전환
+## 15. 서비스 설치 및 경로 전환
 
-기존 `order-monitor`/`dashboard` systemd 유닛을 새 `~/trading-release` 경로를 가리키도록
-갱신하되(`WorkingDirectory=`, `ExecStart=`), **이 시점에도 `ENTRY_DISABLED=true`/
-`KIS_LIVE_ORDER_ENABLED=false`/`LIVE_ROLLOUT_ENABLED=false`/네 `LIVE_ENABLE_*` 플래그를
-유지한 채** 전환한다.
+### 15.1 유닛 설치
+
+저장소에 실제 systemd 유닛과 설치 스크립트가 포함되어 있다.
+
+```text
+deploy/systemd/us-stock-trading-shadow.service      # 평가 전용, 주문 없음
+deploy/systemd/us-stock-trading-shadow.timer        # 5분 주기
+deploy/systemd/us-stock-trading-reconcile.service   # 읽기 전용 대조
+deploy/systemd/us-stock-trading-reconcile.timer     # 2분 주기
+deploy/systemd/us-stock-trading-live.service        # 설치만, enable 하지 않음
+scripts/preflight_kis_live.py                       # 모든 유닛의 ExecStartPre
+scripts/run_shadow_mode.py
+scripts/run_reconciliation.py
+scripts/run_live_buy_entry.py
+scripts/install_oracle_services.sh
+```
+
+환경파일을 먼저 만든다(§7의 내용을 그대로 사용, **root:trading 0640**).
+
+```bash
+sudo install -d -m 0750 -o root -g trading /etc/us-stock-trading
+sudo cp ~/trading-release/.env /etc/us-stock-trading/live-readonly.env
+sudo chown root:trading /etc/us-stock-trading/live-readonly.env
+sudo chmod 0640 /etc/us-stock-trading/live-readonly.env
+```
+
+설치:
+
+```bash
+cd ~/trading-release
+sudo RELEASE_DIR=/home/ubuntu/trading-release scripts/install_oracle_services.sh
+```
+
+이 스크립트는 shadow/reconcile 타이머만 `enable`하고, `us-stock-trading-live.service`는
+설치만 하고 **절대 enable 하지 않는다**(이미 enable되어 있으면 disable한다).
+
+### 15.2 사전 검증 (수동 실행 가능)
+
+```bash
+cd ~/trading-release
+source venv/bin/activate
+python3 scripts/preflight_kis_live.py
+echo "exit=$?"    # 0이 아니면 서비스가 시작되지 않는다
+```
+
+preflight는 필수 환경변수, 계좌 alias, Alpaca/KIS 주문 비활성, `ENTRY_DISABLED=true`,
+DB 마이그레이션 최신 여부, reconciliation 실행 가능 여부, 로그 디렉터리 쓰기 권한, 단일 실행
+lock, 검증 커밋과 배포 커밋(및 실제 체크아웃 커밋) 일치를 확인한다. 비밀값은 출력하지
+않으며 계좌번호는 마스킹된 형태로만 나타난다.
+
+### 15.3 시작·확인
+
+```bash
+sudo systemctl start us-stock-trading-reconcile.service
+sudo systemctl start us-stock-trading-shadow.service
+
+systemctl list-timers | grep us-stock-trading
+journalctl -u us-stock-trading-reconcile.service -n 50 --no-pager
+journalctl -u us-stock-trading-shadow.service -n 50 --no-pager
+```
+
+### 15.4 live 서비스가 비활성인지 확인 (필수)
+
+```bash
+systemctl is-enabled us-stock-trading-live.service   # disabled 이어야 한다
+systemctl is-active  us-stock-trading-live.service   # inactive 이어야 한다
+```
+
+`enabled`가 나오면 즉시 `sudo systemctl disable --now us-stock-trading-live.service`를
+실행하고 원인을 조사한다.
+
+### 15.5 기존 서비스 경로 전환
+
+기존 `order-monitor`/`dashboard` 유닛을 새 `~/trading-release` 경로로 갱신하되,
+**`ENTRY_DISABLED=true`/`KIS_LIVE_ORDER_ENABLED=false`/`LIVE_ROLLOUT_ENABLED=false`/네
+`LIVE_ENABLE_*` 플래그를 유지한 채** 전환한다.
 
 ```bash
 sudo systemctl daemon-reload
@@ -311,33 +393,44 @@ sudo systemctl restart order-monitor dashboard
 systemctl status order-monitor dashboard
 ```
 
-**신규 서비스 (CODEX-044 이후 필수)**: `kis_position_manager.sync_kis_fills_and_manage_exits()`
-를 주기적으로(예: 30~60초 간격) 실행하는 별도 systemd 타이머/서비스가 배포되어야 한다 --
-이 tick이 (1) KIS 체결을 내부 포지션에 반영하고, (2) 손절·익절·부분익절·트레일링·시간
-청산·EOD 청산을 관리하며, (3) §13의 계정 전체 reconciliation 결과를 갱신해 buy/sell Order
-Gate가 "stale"로 자동 차단되지 않도록 유지한다. 이 서비스 파일은 아직 이 저장소에 커밋된
-`systemd/` 유닛으로 존재하지 않는다 -- 배포자가 `systemd/` 디렉터리의 기존 유닛 파일 형식을
-참고해 새로 작성하고, `WorkingDirectory`/`ExecStart`/`EnvironmentFile`을 `~/trading-release`
-와 동일한 `.env`로 지정해야 한다. 이 서비스가 존재/실행되지 않으면 5분(300초) 후부터 모든
-신규 매수·매도가 "reconciliation stale"로 자동 차단된다(§13 참고, fail-closed이므로 안전하지만
-의도된 정상 운영 상태는 아니다).
+### 15.6 정지
+
+```bash
+sudo systemctl stop us-stock-trading-shadow.timer us-stock-trading-reconcile.timer
+sudo systemctl stop us-stock-trading-shadow.service us-stock-trading-reconcile.service
+```
+
+**주의(범위)**: 매도·손절·익절을 실제로 실행하는
+`kis_position_manager.sync_kis_fills_and_manage_exits()` tick은 실주문 경로이므로 초기
+배포에는 서비스로 포함하지 않는다. 활성화는 spec §29의 실주문 활성화 승인 절차에 속한다.
 
 ## 16. 실주문 비활성 상태 최종 확인
 
 ```bash
-grep -E "ENTRY_DISABLED|KIS_LIVE_ORDER_ENABLED|LIVE_ROLLOUT_ENABLED|ALPACA_ORDER_ENABLED|ALPACA_PAPER_ORDER_ENABLED|LIVE_ENABLE_PARTIAL_PROFIT|LIVE_ENABLE_TRAILING_STOP|LIVE_ENABLE_TIME_STOP|LIVE_ENABLE_EOD_EXIT" ~/trading-release/.env
+sudo grep -E "ENTRY_DISABLED|KIS_LIVE_ORDER_ENABLED|LIVE_ROLLOUT_ENABLED|ALPACA_ORDER_ENABLED|ALPACA_PAPER_ORDER_ENABLED|LIVE_ENABLE_PARTIAL_PROFIT|LIVE_ENABLE_TRAILING_STOP|LIVE_ENABLE_TIME_STOP|LIVE_ENABLE_EOD_EXIT" /etc/us-stock-trading/live-readonly.env
+systemctl is-enabled us-stock-trading-live.service
 ```
 
-아홉 값 모두 `false`(또는 `ENTRY_DISABLED=true`)인지 육안으로 재확인한다.
+아홉 값 모두 `false`(또는 `ENTRY_DISABLED=true`)이고 live 서비스가 `disabled`인지 육안으로
+재확인한다.
 
 ## 롤백 절차
 
-1. `sudo systemctl stop order-monitor dashboard`, 그리고 §15에서 배포했다면 KIS position-
-   manager 타이머/서비스도 함께 중지한다.
-2. systemd 유닛의 `WorkingDirectory`/`ExecStart`를 `~/trading`(기존 운영본)으로 되돌린다.
-3. `sudo systemctl daemon-reload && sudo systemctl start order-monitor dashboard`
-4. `~/trading-release`는 삭제하지 않고 보존한다(원인 분석용).
-5. 문제가 KIS API 자체(인증/네트워크)라면 `KIS_ACCOUNT_READ_ENABLED=false`로 즉시 KIS
+1. 새 유닛을 먼저 중지·비활성화한다.
+
+   ```bash
+   sudo systemctl disable --now us-stock-trading-shadow.timer
+   sudo systemctl disable --now us-stock-trading-reconcile.timer
+   sudo systemctl stop us-stock-trading-shadow.service us-stock-trading-reconcile.service
+   systemctl is-enabled us-stock-trading-live.service   # disabled 확인
+   ```
+
+2. `sudo systemctl stop order-monitor dashboard`
+3. systemd 유닛의 `WorkingDirectory`/`ExecStart`를 `~/trading`(기존 운영본)으로 되돌린다.
+4. `sudo systemctl daemon-reload && sudo systemctl start order-monitor dashboard`
+5. `~/trading-release`와 `/etc/us-stock-trading/live-readonly.env`는 삭제하지 않고
+   보존한다(원인 분석용).
+6. 문제가 KIS API 자체(인증/네트워크)라면 `KIS_ACCOUNT_READ_ENABLED=false`로 즉시 KIS
    API 호출을 전면 차단할 수 있다 — 코드 변경 없이 환경변수만으로 가능.
 
 ## 긴급 대응 절차

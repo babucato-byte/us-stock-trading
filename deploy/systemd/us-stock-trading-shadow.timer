@@ -1,0 +1,13 @@
+# Runs the Shadow Mode evaluation every 5 minutes during the day. The
+# service itself is oneshot; the timer is what makes it periodic.
+[Unit]
+Description=Run US Stock Trading KIS Shadow Mode evaluation every 5 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=us-stock-trading-shadow.service
+
+[Install]
+WantedBy=timers.target

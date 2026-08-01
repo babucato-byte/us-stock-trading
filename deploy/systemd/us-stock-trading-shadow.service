@@ -1,0 +1,35 @@
+# CODEX-049: Shadow Mode evaluation service.
+#
+# Places NO orders: scripts/run_shadow_mode.py never imports
+# execution.execution_engine and never calls submit_order(). ExecStartPre
+# additionally refuses to start the unit unless the whole read-only
+# posture (KIS_LIVE_ORDER_ENABLED=false, LIVE_ROLLOUT_ENABLED=false,
+# ENTRY_DISABLED=true, validated==deployed commit, current DB schema)
+# holds.
+#
+# Paths below assume the deployment layout the Oracle runbook describes
+# (/home/ubuntu/trading-release). Adjust WorkingDirectory/ExecStart/
+# ReadWritePaths together if the release directory differs.
+[Unit]
+Description=US Stock Trading -- KIS Shadow Mode (evaluation only, places no orders)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=trading
+WorkingDirectory=/home/ubuntu/trading-release
+EnvironmentFile=/etc/us-stock-trading/live-readonly.env
+ExecStartPre=/home/ubuntu/trading-release/venv/bin/python /home/ubuntu/trading-release/scripts/preflight_kis_live.py
+ExecStart=/home/ubuntu/trading-release/venv/bin/python /home/ubuntu/trading-release/scripts/run_shadow_mode.py
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+ReadWritePaths=/home/ubuntu/trading-release /var/log/us-stock-trading
+
+[Install]
+WantedBy=multi-user.target

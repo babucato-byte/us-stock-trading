@@ -1,0 +1,13 @@
+# Reconciliation runs more often than Shadow Mode: the order gates read
+# its durable result, and a stale result fails closed.
+[Unit]
+Description=Run US Stock Trading KIS reconciliation every 2 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=15s
+Unit=us-stock-trading-reconcile.service
+
+[Install]
+WantedBy=timers.target
