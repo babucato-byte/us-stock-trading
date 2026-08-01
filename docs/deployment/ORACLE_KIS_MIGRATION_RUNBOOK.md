@@ -315,17 +315,35 @@ print('runs without a terminal event:', shadow_audit.runs_without_terminal_event
 저장소에 실제 systemd 유닛과 설치 스크립트가 포함되어 있다.
 
 ```text
-deploy/systemd/us-stock-trading-shadow.service      # 평가 전용, 주문 없음
-deploy/systemd/us-stock-trading-shadow.timer        # 5분 주기
-deploy/systemd/us-stock-trading-reconcile.service   # 읽기 전용 대조
-deploy/systemd/us-stock-trading-reconcile.timer     # 2분 주기
-deploy/systemd/us-stock-trading-live.service        # 설치만, enable 하지 않음
-scripts/preflight_kis_live.py                       # 모든 유닛의 ExecStartPre
-scripts/run_shadow_mode.py
+deploy/systemd/us-stock-trading-migrate.service        # 스키마 마이그레이션
+deploy/systemd/us-stock-trading-reconcile.service      # 읽기 전용 대조
+deploy/systemd/us-stock-trading-reconcile.timer        # 2분 주기
+deploy/systemd/us-stock-trading-shadow.service         # 매수 평가, 주문 없음
+deploy/systemd/us-stock-trading-shadow.timer           # 5분 주기
+deploy/systemd/us-stock-trading-shadow-exit.service    # 매도/청산 조건 평가, 주문 없음
+deploy/systemd/us-stock-trading-shadow-exit.timer      # 2분 주기
+deploy/systemd/us-stock-trading-health.service         # 상태 점검
+deploy/systemd/us-stock-trading-health.timer           # 15분 주기
+deploy/systemd/us-stock-trading-live.service           # 설치만, enable 하지 않음
+
+scripts/preflight_kis_live.py
+scripts/run_migrations.py
 scripts/run_reconciliation.py
+scripts/run_shadow_mode.py
+scripts/run_shadow_exit_evaluation.py
+scripts/run_health_report.py
 scripts/run_live_buy_entry.py
 scripts/install_oracle_services.sh
 ```
+
+서비스 기동 순서는 유닛의 `After=`/`Requires=`로 강제된다.
+
+```text
+migrate  →  (각 유닛의 ExecStartPre) preflight  →  reconcile  →  shadow / shadow-exit
+```
+
+`shadow`와 `shadow-exit`는 `Requires=us-stock-trading-reconcile.service`이므로
+reconciliation이 실패하면 시작되지 않는다.
 
 환경파일을 먼저 만든다(§7의 내용을 그대로 사용, **root:trading 0640**).
 
@@ -343,35 +361,85 @@ cd ~/trading-release
 sudo RELEASE_DIR=/home/ubuntu/trading-release scripts/install_oracle_services.sh
 ```
 
-이 스크립트는 shadow/reconcile 타이머만 `enable`하고, `us-stock-trading-live.service`는
-설치만 하고 **절대 enable 하지 않는다**(이미 enable되어 있으면 disable한다).
+이 스크립트는 순서대로 다음을 수행한다.
+
+```text
+모든 entrypoint/unit 파일 존재 확인
+trading 그룹·로그 디렉터리 생성
+환경파일 권한 root:trading 0640 적용
+환경파일의 실주문 플래그가 켜져 있으면 설치 거부
+unit 파일 복사 + daemon-reload
+scripts/run_migrations.py 실행
+scripts/preflight_kis_live.py 실행
+reconcile/shadow/shadow-exit/health timer만 enable
+us-stock-trading-live.service disable + stop
+```
+
+`us-stock-trading-live.service`는 **절대 enable/start 하지 않는다**.
 
 ### 15.2 사전 검증 (수동 실행 가능)
 
 ```bash
 cd ~/trading-release
 source venv/bin/activate
+python3 scripts/run_migrations.py
 python3 scripts/preflight_kis_live.py
 echo "exit=$?"    # 0이 아니면 서비스가 시작되지 않는다
 ```
 
-preflight는 필수 환경변수, 계좌 alias, Alpaca/KIS 주문 비활성, `ENTRY_DISABLED=true`,
-DB 마이그레이션 최신 여부, reconciliation 실행 가능 여부, 로그 디렉터리 쓰기 권한, 단일 실행
-lock, 검증 커밋과 배포 커밋(및 실제 체크아웃 커밋) 일치를 확인한다. 비밀값은 출력하지
-않으며 계좌번호는 마스킹된 형태로만 나타난다.
+preflight는 필수 환경변수, 계좌 alias, Alpaca/KIS 주문 비활성, `LIVE_ROLLOUT_ENABLED`
+비활성, `ENTRY_DISABLED=true`, 플래그 상호 정합성, DB 스키마 버전, reconciliation 실행 가능
+여부, 로그 디렉터리 쓰기 권한, 모든 entrypoint/unit 파일 존재, 단일 실행 lock, 그리고
+**검증 커밋·배포 커밋·실제 체크아웃 커밋이 모두 동일한 40자리 소문자 hex SHA인지**를
+확인한다(CODEX-051 — 짧은 prefix, 대문자, `HEAD` 같은 ref, 존재하지 않는 SHA는 모두 거부).
+비밀값은 출력하지 않으며 계좌번호는 마스킹된 형태로만 나타난다.
 
-### 15.3 시작·확인
+### 15.3 단독 실행 확인 (서비스 등록 전에 손으로 한 번씩)
+
+```bash
+python3 scripts/run_reconciliation.py --log-level INFO          # exit 0 / 2(KIS 조회 불가)
+python3 scripts/run_shadow_mode.py --log-level INFO             # 매수 평가, 주문 0회
+python3 scripts/run_shadow_exit_evaluation.py --log-level INFO  # 매도 조건 평가, 주문 0회
+python3 scripts/run_health_report.py --json                     # exit 0 / 2(문제 있음)
+```
+
+`run_shadow_exit_evaluation.py`는 보유 포지션마다 손절·익절·분할익절·시간청산·EOD 청산
+조건을 `positions.lifecycle.decide_exit()`(실주문 경로가 사용하는 것과 **동일한** 순수
+함수)로 평가하고 결과만 기록한다. `check_and_manage()`를 호출하지 않으므로 청산 주문을
+낼 수 없다.
+
+### 15.4 시작·확인
 
 ```bash
 sudo systemctl start us-stock-trading-reconcile.service
 sudo systemctl start us-stock-trading-shadow.service
+sudo systemctl start us-stock-trading-shadow-exit.service
+sudo systemctl start us-stock-trading-health.service
 
 systemctl list-timers | grep us-stock-trading
 journalctl -u us-stock-trading-reconcile.service -n 50 --no-pager
 journalctl -u us-stock-trading-shadow.service -n 50 --no-pager
+journalctl -u us-stock-trading-shadow-exit.service -n 50 --no-pager
+journalctl -u us-stock-trading-health.service -n 50 --no-pager
 ```
 
-### 15.4 live 서비스가 비활성인지 확인 (필수)
+감사 기록 확인:
+
+```bash
+python3 -c "
+import shadow_audit, shadow_mode
+print('audit events:', len(shadow_audit.read_events()))
+print('integrity:', shadow_audit.audit_integrity_report())
+records, corruption = shadow_mode.read_all_with_integrity()
+print('shadow records:', len(records), 'corrupt lines:', corruption)
+"
+```
+
+`runs_without_terminal_event` 또는 `runs_with_multiple_terminal_events`가 비어 있지 않거나
+`corrupt lines`가 비어 있지 않으면 감사 기록 경로가 깨진 것이므로 다음 단계로 진행하지
+않는다.
+
+### 15.5 live 서비스가 비활성인지 확인 (필수)
 
 ```bash
 systemctl is-enabled us-stock-trading-live.service   # disabled 이어야 한다
@@ -379,9 +447,9 @@ systemctl is-active  us-stock-trading-live.service   # inactive 이어야 한다
 ```
 
 `enabled`가 나오면 즉시 `sudo systemctl disable --now us-stock-trading-live.service`를
-실행하고 원인을 조사한다.
+실행하고 원인을 조사한다. `run_health_report.py`도 매 15분 이 조건을 확인한다.
 
-### 15.5 기존 서비스 경로 전환
+### 15.6 기존 서비스 경로 전환
 
 기존 `order-monitor`/`dashboard` 유닛을 새 `~/trading-release` 경로로 갱신하되,
 **`ENTRY_DISABLED=true`/`KIS_LIVE_ORDER_ENABLED=false`/`LIVE_ROLLOUT_ENABLED=false`/네
@@ -393,16 +461,20 @@ sudo systemctl restart order-monitor dashboard
 systemctl status order-monitor dashboard
 ```
 
-### 15.6 정지
+### 15.7 정지
 
 ```bash
-sudo systemctl stop us-stock-trading-shadow.timer us-stock-trading-reconcile.timer
-sudo systemctl stop us-stock-trading-shadow.service us-stock-trading-reconcile.service
+sudo systemctl stop us-stock-trading-shadow.timer us-stock-trading-shadow-exit.timer \
+    us-stock-trading-reconcile.timer us-stock-trading-health.timer
+sudo systemctl stop us-stock-trading-shadow.service us-stock-trading-shadow-exit.service \
+    us-stock-trading-reconcile.service us-stock-trading-health.service
 ```
 
-**주의(범위)**: 매도·손절·익절을 실제로 실행하는
+**주의(범위)**: 실제 청산 주문을 내는
 `kis_position_manager.sync_kis_fills_and_manage_exits()` tick은 실주문 경로이므로 초기
-배포에는 서비스로 포함하지 않는다. 활성화는 spec §29의 실주문 활성화 승인 절차에 속한다.
+배포에 서비스로 포함하지 않는다. 그 조건 평가는 위 `shadow-exit` 서비스가 주문 없이
+수행하므로 Oracle에서 매도 로직을 검증하는 것 자체는 가능하다. 실제 실행 활성화는 spec §29의
+실주문 활성화 승인 절차에 속한다.
 
 ## 16. 실주문 비활성 상태 최종 확인
 
@@ -420,8 +492,11 @@ systemctl is-enabled us-stock-trading-live.service
 
    ```bash
    sudo systemctl disable --now us-stock-trading-shadow.timer
+   sudo systemctl disable --now us-stock-trading-shadow-exit.timer
    sudo systemctl disable --now us-stock-trading-reconcile.timer
-   sudo systemctl stop us-stock-trading-shadow.service us-stock-trading-reconcile.service
+   sudo systemctl disable --now us-stock-trading-health.timer
+   sudo systemctl stop us-stock-trading-shadow.service us-stock-trading-shadow-exit.service \
+       us-stock-trading-reconcile.service us-stock-trading-health.service
    systemctl is-enabled us-stock-trading-live.service   # disabled 확인
    ```
 

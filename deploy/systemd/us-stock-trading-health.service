@@ -1,18 +1,19 @@
-# CODEX-049: US Stock Trading -- KIS reconciliation (read-only)
+# CODEX-049: US Stock Trading -- durable-state health report
 #
 # Paths assume the deployment layout the Oracle runbook describes
 # (/home/ubuntu/trading-release). Adjust WorkingDirectory / ExecStart /
 # ReadWritePaths together if the release directory differs.
-# Read-only against KIS: get_positions/get_open_orders/get_fills only.
-# Never submit_order()/cancel_order().
+# Makes no KIS call at all: reports on schema version, reconciliation
+# freshness, UNKNOWN orders, shadow-audit integrity, log corruption
+# and whether the live unit is still disabled. Exits 2 when unhealthy.
 [Unit]
-Description=US Stock Trading -- KIS reconciliation (read-only)
+Description=US Stock Trading -- durable-state health report
 After=network-online.target us-stock-trading-migrate.service
 Wants=network-online.target
 Requires=us-stock-trading-migrate.service
 ConditionPathExists=/home/ubuntu/trading-release/venv/bin/python
 ConditionPathExists=/etc/us-stock-trading/live-readonly.env
-ConditionPathExists=/home/ubuntu/trading-release/scripts/run_reconciliation.py
+ConditionPathExists=/home/ubuntu/trading-release/scripts/run_health_report.py
 
 [Service]
 Type=oneshot
@@ -29,8 +30,7 @@ PrivateTmp=true
 ProtectSystem=full
 ProtectHome=false
 ReadWritePaths=/home/ubuntu/trading-release /var/log/us-stock-trading
-ExecStartPre=/home/ubuntu/trading-release/venv/bin/python /home/ubuntu/trading-release/scripts/preflight_kis_live.py
-ExecStart=/home/ubuntu/trading-release/venv/bin/python /home/ubuntu/trading-release/scripts/run_reconciliation.py
+ExecStart=/home/ubuntu/trading-release/venv/bin/python /home/ubuntu/trading-release/scripts/run_health_report.py
 
 [Install]
 WantedBy=multi-user.target

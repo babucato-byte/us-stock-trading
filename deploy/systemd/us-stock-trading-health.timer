@@ -1,0 +1,13 @@
+# CODEX-049: periodic trigger for us-stock-trading-health.service.
+[Unit]
+Description=Run US Stock Trading health report every 15 minutes
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=15min
+AccuracySec=1min
+Persistent=true
+Unit=us-stock-trading-health.service
+
+[Install]
+WantedBy=timers.target

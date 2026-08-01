@@ -1,5 +1,4 @@
-# Reconciliation runs more often than Shadow Mode: the order gates read
-# its durable result, and a stale result fails closed.
+# CODEX-049: periodic trigger for us-stock-trading-reconcile.service.
 [Unit]
 Description=Run US Stock Trading KIS reconciliation every 2 minutes
 
@@ -7,6 +6,7 @@ Description=Run US Stock Trading KIS reconciliation every 2 minutes
 OnBootSec=2min
 OnUnitActiveSec=2min
 AccuracySec=15s
+Persistent=true
 Unit=us-stock-trading-reconcile.service
 
 [Install]

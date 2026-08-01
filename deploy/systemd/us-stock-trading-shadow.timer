@@ -1,12 +1,12 @@
-# Runs the Shadow Mode evaluation every 5 minutes during the day. The
-# service itself is oneshot; the timer is what makes it periodic.
+# CODEX-049: periodic trigger for us-stock-trading-shadow.service.
 [Unit]
-Description=Run US Stock Trading KIS Shadow Mode evaluation every 5 minutes
+Description=Run US Stock Trading KIS Shadow entry evaluation every 5 minutes
 
 [Timer]
 OnBootSec=5min
 OnUnitActiveSec=5min
 AccuracySec=30s
+Persistent=true
 Unit=us-stock-trading-shadow.service
 
 [Install]

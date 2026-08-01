@@ -589,6 +589,78 @@ def _exit_states_reachable_from(current_state):
     )
 
 
+ACTION_NONE = "none"
+ACTION_FULL_EXIT = "full_exit"
+ACTION_PARTIAL_EXIT = "partial_exit"
+ACTION_TRAIL = "trail"
+
+
+@dataclass(frozen=True)
+class ExitDecision:
+    """What check_and_manage() would DO for a position, separated from
+    doing it (CODEX-049).
+
+    Shadow Mode has to answer "would this position have been exited, and
+    why?" without submitting anything. Re-implementing the rules in the
+    Shadow service would be a second, divergent copy of the exit policy --
+    exactly the kind of duplicate safety-critical logic this project
+    forbids. So the decision is extracted here as a pure function and
+    check_and_manage() dispatches on its result: live execution and
+    Shadow evaluation are guaranteed to agree because they are literally
+    the same code."""
+
+    action: str
+    reason: Optional[str] = None
+    detail: Optional[str] = None
+
+
+def decide_exit(record, *, current_price, now, enable_partial_profit=True,
+                 enable_trailing_stop=True, enable_time_stop=True, enable_eod_exit=True):
+    """Pure: no I/O, no state change, no broker. Priority order is
+    unchanged from check_and_manage()'s documented order -- EOD >
+    time-stop > stop-loss > target_2 > target_1 -- and the four CODEX-046
+    feature flags gate exactly the same branches they always did."""
+    if not _exit_states_reachable_from(record["state"]):
+        return ExitDecision(ACTION_NONE, reason="state is not exit-eligible")
+
+    eod_cutoff = combine_eastern(now.date(), MARKET_REGULAR_END) - timedelta(
+        minutes=cfg.EOD_FORCE_CLOSE_MINUTES_BEFORE_CLOSE
+    )
+    if enable_eod_exit and now >= eod_cutoff:
+        return ExitDecision(ACTION_FULL_EXIT, reason="EOD_FORCED_CLOSE")
+
+    entry_time = record.get("entry_time")
+    if enable_time_stop and entry_time:
+        held_minutes = (now - datetime.fromisoformat(entry_time)).total_seconds() / 60.0
+        if held_minutes >= cfg.MAX_POSITION_HOLD_MINUTES:
+            return ExitDecision(
+                ACTION_FULL_EXIT, reason="TIME_STOP", detail=f"held_minutes={held_minutes:.1f}",
+            )
+
+    if current_price <= record["stop_price"]:
+        return ExitDecision(
+            ACTION_FULL_EXIT, reason="STOP_LOSS",
+            detail=f"price={current_price} stop={record['stop_price']}",
+        )
+
+    if record["state"] == states.STOP_ACTIVE and current_price >= record["target_1_price"]:
+        if enable_partial_profit:
+            return ExitDecision(ACTION_PARTIAL_EXIT, reason="TARGET_1")
+        if current_price >= record["target_2_price"]:
+            # Partial profit-taking is disabled -- never leave the
+            # position waiting in STOP_ACTIVE for a partial-exit branch
+            # that will never fire once target_2 is already reached.
+            return ExitDecision(ACTION_FULL_EXIT, reason="TARGET_2")
+
+    if record["state"] in (states.TARGET_1_ACTIVE, states.PARTIAL_EXITED, states.TRAILING):
+        if current_price >= record["target_2_price"]:
+            return ExitDecision(ACTION_FULL_EXIT, reason="TARGET_2")
+        if record["state"] == states.PARTIAL_EXITED and enable_trailing_stop:
+            return ExitDecision(ACTION_TRAIL, reason="TRAILING_BREAKEVEN")
+
+    return ExitDecision(ACTION_NONE)
+
+
 def check_and_manage(position_id, *, current_price, bars=None, now=None, clock=None, broker=None,
                       order_date=None, lock_timeout=store.LOCK_TIMEOUT_SECONDS,
                       enable_partial_profit=True, enable_trailing_stop=True,
@@ -644,50 +716,31 @@ def check_and_manage(position_id, *, current_price, bars=None, now=None, clock=N
     symbol = record["symbol"]
     order_date = order_date or now.strftime("%Y-%m-%d")
 
-    eod_cutoff = combine_eastern(now.date(), MARKET_REGULAR_END) - timedelta(
-        minutes=cfg.EOD_FORCE_CLOSE_MINUTES_BEFORE_CLOSE
+    decision = decide_exit(
+        record, current_price=current_price, now=now,
+        enable_partial_profit=enable_partial_profit, enable_trailing_stop=enable_trailing_stop,
+        enable_time_stop=enable_time_stop, enable_eod_exit=enable_eod_exit,
     )
-    if enable_eod_exit and now >= eod_cutoff:
-        return _force_full_exit(position_id, symbol, order_date, broker, "EOD_FORCED_CLOSE", lock_timeout)
 
-    entry_time = record.get("entry_time")
-    if enable_time_stop and entry_time:
-        held_minutes = (now - datetime.fromisoformat(entry_time)).total_seconds() / 60.0
-        if held_minutes >= cfg.MAX_POSITION_HOLD_MINUTES:
-            return _force_full_exit(position_id, symbol, order_date, broker, "TIME_STOP", lock_timeout)
-
-    if bars is not None:
-        strategy_cls = None  # invalidation is optional and caller-provided; see check_and_manage_with_strategy
-    if current_price <= record["stop_price"]:
-        return _force_full_exit(position_id, symbol, order_date, broker, "STOP_LOSS", lock_timeout)
-
-    if record["state"] == states.STOP_ACTIVE and current_price >= record["target_1_price"]:
-        if enable_partial_profit:
-            return _partial_exit_at_target_1(position_id, symbol, order_date, broker, lock_timeout)
-        if current_price >= record["target_2_price"]:
-            # Partial profit-taking is disabled -- never leave the
-            # position waiting in STOP_ACTIVE for a partial-exit branch
-            # that will never fire once target_2 is already reached.
-            return _force_full_exit(position_id, symbol, order_date, broker, "TARGET_2", lock_timeout)
-
-    if record["state"] in (states.TARGET_1_ACTIVE, states.PARTIAL_EXITED, states.TRAILING):
-        if current_price >= record["target_2_price"]:
-            return _force_full_exit(position_id, symbol, order_date, broker, "TARGET_2", lock_timeout)
-        if record["state"] == states.PARTIAL_EXITED and enable_trailing_stop:
-            # ASSUMPTION (DECISION_LOG.md): minimal trailing rule -- once
-            # target_1 fills, move the stop to breakeven (entry price) and
-            # enter TRAILING. This is a deliberately simple initial policy,
-            # not a full trailing-stop algorithm.
-            with store.locked_position(position_id, lock_timeout=lock_timeout) as locked:
-                if locked["state"] == states.PARTIAL_EXITED:
-                    locked["stop_price"] = locked["average_fill_price"]
-                    states.validate_transition(locked["state"], states.TRAILING)
-                    locked["state"] = states.TRAILING
-                    locked["state_history"].append(
-                        {"state": states.TRAILING, "at": _now_iso(),
-                         "reason": "target_1 filled, stop moved to breakeven"}
-                    )
-            return store.load_position(position_id)
+    if decision.action == ACTION_FULL_EXIT:
+        return _force_full_exit(position_id, symbol, order_date, broker, decision.reason, lock_timeout)
+    if decision.action == ACTION_PARTIAL_EXIT:
+        return _partial_exit_at_target_1(position_id, symbol, order_date, broker, lock_timeout)
+    if decision.action == ACTION_TRAIL:
+        # ASSUMPTION (DECISION_LOG.md): minimal trailing rule -- once
+        # target_1 fills, move the stop to breakeven (entry price) and
+        # enter TRAILING. This is a deliberately simple initial policy,
+        # not a full trailing-stop algorithm.
+        with store.locked_position(position_id, lock_timeout=lock_timeout) as locked:
+            if locked["state"] == states.PARTIAL_EXITED:
+                locked["stop_price"] = locked["average_fill_price"]
+                states.validate_transition(locked["state"], states.TRAILING)
+                locked["state"] = states.TRAILING
+                locked["state_history"].append(
+                    {"state": states.TRAILING, "at": _now_iso(),
+                     "reason": "target_1 filled, stop moved to breakeven"}
+                )
+        return store.load_position(position_id)
 
     return record
 

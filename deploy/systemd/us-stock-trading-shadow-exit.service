@@ -1,19 +1,21 @@
-# CODEX-049: US Stock Trading -- KIS Shadow entry evaluation (places no orders)
+# CODEX-049: US Stock Trading -- KIS Shadow exit evaluation (places no orders)
 #
 # Paths assume the deployment layout the Oracle runbook describes
 # (/home/ubuntu/trading-release). Adjust WorkingDirectory / ExecStart /
 # ReadWritePaths together if the release directory differs.
-# Places NO orders: scripts/run_shadow_mode.py never imports
-# execution.execution_engine. Requires= reconcile, so a failed
-# reconciliation blocks this unit from starting at all.
+# Evaluates stop-loss/take-profit/time-stop/EOD exit conditions on
+# real held positions using positions.lifecycle.decide_exit() -- the
+# same pure function check_and_manage() dispatches on -- and records
+# what WOULD happen. It never calls check_and_manage(), so it cannot
+# submit an exit order.
 [Unit]
-Description=US Stock Trading -- KIS Shadow entry evaluation (places no orders)
+Description=US Stock Trading -- KIS Shadow exit evaluation (places no orders)
 After=network-online.target us-stock-trading-migrate.service us-stock-trading-reconcile.service
 Wants=network-online.target
 Requires=us-stock-trading-migrate.service us-stock-trading-reconcile.service
 ConditionPathExists=/home/ubuntu/trading-release/venv/bin/python
 ConditionPathExists=/etc/us-stock-trading/live-readonly.env
-ConditionPathExists=/home/ubuntu/trading-release/scripts/run_shadow_mode.py
+ConditionPathExists=/home/ubuntu/trading-release/scripts/run_shadow_exit_evaluation.py
 
 [Service]
 Type=oneshot
@@ -31,7 +33,7 @@ ProtectSystem=full
 ProtectHome=false
 ReadWritePaths=/home/ubuntu/trading-release /var/log/us-stock-trading
 ExecStartPre=/home/ubuntu/trading-release/venv/bin/python /home/ubuntu/trading-release/scripts/preflight_kis_live.py
-ExecStart=/home/ubuntu/trading-release/venv/bin/python /home/ubuntu/trading-release/scripts/run_shadow_mode.py
+ExecStart=/home/ubuntu/trading-release/venv/bin/python /home/ubuntu/trading-release/scripts/run_shadow_exit_evaluation.py
 
 [Install]
 WantedBy=multi-user.target
