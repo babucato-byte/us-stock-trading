@@ -115,22 +115,30 @@ class KISBrokerAdapter:
         the buy path does. Before this, `shadow_mode.persist()` was called
         only from kis_live_trading.py's buy cycle, so an exit that was
         gate-rejected, reconciliation-blocked or UNKNOWN-blocked left no
-        Shadow record at all."""
-        shadow_audit.record_event(
-            shadow_run_id=run_id, event_type=event_type, result=result, symbol=symbol,
-            side="sell", internal_order_id=internal_order_id, reason_code=reason_code,
-            payload={"detail": detail} if detail else None, now=now,
-        )
+        Shadow record at all.
+
+        Fails CLOSED, exactly like the buy path: an unpersistable audit
+        event abandons the evaluation instead of continuing."""
+        try:
+            shadow_audit.record_event(
+                shadow_run_id=run_id, event_type=event_type, result=result, symbol=symbol,
+                side="sell", internal_order_id=internal_order_id, reason_code=reason_code,
+                payload={"detail": detail} if detail else None, now=now,
+            )
+        except shadow_audit.ShadowAuditError as exc:
+            shadow_audit.handle_audit_failure(
+                exc, shadow_run_id=run_id, symbol=symbol, side="sell", stage=event_type,
+            )
 
     def _blocked(self, run_id, event_type, *, symbol, internal_order_id, reason_code, detail,
                   status_code, text, now):
-        """Records the specific block event AND the terminal
-        SHADOW_COMPLETED before returning the caller-facing response, so
-        no sell evaluation can end without a final outcome event."""
+        """Records the specific block event AND exactly one terminal
+        SHADOW_BLOCKED before returning the caller-facing response, so no
+        sell evaluation can end without a final outcome event."""
         self._audit(run_id, event_type, shadow_audit.RESULT_BLOCKED, symbol=symbol,
                     internal_order_id=internal_order_id, reason_code=reason_code,
                     detail=detail, now=now)
-        self._audit(run_id, shadow_audit.SHADOW_COMPLETED, shadow_audit.RESULT_BLOCKED,
+        self._audit(run_id, shadow_audit.SHADOW_BLOCKED, shadow_audit.RESULT_BLOCKED,
                     symbol=symbol, internal_order_id=internal_order_id,
                     reason_code=reason_code, now=now)
         return BrokerResponse(
@@ -228,10 +236,14 @@ class KISBrokerAdapter:
 
         try:
             try:
+                # CODEX-048: the engine records GATE_APPROVED and
+                # EXECUTION_PLANNED for this run BEFORE it calls the
+                # broker, so a crash during the transport call still
+                # leaves the approval audited.
                 result = execution_engine.submit_sell_order(
                     order_intent=order_intent, sell_gate_context_builder=_sell_ctx_builder,
                     conn=conn, broker=self.kis_broker, instrument=instrument,
-                    account_id=account_id, now=current,
+                    account_id=account_id, now=current, audit_run_id=run_id,
                 )
             except ExecutionEngineError as exc:
                 return self._blocked(
@@ -241,12 +253,10 @@ class KISBrokerAdapter:
                     text=f"order gate blocked: {exc}", now=current,
                 )
             except KISAmbiguousResponseError as exc:
+                # Exactly one terminal event: SHADOW_ERROR.
                 self._audit(run_id, shadow_audit.SHADOW_ERROR, shadow_audit.RESULT_ERROR,
                             symbol=symbol, internal_order_id=internal_order_id,
                             reason_code="AMBIGUOUS_RESPONSE", detail=str(exc), now=current)
-                self._audit(run_id, shadow_audit.SHADOW_COMPLETED, shadow_audit.RESULT_ERROR,
-                            symbol=symbol, internal_order_id=internal_order_id,
-                            reason_code="AMBIGUOUS_RESPONSE", now=current)
                 # Propagate -- positions/lifecycle.py's _execute_exit()
                 # catches any Exception here and marks the exit intent
                 # SUBMISSION_UNKNOWN, exactly the UNKNOWN-never-auto-
@@ -269,16 +279,15 @@ class KISBrokerAdapter:
         alpaca_status = "accepted" if result.status == "ACCEPTED" else "rejected"
         approved = result.status == "ACCEPTED"
         audit_result = shadow_audit.RESULT_APPROVED if approved else shadow_audit.RESULT_BLOCKED
-        self._audit(run_id, shadow_audit.GATE_APPROVED if approved else shadow_audit.GATE_REJECTED,
-                    audit_result, symbol=symbol, internal_order_id=internal_order_id,
+        # GATE_APPROVED/EXECUTION_PLANNED were recorded by the engine
+        # before the transport call; only the outcome remains, and only
+        # a rejection needs its own non-terminal event.
+        if not approved:
+            self._audit(run_id, shadow_audit.GATE_REJECTED, audit_result, symbol=symbol,
+                        internal_order_id=internal_order_id, reason_code=result.status, now=current)
+        self._audit(run_id, shadow_audit.terminal_event_for(audit_result), audit_result,
+                    symbol=symbol, internal_order_id=internal_order_id,
                     reason_code=result.status, now=current)
-        if approved:
-            self._audit(run_id, shadow_audit.EXECUTION_PLANNED, shadow_audit.RESULT_APPROVED,
-                        symbol=symbol, internal_order_id=internal_order_id,
-                        reason_code="SUBMITTED",
-                        detail=str(result.execution_record.broker_order_id), now=current)
-        self._audit(run_id, shadow_audit.SHADOW_COMPLETED, audit_result, symbol=symbol,
-                    internal_order_id=internal_order_id, reason_code=result.status, now=current)
         return BrokerResponse(
             status_code=200 if result.status == "ACCEPTED" else 400,
             text=f"KIS order {result.execution_record.broker_order_id} status={result.status}",

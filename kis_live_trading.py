@@ -107,21 +107,31 @@ def _audit(run_id, event_type, result, *, symbol=None, signal_id=None, internal_
             reason_code=None, detail=None, now):
     """CODEX-048: one durable audit row per evaluation step, in SQLite,
     for BOTH the block and the approve paths. `detail` is free text from
-    an underlying exception and is redacted at the store boundary."""
-    shadow_audit.record_event(
-        shadow_run_id=run_id, event_type=event_type, result=result, symbol=symbol,
-        side="buy", signal_id=signal_id, internal_order_id=internal_order_id,
-        reason_code=reason_code, payload={"detail": detail} if detail else None, now=now,
-    )
+    an underlying exception and is redacted at the store boundary.
+
+    Fails CLOSED: if the event cannot be persisted, shadow_audit.
+    handle_audit_failure() retries the terminal SHADOW_ERROR, alerts, and
+    raises ShadowAuditFailure -- the evaluation is abandoned rather than
+    continuing with an incomplete audit trail."""
+    try:
+        shadow_audit.record_event(
+            shadow_run_id=run_id, event_type=event_type, result=result, symbol=symbol,
+            side="buy", signal_id=signal_id, internal_order_id=internal_order_id,
+            reason_code=reason_code, payload={"detail": detail} if detail else None, now=now,
+        )
+    except shadow_audit.ShadowAuditError as exc:
+        shadow_audit.handle_audit_failure(
+            exc, shadow_run_id=run_id, symbol=symbol, side="buy", stage=event_type,
+        )
 
 
 def _audit_cycle_block(run_id, event_type, reason_code, detail, *, now):
     """A cycle-level structural block. Emits the specific block event AND
-    the terminal SHADOW_COMPLETED, so no run is ever left without a final
-    outcome event."""
+    exactly one terminal SHADOW_BLOCKED, so no run is ever left without a
+    final outcome event."""
     _audit(run_id, event_type, shadow_audit.RESULT_BLOCKED, symbol=_CYCLE_LEVEL_SYMBOL,
            reason_code=reason_code, detail=detail, now=now)
-    _audit(run_id, shadow_audit.SHADOW_COMPLETED, shadow_audit.RESULT_BLOCKED,
+    _audit(run_id, shadow_audit.SHADOW_BLOCKED, shadow_audit.RESULT_BLOCKED,
            symbol=_CYCLE_LEVEL_SYMBOL, reason_code=reason_code, now=now)
 
 
@@ -225,6 +235,7 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None):
             # run without a recorded outcome.
             run_id = shadow_audit.new_run_id()
             outcome = {"result": shadow_audit.RESULT_BLOCKED, "reason_code": None}
+            terminal_recorded = False
             try:
                 if symbol not in rollout.allowed_symbols:
                     results["skipped"].append((symbol, "not in live_rollout.allowed_symbols"))
@@ -407,22 +418,24 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None):
                     )
 
                 try:
+                    # CODEX-048: audit_run_id lets the Execution Engine
+                    # record GATE_APPROVED and EXECUTION_PLANNED BEFORE it
+                    # calls the broker. Recording them here, after this
+                    # call returns, would leave a crash during the broker
+                    # call with no audit of the approval that authorized
+                    # an order that may already have reached KIS.
                     result = execution_engine.submit_buy_order(
                         order_intent=order_intent, buy_gate_context_builder=_buy_ctx_builder,
                         conn=conn, broker=broker, instrument=instrument,
                         account_id=account_snapshot.account_id, now=current,
+                        audit_run_id=run_id,
                     )
                     results["submitted"].append(symbol)
                     shadow_mode.persist(_shadow_record("APPROVED"))
+                    # GATE_APPROVED and EXECUTION_PLANNED were already
+                    # recorded by the engine, before the transport call.
                     outcome["result"] = shadow_audit.RESULT_APPROVED
                     outcome["reason_code"] = "APPROVED"
-                    _audit(run_id, shadow_audit.GATE_APPROVED, shadow_audit.RESULT_APPROVED,
-                           symbol=symbol, signal_id=signal.signal_id,
-                           internal_order_id=order_intent.internal_order_id, now=current)
-                    _audit(run_id, shadow_audit.EXECUTION_PLANNED, shadow_audit.RESULT_APPROVED,
-                           symbol=symbol, signal_id=signal.signal_id,
-                           internal_order_id=order_intent.internal_order_id,
-                           reason_code="SUBMITTED", detail=str(result.status), now=current)
                     # spec: "매수 체결 이후 포지션 관리는 KIS 실제 보유수량과
                     # 평균체결가를 기준으로 한다" -- create the positions/
                     # lifecycle.py row now so kis_position_manager.py's sync
@@ -466,14 +479,20 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None):
                            signal_id=signal.signal_id,
                            internal_order_id=order_intent.internal_order_id,
                            reason_code="BROKER_REJECTED", detail=str(exc), now=current)
-            except Exception as exc:  # noqa: BLE001 -- audited, then re-raised as a blocked result
+            except shadow_audit.ShadowAuditFailure as exc:
+                # handle_audit_failure() already recorded the terminal
+                # SHADOW_ERROR and alerted. Do not write a second terminal
+                # event for this run.
+                terminal_recorded = True
+                results["blocked"].append((symbol, f"shadow audit failure: {exc}"))
+            except Exception as exc:  # noqa: BLE001 -- audited, then reported as a blocked result
                 outcome = {"result": shadow_audit.RESULT_ERROR, "reason_code": "UNEXPECTED"}
                 results["blocked"].append((symbol, f"unexpected error: {exc}"))
-                _audit(run_id, shadow_audit.SHADOW_ERROR, shadow_audit.RESULT_ERROR,
-                       symbol=symbol, reason_code="UNEXPECTED", detail=str(exc), now=current)
             finally:
-                _audit(run_id, shadow_audit.SHADOW_COMPLETED, outcome["result"], symbol=symbol,
-                       reason_code=outcome["reason_code"], now=current)
+                if not terminal_recorded:
+                    _audit(run_id, shadow_audit.terminal_event_for(outcome["result"]),
+                           outcome["result"], symbol=symbol,
+                           reason_code=outcome["reason_code"], now=current)
     finally:
         conn.close()
 

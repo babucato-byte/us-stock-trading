@@ -9,7 +9,10 @@ Orchestrates, in order:
        (real KIS positions/open-orders/fills vs internal state -- CODEX-044)
     -> execution.authorization.authorize_new_order() (HALT check + order_gate,
        mints a single-use AuthorizedExecution token -- CODEX-043)
-    -> CAS VALIDATING -> APPROVED -> SUBMITTING
+    -> CAS VALIDATING -> APPROVED
+    -> GATE_APPROVED shadow-audit event      (CODEX-048: BEFORE transport)
+    -> CAS APPROVED -> SUBMITTING
+    -> EXECUTION_PLANNED shadow-audit event  (CODEX-048: BEFORE transport)
     -> KISBroker.submit_order(..., authorization=...) (the one real network call)
     -> CAS SUBMITTING -> ACCEPTED/REJECTED/UNKNOWN
 
@@ -43,6 +46,7 @@ from execution import authorization, idempotency, order_gate, order_repository
 from execution.authorization import UnauthorizedExecutionError
 from execution.order_repository import OrderRepositoryError
 from execution.order_state_machine import OrderStateTransitionError
+import shadow_audit
 from reconciliation import snapshot as reconciliation_snapshot
 from reconciliation.snapshot import (
     ReconciliationBlockedError,
@@ -74,6 +78,7 @@ REASON_UNKNOWN_ORDER = "UNKNOWN_ORDER"
 REASON_HALT = "HALT"
 REASON_GATE = "GATE"
 REASON_STATE_PERSISTENCE = "STATE_PERSISTENCE"
+REASON_AUDIT_PERSISTENCE = "AUDIT_PERSISTENCE"
 
 
 class ExecutionResult:
@@ -129,8 +134,37 @@ def _reconcile_now(*, conn, broker, order_intent, account_id, current, side_labe
     return snapshot
 
 
+def _audit_before_transport(*, audit_run_id, event_type, order_intent, side_label, now,
+                             reason_code=None, detail=None):
+    """CODEX-048: records an approval/execution-planned audit event BEFORE
+    the transport call, and BLOCKS the order if it cannot be persisted.
+
+    The ordering is the point. If this is recorded after
+    `broker.submit_order()` returns, a crash during the broker call
+    leaves an order that may well have reached KIS with no durable record
+    of the approval that authorized it -- which is exactly the state the
+    audit trail exists to make impossible. Failing closed here costs a
+    missed order; failing open costs an unaudited real order."""
+    if audit_run_id is None:
+        return
+    try:
+        shadow_audit.record_event(
+            shadow_run_id=audit_run_id, event_type=event_type,
+            result=shadow_audit.RESULT_APPROVED, symbol=order_intent.symbol,
+            side=order_intent.side, signal_id=order_intent.signal_id,
+            internal_order_id=order_intent.internal_order_id, reason_code=reason_code,
+            payload={"detail": detail} if detail else None, now=now,
+        )
+    except shadow_audit.ShadowAuditError as exc:
+        raise ExecutionEngineError(
+            f"{side_label} order blocked -- {event_type} audit event could not be persisted "
+            f"before the transport call: {exc}",
+            reason_code=REASON_AUDIT_PERSISTENCE,
+        ) from exc
+
+
 def submit_buy_order(*, order_intent, buy_gate_context_builder, conn, broker, instrument,
-                     account_id, now=None):
+                     account_id, now=None, audit_run_id=None):
     """`buy_gate_context_builder` is a ONE-ARG callable the caller
     supplies that takes the `ReconciliationSnapshot` this engine just
     built and returns a fully-populated `order_gate.BuyGateContext` --
@@ -143,12 +177,12 @@ def submit_buy_order(*, order_intent, buy_gate_context_builder, conn, broker, in
     return _submit_new_order(
         order_intent=order_intent, gate_context_builder=buy_gate_context_builder,
         gate_fn=order_gate.evaluate_buy_gate, conn=conn, broker=broker, instrument=instrument,
-        account_id=account_id, now=now, side_label="buy",
+        account_id=account_id, now=now, side_label="buy", audit_run_id=audit_run_id,
     )
 
 
 def submit_sell_order(*, order_intent, sell_gate_context_builder, conn, broker, instrument,
-                      account_id, now=None):
+                      account_id, now=None, audit_run_id=None):
     """CODEX-044: identical reconciliation policy to the buy path --
     same snapshot, same TTL, same account/symbol binding, same
     fail-closed outcomes. `sell_gate_context_builder` takes the
@@ -156,12 +190,12 @@ def submit_sell_order(*, order_intent, sell_gate_context_builder, conn, broker, 
     return _submit_new_order(
         order_intent=order_intent, gate_context_builder=sell_gate_context_builder,
         gate_fn=order_gate.evaluate_sell_gate, conn=conn, broker=broker, instrument=instrument,
-        account_id=account_id, now=now, side_label="sell",
+        account_id=account_id, now=now, side_label="sell", audit_run_id=audit_run_id,
     )
 
 
 def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, broker, instrument,
-                       account_id, now, side_label):
+                       account_id, now, side_label, audit_run_id=None):
     """The single new-order flow both submit_buy_order() and
     submit_sell_order() run -- buy and sell differ ONLY in which gate
     function evaluates the context, never in which safety steps run or
@@ -175,7 +209,9 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
         -> real-time reconciliation snapshot + verification
         -> HALT check + Order Gate (mints the single-use authorization)
         -> CAS VALIDATING   -> APPROVED
+        -> GATE_APPROVED audit event        (CODEX-048, before transport)
         -> CAS APPROVED     -> SUBMITTING
+        -> EXECUTION_PLANNED audit event    (CODEX-048, before transport)
         -> the ONE transport call
         -> CAS SUBMITTING   -> ACCEPTED / REJECTED / UNKNOWN
 
@@ -234,6 +270,19 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
             record = order_repository.advance(
                 conn, record, "APPROVED", event_type="GATE_APPROVED", now=current,
             )
+        except OrderRepositoryError as exc:
+            raise ExecutionEngineError(
+                f"{side_label} order blocked -- could not durably record APPROVED: {exc}",
+                reason_code=REASON_STATE_PERSISTENCE,
+            ) from exc
+
+        _audit_before_transport(
+            audit_run_id=audit_run_id, event_type=shadow_audit.GATE_APPROVED,
+            order_intent=order_intent, side_label=side_label, now=current,
+            reason_code="APPROVED",
+        )
+
+        try:
             record = order_repository.advance(
                 conn, record, "SUBMITTING", event_type="TRANSPORT_SUBMITTING", now=current,
             )
@@ -245,6 +294,16 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
                 f"{side_label} order blocked -- could not durably record SUBMITTING: {exc}",
                 reason_code=REASON_STATE_PERSISTENCE,
             ) from exc
+
+        # The LAST thing before the network call: "we are about to submit
+        # this exact order". A crash after this point leaves an audit
+        # trail that says so.
+        _audit_before_transport(
+            audit_run_id=audit_run_id, event_type=shadow_audit.EXECUTION_PLANNED,
+            order_intent=order_intent, side_label=side_label, now=current,
+            reason_code="SUBMITTING",
+            detail=f"quantity={order_intent.quantity} limit={order_intent.limit_price}",
+        )
 
         try:
             execution_record = broker.submit_order(order_intent, instrument, authorization=authorized)

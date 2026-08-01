@@ -275,6 +275,42 @@ def read_all(*, path=None, date=None):
     return records
 
 
+def verify_log_integrity(*, path=None, date=None, alert=True):
+    """CODEX-048: corruption must be REPORTED, not merely skipped.
+
+    Returns the list of `(file, line_number)` pairs that could not be
+    parsed, and (by default) raises an operational alert for them. The
+    reconciliation service calls this every pass, so a torn line becomes
+    an operator-visible event rather than a silently shorter audit log.
+    """
+    _records, corruption = read_all_with_integrity(path=path, date=date)
+    if corruption and alert:
+        message = (
+            "*Shadow Mode log corruption*\n"
+            f"- unreadable lines: {len(corruption)}\n- locations: {corruption[:10]}"
+        )
+        logger.error(message)
+        try:
+            from operations import alerts
+
+            alerts.send_alert(message)
+        except Exception as exc:  # noqa: BLE001 -- alerting must not mask the finding
+            logger.error("could not alert on Shadow Mode log corruption: %s", exc)
+    return corruption
+
+
+def read_all_strict(*, path=None, date=None):
+    """read_all() that REFUSES to return a silently-shortened log. Use
+    this wherever the count of records is itself the evidence (audit,
+    reconciliation), rather than a best-effort listing."""
+    records, corruption = read_all_with_integrity(path=path, date=date)
+    if corruption:
+        raise ShadowModeError(
+            f"Shadow Mode log has {len(corruption)} unreadable line(s): {corruption[:10]}"
+        )
+    return records
+
+
 def read_all_with_integrity(*, path=None, date=None):
     """Returns `(records, corruption)` where `corruption` is a list of
     `(file, line_number)` for every unparseable line encountered. This is

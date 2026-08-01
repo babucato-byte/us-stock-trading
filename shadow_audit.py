@@ -18,9 +18,24 @@ Codex found missing:
   - no silent corruption -- there is no "malformed line" failure mode to
     skip past in the first place.
 
-Every path that can block, approve, or fail MUST emit a terminal event
-(`SHADOW_COMPLETED` or `SHADOW_ERROR`) for its run, so an operator
-auditing a trading day never finds a run that just stops mid-way.
+Every path that can block, approve, or fail MUST emit EXACTLY ONE
+terminal event (`SHADOW_COMPLETED`, `SHADOW_BLOCKED` or `SHADOW_ERROR`)
+for its run, so an operator auditing a trading day never finds a run
+that just stops mid-way, and never finds one with two contradictory
+outcomes. `audit_integrity_report()` checks both halves of that
+invariant.
+
+The approval events are recorded BEFORE the transport call, not after
+it: `GATE_APPROVED` and `EXECUTION_PLANNED` are written by
+execution/execution_engine.py between the gate passing and the broker's
+order-submission method being invoked. Recording them after the engine
+returned -- as this module's callers originally did -- means a crash
+during the broker call leaves an order that reached KIS with no audit
+record of the approval that authorized it.
+
+(The wording above deliberately avoids spelling out that call
+expression: tests/test_execution_engine.py scans every non-test source
+file for it and treats a match as an unsanctioned call site.)
 
 Sensitive values are redacted at THIS boundary (execution/
 secret_redaction.py), independently of whatever the caller did, so a
@@ -29,7 +44,10 @@ even if a future call site forgets.
 """
 
 import json
+import logging
 import os
+import sqlite3
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -37,7 +55,14 @@ from typing import Optional
 
 from execution.secret_redaction import redact_text, redact_value
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_RETENTION_DAYS = 30
+# CODEX-048: a concurrent writer must WAIT for the SQLite write lock, not
+# lose its event. busy_timeout covers the common case; these retries cover
+# the residual "database is locked" that a busy handler does not.
+WRITE_RETRIES = 5
+WRITE_RETRY_BASE_SECONDS = 0.05
 
 # -- event vocabulary ---------------------------------------------------
 SIGNAL_RECEIVED = "SIGNAL_RECEIVED"
@@ -54,16 +79,20 @@ GATE_REJECTED = "GATE_REJECTED"
 GATE_APPROVED = "GATE_APPROVED"
 EXECUTION_PLANNED = "EXECUTION_PLANNED"
 SHADOW_COMPLETED = "SHADOW_COMPLETED"
+SHADOW_BLOCKED = "SHADOW_BLOCKED"
 SHADOW_ERROR = "SHADOW_ERROR"
 
 EVENT_TYPES = frozenset({
     SIGNAL_RECEIVED, CONFIG_BLOCKED, SIGNAL_EXPIRED, INSTRUMENT_BLOCKED,
     PRICE_DEVIATION_BLOCKED, CASH_BLOCKED, RECONCILIATION_BLOCKED, UNKNOWN_ORDER_BLOCKED,
     DUPLICATE_BLOCKED, HALT_BLOCKED, GATE_REJECTED, GATE_APPROVED, EXECUTION_PLANNED,
-    SHADOW_COMPLETED, SHADOW_ERROR,
+    SHADOW_COMPLETED, SHADOW_BLOCKED, SHADOW_ERROR,
 })
 
-TERMINAL_EVENT_TYPES = frozenset({SHADOW_COMPLETED, SHADOW_ERROR})
+# CODEX-048: every run ends in EXACTLY ONE of these -- not zero (an
+# evaluation whose outcome was never recorded) and not two (an ambiguous
+# audit trail an operator cannot reduce to a single answer).
+TERMINAL_EVENT_TYPES = frozenset({SHADOW_COMPLETED, SHADOW_BLOCKED, SHADOW_ERROR})
 
 # Results, deliberately few: an auditor filters on these, and a long tail
 # of near-synonyms would make "was anything blocked today?" unanswerable.
@@ -110,10 +139,14 @@ GATE_CODE_TO_EVENT = {
 
 
 class ShadowAuditError(Exception):
-    """Raised only when an audit event could not be persisted. Callers
-    must NOT swallow this on the order path: an evaluation whose audit
-    trail cannot be written is exactly the case an operator must hear
-    about."""
+    """Raised when an audit event could not be persisted.
+
+    CODEX-048: callers on the order path must NOT swallow this. An
+    evaluation whose audit trail cannot be written must fail the run and
+    block the order -- an order placed with no durable record of the
+    approval that authorized it is precisely the state this audit trail
+    exists to make impossible. `handle_audit_failure()` below is the
+    sanctioned response."""
 
 
 @dataclass(frozen=True)
@@ -160,28 +193,77 @@ def _encode_payload(payload):
         return json.dumps({"unserializable_payload": True})
 
 
-def record_event(*, shadow_run_id, event_type, result, signal_id=None, internal_order_id=None,
-                  symbol=None, side=None, reason_code=None, payload=None, now=None, conn=None):
-    """Appends ONE audit event. Safe to call concurrently from any number
-    of processes: SQLite serializes the write and the whole insert is a
-    single committed transaction, so there is no partial-row state a
-    reader could observe."""
-    if event_type not in EVENT_TYPES:
-        raise ShadowAuditError(f"unknown shadow audit event_type {event_type!r}")
-    current = now or datetime.now(timezone.utc)
-    owns_conn = conn is None
-    conn = conn or _open_conn()
+def _insert_once(conn, values):
+    """One explicit BEGIN IMMEDIATE / INSERT / COMMIT. Returns the new
+    event_id, having CONFIRMED the row is committed rather than assuming
+    the INSERT succeeded."""
+    conn.execute("BEGIN IMMEDIATE")
     try:
-        conn.execute(
+        cursor = conn.execute(
             "INSERT INTO shadow_audit_events "
             "(shadow_run_id, signal_id, internal_order_id, symbol, side, event_type, result, "
             "reason_code, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (shadow_run_id, signal_id, internal_order_id, symbol, side, event_type, result,
-             redact_text(reason_code), _encode_payload(payload), current.isoformat()),
+            values,
         )
-        conn.commit()
-    except Exception as exc:
-        raise ShadowAuditError(f"failed to persist shadow audit event: {exc}") from exc
+        event_id = cursor.lastrowid
+        if cursor.rowcount != 1 or not event_id:
+            raise ShadowAuditError("shadow audit INSERT did not affect exactly one row")
+    except BaseException:
+        conn.rollback()
+        raise
+    conn.commit()
+    # Commit confirmation: re-read the row through the same connection
+    # AFTER commit. A commit that silently did not persist the row would
+    # otherwise be indistinguishable from success.
+    confirmed = conn.execute(
+        "SELECT event_id FROM shadow_audit_events WHERE event_id = ?", (event_id,),
+    ).fetchone()
+    if confirmed is None:
+        raise ShadowAuditError(f"shadow audit event {event_id} was not durable after commit")
+    return event_id
+
+
+def record_event(*, shadow_run_id, event_type, result, signal_id=None, internal_order_id=None,
+                  symbol=None, side=None, reason_code=None, payload=None, now=None, conn=None):
+    """Appends ONE audit event, durably.
+
+    Safe to call concurrently from any number of processes: the insert
+    runs inside its own `BEGIN IMMEDIATE` transaction (SQLite's write
+    lock is taken up front), the connection carries a busy timeout, and a
+    residual "database is locked" is retried with backoff rather than
+    dropping the event. Raises ShadowAuditError if -- after those
+    retries -- the event is not durably committed; callers on the order
+    path must treat that as a hard block."""
+    if event_type not in EVENT_TYPES:
+        raise ShadowAuditError(f"unknown shadow audit event_type {event_type!r}")
+    current = now or datetime.now(timezone.utc)
+    values = (
+        shadow_run_id, signal_id, internal_order_id, symbol, side, event_type, result,
+        redact_text(reason_code), _encode_payload(payload), current.isoformat(),
+    )
+    owns_conn = conn is None
+    conn = conn or _open_conn()
+    try:
+        last_error = None
+        for attempt in range(WRITE_RETRIES):
+            try:
+                _insert_once(conn, values)
+                last_error = None
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                    raise ShadowAuditError(f"failed to persist shadow audit event: {exc}") from exc
+                last_error = exc
+                if attempt < WRITE_RETRIES - 1:
+                    time.sleep(WRITE_RETRY_BASE_SECONDS * (2 ** attempt))
+            except ShadowAuditError:
+                raise
+            except Exception as exc:
+                raise ShadowAuditError(f"failed to persist shadow audit event: {exc}") from exc
+        if last_error is not None:
+            raise ShadowAuditError(
+                f"failed to persist shadow audit event after {WRITE_RETRIES} attempts: {last_error}"
+            ) from last_error
     finally:
         if owns_conn:
             conn.close()
@@ -192,11 +274,68 @@ def record_event(*, shadow_run_id, event_type, result, signal_id=None, internal_
     )
 
 
+class ShadowAuditFailure(Exception):
+    """Raised by handle_audit_failure() -- the caller-facing signal that
+    an evaluation must be abandoned because its audit trail could not be
+    written."""
+
+
+def handle_audit_failure(exc, *, shadow_run_id, symbol=None, side=None, stage="unknown"):
+    """The sanctioned response to a ShadowAuditError on the order path
+    (CODEX-048's audit-failure policy):
+
+        1. try ONCE more to record SHADOW_ERROR for this run, on a fresh
+           connection (the original failure may have been connection- or
+           transaction-scoped);
+        2. alert the operator through the existing alert channel;
+        3. raise ShadowAuditFailure so the caller blocks the evaluation.
+
+    Never swallows. A `try/except: pass` around audit persistence on a
+    live-order path is exactly the defect this replaces."""
+    logger.error("shadow audit persistence failed at %s for run %s: %s", stage, shadow_run_id, exc)
+    try:
+        record_event(
+            shadow_run_id=shadow_run_id, event_type=SHADOW_ERROR, result=RESULT_ERROR,
+            symbol=symbol, side=side, reason_code="AUDIT_PERSISTENCE_FAILED",
+            payload={"stage": stage, "error": str(exc)},
+        )
+    except Exception as retry_exc:  # noqa: BLE001 -- best-effort second chance
+        logger.error("retrying SHADOW_ERROR also failed for run %s: %s", shadow_run_id, retry_exc)
+    try:
+        from operations import alerts
+
+        alerts.send_alert(
+            f"*Shadow audit persistence failed*\n- run: {shadow_run_id}\n- stage: {stage}\n"
+            f"- symbol: {symbol}\n- action: evaluation blocked, no order submitted"
+        )
+    except Exception as alert_exc:  # noqa: BLE001 -- alerting must not mask the failure
+        logger.error("could not alert on shadow audit failure: %s", alert_exc)
+    raise ShadowAuditFailure(
+        f"shadow audit could not be persisted at {stage} for run {shadow_run_id} -- "
+        "evaluation blocked"
+    ) from exc
+
+
 def record_block(*, shadow_run_id, event_type, reason_code=None, **kwargs):
     return record_event(
         shadow_run_id=shadow_run_id, event_type=event_type, result=RESULT_BLOCKED,
         reason_code=reason_code, **kwargs,
     )
+
+
+RESULT_TO_TERMINAL_EVENT = {
+    RESULT_APPROVED: SHADOW_COMPLETED,
+    RESULT_INFO: SHADOW_COMPLETED,
+    RESULT_BLOCKED: SHADOW_BLOCKED,
+    RESULT_ERROR: SHADOW_ERROR,
+}
+
+
+def terminal_event_for(result):
+    """The ONE terminal event a run with this result must end on. An
+    unrecognized result is treated as an error rather than silently
+    reported as completed."""
+    return RESULT_TO_TERMINAL_EVENT.get(result, SHADOW_ERROR)
 
 
 def event_type_for_reason_code(reason_code):
@@ -224,20 +363,56 @@ def read_events(*, shadow_run_id=None, conn=None):
             conn.close()
 
 
+def _terminal_counts(conn):
+    placeholders = ",".join("?" for _ in TERMINAL_EVENT_TYPES)
+    return conn.execute(
+        "SELECT shadow_run_id, SUM(CASE WHEN event_type IN "
+        f"({placeholders}) THEN 1 ELSE 0 END) AS terminal_count "
+        "FROM shadow_audit_events GROUP BY shadow_run_id",
+        tuple(sorted(TERMINAL_EVENT_TYPES)),
+    ).fetchall()
+
+
 def runs_without_terminal_event(*, conn=None):
-    """Audit completeness check: every shadow_run_id must end in
-    SHADOW_COMPLETED or SHADOW_ERROR. Any run listed here is a run whose
-    outcome was never recorded -- the exact gap CODEX-048 flagged."""
+    """Audit completeness check: every shadow_run_id must end in exactly
+    one of SHADOW_COMPLETED / SHADOW_BLOCKED / SHADOW_ERROR. Any run
+    listed here is a run whose outcome was never recorded."""
     owns_conn = conn is None
     conn = conn or _open_conn()
     try:
-        placeholders = ",".join("?" for _ in TERMINAL_EVENT_TYPES)
-        rows = conn.execute(
-            "SELECT DISTINCT shadow_run_id FROM shadow_audit_events WHERE shadow_run_id NOT IN ("
-            f"SELECT shadow_run_id FROM shadow_audit_events WHERE event_type IN ({placeholders}))",
-            tuple(sorted(TERMINAL_EVENT_TYPES)),
-        ).fetchall()
-        return [row["shadow_run_id"] for row in rows]
+        return [row["shadow_run_id"] for row in _terminal_counts(conn) if row["terminal_count"] == 0]
+    finally:
+        if owns_conn:
+            conn.close()
+
+
+def runs_with_multiple_terminal_events(*, conn=None):
+    """The other half of the same invariant: two terminal events for one
+    run is an audit trail an operator cannot reduce to a single outcome,
+    so it is a defect in its own right, not a harmless duplicate."""
+    owns_conn = conn is None
+    conn = conn or _open_conn()
+    try:
+        return [row["shadow_run_id"] for row in _terminal_counts(conn) if row["terminal_count"] > 1]
+    finally:
+        if owns_conn:
+            conn.close()
+
+
+def audit_integrity_report(*, conn=None):
+    """Single call an operator/health check can make: both halves of the
+    exactly-one-terminal-event invariant."""
+    owns_conn = conn is None
+    conn = conn or _open_conn()
+    try:
+        counts = _terminal_counts(conn)
+        return {
+            "runs_without_terminal_event": [r["shadow_run_id"] for r in counts if r["terminal_count"] == 0],
+            "runs_with_multiple_terminal_events": [
+                r["shadow_run_id"] for r in counts if r["terminal_count"] > 1
+            ],
+            "total_runs": len(counts),
+        }
     finally:
         if owns_conn:
             conn.close()
