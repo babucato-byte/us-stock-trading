@@ -348,6 +348,11 @@ def preflight_env(tmp_path, monkeypatch):
     env["VALIDATED_COMMIT"] = head
     env["DEPLOYED_COMMIT"] = head
     env["TRADING_LOG_DIR"] = str(tmp_path / "logs")
+    # CODEX-060 §6: preflight takes the single-run lock, and it runs with
+    # cwd=REPO_ROOT, so without this it would use the operational path.
+    # This is isolation, not a fix -- the lifecycle fix is in
+    # idempotency.single_run_lock() itself.
+    env["TRADING_SINGLE_RUN_LOCK_FILE"] = str(tmp_path / "preflight-single-run.lock")
     monkeypatch.setenv("STATE_STORE_DB_FILE", str(tmp_path / "TEST_STATE.db"))
     monkeypatch.setenv("RECONCILIATION_STATE_FILE", str(tmp_path / "RECON.json"))
     monkeypatch.setenv("KIS_ACCOUNT_ALIAS", "kis-test")
@@ -550,6 +555,7 @@ class TestCommitExactMatch:
         env["DEPLOYED_COMMIT"] = "abc"
         env["STATE_STORE_DB_FILE"] = str(tmp_path / "TEST_STATE.db")
         env["TRADING_LOG_DIR"] = str(tmp_path / "logs")
+        env["TRADING_SINGLE_RUN_LOCK_FILE"] = str(tmp_path / "preflight-single-run.lock")
         result = subprocess.run(
             [sys.executable, str(SCRIPTS_DIR / "preflight_kis_live.py")],
             capture_output=True, text=True, cwd=str(REPO_ROOT), env=env,

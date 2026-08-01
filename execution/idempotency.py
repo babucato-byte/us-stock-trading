@@ -22,6 +22,8 @@ racing each other -- spec §17's "동일 실행 프로세스가 중복 실행되
 """
 
 import fcntl
+import logging
+import os
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -32,8 +34,78 @@ from execution import order_repository
 from execution.order_repository import OrderRepositoryReadError
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-_LOCK_FILE = BASE_DIR / "KIS_ORDER_IDEMPOTENCY.lock"
+DEFAULT_LOCK_FILE = BASE_DIR / "KIS_ORDER_IDEMPOTENCY.lock"
+
+# Module-level override point (tests patch this). The operational default
+# is unchanged; see get_single_run_lock_file() for the resolution order.
+_LOCK_FILE = DEFAULT_LOCK_FILE
+
+LOCK_FILE_ENV_VAR = "TRADING_SINGLE_RUN_LOCK_FILE"
 LOCK_TIMEOUT_SECONDS = 5.0
+
+logger = logging.getLogger(__name__)
+
+
+def get_single_run_lock_file():
+    """CODEX-060: the single-run lock path, resolved per call rather than
+    frozen at import.
+
+    `TRADING_SINGLE_RUN_LOCK_FILE` wins when it is set to a non-blank
+    value; blank or unset falls back to the operational default. A
+    RELATIVE value is allowed and resolves against the current working
+    directory -- which is why every subprocess in the test suite passes an
+    absolute path under its own tmp_path.
+
+    Only a filesystem path is ever read from or written to this variable;
+    no credential, account number or payload is involved.
+    """
+    configured = os.environ.get(LOCK_FILE_ENV_VAR, "").strip()
+    if not configured:
+        return _LOCK_FILE
+    return Path(configured).expanduser().resolve()
+
+
+def _identity(stat_result):
+    """(device, inode) -- what "the same file" actually means. A path is
+    not an identity: it can be unlinked and recreated under our feet."""
+    return (stat_result.st_dev, stat_result.st_ino)
+
+
+def _path_identity(path):
+    try:
+        return _identity(os.stat(path))
+    except OSError:
+        return None
+
+
+def _release_and_close(handle):
+    try:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
+def _unlink_owned_lock(lock_path, identity):
+    """Remove the lock file ONLY while it is still the exact file this
+    context locked. If the path now resolves to a different inode, some
+    other process created it after ours was replaced -- deleting it would
+    destroy a lock we do not own, so warn instead."""
+    on_disk = _path_identity(lock_path)
+    if on_disk is None:
+        return
+    if on_disk != identity:
+        logger.warning(
+            "single-run lock at %s was replaced by a different file while held "
+            "(expected inode %s, found %s) -- leaving it alone",
+            lock_path, identity[1], on_disk[1],
+        )
+        return
+    try:
+        os.unlink(lock_path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.warning("could not remove the single-run lock at %s: %s", lock_path, exc)
 
 
 class IdempotencyError(Exception):
@@ -54,27 +126,78 @@ class DuplicateOrderAttemptError(IdempotencyError):
 
 @contextmanager
 def single_run_lock(timeout=LOCK_TIMEOUT_SECONDS):
-    _LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-    lock_file = open(_LOCK_FILE, "a+")
+    """Exclusive single-instance lock, held for the duration of the block.
+
+    Exclusion is decided by the kernel's flock, never by the presence of
+    the file: a lock file left behind by a SIGKILLed or power-cut process
+    is stale, not authoritative, and must not block the next run. The
+    kernel drops a dead process's flock on exit, so a stale path is simply
+    re-locked and cleaned up by whoever runs next (CODEX-060 §5).
+
+    The file itself IS removed when this context owned it (CODEX-060 §1),
+    on every exit path -- normal, exception, KeyboardInterrupt, SystemExit
+    -- but never when the lock was not acquired, and never when the path
+    has since come to name a different file.
+    """
+    lock_path = get_single_run_lock_file()
     try:
-        deadline = time.monotonic() + timeout
-        while True:
-            try:
-                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except OSError:
-                if time.monotonic() >= deadline:
-                    raise IdempotencyError(
-                        f"Could not acquire KIS order idempotency lock within {timeout}s -- "
-                        "another instance of this process may already be running."
-                    )
-                time.sleep(0.05)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise IdempotencyError(
+            f"Could not prepare the directory for the single-run lock at {lock_path}: {exc}"
+        ) from exc
+
+    deadline = time.monotonic() + timeout
+    handle, identity = _acquire_owned_lock(lock_path, deadline, timeout)
+    try:
         yield
     finally:
+        # Unlink BEFORE releasing, deliberately. Releasing first would let
+        # a waiter acquire this same inode and start work, and our unlink
+        # would then strip the path out from under it -- after which a
+        # third process would create a fresh file, lock that, and run
+        # concurrently with the waiter. Removing the path while we still
+        # hold the lock means every waiter that wakes up on this inode
+        # fails its identity re-check and starts over (CODEX-060 §4).
+        _unlink_owned_lock(lock_path, identity)
+        _release_and_close(handle)
+
+
+def _acquire_owned_lock(lock_path, deadline, timeout):
+    """Returns an (open handle, identity) pair for a lock this process
+    genuinely owns: it holds the flock AND the path still names the very
+    file the flock is on."""
+    while True:
+        handle = open(lock_path, "a+")
         try:
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
-        finally:
-            lock_file.close()
+            while True:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise IdempotencyError(
+                            f"Could not acquire KIS order idempotency lock within {timeout}s -- "
+                            "another instance of this process may already be running."
+                        )
+                    time.sleep(0.05)
+        except BaseException:
+            handle.close()
+            raise
+
+        identity = _identity(os.fstat(handle.fileno()))
+        if _path_identity(lock_path) == identity:
+            return handle, identity
+
+        # The previous owner unlinked this file after we opened it, so our
+        # flock now guards a file no future process will ever find. Drop it
+        # and race for the real one.
+        _release_and_close(handle)
+        if time.monotonic() >= deadline:
+            raise IdempotencyError(
+                f"Could not acquire KIS order idempotency lock within {timeout}s -- "
+                "the lock file kept being replaced by another instance."
+            )
 
 
 def _read(conn, sql, params=(), *, fetch="all"):
