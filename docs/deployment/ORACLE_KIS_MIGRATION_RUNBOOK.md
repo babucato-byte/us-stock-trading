@@ -232,9 +232,39 @@ print('open_orders:', open_orders)
 
 **이 단계가 이 프로젝트 전체에서 처음으로 실제 KIS API에 연결하는 지점이다.** 실패하면
 (인증 오류, 네트워크 오류, 계좌번호 불일치 등) 원인을 해결할 때까지 다음 단계로 진행하지
-않는다. 두 개의 TBD_VERIFY_LIVE_DOCS 항목(`brokers/kis_broker.py`의 일반 취소 TR_ID, 현재가
-응답의 정확한 필드명)을 이 시점에 실제 응답으로 재확인하고, 필요하면 코드를 수정 후 다시
-Codex 검증을 받는다.
+않는다.
+
+### 12.1 wire-format 값 실응답 확인 (CODEX-052)
+
+`brokers/kis_broker.py`의 모든 TR_ID·endpoint·응답 field는 KIS 공식 예제/reference
+repository 기준으로는 확인됐지만(`REFERENCE_VERIFIED`), **실제 KIS 응답으로는 아직
+확인되지 않았다**(`LIVE_RESPONSE_PENDING`). 두 상태는 서로 다른 축이며, 코드의
+`VERIFICATION_MATRIX`가 그 유일한 기준이다.
+
+이 단계에서 확인해야 할 항목 전체를 코드에서 직접 뽑아 쓴다.
+
+```bash
+python3 -c "
+from brokers.kis_broker import VERIFICATION_MATRIX, LIVE_RESPONSE_PENDING
+for e in VERIFICATION_MATRIX:
+    if e.live_status == LIVE_RESPONSE_PENDING:
+        print(f'{e.name:28} {e.value:45} <- {e.source}')
+"
+```
+
+특히 다음 두 가지는 실주문 활성화 전에 반드시 실응답으로 확인한다.
+
+```text
+price_field_last     현재가 응답의 실제 가격 field 이름 (output.last)
+cancel_tr_id_live    일반 주문 취소 TR_ID (TTTT1004U / VTTT1004U) 및 요청 field
+```
+
+현재가 field는 §12의 읽기 전용 조회 응답으로 바로 확인할 수 있다. 취소 TR_ID는 읽기
+전용으로 확인할 수 없으므로 **모의투자(paper) 환경에서 주문 후 취소**로 확인한다. 실계좌
+주문으로 확인하지 않는다.
+
+확인된 항목은 `VERIFICATION_MATRIX`의 `live_status`를 `LIVE_RESPONSE_CONFIRMED`로 갱신하고,
+값이 실제와 다르면 코드를 수정한 뒤 다시 Codex 검증을 받는다.
 
 ## 13. KIS 잔고·미체결 대조 (계정 전체 reconciliation, CODEX-044)
 

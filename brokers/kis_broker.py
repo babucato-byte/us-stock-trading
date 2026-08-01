@@ -32,6 +32,25 @@ The response field name for last-traded price (`output.last`) WAS
 independently confirmed too (examples_llm/overseas_stock/price/
 chk_price.py's own field-name comment: `'last': '현재가'`).
 
+CODEX-052 -- two INDEPENDENT axes of verification, which this module
+previously conflated. An older "to be verified" comment said the cancel
+TR_ID and the price field were unconfirmed, while the paragraphs above
+said they had been confirmed; both described the same values. The two
+statements were about different axes, and neither said which:
+
+  REFERENCE_VERIFIED     the value was read out of KIS's own official
+                         examples / reference repository
+  LIVE_RESPONSE_PENDING  no real KIS response has been observed for it
+                         yet -- Oracle read-only (or a 모의투자 order)
+                         must confirm it before KIS_LIVE_ORDER_ENABLED
+
+The two are orthogonal: a value can be REFERENCE_VERIFIED and still
+LIVE_RESPONSE_PENDING, which is exactly the state of the cancel TR_ID
+and the price field today. `VERIFICATION_MATRIX` below is the single
+machine-readable statement of that status -- prose in this module must
+not contradict it, and tests assert both that the matrix matches the
+constants actually used and that the runbook lists every pending item.
+
 Every state-mutating call (submit_order/cancel_order) runs
 config.validate_live_order_allowed() FIRST, before any network call --
 mirrors broker/alpaca_client.py's _validate_runtime_safety() pattern.
@@ -44,7 +63,7 @@ KIS state without also being able to submit an order.
 import math
 import uuid
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import List, NamedTuple, Optional
 
 import requests
 
@@ -60,12 +79,12 @@ PRICE_PATH = "/uapi/overseas-price/v1/quotations/price"
 BALANCE_PATH = "/uapi/overseas-stock/v1/trading/inquire-balance"
 PSAMOUNT_PATH = "/uapi/overseas-stock/v1/trading/inquire-psamount"
 ORDER_PATH = "/uapi/overseas-stock/v1/trading/order"
-# TBD_VERIFY_LIVE_DOCS: general cancel path/TR_ID -- only the *daytime*
-# variant (daytime-order-rvsecncl / TTTS6038U) was directly confirmed
-# from the official examples during this implementation. This path
-# follows the same "-rvsecncl" naming convention KIS uses elsewhere in
-# that repo, but confirm the exact TR_ID pair against the live docs
-# before enabling KIS_LIVE_ORDER_ENABLED.
+# CODEX-052: REFERENCE_VERIFIED, LIVE_RESPONSE_PENDING. The path and the
+# TTTT1004U/VTTT1004U pair come from the official reference repo's
+# order_rvsecncl.py (this module previously reused the daytime-specific
+# TTTS6038U, which that comparison corrected). No real KIS cancel
+# response has been observed yet -- see VERIFICATION_MATRIX below and
+# the Oracle runbook's read-only confirmation step.
 CANCEL_PATH = "/uapi/overseas-stock/v1/trading/order-rvsecncl"
 NCCS_PATH = "/uapi/overseas-stock/v1/trading/inquire-nccs"
 CCNL_PATH = "/uapi/overseas-stock/v1/trading/inquire-ccnl"
@@ -96,6 +115,77 @@ TR_ID_CANCEL = {"live": "TTTT1004U", "paper": "VTTT1004U"}
 # calls were sending the wrong-format exchange code.
 _EXCHANGE_TO_EXCD = {"NASDAQ": "NAS", "NYSE": "NYS", "AMEX": "AMS"}
 _EXCHANGE_TO_ORDER_EXCG_CD = {"NASDAQ": "NASD", "NYSE": "NYSE", "AMEX": "AMEX"}
+
+# -- CODEX-052: verification status ------------------------------------
+# See the module docstring for what the two axes mean. Nothing here is a
+# runtime switch; it is the authoritative record of HOW each wire-format
+# value was established, so an operator can tell "confirmed against KIS's
+# own examples" apart from "confirmed against a real KIS response".
+REFERENCE_VERIFIED = "REFERENCE_VERIFIED"
+REFERENCE_UNVERIFIED = "REFERENCE_UNVERIFIED"
+LIVE_RESPONSE_CONFIRMED = "LIVE_RESPONSE_CONFIRMED"
+LIVE_RESPONSE_PENDING = "LIVE_RESPONSE_PENDING"
+
+
+class WireValueVerification(NamedTuple):
+    """One wire-format value and how far its verification actually got."""
+
+    name: str
+    value: str
+    reference_status: str
+    live_status: str
+    source: str
+
+
+VERIFICATION_MATRIX = (
+    WireValueVerification(
+        "order_path", ORDER_PATH, REFERENCE_VERIFIED, LIVE_RESPONSE_PENDING,
+        "examples_user/overseas_stock/overseas_stock_functions.py::order()",
+    ),
+    WireValueVerification(
+        "order_tr_id_live_buy", TR_ID_ORDER_US[("live", "buy")], REFERENCE_VERIFIED,
+        LIVE_RESPONSE_PENDING,
+        "examples_user/overseas_stock/overseas_stock_functions.py::order()",
+    ),
+    WireValueVerification(
+        "cancel_path", CANCEL_PATH, REFERENCE_VERIFIED, LIVE_RESPONSE_PENDING,
+        "examples_llm/overseas_stock/order_rvsecncl/order_rvsecncl.py",
+    ),
+    WireValueVerification(
+        "cancel_tr_id_live", TR_ID_CANCEL["live"], REFERENCE_VERIFIED, LIVE_RESPONSE_PENDING,
+        "examples_llm/overseas_stock/order_rvsecncl/order_rvsecncl.py",
+    ),
+    WireValueVerification(
+        "cancel_tr_id_paper", TR_ID_CANCEL["paper"], REFERENCE_VERIFIED, LIVE_RESPONSE_PENDING,
+        "examples_llm/overseas_stock/order_rvsecncl/order_rvsecncl.py",
+    ),
+    WireValueVerification(
+        "cancel_price_field_rule", "OVRS_ORD_UNPR=0", REFERENCE_VERIFIED,
+        LIVE_RESPONSE_PENDING,
+        "order_rvsecncl.py docstring: 취소주문 시, '0' 입력",
+    ),
+    WireValueVerification(
+        "price_path", PRICE_PATH, REFERENCE_VERIFIED, LIVE_RESPONSE_PENDING,
+        "examples_llm/overseas_stock/price/chk_price.py",
+    ),
+    WireValueVerification(
+        "price_field_last", "output.last", REFERENCE_VERIFIED, LIVE_RESPONSE_PENDING,
+        "chk_price.py field comment: 'last': '현재가'",
+    ),
+    WireValueVerification(
+        "order_exchange_code_space", "NASD/NYSE/AMEX", REFERENCE_VERIFIED,
+        LIVE_RESPONSE_PENDING,
+        "reference repo order.py / order_rvsecncl.py / inquire_psamount docstrings",
+    ),
+)
+
+# The items an operator must still confirm against a REAL KIS response
+# during the Oracle read-only stage. Kept in sync with the runbook by
+# tests/test_kis_verification_matrix.py.
+LIVE_RESPONSE_PENDING_ITEMS = tuple(
+    entry.name for entry in VERIFICATION_MATRIX
+    if entry.live_status == LIVE_RESPONSE_PENDING
+)
 
 
 class KISBrokerError(Exception):
@@ -212,9 +302,11 @@ class KISBroker:
 
     def get_current_price(self, instrument) -> float:
         """Returns the last-traded USD price for `instrument.kis_symbol`.
-        TBD_VERIFY_LIVE_DOCS: response field name -- `last` is used here
-        per common KIS documentation convention, but was not directly
-        confirmed from the fetched source excerpt during implementation."""
+
+        CODEX-052: the `output.last` field name is REFERENCE_VERIFIED
+        (chk_price.py's own field comment `'last': '현재가'`) but still
+        LIVE_RESPONSE_PENDING -- no real KIS quote response has been read
+        yet. See VERIFICATION_MATRIX at the top of this module."""
         self.config.validate_read_allowed()
         body = self._get(PRICE_PATH, TR_ID_PRICE, {
             "AUTH": "", "EXCD": _excd_for(instrument.exchange), "SYMB": instrument.kis_symbol,
