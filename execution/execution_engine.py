@@ -46,7 +46,10 @@ from datetime import datetime, timezone
 from brokers.kis_broker import KISAmbiguousResponseError, KISBrokerError
 from execution import authorization, idempotency, order_gate, order_repository
 from execution.authorization import UnauthorizedExecutionError
-from execution.order_repository import OrderRepositoryError
+from execution.order_repository import (
+    OrderRepositoryError,
+    OrderRepositoryRollbackError,
+)
 from execution.order_state_machine import OrderStateTransitionError
 import shadow_audit
 from reconciliation import snapshot as reconciliation_snapshot
@@ -138,6 +141,31 @@ class ExecutionResult:
         self.blocked_reason = blocked_reason
 
 
+def normalize_persistence_error(exc, *, stage, post_transport, connection_invalidated=False):
+    """CODEX-055: one classification for every durable-state failure.
+
+    The engine must not care whether a write failed with an
+    OperationalError, an IntegrityError, a DatabaseError or a repository
+    error -- they all mean the same operationally: this order's durable
+    state is not what we believe it to be, so no success may be returned
+    and a human has to reconcile it. Letting each SQLite class surface
+    raw meant the UNKNOWN fallback skipped normalization, the operator
+    alert and the terminal-audit handling entirely.
+
+    The message carries no SQL, no bound parameters, no broker payload
+    and no account identifier; the original exception is chained."""
+    detail = "; the database connection was invalidated" if connection_invalidated else ""
+    message = (
+        f"durable order state could not be confirmed during {stage}{detail} -- "
+        "manual reconciliation required"
+    )
+    error = ExecutionEngineError(message, reason_code=REASON_STATE_PERSISTENCE)
+    error.post_transport = post_transport
+    error.connection_invalidated = connection_invalidated
+    error.__cause__ = exc
+    return error
+
+
 def _reject(conn, record, *, event_type, reason):
     """Best-effort compare-and-set to REJECTED for governance/visibility
     -- if the current state can't legally reach REJECTED, or another
@@ -149,7 +177,8 @@ def _reject(conn, record, *, event_type, reason):
         return order_repository.advance(
             conn, record, "REJECTED", event_type=event_type, event_payload={"reason": reason},
         )
-    except (OrderStateTransitionError, OrderRepositoryError):
+    except Exception:  # noqa: BLE001 -- best-effort governance write (CODEX-055)
+        logger.exception("could not record REJECTED for %s", record.internal_order_id)
         return record
 
 
@@ -403,7 +432,7 @@ def _force_unknown(conn, record, *, reason, now, broker_order_id=None):
     determine. A CAS conflict here means another writer already moved
     the order (e.g. reconciliation resolved it); that writer's result
     stands and is not overwritten."""
-    updated, _persisted = _force_unknown_reported(
+    updated, _persisted, _error = _force_unknown_reported(
         conn, record, reason=reason, now=now, broker_order_id=broker_order_id,
     )
     return updated
@@ -411,16 +440,28 @@ def _force_unknown(conn, record, *, reason, now, broker_order_id=None):
 
 def _force_unknown_reported(conn, record, *, reason, now, broker_order_id=None):
     """_force_unknown() that also reports whether UNKNOWN was actually
-    persisted. The caller needs to know: "the order is durably UNKNOWN,
-    reconciliation will resolve it" and "we could not even record that we
-    do not know" are very different operational situations."""
+    persisted, and why not.
+
+    Returns `(record, persisted, error)`. The caller needs the
+    distinction: "the order is durably UNKNOWN, reconciliation will
+    resolve it" and "we could not even record that we do not know" are
+    very different operational situations.
+
+    CODEX-055: catches EVERYTHING. A raw sqlite3.Error escaping from here
+    skipped the caller's normalization, its operator alert and its
+    terminal-audit handling -- the exact defect this replaces."""
     try:
-        return order_repository.advance(
+        updated = order_repository.advance(
             conn, record, "UNKNOWN", event_type="RESPONSE_LOST",
             event_payload={"reason": reason}, broker_order_id=broker_order_id, now=now,
-        ), True
-    except (OrderStateTransitionError, OrderRepositoryError):
-        return record, False
+        )
+        return updated, True, None
+    except Exception as exc:  # noqa: BLE001 -- normalized by the caller
+        logger.error(
+            "could not persist UNKNOWN for order %s: %s",
+            record.internal_order_id, type(exc).__name__,
+        )
+        return record, False, exc
 
 
 def submit_cancel(*, order_intent, broker_order_id, cancel_gate_context_builder, conn, broker,
@@ -537,9 +578,14 @@ def submit_cancel(*, order_intent, broker_order_id, cancel_gate_context_builder,
     return result
 
 
-def _alert_cancel_persistence_failure(*, order_intent, unknown_persisted, error):
+def _alert_cancel_persistence_failure(*, order_intent, unknown_persisted, error,
+                                       unknown_error=None, connection_invalidated=False):
     """Operator alert for the one case where KIS's answer and our durable
-    state have genuinely diverged."""
+    state have genuinely diverged.
+
+    CODEX-055: errors are reported by TYPE, never by message -- a raw
+    exception string can carry SQL text and bound parameters, and this
+    goes to an external channel."""
     try:
         from operations import alerts
 
@@ -548,8 +594,12 @@ def _alert_cancel_persistence_failure(*, order_intent, unknown_persisted, error)
             f"- internal_order_id: {order_intent.internal_order_id}\n"
             f"- symbol: {order_intent.symbol}\n"
             f"- left UNKNOWN for reconciliation: {unknown_persisted}\n"
-            f"- error: {error}\n"
-            "- action: no automatic re-cancel; reconcile against KIS order history"
+            f"- database connection invalidated: {connection_invalidated}\n"
+            f"- error type: {type(error).__name__}\n"
+            f"- UNKNOWN fallback error type: "
+            f"{type(unknown_error).__name__ if unknown_error else 'none'}\n"
+            "- action: no automatic re-cancel; manual reconciliation against KIS order "
+            "history is required"
         )
     except Exception as exc:  # noqa: BLE001 -- alerting must not mask the failure
         logger.error("could not alert on cancel persistence failure: %s", exc)
@@ -715,36 +765,52 @@ def _cancel_inner(*, order_intent, broker_order_id, cancel_gate_context_builder,
                 conn, record, "CANCELLED", event_type="CANCEL_CONFIRMED",
                 event_payload={"broker_order_id": broker_order_id}, now=current,
             )
-        except (OrderStateTransitionError, OrderRepositoryError, sqlite3.Error) as exc:
+        except Exception as exc:  # noqa: BLE001 -- every failure is normalized (CODEX-055)
             # CODEX-054: KIS CONFIRMED the cancel and we could not record
             # it. This is not a block -- the execution happened. Do the
             # best safe thing (leave the order durably UNKNOWN so
             # reconciliation resolves it against KIS's own history), never
             # re-cancel automatically, and never return success.
-            _record, unknown_persisted = _force_unknown_reported(
-                conn, record, reason=f"could not durably record CANCELLED: {exc}", now=current,
+            #
+            # CODEX-055/056: the UNKNOWN fallback itself may fail with any
+            # exception class, including one that invalidated the
+            # connection. Every one of those still gets a normalized
+            # reason code, an operator alert and a SHADOW_ERROR terminal.
+            _record, unknown_persisted, unknown_error = _force_unknown_reported(
+                conn, record,
+                reason=f"could not durably record CANCELLED ({type(exc).__name__})", now=current,
             )
+            invalidated = isinstance(exc, OrderRepositoryRollbackError) or isinstance(
+                unknown_error, OrderRepositoryRollbackError,
+            )
+            # The broker result is logged through safe_repr(), never raw,
+            # and the underlying errors only by TYPE -- their messages can
+            # carry SQL text and bound parameters.
             logger.error(
-                "cancel confirmed by KIS but final state not persisted: order=%s broker_result=%s "
-                "unknown_persisted=%s error=%s",
+                "cancel confirmed by KIS but final state not persisted: order=%s "
+                "broker_result=%s unknown_persisted=%s connection_invalidated=%s "
+                "error=%s unknown_error=%s",
                 order_intent.internal_order_id, safe_repr(execution_record), unknown_persisted,
-                exc,
+                invalidated, type(exc).__name__,
+                type(unknown_error).__name__ if unknown_error else None,
             )
             _alert_cancel_persistence_failure(
-                order_intent=order_intent, unknown_persisted=unknown_persisted, error=exc,
+                order_intent=order_intent, unknown_persisted=unknown_persisted,
+                error=exc, unknown_error=unknown_error, connection_invalidated=invalidated,
             )
-            if unknown_persisted:
+            if unknown_persisted and not invalidated:
                 raise CancelPostTransportError(
-                    f"cancel was confirmed by KIS but could not be durably recorded -- left "
-                    f"UNKNOWN for reconciliation: {exc}",
+                    "cancel was confirmed by KIS but its final state could not be recorded -- "
+                    "the order was left UNKNOWN for reconciliation",
                     reason_code=REASON_CANCEL_FINAL_STATE_PERSISTENCE,
                 ) from exc
+            normalized = normalize_persistence_error(
+                unknown_error or exc, stage="cancel final-state persistence",
+                post_transport=True, connection_invalidated=invalidated,
+            )
             raise CancelPostTransportError(
-                f"cancel was confirmed by KIS, the final state could not be recorded, and "
-                f"UNKNOWN could not be recorded either -- this order's durable state does not "
-                f"reflect reality and needs manual reconciliation: {exc}",
-                reason_code=REASON_STATE_PERSISTENCE,
-            ) from exc
+                str(normalized), reason_code=REASON_STATE_PERSISTENCE,
+            ) from (unknown_error or exc)
 
         return ExecutionResult(
             internal_order_id=order_intent.internal_order_id, status=execution_record.status,

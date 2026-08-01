@@ -665,7 +665,9 @@ class TestPostTransportPersistenceFailureIsAnError:
         monkeypatch.setattr(alerts, "send_alert", lambda m: sent.append(m) or True)
         self._run("update")
         assert sent, "no operator alert for a confirmed-but-unrecorded cancel"
-        assert "reconcile" in sent[0].lower()
+        alert = sent[0].lower()
+        assert "reconciliation" in alert
+        assert "no automatic re-cancel" in alert
 
     def test_unknown_persistence_failing_too_is_still_an_error(self, monkeypatch):
         """Neither the confirmed state NOR the UNKNOWN fallback could be

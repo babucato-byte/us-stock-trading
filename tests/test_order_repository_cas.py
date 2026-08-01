@@ -209,8 +209,11 @@ class TestStateAndEventAreOneTransaction:
         conn = _conn()
         record = _register(conn)
         failing = _FailEventInsertConnection(conn)
-        with pytest.raises(sqlite3.OperationalError):
+        # CODEX-055: normalized, never a raw sqlite3 exception.
+        with pytest.raises(order_repository.OrderRepositoryPersistenceError) as excinfo:
             order_repository.advance(failing, record, "VALIDATING", event_type="T", now=NOW)
+        assert not isinstance(excinfo.value, sqlite3.Error)
+        assert isinstance(excinfo.value.__cause__, sqlite3.Error)
         # BOTH must be rolled back: the state is untouched and no event
         # row exists for the failed transition.
         assert order_repository.load(conn, "ord-1").state == "CREATED"
