@@ -23,13 +23,26 @@ from domain.instrument import Instrument
 from domain.order_intent import OrderIntent
 from domain.signal import Signal
 from execution.secret_redaction import mask_account_number
+from reconciliation.snapshot import (
+    ReconciliationBlockedError,
+    ReconciliationSnapshot,
+    verify_snapshot,
+)
 
 
 class OrderGateBlockedError(Exception):
     """Raised with the specific reason the FIRST failing check produced.
     Callers must treat this as a hard block -- zero broker calls happen
     after this is raised (execution_engine.py never calls
-    KISBroker.submit_order() unless both gates return cleanly)."""
+    KISBroker.submit_order() unless both gates return cleanly).
+
+    `code` (CODEX-048) is the stable, machine-readable category of the
+    failing check, so the Shadow audit trail can record WHICH gate
+    rejected an order without pattern-matching English message text."""
+
+    def __init__(self, message, *, code="GATE"):
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -51,8 +64,10 @@ class BuyGateContext:
     has_open_order_for_symbol: bool
     has_order_for_signal_id: bool
     allowed_symbols: FrozenSet[str]
-    reconciliation_ok: bool
-    has_unknown_order: bool
+    # CODEX-044: the gate takes a VERIFIED SNAPSHOT, never a raw
+    # `reconciliation_ok=True`/`has_unknown_order=False` boolean a caller
+    # could simply assert. See reconciliation/snapshot.py.
+    reconciliation: ReconciliationSnapshot
     now: datetime
 
 
@@ -65,12 +80,30 @@ class SellGateContext:
     kis_position_quantity: int
     position_source: str
     has_existing_sell_order_for_symbol: bool
-    reconciliation_ok: bool
-    has_unknown_order: bool
+    # CODEX-044: sells run the IDENTICAL snapshot policy buys do --
+    # account/symbol match, TTL, positions/open-orders/fills agreement,
+    # zero UNKNOWN orders. `kis_account_no`/`now` exist here purely so
+    # that verification is symmetric with the buy gate's.
+    reconciliation: ReconciliationSnapshot
+    kis_account_no: str
+    now: datetime
 
 
 def _is_finite_number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _check_reconciliation(snapshot, *, account_id, symbol, now):
+    """CODEX-044: identical policy for buy and sell. Any failure --
+    missing snapshot, wrong account/symbol, stale, dirty, or an UNKNOWN
+    order anywhere on the account -- is an OrderGateBlockedError, which
+    execution_engine.py turns into zero transport calls."""
+    try:
+        verify_snapshot(snapshot, account_id=account_id, symbol=symbol, now=now)
+    except ReconciliationBlockedError as exc:
+        raise OrderGateBlockedError(
+            f"reconciliation is not OK -- order blocked: {exc}", code="RECONCILIATION",
+        ) from exc
 
 
 def evaluate_buy_gate(ctx: BuyGateContext) -> bool:
@@ -78,61 +111,67 @@ def evaluate_buy_gate(ctx: BuyGateContext) -> bool:
     OrderGateBlockedError with the specific reason otherwise. Checks run
     in the exact order spec §12 lists."""
     if ctx.execution_broker != "kis":
-        raise OrderGateBlockedError(f"execution broker must be 'kis', got {ctx.execution_broker!r}")
+        raise OrderGateBlockedError(
+            f"execution broker must be 'kis', got {ctx.execution_broker!r}", code="BROKER")
     if not ctx.live_order_enabled:
-        raise OrderGateBlockedError("live order flag is not enabled")
+        raise OrderGateBlockedError("live order flag is not enabled", code="LIVE_FLAG")
     if ctx.entry_disabled:
-        raise OrderGateBlockedError("ENTRY_DISABLED is set -- new entries are blocked")
+        raise OrderGateBlockedError("ENTRY_DISABLED is set -- new entries are blocked", code="ENTRY_DISABLED")
     if ctx.validated_commit != ctx.deployed_commit:
         raise OrderGateBlockedError(
             f"validated commit {ctx.validated_commit!r} does not match deployed commit "
-            f"{ctx.deployed_commit!r}"
+            f"{ctx.deployed_commit!r}", code="COMMIT",
         )
     if ctx.kis_account_no != ctx.allowed_account_no:
         raise OrderGateBlockedError(
             f"KIS account {mask_account_number(ctx.kis_account_no)!r} is not the allowed account "
-            f"{mask_account_number(ctx.allowed_account_no)!r}"
+            f"{mask_account_number(ctx.allowed_account_no)!r}", code="ACCOUNT",
         )
     quantity = ctx.order_intent.quantity
     if isinstance(quantity, bool) or not isinstance(quantity, int):
-        raise OrderGateBlockedError(f"quantity must be an integer, got {quantity!r}")
+        raise OrderGateBlockedError(f"quantity must be an integer, got {quantity!r}", code="QUANTITY")
     if quantity < 1:
-        raise OrderGateBlockedError(f"quantity must be >= 1, got {quantity!r}")
+        raise OrderGateBlockedError(f"quantity must be >= 1, got {quantity!r}", code="QUANTITY")
     if ctx.order_intent.order_type != "limit":
-        raise OrderGateBlockedError(f"only limit orders are permitted, got {ctx.order_intent.order_type!r}")
+        raise OrderGateBlockedError(
+            f"only limit orders are permitted, got {ctx.order_intent.order_type!r}", code="ORDER_TYPE")
     if not ctx.is_regular_session:
-        raise OrderGateBlockedError("not currently in the US regular trading session")
+        raise OrderGateBlockedError("not currently in the US regular trading session", code="SESSION")
     if ctx.signal.is_expired(now=ctx.now):
-        raise OrderGateBlockedError(f"signal {ctx.signal.signal_id!r} has expired")
+        raise OrderGateBlockedError(f"signal {ctx.signal.signal_id!r} has expired", code="SIGNAL_EXPIRED")
     if not _is_finite_number(ctx.kis_price_usd) or ctx.kis_price_usd <= 0:
-        raise OrderGateBlockedError(f"KIS price is invalid: {ctx.kis_price_usd!r}")
+        raise OrderGateBlockedError(f"KIS price is invalid: {ctx.kis_price_usd!r}", code="PRICE_INVALID")
     deviation_percent = abs(ctx.kis_price_usd - ctx.signal.signal_price) / ctx.signal.signal_price * 100.0
     if deviation_percent > ctx.max_price_deviation_percent:
         raise OrderGateBlockedError(
             f"KIS price {ctx.kis_price_usd!r} deviates {deviation_percent:.4f}% from signal price "
             f"{ctx.signal.signal_price!r}, exceeding the {ctx.max_price_deviation_percent!r}% limit "
-            "-- order cancelled, no chase-buy"
+            "-- order cancelled, no chase-buy", code="PRICE_DEVIATION",
         )
     order_notional_usd = quantity * ctx.order_intent.limit_price
     if not _is_finite_number(ctx.usd_orderable_cash) or ctx.usd_orderable_cash < order_notional_usd:
         raise OrderGateBlockedError(
             f"insufficient KIS orderable cash: need ${order_notional_usd:.2f}, "
-            f"have ${ctx.usd_orderable_cash!r}"
+            f"have ${ctx.usd_orderable_cash!r}", code="CASH",
         )
     if ctx.has_open_order_for_symbol:
-        raise OrderGateBlockedError(f"an open (unfilled) order already exists for {ctx.order_intent.symbol!r}")
+        raise OrderGateBlockedError(
+            f"an open (unfilled) order already exists for {ctx.order_intent.symbol!r}", code="OPEN_ORDER")
     if ctx.has_order_for_signal_id:
-        raise OrderGateBlockedError(f"an order already exists for signal_id {ctx.signal.signal_id!r}")
+        raise OrderGateBlockedError(
+            f"an order already exists for signal_id {ctx.signal.signal_id!r}", code="DUPLICATE_SIGNAL")
     if ctx.order_intent.symbol not in ctx.allowed_symbols:
-        raise OrderGateBlockedError(f"{ctx.order_intent.symbol!r} is not in the allowed-symbols list")
+        raise OrderGateBlockedError(
+            f"{ctx.order_intent.symbol!r} is not in the allowed-symbols list", code="SYMBOL")
     if not ctx.instrument.is_order_eligible:
         raise OrderGateBlockedError(
-            f"{ctx.instrument.symbol!r} is not order-eligible (leveraged/inverse/OTC/not tradable)"
+            f"{ctx.instrument.symbol!r} is not order-eligible (leveraged/inverse/OTC/not tradable)",
+            code="INSTRUMENT",
         )
-    if not ctx.reconciliation_ok:
-        raise OrderGateBlockedError("reconciliation is not OK -- new buys blocked until resolved")
-    if ctx.has_unknown_order:
-        raise OrderGateBlockedError("an UNKNOWN-state order exists -- new buys blocked until reconciled")
+    _check_reconciliation(
+        ctx.reconciliation, account_id=ctx.kis_account_no,
+        symbol=ctx.order_intent.symbol, now=ctx.now,
+    )
     return True
 
 
@@ -144,29 +183,34 @@ def evaluate_sell_gate(ctx: SellGateContext) -> bool:
     module docstring for the same asymmetry already established for the
     Alpaca/Paper path."""
     if ctx.execution_broker != "kis":
-        raise OrderGateBlockedError(f"execution broker must be 'kis', got {ctx.execution_broker!r}")
+        raise OrderGateBlockedError(
+            f"execution broker must be 'kis', got {ctx.execution_broker!r}", code="BROKER")
     if not ctx.live_order_enabled:
-        raise OrderGateBlockedError("live order flag is not enabled")
+        raise OrderGateBlockedError("live order flag is not enabled", code="LIVE_FLAG")
     if ctx.position_source != "kis":
-        raise OrderGateBlockedError(f"position source must be 'kis', got {ctx.position_source!r}")
+        raise OrderGateBlockedError(
+            f"position source must be 'kis', got {ctx.position_source!r}", code="POSITION_SOURCE")
     if ctx.kis_position_quantity <= 0:
-        raise OrderGateBlockedError(f"no KIS position exists for {ctx.order_intent.symbol!r}")
+        raise OrderGateBlockedError(
+            f"no KIS position exists for {ctx.order_intent.symbol!r}", code="NO_POSITION")
     quantity = ctx.order_intent.quantity
     if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity < 1:
-        raise OrderGateBlockedError(f"sell quantity must be a positive integer, got {quantity!r}")
+        raise OrderGateBlockedError(
+            f"sell quantity must be a positive integer, got {quantity!r}", code="QUANTITY")
     if quantity > ctx.kis_position_quantity:
         raise OrderGateBlockedError(
             f"sell quantity {quantity!r} exceeds actual KIS position quantity "
-            f"{ctx.kis_position_quantity!r}"
+            f"{ctx.kis_position_quantity!r}", code="SELL_QTY",
         )
     if ctx.has_existing_sell_order_for_symbol:
         raise OrderGateBlockedError(
-            f"a sell order already exists for {ctx.order_intent.symbol!r} -- duplicate liquidation blocked"
+            f"a sell order already exists for {ctx.order_intent.symbol!r} -- duplicate liquidation blocked",
+            code="DUPLICATE_SELL",
         )
-    if not ctx.reconciliation_ok:
-        raise OrderGateBlockedError("reconciliation is not OK -- new sells blocked until resolved")
-    if ctx.has_unknown_order:
-        raise OrderGateBlockedError("an UNKNOWN-state order exists -- new sells blocked until reconciled")
+    _check_reconciliation(
+        ctx.reconciliation, account_id=ctx.kis_account_no,
+        symbol=ctx.order_intent.symbol, now=ctx.now,
+    )
     return True
 
 
@@ -189,20 +233,24 @@ def evaluate_cancel_gate(ctx: CancelGateContext) -> bool:
     caller; HALT itself is checked there (by deliberately NOT checking
     it), not here."""
     if ctx.execution_broker != "kis":
-        raise OrderGateBlockedError(f"execution broker must be 'kis', got {ctx.execution_broker!r}")
+        raise OrderGateBlockedError(
+            f"execution broker must be 'kis', got {ctx.execution_broker!r}", code="BROKER")
     if not ctx.broker_order_id:
-        raise OrderGateBlockedError("no broker_order_id supplied -- cannot cancel an unknown order")
+        raise OrderGateBlockedError(
+            "no broker_order_id supplied -- cannot cancel an unknown order", code="CANCEL_TARGET")
     if not ctx.is_actually_open:
         raise OrderGateBlockedError(
-            f"broker_order_id {ctx.broker_order_id!r} is not an actual open KIS order -- refusing to cancel"
+            f"broker_order_id {ctx.broker_order_id!r} is not an actual open KIS order -- refusing to cancel",
+            code="CANCEL_TARGET",
         )
     if ctx.kis_account_no != ctx.allowed_account_no:
         raise OrderGateBlockedError(
             f"KIS account {mask_account_number(ctx.kis_account_no)!r} is not the allowed account "
-            f"{mask_account_number(ctx.allowed_account_no)!r}"
+            f"{mask_account_number(ctx.allowed_account_no)!r}", code="ACCOUNT",
         )
     if ctx.has_cancel_already_in_flight:
         raise OrderGateBlockedError(
-            f"a cancel is already in flight for {ctx.broker_order_id!r} -- duplicate cancel blocked"
+            f"a cancel is already in flight for {ctx.broker_order_id!r} -- duplicate cancel blocked",
+            code="DUPLICATE_CANCEL",
         )
     return True

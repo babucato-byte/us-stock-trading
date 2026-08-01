@@ -43,13 +43,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, Union
 
+import shadow_audit
 from brokers.kis_broker import KISAmbiguousResponseError, KISBroker, KISBrokerError
 from domain.instrument import build_instrument
 from domain.order_intent import OrderIntent, OrderIntentError
 from execution import execution_engine, idempotency, order_gate
 from execution.execution_engine import ExecutionEngineError
 from market_data.kis_validation_provider import KISValidationProvider
-from reconciliation import reconciliation_state
 from state_store import db as state_db
 
 
@@ -109,6 +109,34 @@ class KISBrokerAdapter:
     def _instrument(self, symbol):
         return build_instrument(symbol, exchange="NASDAQ")
 
+    def _audit(self, run_id, event_type, result, *, symbol, internal_order_id=None,
+                reason_code=None, detail=None, now):
+        """CODEX-048: the SELL path records the same durable audit events
+        the buy path does. Before this, `shadow_mode.persist()` was called
+        only from kis_live_trading.py's buy cycle, so an exit that was
+        gate-rejected, reconciliation-blocked or UNKNOWN-blocked left no
+        Shadow record at all."""
+        shadow_audit.record_event(
+            shadow_run_id=run_id, event_type=event_type, result=result, symbol=symbol,
+            side="sell", internal_order_id=internal_order_id, reason_code=reason_code,
+            payload={"detail": detail} if detail else None, now=now,
+        )
+
+    def _blocked(self, run_id, event_type, *, symbol, internal_order_id, reason_code, detail,
+                  status_code, text, now):
+        """Records the specific block event AND the terminal
+        SHADOW_COMPLETED before returning the caller-facing response, so
+        no sell evaluation can end without a final outcome event."""
+        self._audit(run_id, event_type, shadow_audit.RESULT_BLOCKED, symbol=symbol,
+                    internal_order_id=internal_order_id, reason_code=reason_code,
+                    detail=detail, now=now)
+        self._audit(run_id, shadow_audit.SHADOW_COMPLETED, shadow_audit.RESULT_BLOCKED,
+                    symbol=symbol, internal_order_id=internal_order_id,
+                    reason_code=reason_code, now=now)
+        return BrokerResponse(
+            status_code=status_code, text=text, data={"blocked_reason": detail}, dry_run=False,
+        )
+
     def submit_order(self, symbol, qty=1, *, side, order_type="market", time_in_force="day",
                       client_order_id=None, live_entry_context=None, account_cash_snapshot=None):
         if side != "sell":
@@ -117,15 +145,21 @@ class KISBrokerAdapter:
                 f"(got {side!r}) -- KIS buy entries go through kis_live_trading.py's own pipeline"
             )
         current = self._now_fn()
+        run_id = shadow_audit.new_run_id()
         instrument = self._instrument(symbol)
         internal_order_id = client_order_id or f"kissell-{symbol}-{uuid.uuid4().hex[:12]}"
+
+        self._audit(run_id, shadow_audit.SIGNAL_RECEIVED, shadow_audit.RESULT_INFO, symbol=symbol,
+                    internal_order_id=internal_order_id, reason_code="EXIT_REQUESTED", now=current)
 
         try:
             kis_price = self._kis_validation.get_price_quote(symbol).price_usd
         except Exception as exc:
-            return BrokerResponse(
-                status_code=422, text=f"KIS price re-check failed: {exc}",
-                data={"blocked_reason": str(exc)}, dry_run=False,
+            return self._blocked(
+                run_id, shadow_audit.PRICE_DEVIATION_BLOCKED, symbol=symbol,
+                internal_order_id=internal_order_id, reason_code="PRICE_UNAVAILABLE",
+                detail=str(exc), status_code=422,
+                text=f"KIS price re-check failed: {exc}", now=current,
             )
 
         try:
@@ -136,56 +170,83 @@ class KISBrokerAdapter:
                 stop_price=None, target_price=None, created_at=current,
             )
         except OrderIntentError as exc:
-            return BrokerResponse(
-                status_code=422, text=f"order intent construction failed: {exc}",
-                data={"blocked_reason": str(exc)}, dry_run=False,
+            return self._blocked(
+                run_id, shadow_audit.INSTRUMENT_BLOCKED, symbol=symbol,
+                internal_order_id=internal_order_id, reason_code="ORDER_INTENT_INVALID",
+                detail=str(exc), status_code=422,
+                text=f"order intent construction failed: {exc}", now=current,
             )
 
         try:
             kis_positions = self.kis_broker.get_positions()
         except KISBrokerError as exc:
-            return BrokerResponse(
-                status_code=422, text=f"KIS position read failed: {exc}",
-                data={"blocked_reason": str(exc)}, dry_run=False,
+            return self._blocked(
+                run_id, shadow_audit.RECONCILIATION_BLOCKED, symbol=symbol,
+                internal_order_id=internal_order_id, reason_code="POSITION_READ_FAILED",
+                detail=str(exc), status_code=422,
+                text=f"KIS position read failed: {exc}", now=current,
             )
         position_qty = next((p.quantity for p in kis_positions if p.symbol == symbol), 0)
 
         try:
             open_orders = self.kis_broker.get_open_orders()
         except KISBrokerError as exc:
-            return BrokerResponse(
-                status_code=422, text=f"KIS open-orders read failed: {exc}",
-                data={"blocked_reason": str(exc)}, dry_run=False,
+            return self._blocked(
+                run_id, shadow_audit.RECONCILIATION_BLOCKED, symbol=symbol,
+                internal_order_id=internal_order_id, reason_code="OPEN_ORDER_READ_FAILED",
+                detail=str(exc), status_code=422,
+                text=f"KIS open-orders read failed: {exc}", now=current,
             )
         has_existing_sell_order = any(
             (o.get("pdno") or o.get("PDNO")) == symbol for o in open_orders
         )
 
+        try:
+            account_id = self.kis_broker.get_account_snapshot().account_id
+        except KISBrokerError as exc:
+            return self._blocked(
+                run_id, shadow_audit.RECONCILIATION_BLOCKED, symbol=symbol,
+                internal_order_id=internal_order_id, reason_code="ACCOUNT_READ_FAILED",
+                detail=str(exc), status_code=422,
+                text=f"KIS account read failed: {exc}", now=current,
+            )
+
         conn = state_db.open_db()
 
-        def _sell_ctx_builder():
+        def _sell_ctx_builder(reconciliation):
+            # CODEX-044: `reconciliation` is the snapshot the Execution
+            # Engine itself built from live KIS reads immediately before
+            # the gate -- this adapter never asserts reconciliation
+            # status, and the sell path is held to exactly the same
+            # policy as the buy path.
             return order_gate.SellGateContext(
                 execution_broker="kis", live_order_enabled=True, order_intent=order_intent,
                 instrument=instrument, kis_position_quantity=position_qty, position_source="kis",
                 has_existing_sell_order_for_symbol=has_existing_sell_order,
-                reconciliation_ok=reconciliation_state.is_current_and_clean(
-                    max_age_seconds=reconciliation_state.DEFAULT_MAX_AGE_SECONDS, now=current,
-                ),
-                has_unknown_order=idempotency.has_unknown_order(conn, symbol=symbol, side="sell"),
+                reconciliation=reconciliation, kis_account_no=account_id, now=current,
             )
 
         try:
             try:
                 result = execution_engine.submit_sell_order(
                     order_intent=order_intent, sell_gate_context_builder=_sell_ctx_builder,
-                    conn=conn, broker=self.kis_broker, instrument=instrument, now=current,
+                    conn=conn, broker=self.kis_broker, instrument=instrument,
+                    account_id=account_id, now=current,
                 )
             except ExecutionEngineError as exc:
-                return BrokerResponse(
-                    status_code=423, text=f"order gate blocked: {exc}",
-                    data={"blocked_reason": str(exc)}, dry_run=False,
+                return self._blocked(
+                    run_id, shadow_audit.event_type_for_reason_code(exc.reason_code), symbol=symbol,
+                    internal_order_id=internal_order_id, reason_code=exc.reason_code or "GATE",
+                    detail=str(exc), status_code=423,
+                    text=f"order gate blocked: {exc}", now=current,
                 )
             except KISAmbiguousResponseError as exc:
+                self._audit(run_id, shadow_audit.SHADOW_ERROR, shadow_audit.RESULT_ERROR,
+                            symbol=symbol, internal_order_id=internal_order_id,
+                            reason_code="AMBIGUOUS_RESPONSE", detail=str(exc), now=current)
+                self._audit(run_id, shadow_audit.SHADOW_COMPLETED, shadow_audit.RESULT_ERROR,
+                            symbol=symbol, internal_order_id=internal_order_id,
+                            reason_code="AMBIGUOUS_RESPONSE", now=current)
                 # Propagate -- positions/lifecycle.py's _execute_exit()
                 # catches any Exception here and marks the exit intent
                 # SUBMISSION_UNKNOWN, exactly the UNKNOWN-never-auto-
@@ -193,9 +254,11 @@ class KISBrokerAdapter:
                 # into a BrokerResponse.
                 raise
             except KISBrokerError as exc:
-                return BrokerResponse(
-                    status_code=400, text=f"KIS rejected the order: {exc}",
-                    data={"blocked_reason": str(exc)}, dry_run=False,
+                return self._blocked(
+                    run_id, shadow_audit.GATE_REJECTED, symbol=symbol,
+                    internal_order_id=internal_order_id, reason_code="BROKER_REJECTED",
+                    detail=str(exc), status_code=400,
+                    text=f"KIS rejected the order: {exc}", now=current,
                 )
         finally:
             conn.close()
@@ -204,6 +267,18 @@ class KISBrokerAdapter:
         # status vocabulary so positions/order_status.py's EXISTING,
         # unmodified classify_broker_order_status() keeps working.
         alpaca_status = "accepted" if result.status == "ACCEPTED" else "rejected"
+        approved = result.status == "ACCEPTED"
+        audit_result = shadow_audit.RESULT_APPROVED if approved else shadow_audit.RESULT_BLOCKED
+        self._audit(run_id, shadow_audit.GATE_APPROVED if approved else shadow_audit.GATE_REJECTED,
+                    audit_result, symbol=symbol, internal_order_id=internal_order_id,
+                    reason_code=result.status, now=current)
+        if approved:
+            self._audit(run_id, shadow_audit.EXECUTION_PLANNED, shadow_audit.RESULT_APPROVED,
+                        symbol=symbol, internal_order_id=internal_order_id,
+                        reason_code="SUBMITTED",
+                        detail=str(result.execution_record.broker_order_id), now=current)
+        self._audit(run_id, shadow_audit.SHADOW_COMPLETED, audit_result, symbol=symbol,
+                    internal_order_id=internal_order_id, reason_code=result.status, now=current)
         return BrokerResponse(
             status_code=200 if result.status == "ACCEPTED" else 400,
             text=f"KIS order {result.execution_record.broker_order_id} status={result.status}",

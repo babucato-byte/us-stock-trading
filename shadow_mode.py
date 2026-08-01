@@ -27,16 +27,48 @@ a deployment.
 
 import fcntl
 import json
+import logging
 import os
+import re
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 from execution.secret_redaction import redact_text, redact_value
 
+logger = logging.getLogger(__name__)
+
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_LOG_FILE = BASE_DIR / "SHADOW_MODE_LOG.jsonl"
+
+# CODEX-048: size-based rotation on top of the per-day file, plus a
+# retention window, so a single high-volume day cannot grow one file
+# without bound and old days do not accumulate forever. Both are
+# env-overridable with conservative defaults.
+DEFAULT_MAX_FILE_MB = 50
+DEFAULT_RETENTION_DAYS = 30
+_ROTATED_SUFFIX_PATTERN = re.compile(r"\.(\d+)\.jsonl$")
+
+
+def max_file_bytes():
+    raw = os.environ.get("SHADOW_AUDIT_MAX_FILE_MB")
+    try:
+        value = float(raw) if raw is not None else DEFAULT_MAX_FILE_MB
+    except (TypeError, ValueError):
+        value = DEFAULT_MAX_FILE_MB
+    if value <= 0:
+        value = DEFAULT_MAX_FILE_MB
+    return int(value * 1024 * 1024)
+
+
+def retention_days():
+    raw = os.environ.get("SHADOW_AUDIT_RETENTION_DAYS")
+    try:
+        value = int(raw) if raw is not None else DEFAULT_RETENTION_DAYS
+    except (TypeError, ValueError):
+        value = DEFAULT_RETENTION_DAYS
+    return value if value > 0 else DEFAULT_RETENTION_DAYS
 
 
 def _resolve_log_path(*, for_date=None):
@@ -138,29 +170,90 @@ def persist(record: ShadowModeRecord, *, path=None):
     lock_path = _lock_path_for(target)
     try:
         with open(lock_path, "a+") as lock_fh:
+            # The rotation check happens INSIDE the same exclusive lock as
+            # the append (CODEX-048): a rotation that raced an append could
+            # otherwise move the file out from under a writer mid-line.
             fcntl.flock(lock_fh, fcntl.LOCK_EX)
             try:
+                _rotate_if_oversized(target)
                 with open(target, "a", encoding="utf-8") as fh:
                     fh.write(line)
+                    # flush + fsync: without these a process/host crash can
+                    # lose an already-"written" audit record that never left
+                    # the OS page cache.
+                    fh.flush()
+                    os.fsync(fh.fileno())
             finally:
                 fcntl.flock(lock_fh, fcntl.LOCK_UN)
     except OSError as exc:
         raise ShadowModeError(f"failed to persist Shadow Mode record: {exc}") from exc
 
 
-def _read_file(target):
+def _rotate_if_oversized(target):
+    """Renames `target` to `<name>.N.jsonl` once it exceeds the size
+    limit. Caller MUST already hold the sibling lock file's flock."""
+    try:
+        size = target.stat().st_size
+    except OSError:
+        return
+    if size < max_file_bytes():
+        return
+    index = 1
+    while True:
+        rotated = target.with_name(f"{target.stem}.{index}.jsonl")
+        if not rotated.exists():
+            break
+        index += 1
+    try:
+        target.rename(rotated)
+    except OSError as exc:  # pragma: no cover -- disk/permission failure
+        raise ShadowModeError(f"failed to rotate Shadow Mode log: {exc}") from exc
+
+
+def purge_old_files(*, days=None, now=None, base_dir=None):
+    """Retention for the rotated per-day files. Returns the list of files
+    deleted. Never touches an explicit SHADOW_MODE_LOG_FILE override (an
+    operator-chosen path is the operator's to manage)."""
+    limit_days = days if days is not None else retention_days()
+    current = now or datetime.now(timezone.utc)
+    cutoff = (current - timedelta(days=limit_days)).date()
+    directory = Path(base_dir) if base_dir else BASE_DIR
+    deleted = []
+    for path in sorted(directory.glob("shadow-*.jsonl")):
+        stem = path.name[len("shadow-"):].split(".")[0]
+        try:
+            file_date = datetime.strptime(stem, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if file_date < cutoff:
+            try:
+                path.unlink()
+                deleted.append(path)
+            except OSError:  # pragma: no cover -- permission failure
+                continue
+    return deleted
+
+
+def _read_file(target, corruption=None):
+    """`corruption` (optional list) collects `(path, line_number)` for
+    every unparseable line. CODEX-048: a torn line is still skipped (the
+    durable prefix of good rows must never be discarded), but it is no
+    longer INVISIBLE -- read_all() logs it and read_all_with_integrity()
+    returns it, so an audit can tell "no such record" apart from "that
+    record's line was corrupted"."""
     if not target.exists():
         return []
     records = []
-    with open(target, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                records.append(json.loads(line))
-            except ValueError:
-                continue
+    for line_number, line in enumerate(open(target, encoding="utf-8"), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except ValueError:
+            if corruption is not None:
+                corruption.append((str(target), line_number))
+            continue
     return records
 
 
@@ -173,14 +266,29 @@ def read_all(*, path=None, date=None):
     EVERY rotated `shadow-*.jsonl` file (chronological by filename) so
     a full audit still sees every day's records; pass `date` to read
     just one day's file."""
+    records, corruption = read_all_with_integrity(path=path, date=date)
+    if corruption:
+        logger.error(
+            "Shadow Mode log corruption: %d unreadable line(s) skipped: %s",
+            len(corruption), corruption,
+        )
+    return records
+
+
+def read_all_with_integrity(*, path=None, date=None):
+    """Returns `(records, corruption)` where `corruption` is a list of
+    `(file, line_number)` for every unparseable line encountered. This is
+    the audit-grade reader: a caller that must prove the log is intact
+    checks `corruption == []`."""
+    corruption = []
     if path is not None:
-        return _read_file(path)
+        return _read_file(path, corruption), corruption
     override = os.environ.get("SHADOW_MODE_LOG_FILE")
     if override:
-        return _read_file(Path(override))
+        return _read_file(Path(override), corruption), corruption
     if date is not None:
-        return _read_file(_resolve_log_path(for_date=date))
+        return _read_file(_resolve_log_path(for_date=date), corruption), corruption
     records = []
     for rotated_file in sorted(BASE_DIR.glob("shadow-*.jsonl")):
-        records.extend(_read_file(rotated_file))
-    return records
+        records.extend(_read_file(rotated_file, corruption))
+    return records, corruption

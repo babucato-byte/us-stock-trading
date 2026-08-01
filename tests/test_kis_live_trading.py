@@ -58,13 +58,17 @@ def _accepted_record(internal_order_id):
 
 class _FakeBroker:
     def __init__(self, price=100.1, cash_usd=1000.0, submit_response=None, submit_raise=None,
-                 open_orders=None):
+                 open_orders=None, positions=None, fills=None, read_exc=None):
         self.price = price
+        self.positions = positions if positions is not None else []
+        self.fills = fills if fills is not None else []
+        self.read_exc = read_exc
         self.cash_usd = cash_usd
         self.submit_response = submit_response
         self.submit_raise = submit_raise
         self.open_orders = open_orders or []
         self.submit_calls = []
+        self.call_log = []
 
     def get_current_price(self, instrument):
         return self.price
@@ -76,12 +80,25 @@ class _FakeBroker:
         )
 
     def get_open_orders(self):
+        self.call_log.append("get_open_orders")
+        if self.read_exc is not None:
+            raise self.read_exc
         return self.open_orders
 
     def get_positions(self):
-        return []
+        self.call_log.append("get_positions")
+        if self.read_exc is not None:
+            raise self.read_exc
+        return self.positions
+
+    def get_fills(self, *, start_date, end_date):
+        self.call_log.append("get_fills")
+        if self.read_exc is not None:
+            raise self.read_exc
+        return self.fills
 
     def submit_order(self, order_intent, instrument, *, authorization=None):
+        self.call_log.append("submit_order")
         self.submit_calls.append((order_intent, instrument))
         if self.submit_raise is not None:
             raise self.submit_raise
@@ -262,62 +279,78 @@ class TestPerSymbolOutcomes:
         klt.run_live_buy_entry_cycle(broker=broker, live_rollout=_rollout(max_quantity_per_order=1), now=NOW)
         assert broker.submit_calls[0][0].quantity == 1
 
-    def test_no_recorded_reconciliation_blocks_zero_broker_calls(self, tmp_path, monkeypatch):
+    def test_reconciliation_reads_always_precede_the_order(self, monkeypatch):
+        # CODEX-044: on a completely cold start -- no recorded
+        # reconciliation anywhere -- the engine still performs the real
+        # KIS position/open-order/fill reads BEFORE the order is
+        # submitted. There is no window in which an order can be placed
+        # "before reconciliation has run".
         _patch_common(monkeypatch)
-        # Overrides _isolate's seeded clean state -- "결과 없음".
-        monkeypatch.setenv("RECONCILIATION_STATE_FILE", str(tmp_path / "NEVER_WRITTEN.json"))
         broker = _FakeBroker()
         results = klt.run_live_buy_entry_cycle(broker=broker, live_rollout=_rollout(), now=NOW)
-        assert results["submitted"] == []
-        assert broker.submit_calls == []
-
-    def test_stale_reconciliation_blocks_zero_broker_calls(self, monkeypatch):
-        from datetime import timedelta
-        _patch_common(monkeypatch)
-        reconciliation_state.record_result(
-            clean=True, mismatch_count=0,
-            now=NOW - timedelta(seconds=reconciliation_state.DEFAULT_MAX_AGE_SECONDS + 1),
-        )
-        broker = _FakeBroker()
-        results = klt.run_live_buy_entry_cycle(broker=broker, live_rollout=_rollout(), now=NOW)
-        assert results["submitted"] == []
-        assert broker.submit_calls == []
+        assert results["submitted"] == ["AAPL"]
+        assert broker.call_log.index("get_positions") < broker.call_log.index("submit_order")
+        assert broker.call_log.index("get_open_orders") < broker.call_log.index("submit_order")
+        assert broker.call_log.index("get_fills") < broker.call_log.index("submit_order")
 
     def test_dirty_reconciliation_blocks_zero_broker_calls(self, monkeypatch):
+        # CODEX-044: the block now comes from the Execution Engine's own
+        # live comparison -- KIS reports a position the internal store
+        # has never heard of.
         _patch_common(monkeypatch)
-        reconciliation_state.record_result(clean=False, mismatch_count=1, now=NOW)
-        broker = _FakeBroker()
+        from domain.position import Position
+        broker = _FakeBroker(positions=[
+            Position(symbol="TSLA", quantity=3, average_fill_price=200.0, unrealized_pnl=0.0,
+                      realized_pnl=0.0, as_of=NOW, source="kis_balance"),
+        ])
+        results = klt.run_live_buy_entry_cycle(broker=broker, live_rollout=_rollout(), now=NOW)
+        assert results["submitted"] == []
+        assert broker.submit_calls == []
+
+    def test_reconciliation_read_failure_blocks_zero_broker_calls(self, monkeypatch):
+        # A failed KIS read produces NO snapshot at all, so there is
+        # nothing the gate could approve against.
+        _patch_common(monkeypatch)
+        broker = _FakeBroker(read_exc=KISBrokerError("KIS unreachable"))
+        results = klt.run_live_buy_entry_cycle(broker=broker, live_rollout=_rollout(), now=NOW)
+        assert results["submitted"] == []
+        assert broker.submit_calls == []
+
+    def test_untracked_kis_open_order_blocks_new_buy_zero_broker_calls(self, monkeypatch):
+        _patch_common(monkeypatch)
+        broker = _FakeBroker(open_orders=[{"ODNO": "kis-stranger", "pdno": "MSFT"}])
         results = klt.run_live_buy_entry_cycle(broker=broker, live_rollout=_rollout(), now=NOW)
         assert results["submitted"] == []
         assert broker.submit_calls == []
 
     def test_unknown_buy_order_for_symbol_blocks_new_buy_zero_broker_calls(self, monkeypatch):
         _patch_common(monkeypatch)
-        from execution import idempotency
+        from helpers_order_state import register_and_drive
         from state_store import db as state_db
         conn = state_db.open_db()
-        idempotency.register(
+        register_and_drive(
             conn, internal_order_id="prior-buy-1", signal_id="prior-buy-1", symbol="AAPL",
-            side="buy", trading_date="2026-07-29",
+            side="buy", trading_date="2026-07-29", target="UNKNOWN",
         )
-        idempotency.update_status(conn, "prior-buy-1", "UNKNOWN")
         broker = _FakeBroker()
         results = klt.run_live_buy_entry_cycle(broker=broker, live_rollout=_rollout(), now=NOW)
         assert results["submitted"] == []
         assert broker.submit_calls == []
 
-    def test_unknown_sell_order_for_symbol_does_not_block_new_buy(self, monkeypatch):
-        # has_unknown_order() is checked per (symbol, side) -- an UNKNOWN
-        # SELL for this symbol must not block a new BUY for it.
+    def test_unknown_sell_order_also_blocks_new_buy(self, monkeypatch):
+        # CODEX-044: the UNKNOWN block is ACCOUNT-WIDE. The previous
+        # (symbol, side) scoping let a new BUY through while a SELL of
+        # the same symbol sat unresolved -- i.e. while this codebase did
+        # not actually know the account's exposure.
         _patch_common(monkeypatch)
-        from execution import idempotency
+        from helpers_order_state import register_and_drive
         from state_store import db as state_db
         conn = state_db.open_db()
-        idempotency.register(
+        register_and_drive(
             conn, internal_order_id="prior-sell-1", signal_id="prior-sell-1", symbol="AAPL",
-            side="sell", trading_date="2026-07-29",
+            side="sell", trading_date="2026-07-29", target="UNKNOWN",
         )
-        idempotency.update_status(conn, "prior-sell-1", "UNKNOWN")
         broker = _FakeBroker()
         results = klt.run_live_buy_entry_cycle(broker=broker, live_rollout=_rollout(), now=NOW)
-        assert results["submitted"] == ["AAPL"]
+        assert results["submitted"] == []
+        assert broker.submit_calls == []

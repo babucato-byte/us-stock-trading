@@ -313,10 +313,99 @@ MIGRATION_7_STATEMENTS = [
     KIS_ORDER_IDEMPOTENCY_ADD_REQUESTED_QUANTITY,
 ]
 
+# ---------------------------------------------------------------------------
+# Migration 8 (CODEX-047): durable compare-and-set state machine.
+#
+# Before this migration, execution/idempotency.py::update_status() wrote any
+# status string with a bare `UPDATE ... WHERE internal_order_id = ?`: no
+# current-state read, no expected-state predicate, no rowcount check, and no
+# durable record of the transition itself. Two concurrent writers (the buy
+# cycle, the sell/exit tick, a reconciliation pass) could therefore silently
+# clobber each other, and nothing in the DB layer enforced that a status
+# change had ever passed order_state_machine.transition().
+#
+# `version` is the optimistic-concurrency counter: every accepted transition
+# bumps it, and every transition must name the version it believes it is
+# advancing from. `order_state_events` is the append-only history, written in
+# the SAME transaction as the state change so a state and its event can never
+# disagree.
+# ---------------------------------------------------------------------------
+
+KIS_ORDER_IDEMPOTENCY_ADD_VERSION = """
+ALTER TABLE kis_order_idempotency ADD COLUMN version INTEGER NOT NULL DEFAULT 0
+"""
+
+ORDER_STATE_EVENTS_TABLE = """
+CREATE TABLE order_state_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    internal_order_id TEXT NOT NULL,
+    from_state TEXT,
+    to_state TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    payload TEXT,
+    version INTEGER NOT NULL,
+    occurred_at TEXT NOT NULL
+)
+"""
+
+ORDER_STATE_EVENTS_ORDER_INDEX = """
+CREATE INDEX idx_order_state_events_order ON order_state_events (internal_order_id)
+"""
+
+MIGRATION_8_STATEMENTS = [
+    KIS_ORDER_IDEMPOTENCY_ADD_VERSION,
+    ORDER_STATE_EVENTS_TABLE,
+    ORDER_STATE_EVENTS_ORDER_INDEX,
+]
+
+# ---------------------------------------------------------------------------
+# Migration 9 (CODEX-048): durable Shadow Mode audit event store.
+#
+# The JSONL Shadow log stays (shadow_mode.py -- the per-attempt structured
+# record spec §5 requires), but it cannot be the audit system of record: a
+# JSONL append has no cross-process atomicity guarantee beyond the flock this
+# codebase wraps it in, no retention mechanism, and a torn line is silently
+# unreadable. This table is the durable, concurrently-writable, queryable
+# audit trail of every Shadow evaluation step -- one row per event, tied
+# together by `shadow_run_id`, with a retention purge instead of file
+# rotation.
+# ---------------------------------------------------------------------------
+
+SHADOW_AUDIT_EVENTS_TABLE = """
+CREATE TABLE shadow_audit_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    shadow_run_id TEXT NOT NULL,
+    signal_id TEXT,
+    internal_order_id TEXT,
+    symbol TEXT,
+    side TEXT,
+    event_type TEXT NOT NULL,
+    result TEXT NOT NULL,
+    reason_code TEXT,
+    payload TEXT,
+    created_at TEXT NOT NULL
+)
+"""
+
+SHADOW_AUDIT_EVENTS_RUN_INDEX = """
+CREATE INDEX idx_shadow_audit_events_run ON shadow_audit_events (shadow_run_id)
+"""
+
+SHADOW_AUDIT_EVENTS_CREATED_AT_INDEX = """
+CREATE INDEX idx_shadow_audit_events_created_at ON shadow_audit_events (created_at)
+"""
+
+MIGRATION_9_STATEMENTS = [
+    SHADOW_AUDIT_EVENTS_TABLE,
+    SHADOW_AUDIT_EVENTS_RUN_INDEX,
+    SHADOW_AUDIT_EVENTS_CREATED_AT_INDEX,
+]
+
 # Every table this schema version creates -- used by export.py's
 # export_all() and by tests asserting the full table set exists.
 ALL_TABLES = [
     "orders", "fills", "positions", "position_events",
     "strategy_runs", "risk_events", "kill_switch_events",
     "exit_intents", "live_entry_reservations", "kis_order_idempotency",
+    "order_state_events", "shadow_audit_events",
 ]

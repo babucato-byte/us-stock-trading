@@ -44,6 +44,14 @@ class _FakeKISBroker:
     def get_fills(self, *, start_date, end_date):
         return self.fills
 
+    def get_account_snapshot(self, *, source_label="kis_balance"):
+        from domain.account_snapshot import AccountSnapshot
+        return AccountSnapshot(
+            krw_cash=0.0, usd_cash=10000.0, usd_orderable_cash=10000.0,
+            usd_reserved_in_open_orders=0.0, as_of=NOW, source=source_label,
+            account_id="12345678",
+        )
+
     def submit_order(self, order_intent, instrument, *, authorization=None):
         self.submit_calls.append((order_intent, instrument))
         from domain.execution_event import ExecutionRecord

@@ -28,6 +28,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from execution import order_repository
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 _LOCK_FILE = BASE_DIR / "KIS_ORDER_IDEMPOTENCY.lock"
 LOCK_TIMEOUT_SECONDS = 5.0
@@ -121,9 +123,14 @@ def register(conn, *, internal_order_id, signal_id, symbol, side, trading_date, 
         conn.execute(
             "INSERT INTO kis_order_idempotency "
             "(internal_order_id, signal_id, symbol, side, trading_date, broker_order_id, "
-            "status, created_at, updated_at, requested_quantity) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
+            "status, created_at, updated_at, requested_quantity, version) "
+            "VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 0)",
             (internal_order_id, signal_id, symbol, side, trading_date, status, now, now, requested_quantity),
         )
+        # CODEX-047: the creation event is written in the SAME transaction
+        # as the row, so an order can never exist without the durable
+        # event history that every later transition appends to.
+        order_repository.append_creation_event(conn, order_id=internal_order_id, state=status)
     except sqlite3.IntegrityError as exc:
         # Race window between find_existing() and INSERT -- the UNIQUE
         # constraints themselves are the real atomic guarantee.
@@ -138,18 +145,44 @@ def register(conn, *, internal_order_id, signal_id, symbol, side, trading_date, 
         conn.commit()
 
 
-def has_unknown_order(conn, *, symbol, side):
-    """CODEX-044: real query backing the order gate's `has_unknown_order`
-    check -- an order this system submitted but never got a definite
+def has_unknown_order(conn):
+    """CODEX-044: an order this system submitted but never got a definite
     ACCEPTED/REJECTED/FILLED answer for (broker timeout, ambiguous
-    response) blocks any *new* order for the same symbol+side until a
-    human/reconciliation resolves it. Replaces the previous
-    `has_unknown_order=False` constant Codex flagged as a bypass."""
+    response) blocks EVERY new order on the account until a human/
+    reconciliation resolves it.
+
+    Deliberately account-wide, not `(symbol, side)`-scoped as it was
+    before: while any order is UNKNOWN this codebase does not know the
+    account's true exposure, so scoping the block to the same symbol and
+    the same side (Codex's second CODEX-044 finding) would let a new buy
+    through while a sell of the same symbol sat unresolved."""
     row = conn.execute(
-        "SELECT 1 FROM kis_order_idempotency WHERE symbol = ? AND side = ? AND status = 'UNKNOWN' LIMIT 1",
-        (symbol, side),
+        "SELECT 1 FROM kis_order_idempotency WHERE status = 'UNKNOWN' LIMIT 1",
     ).fetchone()
     return row is not None
+
+
+def list_orders_by_status(conn, statuses):
+    """Every order attempt currently in one of `statuses` -- the internal
+    side of reconciliation/snapshot.py's open-order comparison."""
+    statuses = tuple(statuses)
+    if not statuses:
+        return []
+    placeholders = ",".join("?" for _ in statuses)
+    return conn.execute(
+        "SELECT internal_order_id, broker_order_id, symbol, side, status, requested_quantity "
+        f"FROM kis_order_idempotency WHERE status IN ({placeholders})",
+        statuses,
+    ).fetchall()
+
+
+def list_orders_with_broker_id(conn):
+    """Every order attempt that has a KIS-side order id, for matching
+    KIS's own fill rows back to what this codebase actually requested."""
+    return conn.execute(
+        "SELECT internal_order_id, broker_order_id, symbol, side, status, requested_quantity "
+        "FROM kis_order_idempotency WHERE broker_order_id IS NOT NULL"
+    ).fetchall()
 
 
 def list_unknown_orders(conn):
@@ -158,23 +191,16 @@ def list_unknown_orders(conn):
     reconciliation.order_reconciler.reconcile_unknown_order() against
     KIS's own open-order/fill history each pass."""
     return conn.execute(
-        "SELECT internal_order_id, broker_order_id, symbol, side, requested_quantity "
+        "SELECT internal_order_id, broker_order_id, symbol, side, requested_quantity, version "
         "FROM kis_order_idempotency WHERE status = 'UNKNOWN'"
     ).fetchall()
 
 
-def update_status(conn, internal_order_id, status, *, broker_order_id=None, commit=True):
-    now = datetime.now(timezone.utc).isoformat()
-    if broker_order_id is not None:
-        conn.execute(
-            "UPDATE kis_order_idempotency SET status = ?, broker_order_id = ?, updated_at = ? "
-            "WHERE internal_order_id = ?",
-            (status, broker_order_id, now, internal_order_id),
-        )
-    else:
-        conn.execute(
-            "UPDATE kis_order_idempotency SET status = ?, updated_at = ? WHERE internal_order_id = ?",
-            (status, now, internal_order_id),
-        )
-    if commit:
-        conn.commit()
+# CODEX-047: there is deliberately NO update_status() here any more. Every
+# order state change goes through execution/order_repository.py's
+# compare-and-set, which validates the transition against
+# order_state_machine.py, requires the caller's expected state AND version
+# to still hold, and writes the state change and its order_state_events row
+# in one transaction. A bare "set this status" API cannot offer any of that,
+# so keeping one available -- even for "simple" cases -- is exactly the
+# bypass Codex flagged.

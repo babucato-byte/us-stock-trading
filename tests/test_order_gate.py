@@ -15,7 +15,22 @@ from execution.order_gate import (
     evaluate_sell_gate,
 )
 
+from reconciliation.snapshot import ReconciliationSnapshot
+
 NOW = datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc)
+
+
+def _snapshot(**overrides):
+    """CODEX-044: the gates take a real ReconciliationSnapshot, never a
+    `reconciliation_ok=True` boolean. Every test that expects the gate to
+    PASS must therefore supply a genuinely clean, current, correctly
+    account/symbol-bound snapshot."""
+    kwargs = dict(
+        account_id="12345678", symbol="AAPL", checked_at=NOW, positions_match=True,
+        open_orders_match=True, fills_match=True, has_unknown_orders=False, source="test",
+    )
+    kwargs.update(overrides)
+    return ReconciliationSnapshot(**kwargs)
 
 
 def _instrument(**overrides):
@@ -52,8 +67,7 @@ def _buy_ctx(**overrides):
         signal=_signal(), is_regular_session=True, kis_price_usd=100.1,
         max_price_deviation_percent=0.30, usd_orderable_cash=1000.0,
         has_open_order_for_symbol=False, has_order_for_signal_id=False,
-        allowed_symbols=frozenset({"AAPL"}), reconciliation_ok=True, has_unknown_order=False,
-        now=NOW,
+        allowed_symbols=frozenset({"AAPL"}), reconciliation=_snapshot(), now=NOW,
     )
     kwargs.update(overrides)
     return BuyGateContext(**kwargs)
@@ -159,13 +173,43 @@ class TestEvaluateBuyGate:
         with pytest.raises(OrderGateBlockedError, match="order-eligible"):
             evaluate_buy_gate(_buy_ctx(instrument=_instrument(otc=True)))
 
-    def test_reconciliation_not_ok_blocked(self):
+    def test_reconciliation_position_mismatch_blocked(self):
         with pytest.raises(OrderGateBlockedError, match="[Rr]econciliation"):
-            evaluate_buy_gate(_buy_ctx(reconciliation_ok=False))
+            evaluate_buy_gate(_buy_ctx(reconciliation=_snapshot(positions_match=False)))
+
+    def test_reconciliation_open_order_mismatch_blocked(self):
+        with pytest.raises(OrderGateBlockedError, match="[Rr]econciliation"):
+            evaluate_buy_gate(_buy_ctx(reconciliation=_snapshot(open_orders_match=False)))
+
+    def test_reconciliation_fill_mismatch_blocked(self):
+        with pytest.raises(OrderGateBlockedError, match="[Rr]econciliation"):
+            evaluate_buy_gate(_buy_ctx(reconciliation=_snapshot(fills_match=False)))
 
     def test_unknown_order_exists_blocked(self):
         with pytest.raises(OrderGateBlockedError, match="UNKNOWN"):
-            evaluate_buy_gate(_buy_ctx(has_unknown_order=True))
+            evaluate_buy_gate(_buy_ctx(reconciliation=_snapshot(has_unknown_orders=True)))
+
+    def test_missing_snapshot_blocked(self):
+        with pytest.raises(OrderGateBlockedError, match="[Rr]econciliation"):
+            evaluate_buy_gate(_buy_ctx(reconciliation=None))
+
+    def test_boolean_true_is_not_accepted_as_a_snapshot(self):
+        # The exact bypass CODEX-044 exists to make impossible.
+        with pytest.raises(OrderGateBlockedError, match="[Rr]econciliation"):
+            evaluate_buy_gate(_buy_ctx(reconciliation=True))
+
+    def test_stale_snapshot_blocked(self):
+        stale = _snapshot(checked_at=NOW - timedelta(seconds=31))
+        with pytest.raises(OrderGateBlockedError, match="[Rr]econciliation"):
+            evaluate_buy_gate(_buy_ctx(reconciliation=stale))
+
+    def test_snapshot_for_another_account_blocked(self):
+        with pytest.raises(OrderGateBlockedError, match="[Rr]econciliation"):
+            evaluate_buy_gate(_buy_ctx(reconciliation=_snapshot(account_id="87654321")))
+
+    def test_snapshot_for_another_symbol_blocked(self):
+        with pytest.raises(OrderGateBlockedError, match="[Rr]econciliation"):
+            evaluate_buy_gate(_buy_ctx(reconciliation=_snapshot(symbol="MSFT")))
 
 
 def _sell_ctx(**overrides):
@@ -173,7 +217,8 @@ def _sell_ctx(**overrides):
         execution_broker="kis", live_order_enabled=True,
         order_intent=_order_intent(side="sell", quantity=1),
         instrument=_instrument(), kis_position_quantity=5, position_source="kis",
-        has_existing_sell_order_for_symbol=False, reconciliation_ok=True, has_unknown_order=False,
+        has_existing_sell_order_for_symbol=False, reconciliation=_snapshot(),
+        kis_account_no="12345678", now=NOW,
     )
     kwargs.update(overrides)
     return SellGateContext(**kwargs)
@@ -207,13 +252,43 @@ class TestEvaluateSellGate:
         with pytest.raises(OrderGateBlockedError, match="duplicate liquidation"):
             evaluate_sell_gate(_sell_ctx(has_existing_sell_order_for_symbol=True))
 
-    def test_reconciliation_not_ok_blocked(self):
+    def test_reconciliation_position_mismatch_blocked(self):
         with pytest.raises(OrderGateBlockedError, match="[Rr]econciliation"):
-            evaluate_sell_gate(_sell_ctx(reconciliation_ok=False))
+            evaluate_sell_gate(_sell_ctx(reconciliation=_snapshot(positions_match=False)))
+
+    def test_reconciliation_open_order_mismatch_blocked(self):
+        with pytest.raises(OrderGateBlockedError, match="[Rr]econciliation"):
+            evaluate_sell_gate(_sell_ctx(reconciliation=_snapshot(open_orders_match=False)))
+
+    def test_reconciliation_fill_mismatch_blocked(self):
+        with pytest.raises(OrderGateBlockedError, match="[Rr]econciliation"):
+            evaluate_sell_gate(_sell_ctx(reconciliation=_snapshot(fills_match=False)))
 
     def test_unknown_order_exists_blocked(self):
         with pytest.raises(OrderGateBlockedError, match="UNKNOWN"):
-            evaluate_sell_gate(_sell_ctx(has_unknown_order=True))
+            evaluate_sell_gate(_sell_ctx(reconciliation=_snapshot(has_unknown_orders=True)))
+
+    def test_missing_snapshot_blocked(self):
+        with pytest.raises(OrderGateBlockedError, match="[Rr]econciliation"):
+            evaluate_sell_gate(_sell_ctx(reconciliation=None))
+
+    def test_boolean_true_is_not_accepted_as_a_snapshot(self):
+        with pytest.raises(OrderGateBlockedError, match="[Rr]econciliation"):
+            evaluate_sell_gate(_sell_ctx(reconciliation=True))
+
+    def test_stale_snapshot_blocked(self):
+        # CODEX-044: sells are held to the IDENTICAL freshness policy buys are.
+        stale = _snapshot(checked_at=NOW - timedelta(seconds=31))
+        with pytest.raises(OrderGateBlockedError, match="[Rr]econciliation"):
+            evaluate_sell_gate(_sell_ctx(reconciliation=stale))
+
+    def test_snapshot_for_another_account_blocked(self):
+        with pytest.raises(OrderGateBlockedError, match="[Rr]econciliation"):
+            evaluate_sell_gate(_sell_ctx(reconciliation=_snapshot(account_id="87654321")))
+
+    def test_snapshot_for_another_symbol_blocked(self):
+        with pytest.raises(OrderGateBlockedError, match="[Rr]econciliation"):
+            evaluate_sell_gate(_sell_ctx(reconciliation=_snapshot(symbol="MSFT")))
 
     def test_sell_full_position_exactly_passes(self):
         assert evaluate_sell_gate(

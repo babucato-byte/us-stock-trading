@@ -12,11 +12,12 @@ from brokers.kis_broker import KISAmbiguousResponseError, KISBrokerError
 from domain.execution_event import ExecutionRecord
 from domain.instrument import build_instrument
 from domain.order_intent import OrderIntent
-from execution import execution_engine, order_gate
+from execution import execution_engine, order_gate, order_repository
 from execution.execution_engine import ExecutionEngineError
 from state_store import db as state_db
 
 NOW = datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc)
+ACCOUNT_ID = "123"
 
 
 @pytest.fixture(autouse=True)
@@ -47,11 +48,35 @@ def _order_intent(**overrides):
 
 
 class _FakeBroker:
-    def __init__(self, response=None, raise_exc=None):
+    """CODEX-044: the engine now performs the reconciliation reads
+    ITSELF, so a broker double must answer them. Defaults describe a
+    clean, empty account: no positions, no open orders, no fills."""
+
+    def __init__(self, response=None, raise_exc=None, positions=None, open_orders=None,
+                 fills=None, read_exc=None):
         self.response = response
         self.raise_exc = raise_exc
         self.calls = []
         self.cancel_calls = []
+        self.positions = positions or []
+        self.open_orders = open_orders if open_orders is not None else []
+        self.fills = fills if fills is not None else []
+        self.read_exc = read_exc
+
+    def get_positions(self):
+        if self.read_exc is not None:
+            raise self.read_exc
+        return self.positions
+
+    def get_open_orders(self):
+        if self.read_exc is not None:
+            raise self.read_exc
+        return self.open_orders
+
+    def get_fills(self, *, start_date, end_date):
+        if self.read_exc is not None:
+            raise self.read_exc
+        return self.fills
 
     def submit_order(self, order_intent, instrument, *, authorization=None):
         self.calls.append((order_intent, instrument))
@@ -76,7 +101,7 @@ def _accepted_record(order_intent):
 
 
 def _passing_buy_ctx_builder(order_intent):
-    def _build():
+    def _build(reconciliation):
         return order_gate.BuyGateContext(
             execution_broker="kis", live_order_enabled=True, entry_disabled=False,
             validated_commit="c1", deployed_commit="c1", kis_account_no="123",
@@ -84,8 +109,7 @@ def _passing_buy_ctx_builder(order_intent):
             signal=_make_signal(), is_regular_session=True, kis_price_usd=100.1,
             max_price_deviation_percent=0.30, usd_orderable_cash=1000.0,
             has_open_order_for_symbol=False, has_order_for_signal_id=False,
-            allowed_symbols=frozenset({"AAPL"}), reconciliation_ok=True, has_unknown_order=False,
-            now=NOW,
+            allowed_symbols=frozenset({"AAPL"}), reconciliation=reconciliation, now=NOW,
         )
     return _build
 
@@ -100,11 +124,12 @@ def _make_signal():
 
 
 def _passing_sell_ctx_builder(order_intent):
-    def _build():
+    def _build(reconciliation):
         return order_gate.SellGateContext(
             execution_broker="kis", live_order_enabled=True, order_intent=order_intent,
             instrument=_instrument(), kis_position_quantity=5, position_source="kis",
-            has_existing_sell_order_for_symbol=False, reconciliation_ok=True, has_unknown_order=False,
+            has_existing_sell_order_for_symbol=False, reconciliation=reconciliation,
+            kis_account_no=ACCOUNT_ID, now=NOW,
         )
     return _build
 
@@ -117,6 +142,22 @@ def _passing_cancel_ctx_builder():
             has_cancel_already_in_flight=False,
         )
     return _build
+
+
+def _submit_accepted(conn, order_intent, broker=None):
+    """Puts a REAL, durable ACCEPTED order in the ledger by running the
+    engine -- a cancel test must operate on an order this system actually
+    submitted, not on a bare OrderIntent with no durable record."""
+    broker = broker or _FakeBroker(response=_accepted_record(order_intent))
+    builder = (_passing_sell_ctx_builder if order_intent.side == "sell" else _passing_buy_ctx_builder)
+    submit = (execution_engine.submit_sell_order if order_intent.side == "sell"
+              else execution_engine.submit_buy_order)
+    kwargs = {"sell_gate_context_builder" if order_intent.side == "sell"
+              else "buy_gate_context_builder": builder(order_intent)}
+    return submit(
+        order_intent=order_intent, conn=conn, broker=broker, instrument=_instrument(),
+        account_id=ACCOUNT_ID, now=NOW, **kwargs,
+    )
 
 
 def _cancelled_record(order_intent, broker_order_id="kis-1"):
@@ -135,7 +176,7 @@ class TestSubmitBuyOrder:
         broker = _FakeBroker(response=_accepted_record(oi))
         result = execution_engine.submit_buy_order(
             order_intent=oi, buy_gate_context_builder=_passing_buy_ctx_builder(oi),
-            conn=conn, broker=broker, instrument=_instrument(), now=NOW,
+            conn=conn, broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID, now=NOW,
         )
         assert result.status == "ACCEPTED"
         assert len(broker.calls) == 1
@@ -146,14 +187,14 @@ class TestSubmitBuyOrder:
         broker = _FakeBroker(response=_accepted_record(oi))
         execution_engine.submit_buy_order(
             order_intent=oi, buy_gate_context_builder=_passing_buy_ctx_builder(oi),
-            conn=conn, broker=broker, instrument=_instrument(), now=NOW,
+            conn=conn, broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID, now=NOW,
         )
         oi2 = _order_intent(internal_order_id="ord-2")  # same signal/symbol/side/date
         broker2 = _FakeBroker(response=_accepted_record(oi2))
         with pytest.raises(ExecutionEngineError, match="idempotency"):
             execution_engine.submit_buy_order(
                 order_intent=oi2, buy_gate_context_builder=_passing_buy_ctx_builder(oi2),
-                conn=conn, broker=broker2, instrument=_instrument(), now=NOW,
+                conn=conn, broker=broker2, instrument=_instrument(), account_id=ACCOUNT_ID, now=NOW,
             )
         assert broker2.calls == []
 
@@ -162,14 +203,14 @@ class TestSubmitBuyOrder:
         oi = _order_intent()
         broker = _FakeBroker(response=_accepted_record(oi))
 
-        def _failing_ctx():
-            ctx = _passing_buy_ctx_builder(oi)()
+        def _failing_ctx(reconciliation):
+            ctx = _passing_buy_ctx_builder(oi)(reconciliation)
             return ctx.__class__(**{**ctx.__dict__, "entry_disabled": True})
 
         with pytest.raises(ExecutionEngineError, match="order gate"):
             execution_engine.submit_buy_order(
                 order_intent=oi, buy_gate_context_builder=_failing_ctx,
-                conn=conn, broker=broker, instrument=_instrument(), now=NOW,
+                conn=conn, broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID, now=NOW,
             )
         assert broker.calls == []
 
@@ -180,7 +221,7 @@ class TestSubmitBuyOrder:
         with pytest.raises(KISAmbiguousResponseError):
             execution_engine.submit_buy_order(
                 order_intent=oi, buy_gate_context_builder=_passing_buy_ctx_builder(oi),
-                conn=conn, broker=broker, instrument=_instrument(), now=NOW,
+                conn=conn, broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID, now=NOW,
             )
         from execution import idempotency
         row = idempotency.find_existing(
@@ -196,7 +237,7 @@ class TestSubmitBuyOrder:
         with pytest.raises(KISBrokerError):
             execution_engine.submit_buy_order(
                 order_intent=oi, buy_gate_context_builder=_passing_buy_ctx_builder(oi),
-                conn=conn, broker=broker, instrument=_instrument(), now=NOW,
+                conn=conn, broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID, now=NOW,
             )
         from execution import idempotency
         row = idempotency.find_existing(
@@ -213,7 +254,7 @@ class TestSubmitSellOrder:
         broker = _FakeBroker(response=_accepted_record(oi))
         result = execution_engine.submit_sell_order(
             order_intent=oi, sell_gate_context_builder=_passing_sell_ctx_builder(oi),
-            conn=conn, broker=broker, instrument=_instrument(), now=NOW,
+            conn=conn, broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID, now=NOW,
         )
         assert result.status == "ACCEPTED"
         assert len(broker.calls) == 1
@@ -225,7 +266,7 @@ class TestSubmitSellOrder:
         with pytest.raises(ExecutionEngineError, match="order gate"):
             execution_engine.submit_sell_order(
                 order_intent=oi, sell_gate_context_builder=_passing_sell_ctx_builder(oi),
-                conn=conn, broker=broker, instrument=_instrument(), now=NOW,
+                conn=conn, broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID, now=NOW,
             )
         assert broker.calls == []
 
@@ -240,7 +281,7 @@ class TestHaltBlocksNewOrdersButNotCancel:
         with pytest.raises(ExecutionEngineError, match="HALT"):
             execution_engine.submit_buy_order(
                 order_intent=oi, buy_gate_context_builder=_passing_buy_ctx_builder(oi),
-                conn=conn, broker=broker, instrument=_instrument(), now=NOW,
+                conn=conn, broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID, now=NOW,
             )
         assert broker.calls == []
 
@@ -253,15 +294,16 @@ class TestHaltBlocksNewOrdersButNotCancel:
         with pytest.raises(ExecutionEngineError, match="HALT"):
             execution_engine.submit_sell_order(
                 order_intent=oi, sell_gate_context_builder=_passing_sell_ctx_builder(oi),
-                conn=conn, broker=broker, instrument=_instrument(), now=NOW,
+                conn=conn, broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID, now=NOW,
             )
         assert broker.calls == []
 
     def test_halt_does_not_block_cancel(self):
         from operations import kill_switch
-        kill_switch.set_halt(True, reason="risk event", actor="tester")
         conn = _conn()
         oi = _order_intent()
+        _submit_accepted(conn, oi)  # the order exists BEFORE the HALT
+        kill_switch.set_halt(True, reason="risk event", actor="tester")
         broker = _FakeBroker(response=_cancelled_record(oi))
         result = execution_engine.submit_cancel(
             order_intent=oi, broker_order_id="kis-1",
@@ -276,6 +318,7 @@ class TestSubmitCancel:
     def test_success_exactly_one_transport_call(self):
         conn = _conn()
         oi = _order_intent()
+        _submit_accepted(conn, oi)
         broker = _FakeBroker(response=_cancelled_record(oi))
         result = execution_engine.submit_cancel(
             order_intent=oi, broker_order_id="kis-1",
@@ -284,10 +327,51 @@ class TestSubmitCancel:
         )
         assert result.status == "CANCELLED"
         assert len(broker.cancel_calls) == 1
+        record = order_repository.load(conn, oi.internal_order_id)
+        assert record.state == "CANCELLED"
+        # CODEX-047: CANCEL_PENDING is durably recorded BEFORE the
+        # transport call, not skipped as it previously was.
+        states = [e["to_state"] for e in order_repository.load_events(conn, oi.internal_order_id)]
+        assert states.index("CANCEL_PENDING") < states.index("CANCELLED")
+
+    def test_cancel_of_unregistered_order_never_reaches_transport(self):
+        conn = _conn()
+        oi = _order_intent()
+        broker = _FakeBroker(response=_cancelled_record(oi))
+        with pytest.raises(ExecutionEngineError, match="no durable order record"):
+            execution_engine.submit_cancel(
+                order_intent=oi, broker_order_id="kis-1",
+                cancel_gate_context_builder=_passing_cancel_ctx_builder(),
+                conn=conn, broker=broker, instrument=_instrument(), now=NOW,
+            )
+        assert broker.cancel_calls == []
+
+    def test_rejected_cancel_lands_in_unknown_not_rejected(self):
+        # CODEX-047: KIS refusing a cancel says nothing definite about the
+        # underlying order (it may have filled a moment earlier), and
+        # CANCEL_PENDING -> REJECTED is not even a legal transition. The
+        # honest state is UNKNOWN, for reconciliation to resolve.
+        conn = _conn()
+        oi = _order_intent()
+        _submit_accepted(conn, oi)
+        rejected = ExecutionRecord(
+            internal_order_id=oi.internal_order_id, broker="kis", broker_order_id="kis-1",
+            requested_quantity=oi.quantity, requested_price=oi.limit_price, filled_quantity=0.0,
+            average_fill_price=None, status="REJECTED", submitted_at=NOW, updated_at=NOW,
+        )
+        broker = _FakeBroker(response=rejected)
+        result = execution_engine.submit_cancel(
+            order_intent=oi, broker_order_id="kis-1",
+            cancel_gate_context_builder=_passing_cancel_ctx_builder(),
+            conn=conn, broker=broker, instrument=_instrument(), now=NOW,
+        )
+        assert result.status == "UNKNOWN"
+        assert order_repository.load(conn, oi.internal_order_id).state == "UNKNOWN"
 
     def test_cancel_gate_blocked_zero_transport_calls(self):
         conn = _conn()
         oi = _order_intent()
+        _submit_accepted(conn, oi)
         broker = _FakeBroker(response=_cancelled_record(oi))
 
         def _failing_ctx():
@@ -303,3 +387,6 @@ class TestSubmitCancel:
                 conn=conn, broker=broker, instrument=_instrument(), now=NOW,
             )
         assert broker.cancel_calls == []
+        # The order must NOT have been moved to CANCEL_PENDING by a
+        # cancel the gate refused.
+        assert order_repository.load(conn, oi.internal_order_id).state == "ACCEPTED"

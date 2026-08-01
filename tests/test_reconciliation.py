@@ -47,15 +47,57 @@ class TestReconcileUnknownOrder:
     def test_matches_fill_history_resolves_filled(self):
         outcome = reconcile_unknown_order(
             "ord-1", "kis-999", [], [{"ODNO": "kis-999", "ft_ccld_qty": "1"}],
+            requested_quantity=1,
         )
         assert outcome.resolved is True
         assert outcome.confirmed_status == "FILLED"
 
-    def test_matches_fill_history_zero_qty_resolves_cancelled(self):
+    def test_partial_fill_is_not_reported_as_filled(self):
+        # CODEX-044: a 2-share order with a single 1-share fill row was
+        # previously resolved out of UNKNOWN as fully FILLED.
+        outcome = reconcile_unknown_order(
+            "ord-1", "kis-999", [], [{"ODNO": "kis-999", "ft_ccld_qty": "1"}],
+            requested_quantity=2,
+        )
+        assert outcome.resolved is True
+        assert outcome.confirmed_status == "PARTIALLY_FILLED"
+
+    def test_two_fill_rows_summing_to_requested_resolve_filled(self):
+        outcome = reconcile_unknown_order(
+            "ord-1", "kis-999", [], [
+                {"ODNO": "kis-999", "ft_ccld_qty": "1"},
+                {"ODNO": "kis-999", "ft_ccld_qty": "1"},
+            ],
+            requested_quantity=2,
+        )
+        assert outcome.confirmed_status == "FILLED"
+
+    def test_unknown_requested_quantity_never_guesses_filled(self):
+        outcome = reconcile_unknown_order(
+            "ord-1", "kis-999", [], [{"ODNO": "kis-999", "ft_ccld_qty": "1"}],
+            requested_quantity=None,
+        )
+        assert outcome.resolved is False
+        assert outcome.confirmed_status is None
+
+    def test_cumulative_fill_exceeding_requested_is_not_resolved(self):
+        outcome = reconcile_unknown_order(
+            "ord-1", "kis-999", [], [{"ODNO": "kis-999", "ft_ccld_qty": "3"}],
+            requested_quantity=2,
+        )
+        assert outcome.resolved is False
+        assert "data integrity" in outcome.reason
+
+    def test_matches_fill_history_zero_qty_stays_unresolved(self):
+        # A fill row that reports zero filled quantity confirms nothing;
+        # resolving it to CANCELLED was a guess that could clear the
+        # UNKNOWN block on an order that had actually reached the market.
         outcome = reconcile_unknown_order(
             "ord-1", "kis-999", [], [{"ODNO": "kis-999", "ft_ccld_qty": "0"}],
+            requested_quantity=1,
         )
-        assert outcome.confirmed_status == "CANCELLED"
+        assert outcome.resolved is False
+        assert outcome.confirmed_status is None
 
     def test_matches_open_order_resolves_accepted(self):
         outcome = reconcile_unknown_order("ord-1", "kis-999", [{"ODNO": "kis-999"}], [])
@@ -69,6 +111,7 @@ class TestReconcileUnknownOrder:
     def test_fill_takes_priority_over_open_order(self):
         outcome = reconcile_unknown_order(
             "ord-1", "kis-999", [{"ODNO": "kis-999"}], [{"ODNO": "kis-999", "ft_ccld_qty": "1"}],
+            requested_quantity=1,
         )
         assert outcome.confirmed_status == "FILLED"
 

@@ -52,7 +52,7 @@ import risk_config
 from config import scalping_strategy_v1_config as strat_cfg
 from config.live_exit_flags import LiveExitFlags
 from domain.position import Position
-from execution import idempotency
+from execution import idempotency, order_repository
 from positions import lifecycle, states, store
 from reconciliation import reconciliation_state
 from reconciliation.order_reconciler import reconcile_unknown_order
@@ -173,7 +173,39 @@ def _reconcile_account_and_orders(*, kis_broker, conn, open_positions, kis_posit
     never the previous `reconciliation_ok=True` constant. Never raises:
     a KIS read failure here must leave the PREVIOUS (or absent) recorded
     result in place, which is exactly what should make the gates fail
-    closed rather than silently pass."""
+    closed rather than silently pass.
+
+    CODEX-044 (ordering): NOTHING is recorded until every required KIS
+    read has already succeeded. The previous version computed the
+    position comparison, recorded `clean=...` immediately, and only then
+    queried open orders/fills -- so a failure of that second query still
+    left a freshly-stamped clean timestamp behind, i.e. a failed read
+    could refresh the very record the gates use to decide the account is
+    reconciled. The recorded result now also accounts for any order
+    still sitting in UNKNOWN after this tick's resolution attempt."""
+    try:
+        kis_open_orders = kis_broker.get_open_orders()
+        kis_fills = kis_broker.get_fills(start_date=now.strftime("%Y%m%d"), end_date=now.strftime("%Y%m%d"))
+    except Exception:
+        # Can't complete a real reconciliation this tick. Record NOTHING:
+        # the previous (or absent) result simply ages out, which is the
+        # fail-closed outcome -- never an exception that would abort the
+        # tick, and never a refreshed clean timestamp.
+        return
+
+    for row in idempotency.list_unknown_orders(conn):
+        outcome = reconcile_unknown_order(
+            row["internal_order_id"], row["broker_order_id"], kis_open_orders, kis_fills,
+            requested_quantity=row["requested_quantity"],
+        )
+        if outcome.resolved:
+            order_repository.compare_and_set_state(
+                conn, order_id=row["internal_order_id"], expected_state="UNKNOWN",
+                next_state=outcome.confirmed_status, event_type="UNKNOWN_RECONCILED",
+                event_payload={"reason": outcome.reason},
+                expected_version=row["version"], via_reconciliation=True,
+            )
+
     internal_positions = [
         Position(
             symbol=record["symbol"], quantity=record["remaining_qty"],
@@ -183,22 +215,11 @@ def _reconcile_account_and_orders(*, kis_broker, conn, open_positions, kis_posit
         for record in open_positions.values() if record["remaining_qty"]
     ]
     mismatches = reconcile_positions(internal_positions, kis_positions)
-    reconciliation_state.record_result(clean=not mismatches, mismatch_count=len(mismatches), now=now)
-
-    try:
-        kis_open_orders = kis_broker.get_open_orders()
-        kis_fills = kis_broker.get_fills(start_date=now.strftime("%Y%m%d"), end_date=now.strftime("%Y%m%d"))
-    except Exception:
-        # Can't resolve any UNKNOWN order this tick -- they simply stay
-        # UNKNOWN (has_unknown_order() keeps blocking), which is the
-        # fail-closed outcome, not an exception that would abort the tick.
-        return
-    for row in idempotency.list_unknown_orders(conn):
-        outcome = reconcile_unknown_order(
-            row["internal_order_id"], row["broker_order_id"], kis_open_orders, kis_fills,
-        )
-        if outcome.resolved:
-            idempotency.update_status(conn, row["internal_order_id"], outcome.confirmed_status)
+    still_unknown = idempotency.has_unknown_order(conn)
+    reconciliation_state.record_result(
+        clean=not mismatches and not still_unknown,
+        mismatch_count=len(mismatches) + (1 if still_unknown else 0), now=now,
+    )
 
 
 def sync_kis_fills_and_manage_exits(*, kis_broker, broker_adapter, now=None, conn=None):
