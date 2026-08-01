@@ -92,6 +92,7 @@ REASON_AUDIT_PERSISTENCE = "AUDIT_PERSISTENCE"
 REASON_AUDIT_CONTEXT_MISSING = "AUDIT_CONTEXT_MISSING"
 REASON_CANCEL_FINAL_STATE_PERSISTENCE = "CANCEL_FINAL_STATE_PERSISTENCE"
 REASON_STATE_READ_FAILURE = "STATE_READ_FAILURE"
+REASON_FATAL_REPOSITORY_CONNECTION = "FATAL_REPOSITORY_CONNECTION"
 
 
 class CancelPreTransportBlocked(ExecutionEngineError):
@@ -180,6 +181,8 @@ def _reject(conn, record, *, event_type, reason):
         return order_repository.advance(
             conn, record, "REJECTED", event_type=event_type, event_payload={"reason": reason},
         )
+    except FatalRepositoryConnectionError:
+        raise  # CODEX-059: never swallowed by a best-effort write
     except Exception:  # noqa: BLE001 -- best-effort governance write (CODEX-055)
         logger.exception("could not record REJECTED for %s", record.internal_order_id)
         return record
@@ -325,6 +328,8 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
             record = order_repository.advance(
                 conn, record, "VALIDATING", event_type="VALIDATION_STARTED", now=current,
             )
+        except FatalRepositoryConnectionError:
+            raise  # CODEX-059: fatal outranks the ordinary persistence path
         except OrderRepositoryError as exc:
             raise ExecutionEngineError(
                 f"{side_label} order blocked -- could not durably record VALIDATING: {exc}",
@@ -356,6 +361,8 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
             record = order_repository.advance(
                 conn, record, "APPROVED", event_type="GATE_APPROVED", now=current,
             )
+        except FatalRepositoryConnectionError:
+            raise  # CODEX-059
         except OrderRepositoryError as exc:
             raise ExecutionEngineError(
                 f"{side_label} order blocked -- could not durably record APPROVED: {exc}",
@@ -372,6 +379,8 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
             record = order_repository.advance(
                 conn, record, "SUBMITTING", event_type="TRANSPORT_SUBMITTING", now=current,
             )
+        except FatalRepositoryConnectionError:
+            raise  # CODEX-059
         except OrderRepositoryError as exc:
             # The durable state could not be advanced, so the broker is
             # NOT called: an order whose SUBMITTING was never persisted
@@ -409,6 +418,8 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
                 event_payload={"broker_order_id": execution_record.broker_order_id},
                 broker_order_id=execution_record.broker_order_id, now=current,
             )
+        except FatalRepositoryConnectionError:
+            raise  # CODEX-059: no UNKNOWN fallback on a poisoned connection
         except OrderRepositoryError as exc:
             # The order IS live at KIS but we could not record its
             # outcome -- exactly the "we no longer know the true state"
@@ -459,6 +470,8 @@ def _force_unknown_reported(conn, record, *, reason, now, broker_order_id=None):
             event_payload={"reason": reason}, broker_order_id=broker_order_id, now=now,
         )
         return updated, True, None
+    except FatalRepositoryConnectionError:
+        raise  # CODEX-059: the caller must see the fatal type, not a report
     except Exception as exc:  # noqa: BLE001 -- normalized by the caller
         logger.error(
             "could not persist UNKNOWN for order %s: %s",
@@ -533,10 +546,21 @@ def submit_cancel(*, order_intent, broker_order_id, cancel_gate_context_builder,
             transport=transport,
         )
         inner_returned = True
+    except FatalRepositoryConnectionError as exc:
+        # CODEX-059: fatal outranks everything. A terminal event is still
+        # attempted -- on shadow_audit's OWN connection, never the
+        # poisoned one -- but purely best-effort: whether it succeeds or
+        # fails, the exception that leaves this function is the fatal
+        # one, unchanged, so the entrypoint exits 4.
+        terminal_written = _finalize_cancel(
+            audit_run_id=audit_run_id, terminal_event=shadow_audit.SHADOW_ERROR,
+            order_intent=order_intent, broker_order_id=broker_order_id,
+            reason_code=REASON_FATAL_REPOSITORY_CONNECTION, detail=type(exc).__name__,
+            now=current, transport=transport, best_effort=True,
+        )
+        _alert_fatal_connection(order_intent=order_intent, error=exc)
+        raise
     except BaseException as exc:  # noqa: BLE001 -- no path may leave the run open
-        # CODEX-058: a fatal connection fault still ends the run (the
-        # audit store has its own connection), but it propagates
-        # UNCHANGED so the service entrypoint can fail-stop the process.
         terminal_written = _finalize_cancel(
             audit_run_id=audit_run_id,
             terminal_event=_cancel_terminal_for(transport, exc),
@@ -550,6 +574,13 @@ def submit_cancel(*, order_intent, broker_order_id, cancel_gate_context_builder,
         # finalized below, after this block, so this must not pre-empt it.
         # It classifies by the same authority, so it cannot mislabel a
         # post-transport failure as blocked either.
+        # CODEX-059: `_finalize_cancel(best_effort=True)` swallows every
+        # audit failure, so this net cannot downgrade an in-flight fatal
+        # into an audit error. The one exception it does re-raise is a
+        # FatalRepositoryConnectionError, which would replace a fatal
+        # with a fatal -- the entrypoint still exits 4 either way. That is
+        # the property being relied on here, and it is asserted by tests
+        # rather than left implicit.
         if not inner_returned and not terminal_written:
             _finalize_cancel(
                 audit_run_id=audit_run_id,
@@ -609,6 +640,26 @@ def _alert_cancel_persistence_failure(*, order_intent, unknown_persisted, error,
         )
     except Exception as exc:  # noqa: BLE001 -- alerting must not mask the failure
         logger.error("could not alert on cancel persistence failure: %s", exc)
+
+
+def _alert_fatal_connection(*, order_intent, error):
+    """CRITICAL alert for a fault that requires a process restart. Only
+    the error TYPE is reported -- never SQL, a connection repr, an
+    account number or a broker payload."""
+    try:
+        from operations import alerts
+
+        alerts.send_alert(
+            "*CRITICAL: fatal order-state connection fault during cancel*\n"
+            f"- internal_order_id: {order_intent.internal_order_id}\n"
+            f"- symbol: {order_intent.symbol}\n"
+            f"- error type: {type(error).__name__}\n"
+            "- HALT: set\n"
+            "- action: process must restart to release the SQLite write lock; manual "
+            "reconciliation against KIS order history is required"
+        )
+    except Exception as exc:  # noqa: BLE001 -- alerting must not mask the fault
+        logger.error("could not alert on a fatal connection fault: %s", exc)
 
 
 def _alert_repository_read_failure(*, order_intent, operation, error):
@@ -723,6 +774,8 @@ def _finalize_cancel(*, audit_run_id, terminal_event, order_intent, broker_order
             payload=payload, now=now,
         )
         return True
+    except FatalRepositoryConnectionError:
+        raise  # CODEX-059: audit handling never outranks a fatal fault
     except (shadow_audit.ShadowAuditError, shadow_audit.AuditInvariantError) as exc:
         if not best_effort:
             raise ExecutionEngineError(
@@ -797,6 +850,8 @@ def _cancel_inner(*, order_intent, broker_order_id, cancel_gate_context_builder,
                 event_payload={"broker_order_id": broker_order_id},
                 broker_order_id=broker_order_id, now=current,
             )
+        except FatalRepositoryConnectionError:
+            raise  # CODEX-059
         except (OrderStateTransitionError, OrderRepositoryError) as exc:
             raise CancelPreTransportBlocked(
                 f"cancel blocked -- could not durably record CANCEL_PENDING for "
@@ -841,6 +896,21 @@ def _cancel_inner(*, order_intent, broker_order_id, cancel_gate_context_builder,
                 conn, record, "CANCELLED", event_type="CANCEL_CONFIRMED",
                 event_payload={"broker_order_id": broker_order_id}, now=current,
             )
+        except FatalRepositoryConnectionError:
+            # CODEX-059: the connection could neither be rolled back nor
+            # closed. It must NOT be converted into an ordinary execution
+            # error, and nothing further may be attempted on it -- no
+            # UNKNOWN fallback, no additional CAS, no read. HALT and the
+            # CRITICAL alert were already raised by the repository. This
+            # propagates unchanged so the service entrypoint fail-stops
+            # the process, which is the only thing that actually releases
+            # the SQLite write lock.
+            logger.critical(
+                "cancel final-state persistence hit a fatal connection fault for order %s -- "
+                "propagating unchanged so the process can fail-stop",
+                order_intent.internal_order_id,
+            )
+            raise
         except Exception as exc:  # noqa: BLE001 -- every failure is normalized (CODEX-055)
             # CODEX-054: KIS CONFIRMED the cancel and we could not record
             # it. This is not a block -- the execution happened. Do the

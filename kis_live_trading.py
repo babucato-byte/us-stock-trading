@@ -53,6 +53,7 @@ from domain.order_intent import OrderIntent, OrderIntentError
 from domain.signal import Signal, SignalError, build_signal
 from execution import execution_engine, order_gate
 from execution.execution_engine import ExecutionEngineError
+from execution.order_repository import FatalRepositoryConnectionError
 from market_data.kis_validation_provider import (
     KISValidationProvider,
     compute_price_deviation_percent,
@@ -504,6 +505,15 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None):
                 # event for this run.
                 terminal_recorded = True
                 results["blocked"].append((symbol, f"shadow audit failure: {exc}"))
+            except FatalRepositoryConnectionError:
+                # CODEX-059: a fatal connection fault aborts the WHOLE
+                # cycle -- no further symbols are evaluated -- and reaches
+                # the entrypoint unchanged so the process fail-stops.
+                terminal_recorded = True
+                _finalize(run_id, {"result": shadow_audit.RESULT_ERROR,
+                                   "reason_code": "FATAL_REPOSITORY_CONNECTION",
+                                   "detail": None}, symbol=symbol, now=current)
+                raise
             except Exception as exc:  # noqa: BLE001 -- audited, then reported as a blocked result
                 outcome = {"result": shadow_audit.RESULT_ERROR, "reason_code": "UNEXPECTED"}
                 results["blocked"].append((symbol, f"unexpected error: {exc}"))

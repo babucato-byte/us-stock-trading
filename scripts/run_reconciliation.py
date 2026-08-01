@@ -108,6 +108,10 @@ def resolve_unknown_orders(conn, broker, *, now):
                 event_payload={"reason": outcome.reason}, expected_version=row["version"],
                 via_reconciliation=True, now=now,
             )
+        except FatalRepositoryConnectionError:
+            # CODEX-059: not a per-order problem -- the connection is
+            # unusable and the process must stop.
+            raise
         except order_repository.OrderRepositoryError as exc:
             # Another writer got there first -- their result stands.
             logger.warning("CAS conflict resolving %s: %s", row["internal_order_id"], exc)
