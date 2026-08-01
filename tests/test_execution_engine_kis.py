@@ -20,6 +20,13 @@ NOW = datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc)
 ACCOUNT_ID = "123"
 
 
+def _run_id():
+    """CODEX-053: audit_run_id is a REQUIRED argument now, so every test
+    supplies one explicitly -- exactly as production callers must."""
+    import shadow_audit
+    return shadow_audit.new_run_id()
+
+
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
     monkeypatch.setenv("STATE_STORE_DB_FILE", str(tmp_path / "TEST_STATE.db"))
@@ -156,7 +163,7 @@ def _submit_accepted(conn, order_intent, broker=None):
               else "buy_gate_context_builder": builder(order_intent)}
     return submit(
         order_intent=order_intent, conn=conn, broker=broker, instrument=_instrument(),
-        account_id=ACCOUNT_ID, now=NOW, **kwargs,
+        account_id=ACCOUNT_ID, audit_run_id=_run_id(), now=NOW, **kwargs,
     )
 
 
@@ -176,7 +183,8 @@ class TestSubmitBuyOrder:
         broker = _FakeBroker(response=_accepted_record(oi))
         result = execution_engine.submit_buy_order(
             order_intent=oi, buy_gate_context_builder=_passing_buy_ctx_builder(oi),
-            conn=conn, broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID, now=NOW,
+            conn=conn, broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID,
+            audit_run_id=_run_id(), now=NOW,
         )
         assert result.status == "ACCEPTED"
         assert len(broker.calls) == 1
@@ -187,14 +195,16 @@ class TestSubmitBuyOrder:
         broker = _FakeBroker(response=_accepted_record(oi))
         execution_engine.submit_buy_order(
             order_intent=oi, buy_gate_context_builder=_passing_buy_ctx_builder(oi),
-            conn=conn, broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID, now=NOW,
+            conn=conn, broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID,
+            audit_run_id=_run_id(), now=NOW,
         )
         oi2 = _order_intent(internal_order_id="ord-2")  # same signal/symbol/side/date
         broker2 = _FakeBroker(response=_accepted_record(oi2))
         with pytest.raises(ExecutionEngineError, match="idempotency"):
             execution_engine.submit_buy_order(
                 order_intent=oi2, buy_gate_context_builder=_passing_buy_ctx_builder(oi2),
-                conn=conn, broker=broker2, instrument=_instrument(), account_id=ACCOUNT_ID, now=NOW,
+                conn=conn, broker=broker2, instrument=_instrument(), account_id=ACCOUNT_ID,
+                audit_run_id=_run_id(), now=NOW,
             )
         assert broker2.calls == []
 
@@ -210,7 +220,8 @@ class TestSubmitBuyOrder:
         with pytest.raises(ExecutionEngineError, match="order gate"):
             execution_engine.submit_buy_order(
                 order_intent=oi, buy_gate_context_builder=_failing_ctx,
-                conn=conn, broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID, now=NOW,
+                conn=conn, broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID,
+            audit_run_id=_run_id(), now=NOW,
             )
         assert broker.calls == []
 
@@ -221,7 +232,8 @@ class TestSubmitBuyOrder:
         with pytest.raises(KISAmbiguousResponseError):
             execution_engine.submit_buy_order(
                 order_intent=oi, buy_gate_context_builder=_passing_buy_ctx_builder(oi),
-                conn=conn, broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID, now=NOW,
+                conn=conn, broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID,
+            audit_run_id=_run_id(), now=NOW,
             )
         from execution import idempotency
         row = idempotency.find_existing(
@@ -237,7 +249,8 @@ class TestSubmitBuyOrder:
         with pytest.raises(KISBrokerError):
             execution_engine.submit_buy_order(
                 order_intent=oi, buy_gate_context_builder=_passing_buy_ctx_builder(oi),
-                conn=conn, broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID, now=NOW,
+                conn=conn, broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID,
+            audit_run_id=_run_id(), now=NOW,
             )
         from execution import idempotency
         row = idempotency.find_existing(
@@ -254,7 +267,8 @@ class TestSubmitSellOrder:
         broker = _FakeBroker(response=_accepted_record(oi))
         result = execution_engine.submit_sell_order(
             order_intent=oi, sell_gate_context_builder=_passing_sell_ctx_builder(oi),
-            conn=conn, broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID, now=NOW,
+            conn=conn, broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID,
+            audit_run_id=_run_id(), now=NOW,
         )
         assert result.status == "ACCEPTED"
         assert len(broker.calls) == 1
@@ -266,7 +280,8 @@ class TestSubmitSellOrder:
         with pytest.raises(ExecutionEngineError, match="order gate"):
             execution_engine.submit_sell_order(
                 order_intent=oi, sell_gate_context_builder=_passing_sell_ctx_builder(oi),
-                conn=conn, broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID, now=NOW,
+                conn=conn, broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID,
+            audit_run_id=_run_id(), now=NOW,
             )
         assert broker.calls == []
 
@@ -281,7 +296,8 @@ class TestHaltBlocksNewOrdersButNotCancel:
         with pytest.raises(ExecutionEngineError, match="HALT"):
             execution_engine.submit_buy_order(
                 order_intent=oi, buy_gate_context_builder=_passing_buy_ctx_builder(oi),
-                conn=conn, broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID, now=NOW,
+                conn=conn, broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID,
+            audit_run_id=_run_id(), now=NOW,
             )
         assert broker.calls == []
 
@@ -294,7 +310,8 @@ class TestHaltBlocksNewOrdersButNotCancel:
         with pytest.raises(ExecutionEngineError, match="HALT"):
             execution_engine.submit_sell_order(
                 order_intent=oi, sell_gate_context_builder=_passing_sell_ctx_builder(oi),
-                conn=conn, broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID, now=NOW,
+                conn=conn, broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID,
+            audit_run_id=_run_id(), now=NOW,
             )
         assert broker.calls == []
 
@@ -308,7 +325,7 @@ class TestHaltBlocksNewOrdersButNotCancel:
         result = execution_engine.submit_cancel(
             order_intent=oi, broker_order_id="kis-1",
             cancel_gate_context_builder=_passing_cancel_ctx_builder(),
-            conn=conn, broker=broker, instrument=_instrument(), now=NOW,
+            conn=conn, broker=broker, instrument=_instrument(), audit_run_id=_run_id(), now=NOW,
         )
         assert result.status == "CANCELLED"
         assert len(broker.cancel_calls) == 1
@@ -323,7 +340,7 @@ class TestSubmitCancel:
         result = execution_engine.submit_cancel(
             order_intent=oi, broker_order_id="kis-1",
             cancel_gate_context_builder=_passing_cancel_ctx_builder(),
-            conn=conn, broker=broker, instrument=_instrument(), now=NOW,
+            conn=conn, broker=broker, instrument=_instrument(), audit_run_id=_run_id(), now=NOW,
         )
         assert result.status == "CANCELLED"
         assert len(broker.cancel_calls) == 1
@@ -342,7 +359,7 @@ class TestSubmitCancel:
             execution_engine.submit_cancel(
                 order_intent=oi, broker_order_id="kis-1",
                 cancel_gate_context_builder=_passing_cancel_ctx_builder(),
-                conn=conn, broker=broker, instrument=_instrument(), now=NOW,
+                conn=conn, broker=broker, instrument=_instrument(), audit_run_id=_run_id(), now=NOW,
             )
         assert broker.cancel_calls == []
 
@@ -363,7 +380,7 @@ class TestSubmitCancel:
         result = execution_engine.submit_cancel(
             order_intent=oi, broker_order_id="kis-1",
             cancel_gate_context_builder=_passing_cancel_ctx_builder(),
-            conn=conn, broker=broker, instrument=_instrument(), now=NOW,
+            conn=conn, broker=broker, instrument=_instrument(), audit_run_id=_run_id(), now=NOW,
         )
         assert result.status == "UNKNOWN"
         assert order_repository.load(conn, oi.internal_order_id).state == "UNKNOWN"
@@ -384,7 +401,7 @@ class TestSubmitCancel:
         with pytest.raises(ExecutionEngineError, match="order gate"):
             execution_engine.submit_cancel(
                 order_intent=oi, broker_order_id="kis-1", cancel_gate_context_builder=_failing_ctx,
-                conn=conn, broker=broker, instrument=_instrument(), now=NOW,
+                conn=conn, broker=broker, instrument=_instrument(), audit_run_id=_run_id(), now=NOW,
             )
         assert broker.cancel_calls == []
         # The order must NOT have been moved to CANCEL_PENDING by a

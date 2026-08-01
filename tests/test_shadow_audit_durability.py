@@ -126,8 +126,7 @@ class TestApprovalEventsPrecedeTransport:
         oi = _order_intent()
         execution_engine.submit_buy_order(
             order_intent=oi, buy_gate_context_builder=_buy_ctx_builder(oi), conn=conn,
-            broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID, now=NOW,
-            audit_run_id=run_id,
+            broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID, audit_run_id=run_id, now=NOW,
         )
         assert broker.calls, "the transport call never happened"
         assert "GATE_APPROVED" in broker.events_at_transport
@@ -144,8 +143,7 @@ class TestApprovalEventsPrecedeTransport:
         with pytest.raises(KISAmbiguousResponseError):
             execution_engine.submit_buy_order(
                 order_intent=oi, buy_gate_context_builder=_buy_ctx_builder(oi), conn=conn,
-                broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID, now=NOW,
-                audit_run_id=run_id,
+                broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID, audit_run_id=run_id, now=NOW,
             )
         types = [row["event_type"] for row in shadow_audit.read_events(shadow_run_id=run_id)]
         assert "GATE_APPROVED" in types
@@ -158,8 +156,7 @@ class TestApprovalEventsPrecedeTransport:
         oi = _order_intent()
         execution_engine.submit_buy_order(
             order_intent=oi, buy_gate_context_builder=_buy_ctx_builder(oi), conn=conn,
-            broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID, now=NOW,
-            audit_run_id=run_id,
+            broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID, audit_run_id=run_id, now=NOW,
         )
         assert broker.events_at_transport[-1] == "EXECUTION_PLANNED"
         assert broker.events_at_transport.index("GATE_APPROVED") < \
@@ -197,8 +194,7 @@ class TestAuditFailureIsFailClosed:
         with pytest.raises(ExecutionEngineError, match="audit event could not be persisted"):
             execution_engine.submit_buy_order(
                 order_intent=oi, buy_gate_context_builder=_buy_ctx_builder(oi), conn=conn,
-                broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID, now=NOW,
-                audit_run_id=run_id,
+                broker=broker, instrument=_instrument(), account_id=ACCOUNT_ID, audit_run_id=run_id, now=NOW,
             )
         # The whole point: no order was submitted.
         assert broker.calls == []

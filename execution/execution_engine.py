@@ -79,6 +79,35 @@ REASON_HALT = "HALT"
 REASON_GATE = "GATE"
 REASON_STATE_PERSISTENCE = "STATE_PERSISTENCE"
 REASON_AUDIT_PERSISTENCE = "AUDIT_PERSISTENCE"
+REASON_AUDIT_CONTEXT_MISSING = "AUDIT_CONTEXT_MISSING"
+
+
+def validate_audit_run_id(value):
+    """CODEX-053: every execution path must carry the Shadow audit run it
+    belongs to. There is no default and no fallback.
+
+    An engine that quietly generated its own id when the caller forgot
+    one would be worse than useless: the approval events would exist but
+    under an id nothing else references, so the run they belong to would
+    still look unaudited. And skipping the audit when the id is absent
+    would be a fail-OPEN on the one guarantee CODEX-048 established.
+    Both are refused here, before any state transition or network call.
+
+    Returns the normalized id; raises with reason_code
+    AUDIT_CONTEXT_MISSING for None, a non-string, an empty string, or a
+    whitespace-only string."""
+    if not isinstance(value, str):
+        raise ExecutionEngineError(
+            f"audit_run_id is required and must be a string, got {type(value).__name__}",
+            reason_code=REASON_AUDIT_CONTEXT_MISSING,
+        )
+    normalized = value.strip()
+    if not normalized:
+        raise ExecutionEngineError(
+            "audit_run_id is required and must not be empty or whitespace",
+            reason_code=REASON_AUDIT_CONTEXT_MISSING,
+        )
+    return normalized
 
 
 class ExecutionResult:
@@ -144,9 +173,11 @@ def _audit_before_transport(*, audit_run_id, event_type, order_intent, side_labe
     leaves an order that may well have reached KIS with no durable record
     of the approval that authorized it -- which is exactly the state the
     audit trail exists to make impossible. Failing closed here costs a
-    missed order; failing open costs an unaudited real order."""
-    if audit_run_id is None:
-        return
+    missed order; failing open costs an unaudited real order.
+
+    `audit_run_id` is already validated by validate_audit_run_id() at the
+    top of the flow, so there is deliberately no "if not set, skip"
+    branch here -- that branch was CODEX-053."""
     try:
         shadow_audit.record_event(
             shadow_run_id=audit_run_id, event_type=event_type,
@@ -164,7 +195,7 @@ def _audit_before_transport(*, audit_run_id, event_type, order_intent, side_labe
 
 
 def submit_buy_order(*, order_intent, buy_gate_context_builder, conn, broker, instrument,
-                     account_id, now=None, audit_run_id=None):
+                     account_id, audit_run_id, now=None):
     """`buy_gate_context_builder` is a ONE-ARG callable the caller
     supplies that takes the `ReconciliationSnapshot` this engine just
     built and returns a fully-populated `order_gate.BuyGateContext` --
@@ -182,7 +213,7 @@ def submit_buy_order(*, order_intent, buy_gate_context_builder, conn, broker, in
 
 
 def submit_sell_order(*, order_intent, sell_gate_context_builder, conn, broker, instrument,
-                      account_id, now=None, audit_run_id=None):
+                      account_id, audit_run_id, now=None):
     """CODEX-044: identical reconciliation policy to the buy path --
     same snapshot, same TTL, same account/symbol binding, same
     fail-closed outcomes. `sell_gate_context_builder` takes the
@@ -195,7 +226,7 @@ def submit_sell_order(*, order_intent, sell_gate_context_builder, conn, broker, 
 
 
 def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, broker, instrument,
-                       account_id, now, side_label, audit_run_id=None):
+                       account_id, now, side_label, audit_run_id):
     """The single new-order flow both submit_buy_order() and
     submit_sell_order() run -- buy and sell differ ONLY in which gate
     function evaluates the context, never in which safety steps run or
@@ -218,6 +249,9 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
     Any failure before SUBMITTING means zero transport calls. A CAS
     conflict at any point aborts without ever calling the broker again.
     """
+    # CODEX-053: before the idempotency row, before any state transition,
+    # before the gate, before the network. No audit context, no order.
+    audit_run_id = validate_audit_run_id(audit_run_id)
     current = now or datetime.now(timezone.utc)
     trading_date = current.date().isoformat()
     with idempotency.single_run_lock():
@@ -358,7 +392,8 @@ def _force_unknown(conn, record, *, reason, now, broker_order_id=None):
         return record
 
 
-def submit_cancel(*, order_intent, broker_order_id, cancel_gate_context_builder, conn, broker, instrument, now=None):
+def submit_cancel(*, order_intent, broker_order_id, cancel_gate_context_builder, conn, broker,
+                   instrument, audit_run_id, now=None):
     """CODEX-043: cancels a durable, already-submitted order. Uses
     authorization.authorize_cancel() -- deliberately NOT blocked by HALT
     (an existing unfilled order may always be cancelled to reduce risk),
@@ -369,6 +404,10 @@ def submit_cancel(*, order_intent, broker_order_id, cancel_gate_context_builder,
     transitions that SAME row to CANCEL_PENDING/CANCELLED/UNKNOWN, it
     does not register a new idempotency row (a cancel is not a new order
     attempt).
+
+    CODEX-053: `audit_run_id` is required here too. A cancel reaches the
+    KIS transport, so it is held to the same "approval is audited before
+    the network call" rule as a new order.
 
     CODEX-047: the cancel path is now held to the same state machine as
     the order path. It previously skipped CANCEL_PENDING entirely,
@@ -386,6 +425,7 @@ def submit_cancel(*, order_intent, broker_order_id, cancel_gate_context_builder,
         -> REJECTED is not a legal transition in the first place.
         Reconciliation against KIS's own history is what resolves it.
     """
+    audit_run_id = validate_audit_run_id(audit_run_id)
     current = now or datetime.now(timezone.utc)
     with idempotency.single_run_lock():
         record = order_repository.load(conn, order_intent.internal_order_id)
@@ -402,6 +442,14 @@ def submit_cancel(*, order_intent, broker_order_id, cancel_gate_context_builder,
         except (order_gate.OrderGateBlockedError, UnauthorizedExecutionError) as exc:
             raise ExecutionEngineError(f"cancel blocked by order gate: {exc}") from exc
 
+        # CODEX-053: a cancel is a real transport call, so it carries the
+        # same audit obligation a new order does.
+        _audit_before_transport(
+            audit_run_id=audit_run_id, event_type=shadow_audit.GATE_APPROVED,
+            order_intent=order_intent, side_label="cancel", now=current,
+            reason_code="CANCEL_APPROVED",
+        )
+
         try:
             record = order_repository.advance(
                 conn, record, "CANCEL_PENDING", event_type="CANCEL_REQUESTED",
@@ -413,6 +461,12 @@ def submit_cancel(*, order_intent, broker_order_id, cancel_gate_context_builder,
                 f"cancel blocked -- could not durably record CANCEL_PENDING for "
                 f"{order_intent.internal_order_id!r}: {exc}"
             ) from exc
+
+        _audit_before_transport(
+            audit_run_id=audit_run_id, event_type=shadow_audit.EXECUTION_PLANNED,
+            order_intent=order_intent, side_label="cancel", now=current,
+            reason_code="CANCEL_PENDING", detail=f"broker_order_id={broker_order_id}",
+        )
 
         try:
             execution_record = broker.cancel_order(
