@@ -1,9 +1,10 @@
-# CODEX_REVIEW — CODEX-057·058 최종 독립 재검증
+# CODEX_REVIEW — CODEX-059·060 최종 독립 재검증
 
 ## 1. 검증 대상 및 독립성
 
-구현자 완료 보고와 기존 테스트 결과를 재사용하지 않고 코드, DB 오류, 다중 프로세스 lock과
-entrypoint 종료 동작을 새로 검증했다.
+구현자 완료 보고와 기존 테스트 결과를 재사용하지 않고, 실제 코드·subprocess·다중 프로세스 lock
+동작·Git 상태를 새로 확인했다. 저장소 밖 `/private/tmp`에 독립 probe를 작성해 실행하고 검증 후
+삭제했다.
 
 검증 시작 시 실행 결과:
 
@@ -15,310 +16,476 @@ $ git branch --show-current
 feature/kis-live-broker
 
 $ git rev-parse HEAD
-d783251e687686577e8ed29cb7e1837faec52df7
+7309a8313adf7801b47a1c6486703ef81fa3efb9
 
 $ git show --stat --oneline HEAD
-d783251 Normalize repository reads and fail-stop on unrecoverable connections
- execution/execution_engine.py                      |  90 +++-
- execution/idempotency.py                           |  54 +-
- execution/order_repository.py                      | 191 ++++++-
- scripts/run_health_report.py                       |  39 ++
- scripts/run_live_buy_entry.py                      |  45 +-
- scripts/run_reconciliation.py                      |  38 ++
- scripts/run_shadow_exit_evaluation.py              |  37 ++
- scripts/run_shadow_mode.py                         |  38 ++
- tests/test_cancel_audit_lifecycle.py               |  11 +-
- tests/test_persistence_failure_normalization.py    |   8 +-
- tests/test_repository_read_and_fatal_connection.py | 581 +++++++++++++++++++++
- 11 files changed, 1070 insertions(+), 62 deletions(-)
+7309a83 Clean up preflight single-run lock lifecycle
+ execution/idempotency.py                | 159 +++++++++++--
+ tests/test_oracle_deploy_package.py     |   6 +
+ tests/test_single_run_lock_lifecycle.py | 380 ++++++++++++++++++++++++++++++++
+ 3 files changed, 527 insertions(+), 18 deletions(-)
 
 $ git diff --check
 (no output — pass)
 ```
 
-필수 branch, exact HEAD, clean working tree와 diff check 조건은 모두 일치했다. 독립 수집 결과는
-`2223 tests collected in 2.90s`였다.
+branch, exact HEAD, clean working tree, diff check 조건이 모두 일치했다.
+`TARGET_COMMIT_MISMATCH` 아님.
+
+독립 probe 결과 합계: **78/78 PASS** (섹션별 2:14, 3:13, 4:14, 5:6, 6:12, 7:5, 8:14).
+각 fault 시나리오 앞에 무장애 대조군을 두어, 결과가 "코드에 도달하지 못해서 통과한 것"이
+아님을 먼저 확인했다.
+
+---
 
 ## 2. 최종 판정
 
-Overall verdict: **BLOCKED**
-
-CODEX-057: **RESOLVED**
-
-CODEX-058 repository invalidation/process-exit mechanism: **PARTIALLY RESOLVED**
-
-Oracle read-only deployment: **허용하지 않음 (현재 HEAD 기준)**
-
-Real-order activation: **금지**
-
-repository와 5개 entrypoint 자체의 수정은 요구대로 작동한다. 그러나 실제 cancel post-transport
-호출 경로가 `FatalRepositoryConnectionError`를 다른 예외로 변환해 entrypoint의 exit-code 4
-handler까지 전달하지 않는 신규 HIGH가 있다.
-
-### CODEX-059 — HIGH — cancel final-state handler가 fatal fail-stop 오류를 삼킴
-
-독립 production-only probe에서 broker cancel 반환 후 final-state 저장이
-`FatalRepositoryConnectionError`를 발생시키고 UNKNOWN fallback은 invalidated-connection 오류를
-발생시키도록 했다.
-
 ```text
-broker transport calls = 1
-repository fatal raised = FatalRepositoryConnectionError
-caller-visible exception = CancelPostTransportError
-caller-visible reason_code = STATE_PERSISTENCE
-caller-visible FatalRepositoryConnectionError = false
+PASS_WITH_CONDITIONS
 ```
 
-원인은 `_cancel_inner()`의 final `CANCELLED` 저장을 감싼 `except Exception`이 fatal 오류까지
-UNKNOWN fallback 경로로 보내고, 마지막에 항상 `CancelPostTransportError`를 생성하기 때문이다.
-`submit_cancel()` 바깥의 “fatal은 unchanged propagate” 주석과 달리 fatal 타입은 그 전에 소실된다.
+코드 Finding 기준으로는 CRITICAL / HIGH / MEDIUM 모두 0이고 CODEX-059·060은 해결됐다. 다만
+남은 항목이 **실제 KIS 응답 확인**뿐이므로 §16의 `PASS` 조건 중 "기존 Finding 회귀 없음 · 신규
+CRITICAL/HIGH 0"은 충족하나, 9개 wire 값이 `LIVE_RESPONSE_PENDING` 상태로 남아 있어
+`PASS_WITH_CONDITIONS`로 판정한다. 상세는 §11.
 
-결과적으로 해당 cancel이 5개 service 중 어느 실행 흐름에서 발생하더라도 entrypoint의
-`except FatalRepositoryConnectionError`와 exit code 4 경로가 실행되지 않고 일반 오류 처리로
-내려갈 수 있다. 이는 다음 BLOCKED 조건에 해당한다.
-
-- entrypoint가 실제 호출 경로에서 fatal 오류를 받지 못함
-- process가 exit-code 4 fail-stop 대신 계속 실행될 가능성
-- close 실패 후 OS lock 회수 보장 상실
-- 신규 HIGH 존재
-
-필수 조치:
-
-1. `_cancel_inner()`가 `FatalRepositoryConnectionError`를 별도 except로 즉시 재발생시켜 타입을
-   보존한다.
-2. terminal audit는 별도 connection으로 best-effort 시도하되 fatal을 변환하거나 덮지 않는다.
-3. 실제 `submit_cancel()` → service entrypoint call chain에서 exit code 4를 검증하는 테스트를
-   추가한다. entrypoint 함수에 fatal을 직접 주입하는 테스트만으로는 부족하다.
-4. audit DB도 lock에 막힐 때 원래 fatal을 보존하고 process가 종료되는지 고정한다.
-
-## 3. CODEX-057 결과
-
-### Repository read API 목록
-
-직접 검증한 public read API:
-
-- `order_repository.load()`
-- `order_repository.load_events()`
-- `idempotency.find_existing()`
-- `idempotency.has_unknown_order()`
-- `idempotency.list_orders_by_status()`
-- `idempotency.list_unknown_orders()`
-- `idempotency.list_orders_with_broker_id()`
-
-각 API에 `OperationalError`, `IntegrityError`, `DatabaseError`, base `sqlite3.Error`를 주입했다.
-모든 경우 상위 타입은 `OrderRepositoryReadError`였고 원본 타입은 `__cause__`로 보존됐다. raw
-SQLite escape는 0건이었다. 상위 메시지에는 SQL, binding, row, account 또는 payload가 없다.
-
-### Not-found와 read failure 구분
+`BLOCKED` 조건은 하나도 해당하지 않는다.
 
 ```text
-load(missing) = None
-load_events(missing) = []
-query failure = OrderRepositoryReadError
+FatalRepositoryConnectionError 강등            없음
+entrypoint exit code 4 우회                    없음
+정상/예외 종료 후 lock 잔존                    없음
+blocked process가 다른 process lock 삭제       없음
+inode 경쟁으로 두 process 동시 진입            없음
+stale lock이 다음 실행 차단                    없음
+preflight가 저장소 루트 artifact 생성          없음
+신규 CRITICAL/HIGH                             없음
 ```
 
-read failure가 None 또는 빈 이벤트 목록으로 변환되는 경로는 발견하지 않았다.
+---
 
-### 취소 대상 read failure
+## 3. CODEX-059 회귀 — 없음
 
-실제 존재하는 취소 대상과 유효 audit ID를 구성하고 대상 order SELECT만 실패시켰다.
+fatal 주입이 아니라 **실제 취소 final-state 경로**를 통과시켰다. 별도 child process에서 실제
+주문을 넣고 실제 취소를 수행하되, `CANCELLED` 저장 시점부터 commit·rollback·close가 모두
+실패하도록 했다.
+
+대조군(무장애, 같은 child):
 
 ```text
-transport calls = 0
-exception reason_code = STATE_READ_FAILURE
-events = [SHADOW_ERROR]
-SHADOW_BLOCKED = 0
-SHADOW_COMPLETED = 0
-terminal count = 1
-operator alert = 1
+rc=0  NO_FATAL cycles=1   (실제 취소가 CANCELLED까지 durable하게 완료)
 ```
 
-정상 not-found는 transport 0, `SHADOW_BLOCKED` 1건을 유지해 정책 거절과 저장소 장애가 구분됐다.
-
-## 4. CODEX-058 connection invalidation
-
-rollback 실패 시 connection은 close 시도 전에 identity registry에 표시된다. registry는 object
-reference 자체를 value로 유지하므로 표시된 object가 살아 있는 동안 `id()`가 재사용되지 않는다.
-정상 connection의 false invalidation은 없었고 invalidated connection은 임의 복구되지 않는다.
-
-registry는 process lifetime 동안 항목을 제거하지 않으므로 이론상 누적되지만, 정상 설계에서는
-close까지 실패한 첫 fatal에서 즉시 process fail-stop하고 restart 시 module state가 초기화된다.
-
-invalidated connection으로 `load`, `load_events`, `append_creation_event`, `advance`,
-`compare_and_set_state`와 idempotency read를 시도한 집중 테스트는 SQL 실행 전에
-`OrderRepositoryConnectionInvalidatedError`를 발생시켰다.
-
-### Rollback/close 결과
+fault 주입:
 
 ```text
-commit fail + rollback success:
-OrderRepositoryTransactionError, transaction closed, later writer success
-
-commit fail + rollback fail + close success:
-OrderRepositoryRollbackError, connection unusable, later writer success
-
-commit fail + rollback fail + close fail:
-FatalRepositoryConnectionError, HALT set, connection registry-invalidated
+process exit code            = 4          (0 아님)
+caller-visible 예외 타입     = FatalRepositoryConnectionError
+CancelPostTransportError 강등 = 없음
+WRONG_TYPE                   = 없음
+후속 cycle                   = 0회 (cycles=1)
+HALT                         = True
+CRITICAL alert               = 발생
 ```
 
-close 실패 alert는 CRITICAL 문구와 process restart 필요를 포함하고 rollback 원인은 exception
-chain에 보존된다. 정상 success return은 없다. 단, CODEX-059 때문에 cancel 실제 호출 경로의
-fatal 전달은 실패한다.
-
-## 5. 5개 entrypoint와 systemd
-
-각 entrypoint work function에 `FatalRepositoryConnectionError`를 직접 주입한 독립 결과:
+프로세스 종료 후 DB write lock 회수:
 
 ```text
-run_live_buy_entry.main() = 4
-run_reconciliation.main() = 4
-run_shadow_mode.main() = 4
-run_shadow_exit_evaluation.main() = 4
-run_health_report.main() = 4
+새 writer의 BEGIN IMMEDIATE + UPDATE + commit = 성공
+미커밋 CANCELLED의 durable 여부 = 아님 (status=CANCEL_PENDING 유지)
 ```
 
-각 handler는 CRITICAL alert를 시도하고 정상 0으로 종료하지 않았다. 관련 5개 systemd unit은
-모두 `Restart=on-failure`이며 exit 4를 restart 방지 목록에 두지 않아 재시작 대상이다.
-
-그러나 이것은 fatal을 entrypoint에 직접 주입한 대조군이다. 실제 cancel 내부에서 fatal이
-CODEX-059처럼 변환되면 이 handler에 도달하지 못하므로 end-to-end 결과는 FAIL이다.
-
-## 6. 실제 다중 프로세스 DB lock
-
-실제 SQLite 파일과 별도 Python process를 사용했다.
-
-대조군:
+5개 entrypoint 직접 주입 대조:
 
 ```text
-process A: BEGIN IMMEDIATE + INSERT, process alive
-process B: BEGIN IMMEDIATE -> OperationalError(database is locked)
+run_live_buy_entry.main()        = 4
+run_reconciliation.main()        = 4
+run_shadow_mode.main()           = 4
+run_shadow_exit_evaluation.main()= 4
+run_health_report.main()         = 4
 ```
 
-장애군:
+취소 final-state persistence, UNKNOWN fallback, execution engine broad catch, `finally` 안전망,
+5개 entrypoint 모두에서 fatal 타입이 보존됐다. CODEX-059 회귀 없음.
+
+---
+
+## 4. CODEX-060 lock 경로 해석
 
 ```text
-process A: real write transaction + injected commit/rollback/close failure
-repository result: FatalRepositoryConnectionError
-process exit code: 4
-HALT: true
-process A 종료 후 process B BEGIN IMMEDIATE/write/commit: success
+미설정                     → 기존 운영 기본 경로 (<repo>/KIS_ORDER_IDEMPOTENCY.lock)
+"" / "   " / "\t"          → 기존 운영 기본 경로
+절대 경로                  → 해당 경로 사용
+상대 경로                  → 현재 cwd 기준 resolve
+부모 디렉터리 없음         → 생성
+부모가 디렉터리가 아님     → IdempotencyError (명시적 실패)
 ```
 
-따라서 fatal process가 실제로 종료되면 OS가 lock을 회수하고 영구 lock은 없다. 차단점은 이
-종료 메커니즘이 cancel actual call chain에서 CODEX-059 때문에 호출되지 않는다는 것이다.
-
-## 7. Order connection과 audit connection
-
-close 성공 invalidation 경로에서는 poisoned order connection 재사용 없이 별도 connection으로
-`SHADOW_ERROR` terminal, alert, HALT 기록이 가능했고 terminal은 최대 1건이었다.
-
-동일 DB lock 때문에 audit 저장이 실패하는 경우에도 `_finalize_cancel(..., best_effort=True)`는
-추가 alert를 시도한다. 하지만 fatal은 반드시 원형대로 보존돼야 하는데 final-state handler가
-먼저 `CancelPostTransportError`로 바꾸므로 이 항목은 end-to-end FAIL이다.
-
-## 8. Redaction
-
-raw SQLite 메시지에 가짜 계좌번호, CANO, App Key/Secret, token, Authorization, SQL, binding,
-broker payload와 connection 표현을 삽입한 저장소 및 process 검증에서 다음 출력의 원문 노출은
-0건이었다.
-
-- `OrderRepositoryReadError`
-- `FatalRepositoryConnectionError`
-- 운영 alert
-- Shadow audit/HALT 기록
-- 일반 로그 및 process stderr
-
-독립 stderr에서도 planted account, secret, SQL payload 검색 결과는 모두 0건이었다.
-
-## 9. 기존 CODEX-042~056 회귀
-
-집중 범위에서 다음을 재확인했다.
-
-- Alpaca 실제 주문 socket 0회
-- KIS central authorization/gate 우회 0건
-- reconciliation 실패 transport 0회, UNKNOWN account-wide 차단
-- 부분체결 정확성, 고위험 exit 기본 false
-- CAS 밖 상태 UPDATE 0건, `update_status` API 부재
-- audit ID 필수, terminal exactly once
-- cancel pre-transport `SHADOW_BLOCKED`, post-transport `SHADOW_ERROR`
-- UNKNOWN fallback raw SQLite 정규화
-- commit 실패 + rollback 성공 경로 정상
-- full SHA exact match, secret redaction
-- Shadow entry/exit 실제 주문 0회
-
-기존 기능 회귀는 발견하지 않았다. 신규 CODEX-059가 최종 판정을 차단한다.
-
-## 10. 테스트 결과
-
-### 집중 안전 테스트
-
-구현자 범위보다 넓게 관련 파일을 새로 선택했다.
+상대 경로가 cwd에 종속됨을 직접 확인했다. 동일 값 `rel/run.lock`으로 cwd를 바꿔 해석시켰다.
 
 ```text
-1704 passed
-0 failed
-0 skipped
-0 xfailed
-1 warning
-66.23s
+cwd=<repo>  → <repo>/rel/run.lock
+cwd=<tmp>   → <tmp>/rel/run.lock
+두 값 서로 다름 = 확인
 ```
 
-### 정방향 전체
+경로 해석이 **호출 시점**에 일어나는 것도 확인했다. 같은 프로세스에서 환경변수를 바꾸면
+`get_single_run_lock_file()` 반환값이 즉시 달라진다. import 시점 고정 아님.
+
+secret 노출: 이 lock 코드가 읽는 환경변수는 `TRADING_SINGLE_RUN_LOCK_FILE` 하나뿐이고
+(`os.environ` 참조 1회), 값은 파일 경로로만 사용된다. credential, 계좌번호, payload는 관여하지
+않는다.
+
+cwd 종속성은 `execution/idempotency.py`의 `get_single_run_lock_file()` docstring에 명시돼 있다
+(§3의 "런북 또는 코드 문서" 조건 충족). 다만 런북에는 이 환경변수가 전혀 언급돼 있지 않다 —
+§10의 LOW-2 참조.
+
+---
+
+## 5. 정상·예외 종료 cleanup
+
+각 경로를 실제로 실행했다.
 
 ```text
-2223 passed
-0 failed
-0 skipped
-0 xfailed
-2 warnings
-72.48s
+                    보유 중 파일 존재   종료 후 파일   예외 타입   메시지
+정상 종료                  O                없음          -          -
+RuntimeError               O                없음        보존       보존
+KeyboardInterrupt          O                없음        보존       보존
+SystemExit                 O                없음        보존       보존
+preflight 성공             O                없음          -          -
+preflight 실패             O                없음          -          -
 ```
 
-### 역방향 전체
+예외는 다른 타입으로 교체되지 않았고 원문 메시지도 그대로였다. 대조군으로 "보유 중에는 파일이
+실제로 존재한다"를 먼저 확인했으므로, cleanup 통과가 "애초에 파일이 안 만들어져서"가 아니다.
+
+저장소 루트 artifact: 모든 경우 0건.
+
+---
+
+## 6. Lock 소유권과 inode 검증
+
+획득 실패 process의 삭제 금지:
 
 ```text
-2223 passed
-0 failed
-0 skipped
-0 xfailed
-2 warnings
-75.28s
+process A가 flock 보유
+process B 획득 시도 (timeout 0.2s)
+→ B = BLOCKED
+→ B가 lock path 삭제하지 않음
+→ A의 inode 유지 (변경 없음)
 ```
 
-경고는 local LibreSSL/urllib3 호환 경고와 의도된 unsupported scanner-field 경고다.
-
-## 11. 네트워크, 운영 파일, artifact
-
-저장소 밖 socket guard가 `socket.connect`, `connect_ex`, `create_connection`을 차단·기록하는
-상태에서 집중 및 전체 정·역순 테스트와 독립 process probe를 실행했다.
+획득한 process의 identity 조건부 삭제:
 
 ```text
-socket guard log = absent
-Alpaca attempts = 0
-KIS attempts = 0
-Slack attempts = 0
-other external socket attempts = 0
+보유 중 path가 다른 inode로 교체됨
+→ 삭제 0회
+→ 교체된 파일 보존 (해당 inode 그대로)
+→ 경고 발생:
+  "single-run lock at ... was replaced by a different file while held
+   (expected inode N, found M) -- leaving it alone"
 ```
 
-운영 파일의 전후 SHA-256, size, mtime는 모두 동일하다.
+코드상으로도 `_unlink_owned_lock()`이 `os.stat(path)`의 (dev, inode)와 획득 시
+`os.fstat(handle)`로 잡은 identity가 일치할 때만 `os.unlink`한다. 실패 획득 경로는
+`_acquire_owned_lock()` 안에서 예외가 나가므로 unlink가 있는 `finally`에 도달하지 않는다.
+
+---
+
+## 7. unlink 순서와 경쟁 조건
+
+구현 순서는 보고된 대로다.
 
 ```text
-order_history.csv
-153feb31c2539c19cd60f63e3f90d0d0f734ba7a209ed1800af7c0070a0a91c7 | 31 | 1784558966
-
-universe.csv
-9fdaf3ac0ba7d94e24b6276fc603709a0c79c6842cf8143b8a242acdd16188b3 | 833518 | 1784558966
-
-strategy_performance.csv
-ca012439cb2ba6a8f285b3f95493f9b17d22abb5b01a924ef2bd4cfe96f66da8 | 69 | 1785083284
+flock 보유 → path unlink → flock 해제 → descriptor close
 ```
 
-신규 저장소 artifact는 0건이다. 검증 전부터 존재한 ignored zero-byte lock
-`KIS_ORDER_IDEMPOTENCY.lock`, `NOTIFICATION_HEALTH_STATE.lock`은 변경하지 않았다. 외부 probe,
-DB/WAL/SHM, 임시 env/lock/log와 socket guard는 검증 후 저장소 밖에서 제거했다.
+그리고 `_acquire_owned_lock()`은 flock 획득 **후** `fstat` identity와 `stat(path)` identity를
+재비교해, 불일치면 기존 descriptor를 버리고 처음부터 다시 획득한다.
 
-## 12. 남은 MEDIUM 및 Oracle read-only
+지시서 §3이 제시한 순서(해제 → close → unlink)와 다르다. 검증자 판단으로는 §3 순서가 §4가
+막으라고 한 경쟁을 오히려 만든다.
 
-`price_field_last`, `cancel_tr_id_live`는 공식 reference 확인 완료/실제 KIS 응답 미확인 상태이며
-실주문 전 Oracle read-only 또는 모의투자 확인이 필요하다. 그러나 현재는 신규 HIGH CODEX-059가
-존재해 남은 조건이 외부 확인뿐이 아니다. Oracle read-only 단계는 허용하지 않는다.
+```text
+A 해제 → B가 같은 inode 획득하고 임계구역 진입
+→ A가 뒤늦게 unlink → C가 새 파일 생성·획득 → B와 C 동시 진입
+```
+
+현재 구현은 unlink를 보유 중에 하므로, 해당 inode에서 깨어난 waiter는 identity 재확인에 실패해
+재시작한다. **채택된 순서가 더 안전하다고 판정한다.**
+
+이 주장을 단위 테스트가 아니라 실제 다중 프로세스로 검증했다.
+
+대조군 및 기본 배타성:
+
+```text
+무경합 taker 1개          → ACQUIRED, 종료 후 파일 없음
+A 보유 중 B·C·D·E 동시    → 4개 전부 BLOCKED
+                          → 누구도 A의 파일 삭제하지 않음
+                          → A의 inode 유지
+A 해제                    → A가 자기 파일 제거
+이후 taker                → ACQUIRED (영구 lock 없음)
+```
+
+동시 진입 탐지 stress (핵심):
+
+```text
+6개 독립 process × 25회 반복 = 150회 임계구역 진입
+각 process가 임계구역 진입/이탈 시 공유 journal에 O_APPEND 기록
+기록 총량 = 300줄 (대조군: stress가 실제로 수행됨)
+
+중첩 진입(E-E 연속) 탐지 = 0건
+mismatched exit 탐지      = 0건
+종료 후 lock 파일         = 없음
+```
+
+임계구역 동시 진입 최대 1 process, lock 파일 오삭제 0건, 영구 lock 0건.
+
+---
+
+## 8. Stale lock 복구 (실제 SIGKILL)
+
+```text
+child A: flock 획득 → "HELD" → SIGKILL
+  (finally 미실행, LOCK_UN 없음, unlink 없음)
+
+A 생존 중 획득 시도  = BLOCKED          (대조군: 살아 있는 보유자는 실제로 막는다)
+A 사망 후 파일 상태  = 존재 (stale)
+다음 실행            = 획득 성공, stale inode를 그 자리에서 재사용
+종료 후              = 파일 정리됨
+```
+
+파일 존재 자체는 실행을 차단하지 않으며, 실제 배타성 기준은 OS flock이다. stale path 자동 회수,
+종료 후 artifact 0건.
+
+---
+
+## 9. Preflight 실제 subprocess 재현
+
+`scripts/preflight_kis_live.py`를 cwd=저장소 루트로 실제 child process 실행했다.
+
+격리 환경변수 있음:
+
+```text
+성공: exit 0, "single_run_lock: no other instance holds the single-run lock" 출력(대조군)
+      tmp lock 종료 후 없음, 저장소 루트 lock 없음
+실패: exit 1, "PREFLIGHT FAILED"
+      tmp lock 종료 후 없음, 저장소 루트 lock 없음
+```
+
+격리 환경변수 **없음** (기존 결함의 원래 조건):
+
+```text
+성공 경로: single_run_lock 검사 실제 수행 → 저장소 루트 lock 없음
+실패 경로: PREFLIGHT FAILED → 저장소 루트 lock 없음
+```
+
+즉 테스트 cwd 변경이나 환경변수 격리로 결함을 숨긴 것이 아니라, 기본 운영 경로를 쓰는
+원래 조건에서도 lock 파일이 남지 않는다. 수정의 본체가 lock lifecycle 자체임을 확인했다.
+
+원 결함 경로 전체 재현:
+
+```text
+tests/test_oracle_deploy_package.py 단독 실행 = 155 passed
+저장소 루트 lock artifact = 0건
+```
+
+---
+
+## 10. Lock API 정적 검증 및 다른 flock context
+
+정적 확인 결과:
+
+```text
+import 시점 환경변수 고정   없음 (DEFAULT_LOCK_FILE만 상수, 해석은 호출 시)
+호출 시점 경로 해석         있음 (single_run_lock 진입 시 get_single_run_lock_file())
+획득 실패 process cleanup   없음 (예외가 finally 진입 전에 나감)
+inode identity 검증         있음 (fstat vs stat, (st_dev, st_ino))
+waiter 획득 후 identity 재확인 있음 (불일치 시 재획득 루프)
+```
+
+`single_run_lock` 의미(프로세스 단일 실행 잠금)를 갖는 것은 `execution/idempotency.py` 하나뿐이다.
+
+### LOW-1 — 다른 9개 flock context (범위 밖, 회귀 아님)
+
+```text
+scalping_watchlist/atomic_io.py      positions/store.py
+kill_switch_state.py                 notification_health.py
+order_intent_ledger.py               paper_strategy_order.py
+strategy_sources/repository.py       shadow_mode.py
+live_readiness/entry_reservation_ledger.py
+```
+
+확인 결과:
+
+```text
+모두 fcntl.flock(LOCK_EX | LOCK_NB) 사용 — 실제 배타성 기준은 OS lock
+.lock 파일을 남기는 것이 설계상 의도이며 문서화돼 있음
+  (예: positions/store.py "a stale .lock file left by a crashed process never blocks
+   the next", kill_switch_state.py, scalping_watchlist/atomic_io.py 동일 취지)
+파일 존재만으로 stale 실행을 차단하지 않음
+전체 정방향·역방향 실행에서 저장소 stray artifact 0건
+단일 실행(single-run) semantics를 주장하지 않음 — 각각 특정 state 파일의
+  read-modify-write 보호용이며 CODEX-060과 혼동될 여지 없음
+```
+
+신규 HIGH 아님. **LOW / 별도 정리 후보**로 기록한다.
+
+### LOW-2 — 런북에 신규 환경변수 미기재
+
+`TRADING_SINGLE_RUN_LOCK_FILE`이 `docs/`와 `deploy/` 어디에도 없다. 코드 docstring에는 cwd
+종속성까지 명시돼 있어 §3 조건 자체는 충족하지만, 운영자가 Oracle 배포 시 이 knob의 존재와
+상대 경로 함정을 런북에서 알 수 없다. 기능 결함 아님. **LOW / 문서 보완 후보**.
+
+---
+
+## 11. 코드 Finding과 Oracle 외부 조건 구분
+
+이 둘은 분리해서 판정한다.
+
+```text
+코드 Finding CRITICAL : 0
+코드 Finding HIGH     : 0
+코드 Finding MEDIUM   : 0
+코드 Finding LOW      : 2 (LOW-1 다른 flock context, LOW-2 런북 미기재)
+```
+
+```text
+Oracle 외부 검증 조건 : 미해소
+```
+
+`brokers/kis_broker.VERIFICATION_MATRIX` 실측:
+
+```text
+REFERENCE_VERIFIED 아닌 항목 = 0건
+LIVE_RESPONSE_PENDING 항목   = 9건
+  price_field_last     포함
+  cancel_tr_id_live    포함
+```
+
+즉 직전 완료 보고의 "남은 MEDIUM 0"은 **코드 Finding 기준**이며, `price_field_last` /
+`cancel_tr_id_live`를 포함한 9개 wire 값은 공식 reference 확인은 끝났으나 **실제 KIS 응답으로는
+확인되지 않은 상태**로 그대로 남아 있다. 이 항목들은 코드로 해소할 수 없고 Oracle에서
+read-only 또는 모의투자 단계의 실제 응답으로만 해소된다.
+
+**실제 KIS 응답 확인 전에는 실주문 활성화를 허용하지 않는다.**
+
+---
+
+## 12. 테스트
+
+집중 범위 (구현자 보고 214건보다 넓게 실행):
+
+```text
+tests/test_single_run_lock_lifecycle.py
+tests/test_idempotency.py
+tests/test_oracle_deploy_package.py
+tests/test_fatal_connection_propagation.py
+tests/test_repository_read_and_fatal_connection.py
+tests/test_persistence_failure_normalization.py
+tests/test_cancel_audit_lifecycle.py
+tests/test_audit_context_required.py
+tests/test_secret_leak_sweep.py
+tests/test_shadow_audit_durability.py
+tests/test_kis_verification_matrix.py
+
+→ 440 passed / 0 failed / 0 skipped / 0 xfailed
+```
+
+전체 정방향:
+
+```text
+2273 passed / 0 failed / 0 skipped / 0 xfailed   (78.44s)
+```
+
+전체 역방향 (수집 순서 역전):
+
+```text
+2273 passed / 0 failed / 0 skipped / 0 xfailed   (77.42s)
+```
+
+세 실행 모두 다른 작업과 동시 실행하지 않고 순차로 수행했다.
+
+---
+
+## 13. 외부 네트워크
+
+저장소 밖 socket guard 플러그인(`connect` / `connect_ex` / `create_connection` 후킹, loopback
+외 연결 시 즉시 실패)을 세 실행 모두에 적용했다.
+
+```text
+집중 : NETGUARD external socket connects: 0   targets: []
+정방향: NETGUARD external socket connects: 0   targets: []
+역방향: NETGUARD external socket connects: 0   targets: []
+
+Alpaca socket 시도 0
+KIS socket 시도 0
+Slack socket 시도 0
+기타 외부 socket 시도 0
+```
+
+---
+
+## 14. 운영 파일 및 artifact
+
+검증 전후 비교 — SHA-256 / size / mtime 3항목 모두 동일:
+
+```text
+order_history.csv          153feb31...0a91c7   31 bytes      mtime 1784558966
+universe.csv               9fdaf3ac...6188b3   833518 bytes  mtime 1784558966
+strategy_performance.csv   ca012439...f66da8   69 bytes      mtime 1785083284
+```
+
+artifact — 저장소 루트와 운영 경로 모두 0건:
+
+```text
+*.lock            0
+*.db              0
+*.db-wal          0
+*.db-shm          0
+*.db-journal      0
+shadow-*.jsonl    0
+임시 env          0
+테스트 logs       0
+독립 probe        0   (저장소 밖에서 작성·실행 후 삭제 완료)
+```
+
+종료 시 Git 상태:
+
+```text
+$ git status --short
+ M docs/autonomous/CODEX_REVIEW.md
+
+$ git diff --check
+(no output — pass)
+
+$ git rev-parse HEAD
+7309a8313adf7801b47a1c6486703ef81fa3efb9
+```
+
+변경 파일은 이 문서 하나뿐이다. 코드·테스트 수정, 커밋, push, merge, Oracle 배포, 실주문,
+안전 플래그 변경은 수행하지 않았다.
+
+---
+
+## 15. Oracle 진행 허용 범위
+
+```text
+허용: Oracle read-only 배포 및 Shadow / 모의투자 단계 진행
+      (CODEX-059·060 해결, 코드 CRITICAL/HIGH/MEDIUM 0, 회귀 없음)
+
+금지: 실주문 활성화
+```
+
+실주문 활성화 금지 해제 조건:
+
+```text
+LIVE_RESPONSE_PENDING 9건이 실제 KIS 응답으로 확인될 것
+  (price_field_last, cancel_tr_id_live 포함)
+확인 전까지 다음 유지:
+  KIS_LIVE_ORDER_ENABLED=false
+  LIVE_ROLLOUT_ENABLED=false
+  ENTRY_DISABLED=true
+```
+
+실거래 활성화 판정은 이 검증의 범위가 아니며 수행하지 않는다.
