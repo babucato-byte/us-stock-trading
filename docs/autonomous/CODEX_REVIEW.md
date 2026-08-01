@@ -1,457 +1,266 @@
-# CODEX_REVIEW — KIS 실거래 전환 재검증
+# CODEX_REVIEW — KIS 최종 독립 재검증
 
-## 0. 검증자 고지 (중요)
+## 1. 검증 대상 고정
 
-이 라운드의 검증은 **구현자와 동일한 에이전트가 수행했다.** 지시문이 요구하는 독립
-검증자(Codex)가 아니다. 아래 모든 확인은 자기 코드에 대한 자기 검증이므로, 다음 한계를
-명시한다.
+검증자: 구현자 완료 보고와 이전 Codex 결과를 재사용하지 않은 독립 검증
 
-- 구현자가 놓친 전제를 검증자도 동일하게 놓칠 수 있다. 본 문서의 PASS 판정은
-  "독립 검증 통과"가 아니라 "구현자 자체 재현 결과"로 읽어야 한다.
-- 이를 보정하기 위해 저장소의 기존 테스트에 의존하지 않는 **독립 probe 스크립트**를
-  저장소 밖(`/private/tmp`)에서 작성해 실행했다. 각 probe는 먼저 "패치하지 않은 대조군이
-  실제로 주문에 도달하는가"를 확인한 뒤 결함을 주입하는 구조로, 통과가 우연이 아님을
-  스스로 증명하도록 만들었다.
-- 실거래 활성화 판단 전에는 **반드시 별도 독립 검증자의 재검증이 필요하다.**
+검증 시작 시 실행 결과:
 
-## 1. 검증 대상
+```text
+$ git status --short
+(no output — clean)
 
-- 저장소: `us-stock-trading`
-- 브랜치: `feature/kis-live-broker`
-- 검증 HEAD: `6beb1c917afb57dae4f81c4dc478e58d791ce6a8`
-- 지시된 대상 커밋과 일치 (TARGET_COMMIT_MISMATCH 아님)
-- 검증 시작 시 working tree: clean
-- `git diff --check`: pass
+$ git branch --show-current
+feature/kis-live-broker
 
-주요 대상: CODEX-048, CODEX-049, CODEX-051
-회귀 대상: CODEX-042, 043, 044, 045, 046, 047, 050
+$ git rev-parse HEAD
+c30f867c2522917833a5232a99f84d4b24869cb9
 
-검증 중 코드·테스트·설정·서비스·스크립트는 수정하지 않았다. 커밋, push, merge, 배포,
-실주문, 플래그 변경, 테스트 완화/skip/xfail 추가도 하지 않았다. 변경한 파일은 이 문서뿐이다.
+$ git show --stat --oneline HEAD
+c30f867 CODEX-052: reconcile the KIS wire-format verification documentation
+ brokers/kis_broker.py                           | 112 ++++++++++++++--
+ docs/deployment/ORACLE_KIS_MIGRATION_RUNBOOK.md |  36 ++++-
+ tests/test_kis_verification_matrix.py           | 168 ++++++++++++++++++++++++
+ 3 files changed, 303 insertions(+), 13 deletions(-)
+
+$ git diff --check
+(no output — pass)
+```
+
+필수 조건은 모두 일치했다. `TARGET_COMMIT_MISMATCH`가 아니므로 코드 검증을 진행했다.
+
+collection도 새로 확인했다.
+
+```text
+2103 tests collected in 2.91s
+```
 
 ## 2. 최종 판정
 
-Verdict: **PASS_WITH_CONDITIONS**
+Overall verdict: **BLOCKED**
 
-Oracle deployment: **ALLOWED_FOR_READ_ONLY_SHADOW_STAGE** (아래 조건부)
+Oracle read-only deployment: **허용하지 않음 (현재 HEAD 기준)**
 
-Live trading: **DO_NOT_ENABLE**
+Real-order activation: **금지**
 
-CODEX-048, CODEX-049, CODEX-051은 모두 해결됐다. 기존 해결 Finding의 회귀는 없다.
-신규 CRITICAL 0건, 신규 HIGH 0건이다.
+CODEX-052와 기존 CODEX-042~051 회귀는 통과했다. CODEX-053도 신규 buy/sell의 필수 audit
+context와 transport 전 durability는 해결됐다. 그러나 cancel 성공/실패 lifecycle이 같은
+`audit_run_id`의 terminal event 없이 끝난다.
 
-조건:
-
-1. 이 판정은 **자기 검증**이다(§0). 실주문 활성화 전 독립 검증자의 재검증이 선행되어야 한다.
-2. Oracle read-only 단계에서 KIS 실응답으로 현재가 field(`output.last`)와 일반 취소 TR_ID
-   (`TTTT1004U`/`VTTT1004U`)를 반드시 확인한다(§9의 잔여 MEDIUM).
-3. 신규 LOW 2건(CODEX-052, CODEX-053)은 Oracle read-only 단계 진행을 막지 않으나,
-   실주문 활성화 전에 정리한다.
-
-## 3. 테스트 재현
-
-구현자 주장과 동일한 수치를 독립적으로 재현했다.
-
-### 수집 개수
+독립 probe의 실제 cancel 결과:
 
 ```text
-venv/bin/python -m pytest --collect-only -q
-2053 tests collected
+cancel transport 시점:
+state = CANCEL_PENDING
+events = [GATE_APPROVED, EXECUTION_PLANNED]
+
+cancel 성공 반환 후:
+events = [GATE_APPROVED, EXECUTION_PLANNED]
 ```
 
-### 정방향 전체 (외부 네트워크 차단 plugin 적용)
+`SHADOW_COMPLETED`, block terminal event 또는 `SHADOW_ERROR`가 없다. 지시문의 “취소도 동일한
+감사 lifecycle” 조건과 `BLOCKED` 기준인 “감사 생략/취소 감사 순서 미강제”에 해당한다.
+
+## 3. CODEX-053 — audit_run_id 필수화
+
+Status: **PARTIALLY_RESOLVED / BLOCKING REMAINDER**
+
+### 통과한 항목
+
+- `submit_buy_order`, `submit_sell_order`, `_submit_new_order`, `submit_cancel`의
+  `audit_run_id`는 모두 default 없는 keyword-only 필수 인자다.
+- non-test 운영 signature의 `audit_run_id=None`은 0건이다.
+- `validate_audit_run_id()`는 None, empty, whitespace, int/float/bool/list/dict/object를
+  `AUDIT_CONTEXT_MISSING`으로 차단한다.
+- `_submit_new_order()`와 `submit_cancel()`은 idempotency/state/gate/authorization/transport보다
+  먼저 ID를 검증한다.
+- 엔진이 audit ID를 `uuid4`, `token_hex`, `audit_run_id or ...`로 자동 생성하지 않는다.
+  ID는 buy/sell pipeline 시작점에서 생성되어 engine과 terminal event로 전달된다.
+- operational engine caller의 `audit_run_id` 누락은 0건이다. 의도적 TypeError 테스트 한 곳만
+  허용 예외로 존재한다.
+- 유효 buy/sell pipeline은 동일 ID로 `SIGNAL_RECEIVED`, `GATE_APPROVED`,
+  `EXECUTION_PLANNED`, `SHADOW_COMPLETED`를 기록한다.
+- 새 주문 순서는 다음과 같이 코드와 별도-connection durability test에서 확인됐다.
 
 ```text
-PYTHONPATH=/private/tmp/.../netguard venv/bin/python -m pytest -q -p netguard
-2053 passed, 0 failed, 0 skipped, 0 xfailed, 2 warnings in 62.11s
-NETGUARD: 0 outbound connection attempt(s): []
+CAS APPROVED
+-> durable GATE_APPROVED
+-> CAS SUBMITTING
+-> durable EXECUTION_PLANNED
+-> broker transport
 ```
 
-### 역방향 전체 (동일 plugin 적용)
+- cancel transport 시점에도 별도 DB connection으로 `CANCEL_PENDING`, `GATE_APPROVED`,
+  `EXECUTION_PLANNED`이 이미 보였다.
+- audit persistence 실패는 transport 0회와 `AUDIT_PERSISTENCE`로 차단된다. pipeline의 audit
+  failure handler는 terminal `SHADOW_ERROR` 재시도와 운영 alert를 수행한다.
+
+### 독립 probe: 누락/재시도 대조군
 
 ```text
-venv/bin/python -m pytest -q -p netguard $(ls tests/test_*.py | sort -r)
-2053 passed, 0 failed, 0 skipped, 0 xfailed, 2 warnings in 62.14s
-NETGUARD: 0 outbound connection attempt(s): []
+invalid_reason AUDIT_CONTEXT_MISSING
+invalid_transport 0
+invalid_row None
+control_status ACCEPTED control_transport 1
 ```
 
-`netguard`는 저장소 **밖**에 둔 pytest plugin으로, `socket.socket.connect`,
-`connect_ex`, `socket.create_connection`을 감싸 loopback 이외 주소로의 연결 시도를 전부
-예외로 만들고 그 횟수를 보고한다. 저장소의 conftest나 테스트 fake에 의존하지 않는 독립
-증거이며, 정·역방향 모두 시도 0건이었다.
+무효 ID가 idempotency key를 점유하지 않았고, 같은 order/signal에 유효 ID를 준 후 fake transport
+1회로 정상 제출됐다.
+
+### 미해결 항목
+
+`execution_engine.submit_cancel()`은 `GATE_APPROVED`, `EXECUTION_PLANNED`까지만 기록한다.
+성공 시 `CANCELLED` state를 반환하지만 terminal Shadow audit를 기록하지 않는다. ambiguous,
+broker error, gate block 경로도 이 함수 또는 다른 operational cancel caller가 같은 run ID로
+terminal block/error event를 보장하지 않는다. 저장소 non-test call graph에는 `submit_cancel()`의
+operational caller도 없다.
+
+신규 테스트 `test_cancel_audits_its_approval_before_the_transport` 역시 기대값을 정확히 두 event로
+고정해 이 누락을 검출하지 않는다.
+
+필수 조치:
+
+1. cancel orchestration owner를 명확히 하고 성공에는 `SHADOW_COMPLETED`, gate/persistence block에는
+   terminal blocked outcome, ambiguous/error에는 `SHADOW_ERROR`를 같은 `audit_run_id`로 기록한다.
+2. success, gate rejection, CAS conflict, audit failure, ambiguous transport 각각에 terminal event
+   exactly-once test를 추가한다.
+3. 취소 평가가 시작됐지만 terminal event가 없는 run이 `runs_without_terminal_event()`에 남지
+   않도록 end-to-end로 강제한다.
+
+## 4. CODEX-052 — KIS 검증 상태 문서 일관성
+
+Status: **RESOLVED_WITH_EXTERNAL_CONFIRMATION_PENDING**
+
+- `REFERENCE_VERIFIED`와 `LIVE_RESPONSE_PENDING`이 독립 축으로 명시됐다.
+- `WireValueVerification` matrix는 name, 실제 value, reference status, live status, source를
+  갖는다.
+- `price_field_last=output.last`와 `cancel_tr_id_live=TTTT1004U`가 공식 reference source 및
+  live pending 상태로 명시됐다.
+- 런북은 현재가 field는 Oracle read-only quote 응답, cancel TR_ID는 실계좌가 아닌 KIS
+  모의투자 주문/취소로 확인하도록 구체적으로 안내한다.
+- `TBD_VERIFY_LIVE_DOCS`는 운영 코드와 런북에서 제거됐다.
+- AST 검사에서 `VERIFICATION_MATRIX`와 `LIVE_RESPONSE_PENDING_ITEMS`는 주문 분기나 runtime
+  feature flag로 사용되지 않는다.
+- 이번 문서 변경에서 TR_ID, endpoint, quotation/order exchange code, `output.last`, cancel
+  payload field 값은 바뀌지 않았다. 관련 테스트가 값을 literal로 고정한다.
+
+남은 MEDIUM 외부 조건:
+
+| Item | Reference | Live response | 해소 방법 |
+|---|---|---|---|
+| `price_field_last` | `REFERENCE_VERIFIED` | `LIVE_RESPONSE_PENDING` | Oracle read-only quote 응답 확인 |
+| `cancel_tr_id_live` | `REFERENCE_VERIFIED` | `LIVE_RESPONSE_PENDING` | KIS 모의투자 주문/취소 확인; 실계좌 주문 금지 |
+
+공식 예제와 코드 값의 명백한 충돌은 발견하지 않았다. 두 항목 자체는 코드 CRITICAL/HIGH가
+아니지만 실주문 활성화 전 반드시 확인하고 변경 시 재검증해야 한다.
+
+## 5. 기존 CODEX-042~051 회귀
+
+| Finding | 결과 | 독립 확인 요약 |
+|---|---|---|
+| CODEX-042 | PASS | Alpaca direct/wrapper/alias order 목적은 final request boundary에서 차단; recording HTTP 0회 |
+| CODEX-043 | PASS | KIS submit/cancel은 single-use central authorization 없이는 transport 0회; HALT 신규 주문 0회 |
+| CODEX-044 | PASS | KIS read failure, mismatch, account-wide UNKNOWN, stale/wrong account/symbol snapshot 모두 transport 0회 |
+| CODEX-045 | PASS | 2주 중 1주 fill은 PARTIALLY_FILLED; 잔여 1주만 관리하고 2주 재매도 없음 |
+| CODEX-046 | PASS | partial/trailing/time/EOD 기본값 각각 false, 독립 enable |
+| CODEX-047 | PASS | status mutation은 expected state/version CAS repository만 사용; row/event 동일 transaction |
+| CODEX-048 | PASS for new orders | APPROVED/audit/SUBMITTING-or-CANCEL_PENDING/audit/transport 순서 및 audit failure fail-closed 확인. Cancel terminal 누락은 CODEX-053 remainder로 별도 차단 |
+| CODEX-049 | PASS | entry/exit Shadow service 주문 호출 없음, live unit 기본 disabled, installer가 live enable/start 안 함, migration/preflight/reconciliation/shadow 절차 존재 |
+| CODEX-050 | PASS | account/CANO/key/secret/token/Bearer/raw response/Python repr redaction 통과 |
+| CODEX-051 | PASS | full lowercase 40-char SHA exact equality와 commit-object 존재 검사; short/invalid/ref/mismatch 거부 |
+
+CODEX-051 독립 probe:
+
+```text
+1자리 prefix       rejected
+7자리 short SHA    rejected
+39자리             rejected
+uppercase          rejected
+HEAD               rejected
+empty              rejected
+```
+
+코드는 41자리, whitespace, 존재하지 않는 SHA, 다른 full SHA도 거부하며 관련 negative tests가
+통과했다.
+
+CODEX-050 독립 probe:
+
+```text
+input:
+Authorization: Bearer token-123456 {'CANO':'12345678','appsecret':'secret-x'}
+
+output:
+Authorization: ***REDACTED*** {'CANO':'***REDACTED***','appsecret':'***REDACTED***'}
+```
+
+## 6. 독립 probe 및 네트워크 차단
+
+probe는 `/private/tmp`/OS temp directory에 작성했고 저장소 코드는 수정하지 않았다. 먼저 유효
+audit ID 대조군이 fake transport 평가점까지 실제 1회 도달함을 확인한 뒤 무효 ID를 주입했다.
+
+별도의 `/private/tmp` `sitecustomize` socket guard로 `socket.connect`, `connect_ex`,
+`create_connection`을 기록·차단한 상태에서 집중 및 전체 정·역순 테스트를 실행했다.
+
+```text
+socket guard log: absent
+actual TCP/HTTP connect attempts: 0
+Alpaca: 0
+KIS: 0
+Slack: 0
+other external socket: 0
+```
+
+fake session/broker의 in-memory 호출은 각 safety assertion의 대조군으로만 사용했으며 외부
+network가 아니다. Shadow entry/exit tests는 read/evaluation 경로를 실행하면서 state-mutating
+broker call 0회를 확인한다.
+
+probe source, socket guard와 probe DB/WAL/SHM/lock 디렉터리는 검증 후 모두 제거했다.
+
+## 7. 테스트 결과
 
 ### 집중 안전 테스트
 
-구현자 보고(679)보다 넓은 범위로 실행했다.
+구현자 보고 766건보다 넓게 broker/config/authorization/engine/CAS/reconciliation/lifecycle/
+Shadow/redaction/Oracle package 관련 1,026건을 명시적으로 수집해 실행했다.
 
 ```text
-30개 파일 (shadow audit/durability/coverage, shadow exit, oracle deploy, redaction,
-CAS, reconciliation, order gate, execution engine, KIS broker/adapter/negative,
-position lifecycle, exit flags, broker safety, crash recovery, kill-switch gate,
-alpaca operational path)
-
-716 passed, 0 failed, 0 skipped, 0 xfailed, 1 warning in 24.71s
+1026 passed
+0 failed
+0 skipped
+0 xfailed
+1 warning
+33.96s
 ```
 
-경고 2건은 기존과 동일하다(LibreSSL urllib3 경고, 의도적 scanner field skip 경고).
-
-## 4. CODEX-048 — Shadow 감사 순서·내구성·Fail-closed
-
-Status: **RESOLVED**
-
-### 4.1 transport 이전 durable commit (핵심 결함)
-
-이전 라운드의 결함은 `GATE_APPROVED`/`EXECUTION_PLANNED`가
-`execution_engine.submit_*_order()` **반환 후**에 기록된 것이었다. 현재 두 이벤트는
-`execution/execution_engine.py`가 직접, transport 호출 전에 기록한다.
-
-독립 probe: fake broker의 `submit_order()` 내부에서 **별도 sqlite3 connection**을 열어
-그 시점에 커밋된 행만 조회했다.
-
-매도 경로 (probe_048.py):
+### 정방향 전체
 
 ```text
-[PASS] SELL: GATE_APPROVED committed before transport
-       -- ['GATE_APPROVED', 'EXECUTION_PLANNED']
-[PASS] SELL: EXECUTION_PLANNED committed before transport
-[PASS] SELL: EXECUTION_PLANNED is last before transport
+2103 passed
+0 failed
+0 skipped
+0 xfailed
+2 warnings
+66.35s
 ```
 
-매수 경로는 저장소 테스트(`tests/test_shadow_audit_durability.py`)가 동일 기법으로 검증하며,
-`_audit_before_transport()`를 무력화하면 해당 3건이 실패하는 것을 직접 확인했다(테스트가
-실제로 이 속성에 결합되어 있음을 증명).
-
-같은 connection의 uncommitted 상태나 반환 후 기록은 인정하지 않았다. probe는 항상 새
-connection으로 조회한다.
-
-### 4.2 감사 저장 실패 → transport 0회
-
-probe_048b.py는 케이스마다 **완전히 새로운 임시 상태**를 만들고, 먼저 무패치 대조군이
-실제로 transport에 도달하는지 확인한 뒤 결함을 주입한다.
+### 역방향 전체
 
 ```text
-[PASS] 0. unpatched control order reaches transport -- exc=NONE calls=1
-
-[PASS] B. audit COMMIT failure blocks with AUDIT_PERSISTENCE
-[PASS] B. audit COMMIT failure -> transport 0 calls
-[PASS] C. busy-retry exhausted blocks with AUDIT_PERSISTENCE
-[PASS] C. busy-retry exhausted -> transport 0 calls
-[PASS] D. missing shadow_audit_events table blocks the order
-[PASS] D. missing audit table -> transport 0 calls
+2103 passed
+0 failed
+0 skipped
+0 xfailed
+2 warnings
+67.18s
 ```
 
-insert 실패는 저장소 테스트가 별도로 검증한다. commit 실패, SQLITE_BUSY 재시도 소진,
-migration 9 누락(테이블 삭제)까지 모두 `ExecutionEngineError(reason_code=
-"AUDIT_PERSISTENCE")`로 차단되고 transport 호출은 0회다.
+두 경고는 local LibreSSL/urllib3 호환 경고와 의도된 unsupported scanner-field 방어 경고다.
+테스트 결과에는 영향을 주지 않았다. Oracle Python의 OpenSSL 1.1.1+ 확인은 실제 KIS HTTPS
+read-only 단계 전 조건으로 유지한다.
 
-주의: 첫 probe(probe_048.py)의 B/C/D는 직전 케이스가 남긴 주문 때문에 reconciliation이
-먼저 차단해 `RECONCILIATION_DIRTY`가 나왔다. probe 자체의 상태 격리 결함이었고, 격리 후
-전부 `AUDIT_PERSISTENCE`로 재현됐다. 어느 쪽이든 transport는 0회였다.
+## 8. 운영 파일 및 stray artifact
 
-`try/except: pass` 패턴은 `kis_live_trading.py`, `brokers/kis_broker_adapter.py`,
-`execution/execution_engine.py`, `shadow_audit.py`에 없다(저장소 AST 테스트 + 육안 확인).
-`shadow_audit.handle_audit_failure()`가 SHADOW_ERROR 재시도, `operations/alerts.py` 알림,
-`ShadowAuditFailure` 발생으로 평가를 종료한다.
-
-### 4.3 종료 이벤트 정확히 1건
-
-probe_terminal.py가 실제 파이프라인으로 7개 run을 만들었다(매수 승인, 매수 차단,
-매수 예외, 사이클 HALT 차단, 매도 승인, 매도 차단, 매도 reconciliation 차단).
-
-```text
-[PASS] terminal event exactly once for all 7 runs -- zero=[] multi=[]
-[PASS] all three terminal kinds observed
-       -- {'SHADOW_COMPLETED': 1, 'SHADOW_BLOCKED': 5, 'SHADOW_ERROR': 1}
-[PASS] audit_integrity_report agrees
-       -- {'runs_without_terminal_event': [], 'runs_with_multiple_terminal_events': [],
-           'total_runs': 7}
-[PASS] both sides recorded -- {'buy', 'sell'}
-```
-
-`SHADOW_COMPLETED`/`SHADOW_BLOCKED`/`SHADOW_ERROR` 세 종류가 모두 실제로 관측됐고,
-0건·2건 이상은 없다. `audit_integrity_report()`가 양쪽 위반을 모두 조회 가능하게 한다.
-
-### 4.4 매수·매도 양쪽
-
-매도 경로가 SQLite 감사 저장소를 우회하지 않는다. probe에서 `side` 값 집합이
-`{'buy', 'sell'}`로 확인됐고, 매도 손절/익절/일반매도 판정은 §5의 shadow-exit 서비스가
-동일 감사 lifecycle로 기록한다. reconciliation 차단, UNKNOWN 차단, HALT 차단 각각에 대한
-전용 이벤트가 저장소 테스트(`tests/test_shadow_audit_coverage.py`)와 probe 양쪽에서
-확인됐다.
-
-### 4.5 SQLite 내구성·동시성
-
-`shadow_audit._insert_once()`는 명시적 `BEGIN IMMEDIATE` → INSERT → `rowcount`/`lastrowid`
-확인 → `commit()` → **commit 후 재조회**로 durable 여부를 확인한다. SQLITE_BUSY는 지수
-backoff로 5회 재시도 후 `ShadowAuditError`를 발생시키며 조용히 버리지 않는다(§4.2 케이스 C).
-
-새 connection 재조회, migration 9 적용, 12개 프로세스 동시 insert(총 72건, 누락 0),
-JSONL 12 프로세스 동시 append(총 120줄, 전 줄 파싱 가능)는 저장소 테스트가 검증하며 이번
-전체 실행에서 통과했다.
-
-### 4.6 JSONL 보조 경로
-
-`flock` 프로세스 간 잠금, `O_APPEND`(`open(..., "a")`), `flush()`, `os.fsync()`,
-잠금 내부 rotation, 크기 기반 rotation, 보관 기간, 손상 라인 탐지, 손상 시 운영 알림
-(`verify_log_integrity()`)과 엄격 reader(`read_all_strict()`)가 모두 존재하고 테스트로
-검증된다. fsync 호출 자체를 monkeypatch로 관측하는 테스트가 있다.
-
-### 4.7 민감정보
-
-probe_terminal.py가 SQLite 감사 행과 JSONL 파일 전체를 합쳐 검색한 결과 `Bearer `,
-`appkey=`, `app_secret`, `CANO':`, `"CANO"` 원문 0건이다. 저장소의
-`tests/test_secret_leak_sweep.py`(24건)도 통과한다.
-
-### 4.8 관찰 사항 (차단 아님)
-
-- `submit_buy_order`/`submit_sell_order`의 `audit_run_id` 기본값이 `None`이며, `None`이면
-  `_audit_before_transport()`가 조용히 반환한다. 현재 두 호출자는 모두 값을 전달하고
-  테스트가 이를 고정하지만, 향후 호출자가 누락하면 승인 감사 없이 주문이 진행된다.
-  → CODEX-053 (LOW)로 기록.
-- cancel 경로에는 shadow_audit run이 없다. 다만 `order_state_events`에 `CANCEL_PENDING`이
-  transport **이전**에 durable하게 기록되는 것을 probe로 확인했다
-  (`['CREATED','VALIDATING','APPROVED','SUBMITTING','ACCEPTED','CANCEL_PENDING']`).
-  지시문의 CODEX-048 대상 목록에 cancel은 없으므로 결함으로 판정하지 않는다.
-
-## 5. CODEX-049 — Oracle Shadow 매도 평가 배포
-
-Status: **RESOLVED**
-
-### 5.1 Shadow / Live 분리와 공통 판단 로직
-
-`positions/lifecycle.py::decide_exit()`가 순수 판단 함수로 존재하고,
-`check_and_manage()`가 그 결과로 분기한다. Shadow 전용 별도 매도 판단 구현은 없다.
-
-probe_049.py는 **모든 실주문 플래그를 true로 켠 상태**에서 두 Shadow 서비스를, 주문
-메서드가 호출되면 예외를 던지는 broker에 대해 실행했다.
-
-```text
-[PASS] shadow ENTRY places no order with ALL live flags on
-[PASS] shadow ENTRY still produced a verdict -- hypothetical=WOULD_APPROVE
-[PASS] shadow EXIT places no order with ALL live flags on
-[PASS] shadow EXIT still reached a FULL_EXIT verdict (stop breached)
-       -- decision=full_exit reason=STOP_LOSS
-[PASS] shadow EXIT mutated no position state -- STOP_ACTIVE->STOP_ACTIVE
-[PASS] the SAME decision does order on the live path (shadow/live agree)
-       -- [('AAPL', 10, 'sell')]
-```
-
-환경변수만으로는 우회되지 않는다. 주문 불가능성은 플래그가 아니라 구조에서 온다:
-두 Shadow 진입점 모두 `execution.execution_engine`, `brokers.kis_broker_adapter`,
-`kis_position_manager`를 import하지 않으며 `check_and_manage()`를 호출하지 않는다(AST 및
-호출 문자열 스캔 테스트 존재). 마지막 항목은 같은 판단이 live 경로에서는 실제로 주문을
-낸다는 것, 즉 Shadow 판정이 무의미한 no-op이 아님을 보인다.
-
-### 5.2 진입점
-
-```text
-scripts/install_oracle_services.sh
-scripts/preflight_kis_live.py
-scripts/run_health_report.py
-scripts/run_live_buy_entry.py
-scripts/run_migrations.py
-scripts/run_reconciliation.py
-scripts/run_shadow_exit_evaluation.py
-scripts/run_shadow_mode.py
-```
-
-7개 Python 진입점 전부 `--help` 성공(exit 0, usage 출력 확인), import 성공, 실행 가능
-비트 설정됨.
-
-### 5.3 unit / timer
-
-```text
-deploy/systemd/us-stock-trading-migrate.service
-deploy/systemd/us-stock-trading-reconcile.service   + .timer
-deploy/systemd/us-stock-trading-shadow.service      + .timer
-deploy/systemd/us-stock-trading-shadow-exit.service + .timer
-deploy/systemd/us-stock-trading-health.service      + .timer
-deploy/systemd/us-stock-trading-live.service        (timer 없음)
-```
-
-macOS라 `systemd-analyze`를 쓸 수 없어 정적 parser를 직접 작성해 검증했다(섹션 유효성,
-키 유효성, key=value 형식). 10개 unit 전부 통과.
-
-각 service unit에서 실제 값 대조 결과 전부 일치:
-
-```text
-User=ubuntu                 Group=trading
-WorkingDirectory=/home/ubuntu/trading-release
-EnvironmentFile=/etc/us-stock-trading/live-readonly.env
-Restart=on-failure          RestartSec=10
-TimeoutStartSec=300         UMask=0027
-NoNewPrivileges=true        PrivateTmp=true
-ProtectSystem=full          ProtectHome=false (존재)
-ReadWritePaths=/home/ubuntu/trading-release /var/log/us-stock-trading
-```
-
-모든 `ExecStart`/`ExecStartPre`의 `.py` 대상이 `scripts/`에 실재한다.
-
-의존 순서는 런북 설명이 아니라 unit 지시자로 강제된다.
-
-```text
-migrate 이외 전 unit: Requires/After = us-stock-trading-migrate.service
-shadow, shadow-exit, live: Requires/After 에 us-stock-trading-reconcile.service 추가
-migrate/health 이외 전 unit: ExecStartPre = preflight_kis_live.py
-```
-
-`Requires=`가 곧 "선행 unit 실패 시 시작 안 함"이므로 reconciliation 실패는 shadow 시작을
-차단한다. `ConditionPathExists`가 인터프리터, 환경파일, 자기 진입점을 각각 가드한다.
-timer 4개는 각각 실재하는 service를 가리키고, live.service를 가리키는 timer는 없다.
-
-preflight 예외 2건은 의도적이며 타당하다: migrate는 preflight가 검사하는 스키마 자체를
-만들므로 순환이고, health는 문제가 있을 때야말로 실행돼야 한다.
-
-### 5.4 설치 스크립트
-
-가짜 release 트리에 `DRY_RUN=1`로 실행해 확인했다.
-
-```text
-KIS_LIVE_ORDER_ENABLED=true  -> ERROR ... only deploys the read-only posture (설치 거부)
-LIVE_ROLLOUT_ENABLED=true    -> ERROR ... only deploys the read-only posture (설치 거부)
-ENTRY_DISABLED=false         -> ERROR ... does not set ENTRY_DISABLED=true (설치 거부)
-```
-
-정상 read-only 환경파일에서의 실행 계획:
-
-```text
-systemctl daemon-reload
-run_migrations.py
-preflight_kis_live.py
-systemctl enable us-stock-trading-migrate.service
-systemctl enable --now us-stock-trading-reconcile.timer
-systemctl enable --now us-stock-trading-shadow.timer
-systemctl enable --now us-stock-trading-shadow-exit.timer
-systemctl enable --now us-stock-trading-health.timer
-systemctl disable us-stock-trading-live.service
-systemctl stop    us-stock-trading-live.service
-```
-
-live service의 enable/start는 0건이다. migration과 preflight가 enable보다 먼저 실행된다.
-스크립트 어디에도 `KIS_LIVE_ORDER_ENABLED=true` / `LIVE_ROLLOUT_ENABLED=true` /
-`ENTRY_DISABLED=false` 대입이 없다.
-
-### 5.5 런북 정합성
-
-런북이 언급하는 `scripts/`·`deploy/` 경로 18개 전부 실재하고, 언급된 unit 10개 전부
-파일이 존재한다. 존재하지 않는 모듈·unit·timer·명령은 없다.
-
-단계 순서(백업 → release → venv → 환경파일 → migration → preflight → reconciliation →
-shadow entry → shadow exit → systemd 설치 → timer 확인 → 로그 확인 → live disabled 확인 →
-롤백)가 문서에 순서대로 존재한다.
-
-## 6. CODEX-051 — Full SHA exact match
-
-Status: **RESOLVED**
-
-직접 실행한 negative/positive 케이스 전부 기대와 일치했다.
-
-```text
-[PASS] 1-char prefix                        -> rejected   (이전 라운드에서 통과하던 값)
-[PASS] 7-char short SHA                     -> rejected
-[PASS] 39 chars                             -> rejected
-[PASS] 41 chars                             -> rejected
-[PASS] uppercase SHA                        -> rejected
-[PASS] leading whitespace                   -> rejected
-[PASS] trailing whitespace                  -> rejected
-[PASS] HEAD literal                         -> rejected
-[PASS] refs/heads/main                      -> rejected
-[PASS] empty string                         -> rejected
-[PASS] None                                 -> rejected
-[PASS] nonexistent well-formed SHA          -> rejected
-[PASS] validated==deployed but != real HEAD -> rejected
-[PASS] validated != deployed                -> rejected
-[PASS] full correct SHA                     -> ACCEPTED
-```
-
-- 허용 형식은 `^[0-9a-f]{40}$`이며 대문자는 정규화하지 않고 거부한다.
-- 비교 대상 3값(`git rev-parse HEAD`, `VALIDATED_COMMIT`, `DEPLOYED_COMMIT`)이 모두 문자열
-  동일성으로 대조된다. 환경변수끼리만 비교하지 않는다.
-- 실제 commit object 존재를 `git rev-parse --verify --quiet <sha>^{commit}`로 확인한다.
-  함수 단위로 직접 호출해 확인했다: 실제 HEAD → True, `0*39+1` → False.
-- 실행 코드의 `startswith` 비교는 AST 기준 0건이다(`ast.Attribute.attr == "startswith"`
-  탐색). 남은 1건은 결함을 설명하는 주석이다.
-
-## 7. 기존 Finding 회귀
-
-| Finding | 결과 | 근거 |
-|---|---|---|
-| CODEX-042 | 회귀 없음 | Alpaca direct 주문 차단 테스트 통과 (`test_alpaca_operational_path_disabled`, `test_broker_kill_switch_gate`) |
-| CODEX-043 | 회귀 없음 | KIS direct submit/cancel 및 HALT 신규 주문 transport 0회 (`test_kis_broker`, `test_kis_negative_suite`, `test_execution_engine_kis`) |
-| CODEX-044 | 회귀 없음 | KIS 조회 실패·mismatch·UNKNOWN account-wide·snapshot TTL/계좌/종목 검증 전부 통과. 운영 코드의 상수 주입 0건(검색 결과는 과거 구현을 설명하는 주석뿐) |
-| CODEX-045 | 회귀 없음 | 부분체결 분류 테스트 통과 (`test_kis_broker_adapter`, `test_reconciliation`) |
-| CODEX-046 | 회귀 없음 | 네 exit 플래그 기본 false, `test_live_exit_flags` 통과. probe에서 플래그를 켰을 때만 PARTIAL_EXIT 판정이 나오는 것도 확인 |
-| CODEX-047 | 회귀 없음 | `UPDATE kis_order_idempotency`는 `execution/order_repository.py`에만 존재(4건, 전부 CAS). `update_status(` 호출 0건(잔존 문자열은 전부 주석/문서). cancel의 CANCEL_PENDING이 transport 이전 durable 기록됨을 probe로 확인 |
-| CODEX-050 | 회귀 없음 | `{output!r}`/`{row!r}` 류 raw repr 보간 0건. secret sweep 24건 통과. probe에서 두 저장소 합산 원문 0건 |
-
-비-테스트 코드의 `broker.submit_order(` 호출부는 `paper_strategy_order.py`(legacy 유예),
-`live_readiness/execution_engine.py`(Alpaca 엔진), `execution/execution_engine.py`(KIS 엔진)
-세 곳뿐으로, 기존 allow-list와 동일하다. 신규 호출부는 없다.
-
-## 8. 신규 Finding
-
-### CODEX-052 — LOW — `brokers/kis_broker.py`의 TBD 주석이 모듈 docstring과 모순
-
-Status: **OPEN**
-
-모듈 docstring(9~35행)은 공식 reference repo와 대조해 다음을 **확인 완료**했다고 기술한다.
-
-- 일반 취소 TR_ID 쌍 = `TTTT1004U` / `VTTT1004U`
-- 현재가 field `output.last` (chk_price.py의 필드 주석으로 독립 확인)
-
-그러나 아래 두 주석이 아직 남아 정반대로 기술한다.
-
-```text
-brokers/kis_broker.py:63-68
-  "TBD_VERIFY_LIVE_DOCS: general cancel path/TR_ID -- only the *daytime*
-   variant ... was directly confirmed"
-
-brokers/kis_broker.py:215-217
-  "TBD_VERIFY_LIVE_DOCS: response field name -- `last` ... was not directly
-   confirmed"
-```
-
-코드 값 자체는 docstring의 확인 내용과 일치하므로 **동작 결함은 아니다.** 문서 모순이며,
-Oracle 단계 운영자가 "무엇을 아직 확인해야 하는가"를 잘못 판단할 수 있다. 안전 방향으로
-기운 오류(실제보다 덜 확인된 것으로 읽힘)이므로 LOW로 분류한다. 실주문 활성화 전에
-주석을 실제 상태에 맞추거나, 반대로 docstring의 확인 주장을 근거와 함께 재확인해야 한다.
-
-### CODEX-053 — LOW — `audit_run_id` 누락 시 승인 감사가 조용히 생략됨
-
-Status: **OPEN**
-
-`execution_engine.submit_buy_order()`/`submit_sell_order()`의 `audit_run_id` 기본값이
-`None`이고, `_audit_before_transport()`는 `None`이면 아무 것도 기록하지 않고 반환한다.
-현재 호출자(`kis_live_trading.py`, `brokers/kis_broker_adapter.py`)는 둘 다 값을 전달하며
-테스트가 이를 고정하고 있어 현 시점 결함은 아니다. 다만 CODEX-048의 핵심 보호가
-"호출자가 인자를 잊지 않는 것"에 의존하는 구조이므로, 향후 신규 호출자가 생길 때
-fail-open이 된다. 실주문 활성화 전에 필수 인자로 승격하거나, `None`을 명시적 오류로
-바꾸는 것이 바람직하다.
-
-신규 CRITICAL/HIGH는 발견하지 않았다.
-
-## 9. 잔여 MEDIUM
-
-```text
-KIS 현재가 응답 field (output.last)
-일반 취소 TR_ID (TTTT1004U / VTTT1004U)
-```
-
-공식 reference repo 기준으로는 확인됐으나, **KIS 실서버 응답으로는 아직 확인되지 않았다.**
-이 저장소에서 네트워크 없이 검증할 수 없으므로 분류는 다음과 같다.
-
-```text
-CRITICAL/HIGH 아님
-코드 재검증 차단 아님
-Oracle live-readonly 단계 필수 조건
-실주문 활성화 전 반드시 확인
-```
-
-공식 KIS 문서와 현재 구현의 명백한 충돌은 발견하지 않았으므로 HIGH로 승격하지 않는다.
-
-## 10. 운영 파일
-
-검증 전후 SHA-256, size, mtime 모두 동일하다(diff 결과 완전 일치).
+검증 전후 값은 동일하다.
 
 | File | SHA-256 | Size | mtime |
 |---|---|---:|---:|
@@ -459,45 +268,28 @@ Oracle live-readonly 단계 필수 조건
 | `universe.csv` | `9fdaf3ac0ba7d94e24b6276fc603709a0c79c6842cf8143b8a242acdd16188b3` | 833518 | 1784558966 |
 | `strategy_performance.csv` | `ca012439cb2ba6a8f285b3f95493f9b17d22abb5b01a924ef2bd4cfe96f66da8` | 69 | 1785083284 |
 
-## 11. Stray artifact
+- 새 repository-path `*.db`, WAL, SHM, journal: 없음
+- 새 `shadow-*.jsonl`: 없음
+- test log/env/probe artifact: 없음
+- 테스트가 생성한 `/private/tmp`/OS temp probe artifact: 제거 완료
+- 검증 전부터 존재하던 ignored zero-byte lock은 운영 파일 변경으로 계산하지 않았으며 삭제하지
+  않았다.
+- 보고서 수정 전 `git status --short`: clean
+- 보고서 수정 전 `git diff --check`: pass
 
-검증 후 저장소 운영 경로에 다음이 남지 않았다.
+## 9. Oracle 및 실주문 조건
 
-```text
-*.db  *.db-wal  *.db-shm  *.db-journal
-shadow-*.jsonl  SHADOW_MODE_LOG.jsonl  RECONCILIATION_STATE.json
-logs/  임시 env  임시 systemd 출력  임시 lock
-```
+현재 HEAD는 CODEX-053 cancel terminal audit 누락 때문에 Oracle read-only 배포도 승인하지 않는다.
+수정 후 동일 검증을 다시 통과해야 한다.
 
-probe 스크립트와 가짜 release 트리는 전부 `/private/tmp` 아래에서만 생성·삭제했다.
+그 후에도 다음은 실주문 활성화 전 필수 외부 조건이다.
 
-## 12. 네트워크
+1. Oracle Python/OpenSSL 및 KIS read-only 인증·계좌·position/open-order/fill 조회 확인
+2. `price_field_last` 실제 quote response 확인
+3. `cancel_tr_id_live`와 cancel payload를 KIS 모의투자에서 확인
+4. 결과에 맞춰 matrix status를 갱신하고 값이 다르면 코드 수정 후 독립 재검증
+5. 그 전까지 Alpaca/KIS order flags와 live rollout/exit flags disabled, `ENTRY_DISABLED=true`,
+   live service disabled 유지
 
-```text
-Alpaca HTTP        0
-KIS HTTP           0
-Slack 실제 호출     0
-기타 외부 네트워크   0
-```
-
-저장소 밖 `netguard` plugin으로 정·역방향 전체 실행에서 loopback 이외 연결 시도 0건을
-독립 확인했다. 모든 broker 상호작용은 주입된 fake/read-only double을 통해서만 이뤄졌다.
-
-## 13. Oracle 단계 허용 여부
-
-read-only Shadow 단계 진행을 **허용**한다. 단, §2의 세 조건을 전제로 한다.
-
-실주문 활성화는 **허용하지 않는다.** 다음 세 가지가 선행되어야 한다.
-
-1. 독립 검증자(본 문서 §0의 자기 검증이 아닌)의 재검증
-2. Oracle read-only 단계에서 KIS 실응답으로 현재가 field·취소 TR_ID 확인
-3. CODEX-052, CODEX-053 정리
-
-## 14. 최종 상태 확인
-
-```text
-git status --short        -> 이 문서 외 변경 없음
-git diff --check          -> pass
-검증 중 수정한 파일       -> docs/autonomous/CODEX_REVIEW.md 뿐
-커밋/push/merge/배포/실주문 -> 수행하지 않음
-```
+코드·테스트·커밋·push·merge·배포·실주문·환경변수 활성화는 수행하지 않았다. 이 보고서 파일만
+변경했다.
