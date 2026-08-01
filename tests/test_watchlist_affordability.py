@@ -25,11 +25,18 @@ NOW = datetime.now(timezone.utc)  # real time -- evaluate_affordability() defaul
 
 
 def _account(**overrides):
+    # `as_of` is stamped when the account is BUILT, not at module import:
+    # evaluate_affordability() defaults `now` to real wall-clock time and
+    # blocks a snapshot older than its max_age, so a module-level
+    # timestamp silently turns every non-staleness test in this file into
+    # STATUS_STALE_ACCOUNT_STATE once the whole suite takes longer than
+    # that max_age to reach this file. Staleness itself is still covered
+    # explicitly by the three tests below that pass `as_of` deliberately.
     defaults = dict(
         available_cash_krw=30_000,
         cash_usage_percent=100,
         fx_rate_krw_per_usd=1_350.0,
-        as_of=NOW,
+        as_of=datetime.now(timezone.utc),
     )
     defaults.update(overrides)
     return AccountState(**defaults)
