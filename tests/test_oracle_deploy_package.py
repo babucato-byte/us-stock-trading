@@ -26,19 +26,37 @@ SCRIPTS_DIR = REPO_ROOT / "scripts"
 RUNBOOK = REPO_ROOT / "docs" / "deployment" / "ORACLE_KIS_MIGRATION_RUNBOOK.md"
 
 SERVICE_UNITS = [
-    "us-stock-trading-shadow.service",
+    "us-stock-trading-migrate.service",
     "us-stock-trading-reconcile.service",
+    "us-stock-trading-shadow.service",
+    "us-stock-trading-shadow-exit.service",
+    "us-stock-trading-health.service",
     "us-stock-trading-live.service",
 ]
 TIMER_UNITS = [
-    "us-stock-trading-shadow.timer",
     "us-stock-trading-reconcile.timer",
+    "us-stock-trading-shadow.timer",
+    "us-stock-trading-shadow-exit.timer",
+    "us-stock-trading-health.timer",
 ]
 ENTRYPOINTS = [
     "preflight_kis_live.py",
-    "run_shadow_mode.py",
+    "run_migrations.py",
     "run_reconciliation.py",
+    "run_shadow_mode.py",
+    "run_shadow_exit_evaluation.py",
+    "run_health_report.py",
     "run_live_buy_entry.py",
+]
+# Units whose ExecStartPre must run the preflight. Two deliberate
+# exceptions:
+#   - migrate: preflight CHECKS the schema version, so gating migrations
+#     behind it would be circular;
+#   - health: a health report that refuses to run when the deployment is
+#     unhealthy is useless precisely when it is needed.
+PREFLIGHT_UNITS = [
+    u for u in SERVICE_UNITS
+    if u not in ("us-stock-trading-migrate.service", "us-stock-trading-health.service")
 ]
 
 
@@ -86,11 +104,75 @@ class TestServiceHardening:
         service = _parse_unit(unit)["Service"]
         assert service.get("EnvironmentFile") == "/etc/us-stock-trading/live-readonly.env"
 
-    @pytest.mark.parametrize("unit", SERVICE_UNITS)
+    @pytest.mark.parametrize("unit", PREFLIGHT_UNITS)
     def test_runs_preflight_before_start(self, unit):
         raw = (UNIT_DIR / unit).read_text(encoding="utf-8")
         assert "ExecStartPre=" in raw
         assert "preflight_kis_live.py" in raw
+
+    @pytest.mark.parametrize("unit", SERVICE_UNITS)
+    def test_additional_hardening_directives(self, unit):
+        service = _parse_unit(unit)["Service"]
+        assert service.get("TimeoutStartSec") == "300"
+        assert service.get("UMask") == "0027"
+        assert service.get("ProtectHome") is not None
+        assert service.get("User") == "ubuntu"
+        assert service.get("Group") == "trading"
+        assert service.get("WorkingDirectory") == "/home/ubuntu/trading-release"
+
+    @pytest.mark.parametrize("unit", SERVICE_UNITS)
+    def test_read_write_paths_cover_the_data_and_log_locations(self, unit):
+        paths = _parse_unit(unit)["Service"]["ReadWritePaths"].split()
+        assert "/home/ubuntu/trading-release" in paths
+        assert "/var/log/us-stock-trading" in paths
+
+    @pytest.mark.parametrize("unit", SERVICE_UNITS)
+    def test_preconditions_guard_missing_files(self, unit):
+        raw = (UNIT_DIR / unit).read_text(encoding="utf-8")
+        conditions = re.findall(r"^ConditionPathExists=(.+)$", raw, flags=re.MULTILINE)
+        assert "/etc/us-stock-trading/live-readonly.env" in conditions
+        assert any(c.endswith("venv/bin/python") for c in conditions)
+
+
+class TestServiceOrdering:
+    """migration -> preflight -> reconciliation -> shadow services."""
+
+    @pytest.mark.parametrize("unit", [u for u in SERVICE_UNITS
+                                       if u != "us-stock-trading-migrate.service"])
+    def test_every_unit_requires_the_migration_unit(self, unit):
+        section = _parse_unit(unit)["Unit"]
+        assert "us-stock-trading-migrate.service" in section["Requires"]
+        assert "us-stock-trading-migrate.service" in section["After"]
+
+    @pytest.mark.parametrize("unit", [
+        "us-stock-trading-shadow.service",
+        "us-stock-trading-shadow-exit.service",
+        "us-stock-trading-live.service",
+    ])
+    def test_shadow_and_live_units_require_reconciliation(self, unit):
+        section = _parse_unit(unit)["Unit"]
+        assert "us-stock-trading-reconcile.service" in section["Requires"]
+        assert "us-stock-trading-reconcile.service" in section["After"]
+
+    def test_a_failed_reconciliation_blocks_the_shadow_units(self):
+        # `Requires=` is precisely systemd's "if that unit failed, do not
+        # start this one" relationship, so asserting it IS the assertion
+        # that a failed reconciliation blocks shadow startup.
+        for unit in ("us-stock-trading-shadow.service", "us-stock-trading-shadow-exit.service"):
+            assert "us-stock-trading-reconcile.service" in _parse_unit(unit)["Unit"]["Requires"]
+
+    @pytest.mark.parametrize("timer,unit", [
+        ("us-stock-trading-reconcile.timer", "us-stock-trading-reconcile.service"),
+        ("us-stock-trading-shadow.timer", "us-stock-trading-shadow.service"),
+        ("us-stock-trading-shadow-exit.timer", "us-stock-trading-shadow-exit.service"),
+        ("us-stock-trading-health.timer", "us-stock-trading-health.service"),
+    ])
+    def test_each_timer_targets_its_service(self, timer, unit):
+        assert _parse_unit(timer)["Timer"]["Unit"] == unit
+
+    def test_the_live_service_has_no_timer(self):
+        for timer in TIMER_UNITS:
+            assert _parse_unit(timer)["Timer"]["Unit"] != "us-stock-trading-live.service"
 
 
 class TestExecStartTargetsExist:
@@ -120,6 +202,59 @@ class TestExecStartTargetsExist:
         path = SCRIPTS_DIR / entrypoint
         assert path.stat().st_mode & 0o111, f"{entrypoint} is not executable"
 
+    @pytest.mark.parametrize("entrypoint", ENTRYPOINTS)
+    def test_entrypoint_help_succeeds(self, entrypoint):
+        result = subprocess.run(
+            [sys.executable, str(SCRIPTS_DIR / entrypoint), "--help"],
+            capture_output=True, text=True, cwd=str(REPO_ROOT),
+        )
+        assert result.returncode == 0, result.stderr
+        assert "usage" in result.stdout.lower()
+
+
+class TestShadowServicesCannotOrder:
+    """Structural, not behavioural: a Shadow entrypoint that cannot even
+    REACH the order path is a stronger guarantee than one that merely
+    checks a flag before using it."""
+
+    @pytest.mark.parametrize("entrypoint", ["run_shadow_mode.py", "run_shadow_exit_evaluation.py"])
+    def test_shadow_entrypoint_does_not_import_the_execution_engine(self, entrypoint):
+        import ast
+
+        tree = ast.parse((SCRIPTS_DIR / entrypoint).read_text(encoding="utf-8"))
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module)
+                imported.update(f"{node.module}.{alias.name}" for alias in node.names)
+        forbidden = {
+            "execution.execution_engine", "execution.execution_engine.submit_buy_order",
+            "brokers.kis_broker_adapter", "kis_position_manager",
+        }
+        assert not (imported & forbidden), f"{entrypoint} imports {imported & forbidden}"
+
+    @pytest.mark.parametrize("entrypoint", ["run_shadow_mode.py", "run_shadow_exit_evaluation.py"])
+    def test_shadow_entrypoint_calls_no_order_submitting_method(self, entrypoint):
+        source = (SCRIPTS_DIR / entrypoint).read_text(encoding="utf-8")
+        code_lines = [
+            line for line in source.splitlines()
+            if not line.strip().startswith("#")
+        ]
+        # Strip the module docstring, which legitimately discusses these.
+        body = "\n".join(code_lines).split('"""')[-1]
+        for forbidden in ("submit_order(", "cancel_order(", "submit_buy_order(",
+                          "submit_sell_order(", "check_and_manage("):
+            assert forbidden not in body, f"{entrypoint} calls {forbidden}"
+
+    def test_shadow_exit_uses_the_same_decision_function_the_live_path_uses(self):
+        source = (SCRIPTS_DIR / "run_shadow_exit_evaluation.py").read_text(encoding="utf-8")
+        assert "lifecycle.decide_exit(" in source, (
+            "the Shadow exit service must reuse positions.lifecycle.decide_exit(), "
+            "not re-implement the exit rules"
+        )
+
 
 class TestInstallerScript:
     def test_installer_exists_and_is_valid_bash(self):
@@ -128,17 +263,53 @@ class TestInstallerScript:
         result = subprocess.run(["bash", "-n", str(installer)], capture_output=True, text=True)
         assert result.returncode == 0, result.stderr
 
-    def test_installer_enables_only_the_readonly_services(self):
+    def test_installer_enables_only_the_readonly_timers(self):
         raw = (SCRIPTS_DIR / "install_oracle_services.sh").read_text(encoding="utf-8")
-        enable_lines = [
-            line.strip() for line in raw.splitlines()
-            if "systemctl enable" in line and not line.strip().startswith("#")
-        ]
-        assert any("us-stock-trading-shadow.timer" in line for line in enable_lines)
-        assert any("us-stock-trading-reconcile.timer" in line for line in enable_lines)
-        # The live unit is installed but must never be enabled here.
-        assert not any("us-stock-trading-live.service" in line for line in enable_lines)
+        enable_block = re.search(r"ENABLE_TIMERS=\((.*?)\)", raw, flags=re.DOTALL)
+        assert enable_block, "installer has no ENABLE_TIMERS list"
+        enabled = enable_block.group(1).split()
+        assert set(enabled) == set(TIMER_UNITS)
+        # The live unit must never appear in anything the installer enables.
+        assert "us-stock-trading-live.service" not in enabled
+
+    def test_installer_never_enables_or_starts_the_live_service(self):
+        raw = (SCRIPTS_DIR / "install_oracle_services.sh").read_text(encoding="utf-8")
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            if "us-stock-trading-live.service" not in stripped:
+                continue
+            assert "systemctl enable" not in stripped, f"installer enables the live unit: {stripped}"
+            assert "systemctl start" not in stripped, f"installer starts the live unit: {stripped}"
         assert "systemctl disable us-stock-trading-live.service" in raw
+        assert "systemctl stop us-stock-trading-live.service" in raw
+
+    def test_installer_never_flips_a_live_order_flag(self):
+        raw = (SCRIPTS_DIR / "install_oracle_services.sh").read_text(encoding="utf-8")
+        for flag in ("KIS_LIVE_ORDER_ENABLED", "LIVE_ROLLOUT_ENABLED", "ENTRY_DISABLED",
+                     "ALPACA_ORDER_ENABLED"):
+            for line in raw.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("#") or flag not in stripped:
+                    continue
+                # Reading/validating the flag is fine; assigning it is not.
+                assert not re.search(rf"^{flag}=", stripped), (
+                    f"installer assigns {flag}: {stripped}"
+                )
+
+    def test_installer_runs_migration_and_preflight_before_enabling_anything(self):
+        raw = (SCRIPTS_DIR / "install_oracle_services.sh").read_text(encoding="utf-8")
+        migrate_at = raw.index("run_migrations.py")
+        preflight_at = raw.rindex("preflight_kis_live.py")
+        enable_at = raw.index('systemctl enable --now "${timer}"')
+        assert migrate_at < enable_at
+        assert preflight_at < enable_at
+
+    def test_installer_refuses_a_live_enabled_environment_file(self):
+        raw = (SCRIPTS_DIR / "install_oracle_services.sh").read_text(encoding="utf-8")
+        assert "only deploys the read-only posture" in raw
+        assert "ENTRY_DISABLED" in raw
 
     def test_installer_sets_root_trading_0640_on_the_env_file(self):
         raw = (SCRIPTS_DIR / "install_oracle_services.sh").read_text(encoding="utf-8")
@@ -232,6 +403,128 @@ class TestPreflight:
         results = _run_preflight(env)
         assert any(name == "commit_match" for name, _, _ in results.failures)
 
+    def test_migration_behind_the_code_fails_preflight(self, preflight_env, tmp_path, monkeypatch):
+        # A database that has NOT had the migrations applied must block
+        # every service from starting.
+        import sqlite3
+
+        stale = tmp_path / "STALE.db"
+        conn = sqlite3.connect(str(stale))
+        conn.execute(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, "
+            "description TEXT NOT NULL, applied_at TEXT NOT NULL)"
+        )
+        conn.commit()
+        conn.close()
+        monkeypatch.setenv("STATE_STORE_DB_FILE", str(stale))
+
+        from state_store import db as state_db
+        monkeypatch.setattr(state_db, "init_db", lambda conn, **kwargs: 0)
+        results = _run_preflight(preflight_env)
+        assert any(name == "db_migrations" for name, _, _ in results.failures)
+
+    def test_missing_entrypoint_fails_preflight(self, preflight_env, monkeypatch):
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        try:
+            import importlib
+
+            module = importlib.import_module("preflight_kis_live")
+            monkeypatch.setattr(
+                module, "REQUIRED_ENTRYPOINTS",
+                module.REQUIRED_ENTRYPOINTS + ("definitely_not_here.py",),
+            )
+            results = module.run_preflight(env=preflight_env)
+        finally:
+            sys.path.remove(str(SCRIPTS_DIR))
+        assert any(name == "entrypoints_exist" for name, _, _ in results.failures)
+
+    def test_missing_unit_file_fails_preflight(self, preflight_env, monkeypatch):
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        try:
+            import importlib
+
+            module = importlib.import_module("preflight_kis_live")
+            monkeypatch.setattr(
+                module, "REQUIRED_UNITS",
+                module.REQUIRED_UNITS + ("us-stock-trading-nonexistent.service",),
+            )
+            results = module.run_preflight(env=preflight_env)
+        finally:
+            sys.path.remove(str(SCRIPTS_DIR))
+        assert any(name == "units_exist" for name, _, _ in results.failures)
+
+
+class TestCommitExactMatch:
+    """CODEX-051: a deployment commit is a full 40-character lowercase hex
+    SHA that names a real commit, or preflight fails. Codex reproduced a
+    single character 'f' passing as an exact match."""
+
+    def _head(self):
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=str(REPO_ROOT), capture_output=True,
+            text=True, check=True,
+        ).stdout.strip()
+
+    def _check(self, preflight_env, validated, deployed=None):
+        env = dict(preflight_env)
+        env["VALIDATED_COMMIT"] = validated
+        env["DEPLOYED_COMMIT"] = deployed if deployed is not None else validated
+        results = _run_preflight(env)
+        return [name for name, _, _ in results.failures]
+
+    def test_full_matching_sha_passes(self, preflight_env):
+        assert "commit_match" not in self._check(preflight_env, self._head())
+
+    def test_full_but_different_sha_fails(self, preflight_env):
+        assert "commit_match" in self._check(preflight_env, "0" * 40)
+
+    def test_single_character_prefix_fails(self, preflight_env):
+        # The exact value Codex reproduced as passing.
+        assert "commit_match" in self._check(preflight_env, self._head()[:1])
+
+    def test_seven_character_short_sha_fails(self, preflight_env):
+        assert "commit_match" in self._check(preflight_env, self._head()[:7])
+
+    def test_thirty_nine_characters_fails(self, preflight_env):
+        assert "commit_match" in self._check(preflight_env, self._head()[:39])
+
+    def test_forty_one_characters_fails(self, preflight_env):
+        assert "commit_match" in self._check(preflight_env, self._head() + "a")
+
+    def test_uppercase_sha_fails(self, preflight_env):
+        assert "commit_match" in self._check(preflight_env, self._head().upper())
+
+    @pytest.mark.parametrize("value", ["HEAD", "refs/heads/main", "", "  "])
+    def test_non_sha_values_fail(self, preflight_env, value):
+        assert "commit_match" in self._check(preflight_env, value)
+
+    def test_whitespace_padded_sha_fails(self, preflight_env):
+        assert "commit_match" in self._check(preflight_env, " " + self._head())
+
+    def test_nonexistent_but_well_formed_sha_fails(self, preflight_env):
+        assert "commit_match" in self._check(preflight_env, "0" * 39 + "1")
+
+    def test_validated_and_deployed_agree_but_head_differs_fails(self, preflight_env):
+        # Both env vars are a valid, real commit -- just not the one that
+        # is actually checked out.
+        parent = subprocess.run(
+            ["git", "rev-parse", "HEAD~1"], cwd=str(REPO_ROOT), capture_output=True,
+            text=True, check=True,
+        ).stdout.strip()
+        assert "commit_match" in self._check(preflight_env, parent)
+
+    def test_validated_and_deployed_differ_fails(self, preflight_env):
+        parent = subprocess.run(
+            ["git", "rev-parse", "HEAD~1"], cwd=str(REPO_ROOT), capture_output=True,
+            text=True, check=True,
+        ).stdout.strip()
+        assert "commit_match" in self._check(preflight_env, self._head(), parent)
+
+    def test_no_prefix_comparison_remains_in_the_source(self):
+        source = (SCRIPTS_DIR / "preflight_kis_live.py").read_text(encoding="utf-8")
+        for banned in ("head.startswith(", "deployed.startswith(", "validated.startswith("):
+            assert banned not in source, f"preflight still uses {banned}"
+
     def test_missing_required_variable_is_detected(self, preflight_env):
         env = dict(preflight_env)
         del env["KIS_APP_KEY"]
@@ -281,10 +574,62 @@ class TestRunbookMatchesTheRepository:
         for required in [
             "install_oracle_services.sh",
             "preflight_kis_live.py",
+            "run_migrations.py",
+            "run_reconciliation.py",
+            "run_shadow_mode.py",
+            "run_shadow_exit_evaluation.py",
+            "run_health_report.py",
+            "us-stock-trading-migrate",
             "us-stock-trading-shadow",
+            "us-stock-trading-shadow-exit",
             "us-stock-trading-reconcile",
+            "us-stock-trading-health",
             "us-stock-trading-live",
             "journalctl",
             "systemctl is-enabled",
+            "systemctl list-timers",
+            "audit_integrity_report",
         ]:
             assert required in text, f"runbook does not mention {required!r}"
+
+    def test_runbook_covers_the_required_deployment_sequence(self):
+        """The stage HEADINGS must appear in deployment order. Individual
+        command names are checked for presence, not position -- the
+        runbook legitimately lists a file (the unit inventory) before the
+        step that runs it."""
+        text = RUNBOOK.read_text(encoding="utf-8")
+        ordered_headings = [
+            "## 4. 백업",
+            "## 5. 신규 릴리스 디렉터리 배포",
+            "## 6. 별도 가상환경 준비",
+            "## 7. 환경변수 설정",
+            "## 8. 스키마 마이그레이션",
+            "## 13. KIS 잔고·미체결 대조",
+            "## 14. Shadow Mode 실행",
+            "### 15.1 유닛 설치",
+            "### 15.2 사전 검증",
+            "### 15.3 단독 실행 확인",
+            "### 15.4 시작·확인",
+            "### 15.5 live 서비스가 비활성인지 확인",
+            "### 15.7 정지",
+            "## 16. 실주문 비활성 상태 최종 확인",
+            "## 롤백 절차",
+        ]
+        last = -1
+        for heading in ordered_headings:
+            index = text.find(heading)
+            assert index != -1, f"runbook is missing the {heading!r} stage"
+            assert index > last, f"runbook has {heading!r} out of order"
+            last = index
+
+        for command in [
+            "run_migrations.py", "preflight_kis_live.py", "run_reconciliation.py",
+            "run_shadow_mode.py", "run_shadow_exit_evaluation.py", "run_health_report.py",
+            "install_oracle_services.sh", "systemctl list-timers", "journalctl",
+        ]:
+            assert command in text, f"runbook never names {command!r}"
+
+    def test_runbook_names_every_unit_file_that_exists(self):
+        text = RUNBOOK.read_text(encoding="utf-8")
+        for unit in SERVICE_UNITS + TIMER_UNITS:
+            assert unit in text, f"runbook does not mention the {unit} unit"

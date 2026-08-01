@@ -15,7 +15,9 @@ not true:
     the reconciliation entrypoint is importable and its state file writable
     the log directory is writable
     no other instance already holds the single-run lock
-    VALIDATED_COMMIT == DEPLOYED_COMMIT == the actual checked-out commit
+    every service entrypoint and systemd unit file the deployment needs exists
+    VALIDATED_COMMIT == DEPLOYED_COMMIT == the actual checked-out commit,
+      each a full 40-character lowercase hex SHA naming a real commit (CODEX-051)
 
 It prints only variable NAMES and pass/fail -- never a secret's value,
 and never a full account number (`--verbose` shows the masked last-4
@@ -29,6 +31,7 @@ one of the checks.
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -142,15 +145,72 @@ def check_flag_consistency(results, env):
     results.ok("flag_consistency", "order/entry/rollout flags are mutually consistent")
 
 
+# CODEX-051: a deployment commit is a FULL 40-character lowercase hex
+# SHA-1 or it is not a commit identifier at all. The previous
+# implementation compared with startswith() in both directions, so a
+# single character ("f") matched any HEAD beginning with it and was
+# reported as an exact match -- reproduced directly by Codex.
+FULL_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _validate_full_sha(name, value):
+    """Returns an error string, or None if `value` is a full 40-character
+    lowercase hex SHA. Deliberately strict: short SHAs, uppercase, refs
+    ('HEAD', 'refs/heads/main'), surrounding whitespace and empty values
+    are all rejected rather than normalized, because every one of them
+    means the operator pinned something other than an exact commit."""
+    if value is None:
+        return f"{name} is not set"
+    if not isinstance(value, str):
+        return f"{name} is not a string"
+    if value != value.strip():
+        return f"{name} has surrounding whitespace"
+    if not value:
+        return f"{name} is empty"
+    if not FULL_SHA_PATTERN.match(value):
+        return (
+            f"{name} must be a full 40-character lowercase hex commit SHA, got a "
+            f"{len(value)}-character value"
+        )
+    return None
+
+
+def _commit_exists(sha, repo_root):
+    """True only if `sha` names a real commit OBJECT in this repository."""
+    try:
+        subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"],
+            cwd=str(repo_root), capture_output=True, text=True, check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return True
+
+
 def check_commit_match(results, env, repo_root=REPO_ROOT):
-    validated = env.get("VALIDATED_COMMIT", "")
-    deployed = env.get("DEPLOYED_COMMIT", "")
-    if not validated or validated != deployed:
+    """CODEX-051: all THREE of VALIDATED_COMMIT, DEPLOYED_COMMIT and the
+    actual checked-out HEAD must be the same full 40-character SHA. No
+    prefix matching, in either direction, at any length."""
+    validated = env.get("VALIDATED_COMMIT")
+    deployed = env.get("DEPLOYED_COMMIT")
+
+    errors = [
+        error for error in (
+            _validate_full_sha("VALIDATED_COMMIT", validated),
+            _validate_full_sha("DEPLOYED_COMMIT", deployed),
+        ) if error
+    ]
+    if errors:
+        results.fail("commit_match", "; ".join(errors))
+        return
+
+    if validated != deployed:
         results.fail(
             "commit_match",
-            f"VALIDATED_COMMIT ({validated[:12]!r}) != DEPLOYED_COMMIT ({deployed[:12]!r})",
+            f"VALIDATED_COMMIT ({validated}) != DEPLOYED_COMMIT ({deployed})",
         )
         return
+
     try:
         head = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=str(repo_root), capture_output=True, text=True,
@@ -159,13 +219,27 @@ def check_commit_match(results, env, repo_root=REPO_ROOT):
     except (OSError, subprocess.CalledProcessError) as exc:
         results.fail("commit_match", f"could not read the checked-out commit: {exc}")
         return
-    if not head.startswith(deployed) and not deployed.startswith(head):
+
+    head_error = _validate_full_sha("git rev-parse HEAD", head)
+    if head_error:
+        results.fail("commit_match", head_error)
+        return
+
+    if deployed != head:
         results.fail(
             "commit_match",
-            f"DEPLOYED_COMMIT {deployed[:12]!r} is not the checked-out commit {head[:12]!r}",
+            f"DEPLOYED_COMMIT ({deployed}) is not the checked-out commit ({head})",
         )
         return
-    results.ok("commit_match", f"validated == deployed == HEAD ({head[:12]})")
+
+    if not _commit_exists(deployed, repo_root):
+        results.fail(
+            "commit_match",
+            f"DEPLOYED_COMMIT ({deployed}) does not name a commit object in this repository",
+        )
+        return
+
+    results.ok("commit_match", f"validated == deployed == HEAD ({head})")
 
 
 def check_db_migrations(results):
@@ -224,6 +298,52 @@ def check_log_dir_writable(results, env):
     results.ok("log_dir_writable", str(log_dir))
 
 
+REQUIRED_ENTRYPOINTS = (
+    "preflight_kis_live.py",
+    "run_migrations.py",
+    "run_reconciliation.py",
+    "run_shadow_mode.py",
+    "run_shadow_exit_evaluation.py",
+    "run_health_report.py",
+    "run_live_buy_entry.py",
+)
+
+REQUIRED_UNITS = (
+    "us-stock-trading-migrate.service",
+    "us-stock-trading-reconcile.service",
+    "us-stock-trading-reconcile.timer",
+    "us-stock-trading-shadow.service",
+    "us-stock-trading-shadow.timer",
+    "us-stock-trading-shadow-exit.service",
+    "us-stock-trading-shadow-exit.timer",
+    "us-stock-trading-health.service",
+    "us-stock-trading-health.timer",
+    "us-stock-trading-live.service",
+)
+
+
+def check_entrypoints_exist(results, repo_root=REPO_ROOT):
+    missing = [
+        name for name in REQUIRED_ENTRYPOINTS
+        if not (repo_root / "scripts" / name).is_file()
+    ]
+    if missing:
+        results.fail("entrypoints_exist", f"missing service entrypoints: {sorted(missing)}")
+        return
+    results.ok("entrypoints_exist", f"{len(REQUIRED_ENTRYPOINTS)} entrypoints present")
+
+
+def check_units_exist(results, repo_root=REPO_ROOT):
+    missing = [
+        name for name in REQUIRED_UNITS
+        if not (repo_root / "deploy" / "systemd" / name).is_file()
+    ]
+    if missing:
+        results.fail("units_exist", f"missing systemd units: {sorted(missing)}")
+        return
+    results.ok("units_exist", f"{len(REQUIRED_UNITS)} unit files present")
+
+
 def check_single_run_lock(results):
     from execution import idempotency
 
@@ -271,6 +391,8 @@ def run_preflight(env=None, *, verbose=False):
     check_db_migrations(results)
     check_reconciliation_runnable(results)
     check_log_dir_writable(results, env)
+    check_entrypoints_exist(results)
+    check_units_exist(results)
     check_single_run_lock(results)
     return results
 
