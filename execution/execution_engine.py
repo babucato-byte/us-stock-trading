@@ -39,6 +39,8 @@ intentionally NOT retried by this function (spec §9) -- reconciliation/
 order_reconciler.py is the only path that can move it out of UNKNOWN.
 """
 
+import logging
+import sqlite3
 from datetime import datetime, timezone
 
 from brokers.kis_broker import KISAmbiguousResponseError, KISBrokerError
@@ -48,10 +50,13 @@ from execution.order_repository import OrderRepositoryError
 from execution.order_state_machine import OrderStateTransitionError
 import shadow_audit
 from reconciliation import snapshot as reconciliation_snapshot
+from execution.secret_redaction import safe_repr
 from reconciliation.snapshot import (
     ReconciliationBlockedError,
     ReconciliationUnavailableError,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ExecutionEngineError(Exception):
@@ -80,6 +85,21 @@ REASON_GATE = "GATE"
 REASON_STATE_PERSISTENCE = "STATE_PERSISTENCE"
 REASON_AUDIT_PERSISTENCE = "AUDIT_PERSISTENCE"
 REASON_AUDIT_CONTEXT_MISSING = "AUDIT_CONTEXT_MISSING"
+REASON_CANCEL_FINAL_STATE_PERSISTENCE = "CANCEL_FINAL_STATE_PERSISTENCE"
+
+
+class CancelPreTransportBlocked(ExecutionEngineError):
+    """A cancel refused BEFORE broker.cancel_order() was called. The
+    execution never reached KIS, so the run ends as SHADOW_BLOCKED."""
+
+
+class CancelPostTransportError(ExecutionEngineError):
+    """A cancel that DID reach broker.cancel_order() and then failed --
+    typically because the confirmed outcome could not be persisted.
+
+    CODEX-054: this is the distinction that was missing. Classifying it
+    as "blocked" would tell an operator the cancel never ran, while the
+    order may in fact be cancelled at KIS. It is an execution error."""
 
 
 def validate_audit_run_id(value):
@@ -383,13 +403,24 @@ def _force_unknown(conn, record, *, reason, now, broker_order_id=None):
     determine. A CAS conflict here means another writer already moved
     the order (e.g. reconciliation resolved it); that writer's result
     stands and is not overwritten."""
+    updated, _persisted = _force_unknown_reported(
+        conn, record, reason=reason, now=now, broker_order_id=broker_order_id,
+    )
+    return updated
+
+
+def _force_unknown_reported(conn, record, *, reason, now, broker_order_id=None):
+    """_force_unknown() that also reports whether UNKNOWN was actually
+    persisted. The caller needs to know: "the order is durably UNKNOWN,
+    reconciliation will resolve it" and "we could not even record that we
+    do not know" are very different operational situations."""
     try:
         return order_repository.advance(
             conn, record, "UNKNOWN", event_type="RESPONSE_LOST",
             event_payload={"reason": reason}, broker_order_id=broker_order_id, now=now,
-        )
+        ), True
     except (OrderStateTransitionError, OrderRepositoryError):
-        return record
+        return record, False
 
 
 def submit_cancel(*, order_intent, broker_order_id, cancel_gate_context_builder, conn, broker,
@@ -441,6 +472,13 @@ def submit_cancel(*, order_intent, broker_order_id, cancel_gate_context_builder,
     """
     audit_run_id = validate_audit_run_id(audit_run_id)
     current = now or datetime.now(timezone.utc)
+    # CODEX-054: the AUTHORITY for terminal classification. Not the
+    # exception type -- whether broker.cancel_order() was actually
+    # invoked. A post-transport failure that surfaced as a generic
+    # ExecutionEngineError used to be reported as SHADOW_BLOCKED, i.e.
+    # "never reached the broker", for an order that may well be cancelled
+    # at KIS.
+    transport = {"attempted": False, "completed": False}
     terminal_written = False
     inner_returned = False
     try:
@@ -448,52 +486,33 @@ def submit_cancel(*, order_intent, broker_order_id, cancel_gate_context_builder,
             order_intent=order_intent, broker_order_id=broker_order_id,
             cancel_gate_context_builder=cancel_gate_context_builder, conn=conn, broker=broker,
             instrument=instrument, audit_run_id=audit_run_id, current=current,
+            transport=transport,
         )
         inner_returned = True
-    except ExecutionEngineError as exc:
-        # Every pre-transport refusal -- no durable record, gate block,
-        # CAS conflict, approval-audit failure -- ends the run as BLOCKED
-        # under the SAME audit_run_id.
-        terminal_written = _finalize_cancel(
-            audit_run_id=audit_run_id, terminal_event=shadow_audit.SHADOW_BLOCKED,
-            order_intent=order_intent, broker_order_id=broker_order_id,
-            reason_code=exc.reason_code or "CANCEL_BLOCKED", detail=str(exc), now=current,
-            best_effort=True,
-        )
-        raise
-    except (KISAmbiguousResponseError, KISBrokerError) as exc:
-        # The transport was reached and its outcome is not a confirmed
-        # cancel. The order is already UNKNOWN (see _cancel_inner); the
-        # run ends as ERROR.
-        terminal_written = _finalize_cancel(
-            audit_run_id=audit_run_id, terminal_event=shadow_audit.SHADOW_ERROR,
-            order_intent=order_intent, broker_order_id=broker_order_id,
-            reason_code="CANCEL_OUTCOME_UNKNOWN", detail=str(exc), now=current,
-            best_effort=True,
-        )
-        raise
     except BaseException as exc:  # noqa: BLE001 -- no path may leave the run open
         terminal_written = _finalize_cancel(
-            audit_run_id=audit_run_id, terminal_event=shadow_audit.SHADOW_ERROR,
+            audit_run_id=audit_run_id,
+            terminal_event=_cancel_terminal_for(transport),
             order_intent=order_intent, broker_order_id=broker_order_id,
-            reason_code="CANCEL_UNEXPECTED_ERROR", detail=str(exc), now=current,
-            best_effort=True,
+            reason_code=_cancel_reason_for(exc, transport), detail=str(exc), now=current,
+            transport=transport, best_effort=True,
         )
         raise
     finally:
         # Safety net for the FAILURE paths only -- the success outcome is
         # finalized below, after this block, so this must not pre-empt it.
-        # finalize_audit_run() is idempotent for the same terminal event,
-        # so a handler that already ran cannot be doubled here either.
+        # It classifies by the same authority, so it cannot mislabel a
+        # post-transport failure as blocked either.
         if not inner_returned and not terminal_written:
             _finalize_cancel(
-                audit_run_id=audit_run_id, terminal_event=shadow_audit.SHADOW_ERROR,
+                audit_run_id=audit_run_id,
+                terminal_event=_cancel_terminal_for(transport),
                 order_intent=order_intent, broker_order_id=broker_order_id,
                 reason_code="CANCEL_RUN_NOT_FINALIZED", detail=None, now=current,
-                best_effort=True,
+                transport=transport, best_effort=True,
             )
 
-    # Success path. Unlike the handlers above, a terminal-audit failure
+    # Success path. Unlike the handler above, a terminal-audit failure
     # here is NOT best-effort: returning a successful-looking result for a
     # cancel whose outcome was never audited is exactly what CODEX-053
     # forbids. The durable order state is left at whatever was actually
@@ -503,21 +522,59 @@ def submit_cancel(*, order_intent, broker_order_id, cancel_gate_context_builder,
             audit_run_id=audit_run_id, terminal_event=shadow_audit.SHADOW_COMPLETED,
             order_intent=order_intent, broker_order_id=broker_order_id,
             reason_code="CANCEL_CONFIRMED", final_order_state="CANCELLED", now=current,
+            transport=transport,
         )
     else:
         # KIS returned something other than a confirmed cancel; the order
-        # was already forced to UNKNOWN by _cancel_inner().
+        # was already forced to UNKNOWN by _cancel_inner(). The transport
+        # ran, so this is an execution ERROR, never a block.
         _finalize_cancel(
             audit_run_id=audit_run_id, terminal_event=shadow_audit.SHADOW_ERROR,
             order_intent=order_intent, broker_order_id=broker_order_id,
             reason_code="CANCEL_OUTCOME_UNKNOWN", detail=result.blocked_reason,
-            final_order_state=result.status, now=current,
+            final_order_state=result.status, now=current, transport=transport,
         )
     return result
 
 
+def _alert_cancel_persistence_failure(*, order_intent, unknown_persisted, error):
+    """Operator alert for the one case where KIS's answer and our durable
+    state have genuinely diverged."""
+    try:
+        from operations import alerts
+
+        alerts.send_alert(
+            "*KIS cancel confirmed but final state not persisted*\n"
+            f"- internal_order_id: {order_intent.internal_order_id}\n"
+            f"- symbol: {order_intent.symbol}\n"
+            f"- left UNKNOWN for reconciliation: {unknown_persisted}\n"
+            f"- error: {error}\n"
+            "- action: no automatic re-cancel; reconcile against KIS order history"
+        )
+    except Exception as exc:  # noqa: BLE001 -- alerting must not mask the failure
+        logger.error("could not alert on cancel persistence failure: %s", exc)
+
+
+def _cancel_terminal_for(transport):
+    """CODEX-054, in one line: SHADOW_BLOCKED means "the execution never
+    reached the broker". Once the transport has been attempted, every
+    failure is SHADOW_ERROR."""
+    return shadow_audit.SHADOW_ERROR if transport["attempted"] else shadow_audit.SHADOW_BLOCKED
+
+
+def _cancel_reason_for(exc, transport):
+    explicit = getattr(exc, "reason_code", None)
+    if explicit:
+        return explicit
+    if isinstance(exc, (KISAmbiguousResponseError, KISBrokerError)):
+        return "CANCEL_OUTCOME_UNKNOWN"
+    if transport["attempted"]:
+        return "CANCEL_POST_TRANSPORT_ERROR"
+    return "CANCEL_BLOCKED"
+
+
 def _finalize_cancel(*, audit_run_id, terminal_event, order_intent, broker_order_id,
-                      reason_code, now, detail=None, final_order_state=None,
+                      reason_code, now, detail=None, final_order_state=None, transport=None,
                       best_effort=False):
     """Ends a cancel run. Returns True if a terminal event is now durably
     recorded for this run.
@@ -536,6 +593,12 @@ def _finalize_cancel(*, audit_run_id, terminal_event, order_intent, broker_order
         "internal_order_id": order_intent.internal_order_id,
         "symbol": order_intent.symbol,
     }
+    if transport is not None:
+        # CODEX-054: the audit row itself records whether the transport
+        # ran, so an auditor can check the classification rather than
+        # having to trust it.
+        payload["transport_attempted"] = transport["attempted"]
+        payload["transport_completed"] = transport["completed"]
     if detail:
         payload["detail"] = detail
     if final_order_state:
@@ -566,13 +629,19 @@ def _finalize_cancel(*, audit_run_id, terminal_event, order_intent, broker_order
 
 
 def _cancel_inner(*, order_intent, broker_order_id, cancel_gate_context_builder, conn, broker,
-                   instrument, audit_run_id, current):
+                   instrument, audit_run_id, current, transport):
     """The cancel flow itself. Raises for every refusal so submit_cancel()
-    above owns terminal-event handling in exactly one place."""
+    above owns terminal-event handling in exactly one place.
+
+    `transport` is the shared marker submit_cancel() classifies on. It is
+    set to attempted=True IMMEDIATELY before broker.cancel_order() and
+    never reset, so any failure from that point on -- including one that
+    surfaces as a plain ExecutionEngineError -- is classified as an
+    execution error rather than as a pre-transport block (CODEX-054)."""
     with idempotency.single_run_lock():
         record = order_repository.load(conn, order_intent.internal_order_id)
         if record is None:
-            raise ExecutionEngineError(
+            raise CancelPreTransportBlocked(
                 f"cancel blocked -- no durable order record exists for "
                 f"{order_intent.internal_order_id!r}",
                 reason_code="CANCEL_NO_ORDER_RECORD",
@@ -583,7 +652,7 @@ def _cancel_inner(*, order_intent, broker_order_id, cancel_gate_context_builder,
                 order_intent, cancel_gate_context_builder, order_gate.evaluate_cancel_gate, now=current,
             )
         except (order_gate.OrderGateBlockedError, UnauthorizedExecutionError) as exc:
-            raise ExecutionEngineError(
+            raise CancelPreTransportBlocked(
                 f"cancel blocked by order gate: {exc}",
                 reason_code=f"{REASON_GATE}:{getattr(exc, 'code', 'GATE')}",
             ) from exc
@@ -603,7 +672,7 @@ def _cancel_inner(*, order_intent, broker_order_id, cancel_gate_context_builder,
                 broker_order_id=broker_order_id, now=current,
             )
         except (OrderStateTransitionError, OrderRepositoryError) as exc:
-            raise ExecutionEngineError(
+            raise CancelPreTransportBlocked(
                 f"cancel blocked -- could not durably record CANCEL_PENDING for "
                 f"{order_intent.internal_order_id!r}: {exc}",
                 reason_code=REASON_STATE_PERSISTENCE,
@@ -615,6 +684,8 @@ def _cancel_inner(*, order_intent, broker_order_id, cancel_gate_context_builder,
             reason_code="CANCEL_PENDING", detail=f"broker_order_id={broker_order_id}",
         )
 
+        # From here on, any failure is a POST-transport failure.
+        transport["attempted"] = True
         try:
             execution_record = broker.cancel_order(
                 order_intent, instrument, broker_order_id, authorization=authorized,
@@ -625,6 +696,7 @@ def _cancel_inner(*, order_intent, broker_order_id, cancel_gate_context_builder,
         except KISBrokerError as exc:
             _force_unknown(conn, record, reason=f"cancel failed: {exc}", now=current)
             raise
+        transport["completed"] = True
 
         if execution_record.status != "CANCELLED":
             _force_unknown(
@@ -643,13 +715,34 @@ def _cancel_inner(*, order_intent, broker_order_id, cancel_gate_context_builder,
                 conn, record, "CANCELLED", event_type="CANCEL_CONFIRMED",
                 event_payload={"broker_order_id": broker_order_id}, now=current,
             )
-        except (OrderStateTransitionError, OrderRepositoryError) as exc:
-            _force_unknown(
+        except (OrderStateTransitionError, OrderRepositoryError, sqlite3.Error) as exc:
+            # CODEX-054: KIS CONFIRMED the cancel and we could not record
+            # it. This is not a block -- the execution happened. Do the
+            # best safe thing (leave the order durably UNKNOWN so
+            # reconciliation resolves it against KIS's own history), never
+            # re-cancel automatically, and never return success.
+            _record, unknown_persisted = _force_unknown_reported(
                 conn, record, reason=f"could not durably record CANCELLED: {exc}", now=current,
             )
-            raise ExecutionEngineError(
-                f"cancel was confirmed by KIS but could not be durably recorded -- left UNKNOWN "
-                f"for reconciliation: {exc}",
+            logger.error(
+                "cancel confirmed by KIS but final state not persisted: order=%s broker_result=%s "
+                "unknown_persisted=%s error=%s",
+                order_intent.internal_order_id, safe_repr(execution_record), unknown_persisted,
+                exc,
+            )
+            _alert_cancel_persistence_failure(
+                order_intent=order_intent, unknown_persisted=unknown_persisted, error=exc,
+            )
+            if unknown_persisted:
+                raise CancelPostTransportError(
+                    f"cancel was confirmed by KIS but could not be durably recorded -- left "
+                    f"UNKNOWN for reconciliation: {exc}",
+                    reason_code=REASON_CANCEL_FINAL_STATE_PERSISTENCE,
+                ) from exc
+            raise CancelPostTransportError(
+                f"cancel was confirmed by KIS, the final state could not be recorded, and "
+                f"UNKNOWN could not be recorded either -- this order's durable state does not "
+                f"reflect reality and needs manual reconciliation: {exc}",
                 reason_code=REASON_STATE_PERSISTENCE,
             ) from exc
 

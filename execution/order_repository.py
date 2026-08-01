@@ -186,7 +186,17 @@ def compare_and_set_state(conn, *, order_id, expected_state, next_state, event_t
     except (sqlite3.Error, OrderRepositoryError):
         conn.rollback()
         raise
-    conn.commit()
+    try:
+        conn.commit()
+    except sqlite3.Error:
+        # A failed COMMIT leaves the write transaction open, which would
+        # then lock out every other writer (including the audit trail).
+        # Roll it back before surfacing the failure.
+        try:
+            conn.rollback()
+        except sqlite3.Error:  # pragma: no cover -- nothing more we can do
+            pass
+        raise
     record = load(conn, order_id)
     if record is None:  # pragma: no cover -- the UPDATE above matched a row
         raise OrderRepositoryError(f"order {order_id!r} vanished during compare-and-set")

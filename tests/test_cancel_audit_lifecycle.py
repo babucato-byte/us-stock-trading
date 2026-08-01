@@ -541,6 +541,225 @@ class TestTerminalInvariantAcrossEveryCancelPath:
         ]
 
 
+class _FailFinalStateConn:
+    """Lets everything through except the durable write that records the
+    CONFIRMED cancel -- the exact window CODEX-054 is about."""
+
+    def __init__(self, conn, mode="update"):
+        self._conn = conn
+        self._mode = mode
+        self.armed = False
+        self._final_write_seen = False
+
+    def arm(self):
+        self.armed = True
+
+    def execute(self, sql, *args, **kwargs):
+        params = tuple(args[0]) if args else ()
+        if self.armed and self._mode == "update" and "SET status = ?" in sql:
+            if "CANCELLED" in params:
+                raise sqlite3.OperationalError("simulated final-state UPDATE failure")
+        if self.armed and self._mode == "event" and "INSERT INTO order_state_events" in sql:
+            if "CANCEL_CONFIRMED" in params:
+                raise sqlite3.OperationalError("simulated final-state event failure")
+        if self.armed and self._mode == "commit" and "SET status = ?" in sql:
+            # Only the COMMIT that would persist the confirmed cancel
+            # fails; every earlier transition must still work, or this
+            # would be a PRE-transport failure instead.
+            if "CANCELLED" in params:
+                self._final_write_seen = True
+        return self._conn.execute(sql, *args, **kwargs)
+
+    def commit(self):
+        if self.armed and self._mode == "commit" and self._final_write_seen:
+            self._final_write_seen = False
+            raise sqlite3.OperationalError("simulated commit failure")
+        return self._conn.commit()
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+class TestPostTransportPersistenceFailureIsAnError:
+    """CODEX-054: SHADOW_BLOCKED means the execution never reached the
+    broker. Once broker.cancel_order() has run, every failure is
+    SHADOW_ERROR -- otherwise the audit trail says an order that may be
+    cancelled at KIS was never even attempted."""
+
+    def _run(self, mode):
+        conn = state_db.open_db()
+        broker = _Broker()
+        _place_order(conn, broker)
+        failing = _FailFinalStateConn(conn, mode=mode)
+        run_id = shadow_audit.new_run_id()
+        failing.arm()
+        with pytest.raises(ExecutionEngineError) as excinfo:
+            execution_engine.submit_cancel(
+                order_intent=_order_intent(), broker_order_id="kis-1",
+                cancel_gate_context_builder=_cancel_ctx_builder(), conn=failing, broker=broker,
+                instrument=_instrument(), audit_run_id=run_id, now=NOW,
+            )
+        return conn, broker, run_id, excinfo.value
+
+    def test_reproduction_final_state_update_failure(self):
+        """The exact path Codex reported: transport ran, KIS confirmed the
+        cancel, persisting the final state failed."""
+        conn, broker, run_id, exc = self._run("update")
+
+        assert broker.cancel_calls == 1, "the transport DID run"
+        types = _events(run_id)
+        assert "SHADOW_ERROR" in types
+        assert "SHADOW_BLOCKED" not in types
+        assert "SHADOW_COMPLETED" not in types
+        assert _terminal_count(run_id) == 1
+        assert order_repository.load(conn, "ord-1").state == "UNKNOWN"
+        assert exc.reason_code == "CANCEL_FINAL_STATE_PERSISTENCE"
+
+    def test_final_state_event_insert_failure(self):
+        conn, broker, run_id, exc = self._run("event")
+        assert broker.cancel_calls == 1
+        assert _events(run_id)[-1] == "SHADOW_ERROR"
+        assert _terminal_count(run_id) == 1
+        assert order_repository.load(conn, "ord-1").state == "UNKNOWN"
+
+    def test_commit_failure_after_confirmation(self):
+        conn, broker, run_id, exc = self._run("commit")
+        assert broker.cancel_calls == 1
+        assert _events(run_id)[-1] == "SHADOW_ERROR"
+        assert _terminal_count(run_id) == 1
+
+    def test_cas_conflict_on_the_final_transition(self, monkeypatch):
+        """A concurrent writer moved the order between CANCEL_PENDING and
+        the final write. Still post-transport, still an ERROR."""
+        conn = state_db.open_db()
+        broker = _Broker()
+        _place_order(conn, broker)
+        run_id = shadow_audit.new_run_id()
+
+        real_advance = execution_engine.order_repository.advance
+
+        def _conflict(conn_, record, next_state, **kwargs):
+            if next_state == "CANCELLED":
+                raise execution_engine.order_repository.OrderStateConflictError("lost the race")
+            return real_advance(conn_, record, next_state, **kwargs)
+
+        # NOTE: no monkeypatch.undo() here -- it would undo the autouse
+        # _isolate fixture's env vars too and point the assertions below
+        # at a different database. pytest tears the patch down anyway.
+        monkeypatch.setattr(execution_engine.order_repository, "advance", _conflict)
+        with pytest.raises(ExecutionEngineError):
+            _cancel(conn, broker, run_id)
+
+        assert broker.cancel_calls == 1
+        assert _events(run_id)[-1] == "SHADOW_ERROR"
+        assert _terminal_count(run_id) == 1
+
+    def test_no_automatic_re_cancel_after_a_persistence_failure(self):
+        _conn, broker, _run_id, _exc = self._run("update")
+        assert broker.cancel_calls == 1
+
+    def test_alert_is_raised_for_the_divergence(self, monkeypatch):
+        sent = []
+        from operations import alerts
+
+        monkeypatch.setattr(alerts, "send_alert", lambda m: sent.append(m) or True)
+        self._run("update")
+        assert sent, "no operator alert for a confirmed-but-unrecorded cancel"
+        assert "reconcile" in sent[0].lower()
+
+    def test_unknown_persistence_failing_too_is_still_an_error(self, monkeypatch):
+        """Neither the confirmed state NOR the UNKNOWN fallback could be
+        written. Still post-transport, so still SHADOW_ERROR -- and the
+        reason code says the durable state does not reflect reality."""
+        conn = state_db.open_db()
+        broker = _Broker()
+        _place_order(conn, broker)
+        run_id = shadow_audit.new_run_id()
+
+        real_advance = execution_engine.order_repository.advance
+
+        def _fail_both(conn_, record, next_state, **kwargs):
+            if next_state in ("CANCELLED", "UNKNOWN"):
+                raise execution_engine.order_repository.OrderRepositoryError("no writes")
+            return real_advance(conn_, record, next_state, **kwargs)
+
+        monkeypatch.setattr(execution_engine.order_repository, "advance", _fail_both)
+        with pytest.raises(ExecutionEngineError) as excinfo:
+            _cancel(conn, broker, run_id)
+
+        assert broker.cancel_calls == 1
+        assert _events(run_id)[-1] == "SHADOW_ERROR"
+        assert _terminal_count(run_id) == 1
+        assert excinfo.value.reason_code == "STATE_PERSISTENCE"
+
+    def test_terminal_payload_records_that_the_transport_ran(self):
+        _conn, _broker, run_id, _exc = self._run("update")
+        terminal = [r for r in shadow_audit.read_events(shadow_run_id=run_id)
+                    if r["event_type"] == "SHADOW_ERROR"][0]
+        payload = terminal["payload"] or ""
+        assert '"transport_attempted": true' in payload
+        assert '"action": "cancel"' in payload
+
+
+class TestPreTransportBlocksStayBlocked:
+    """The other half of CODEX-054: nothing that never reached the broker
+    may be reclassified as an execution error."""
+
+    def _assert_blocked_only(self, run_id, broker):
+        types = _events(run_id)
+        assert broker.cancel_calls == 0
+        assert "SHADOW_BLOCKED" in types
+        assert "SHADOW_ERROR" not in types
+        assert "SHADOW_COMPLETED" not in types
+        assert _terminal_count(run_id) == 1
+
+    def test_gate_rejection(self):
+        conn = state_db.open_db()
+        broker = _Broker()
+        _place_order(conn, broker)
+        run_id = shadow_audit.new_run_id()
+        with pytest.raises(ExecutionEngineError):
+            _cancel(conn, broker, run_id, ctx=_cancel_ctx_builder(is_actually_open=False))
+        self._assert_blocked_only(run_id, broker)
+
+    def test_missing_order_record(self):
+        conn = state_db.open_db()
+        broker = _Broker()
+        run_id = shadow_audit.new_run_id()
+        with pytest.raises(ExecutionEngineError):
+            _cancel(conn, broker, run_id)
+        self._assert_blocked_only(run_id, broker)
+
+    def test_cancel_pending_cas_conflict(self):
+        conn = state_db.open_db()
+        broker = _Broker()
+        _place_order(conn, broker)
+        _cancel(conn, broker, shadow_audit.new_run_id())
+        broker.cancel_calls = 0
+        run_id = shadow_audit.new_run_id()
+        with pytest.raises(ExecutionEngineError):
+            _cancel(conn, broker, run_id)
+        self._assert_blocked_only(run_id, broker)
+
+    def test_execution_planned_audit_failure(self, monkeypatch):
+        conn = state_db.open_db()
+        broker = _Broker()
+        _place_order(conn, broker)
+        real_open = shadow_audit._open_conn
+        monkeypatch.setattr(
+            shadow_audit, "_open_conn", lambda: _FailAuditAt(real_open(), "EXECUTION_PLANNED"),
+        )
+        run_id = shadow_audit.new_run_id()
+        with pytest.raises(ExecutionEngineError):
+            _cancel(conn, broker, run_id)
+        # The audit store itself is broken here, so the terminal event
+        # cannot be written either (handle_audit_failure() alerts). What
+        # must hold is that nothing reached the broker and nothing was
+        # misclassified as an execution error.
+        assert broker.cancel_calls == 0
+        assert "SHADOW_ERROR" not in _events(run_id)
+
+
 class TestFinalizeAuditRun:
     def test_same_terminal_event_twice_is_an_idempotent_no_op(self):
         state_db.open_db().close()
