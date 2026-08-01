@@ -274,6 +274,109 @@ def record_event(*, shadow_run_id, event_type, result, signal_id=None, internal_
     )
 
 
+class AuditInvariantError(ShadowAuditError):
+    """Raised when a run is being finalized with a DIFFERENT terminal
+    event than the one it already ended on. Two contradictory outcomes
+    for one run is an audit trail an operator cannot reduce to a single
+    answer, so it is surfaced rather than silently resolved."""
+
+
+def _existing_terminal_events(conn, shadow_run_id):
+    placeholders = ",".join("?" for _ in TERMINAL_EVENT_TYPES)
+    rows = conn.execute(
+        f"SELECT event_type FROM shadow_audit_events WHERE shadow_run_id = ? "
+        f"AND event_type IN ({placeholders})",
+        (shadow_run_id, *sorted(TERMINAL_EVENT_TYPES)),
+    ).fetchall()
+    return [row["event_type"] for row in rows]
+
+
+def finalize_audit_run(*, audit_run_id, terminal_event, internal_order_id=None, action=None,
+                        symbol=None, side=None, reason_code=None, payload=None, now=None,
+                        conn=None):
+    """CODEX-053: the ONE way a run is ended.
+
+    Every execution path -- buy, sell, cancel, success, block, error --
+    finishes here, so "exactly one terminal event per run" is a property
+    of a single function rather than of every call site remembering the
+    rule.
+
+    Re-finalizing with the SAME terminal event is an idempotent no-op
+    (a retry, or a `finally` safety net running after the explicit
+    handler already finished the run, must not create a second row).
+    Re-finalizing with a DIFFERENT one raises AuditInvariantError and
+    alerts: that means two code paths each believe they own the outcome,
+    which is a defect worth surfacing, not papering over.
+
+    The database enforces the same rule (migration 10's partial unique
+    index), so a race between two finalizers cannot produce two terminal
+    rows even though both passed the read below."""
+    if terminal_event not in TERMINAL_EVENT_TYPES:
+        raise ShadowAuditError(
+            f"{terminal_event!r} is not a terminal event; expected one of "
+            f"{sorted(TERMINAL_EVENT_TYPES)}"
+        )
+    owns_conn = conn is None
+    conn = conn or _open_conn()
+    try:
+        existing = _existing_terminal_events(conn, audit_run_id)
+        if existing:
+            return _resolve_existing_terminal(audit_run_id, terminal_event, existing)
+        try:
+            record_event(
+                shadow_run_id=audit_run_id, event_type=terminal_event,
+                result=_result_for_terminal(terminal_event), symbol=symbol, side=side,
+                internal_order_id=internal_order_id, reason_code=reason_code,
+                payload=_with_action(payload, action), now=now, conn=conn,
+            )
+        except ShadowAuditError:
+            # The DB index is the authority on "already finalized"; a
+            # losing race looks like a persistence failure until we
+            # re-read it.
+            existing = _existing_terminal_events(conn, audit_run_id)
+            if existing:
+                return _resolve_existing_terminal(audit_run_id, terminal_event, existing)
+            raise
+        return terminal_event
+    finally:
+        if owns_conn:
+            conn.close()
+
+
+def _with_action(payload, action):
+    if action is None:
+        return payload
+    merged = dict(payload or {})
+    merged["action"] = action
+    merged["terminal"] = True
+    return merged
+
+
+def _result_for_terminal(terminal_event):
+    return {
+        SHADOW_COMPLETED: RESULT_APPROVED,
+        SHADOW_BLOCKED: RESULT_BLOCKED,
+        SHADOW_ERROR: RESULT_ERROR,
+    }[terminal_event]
+
+
+def _resolve_existing_terminal(audit_run_id, terminal_event, existing):
+    if all(event == terminal_event for event in existing):
+        return terminal_event  # idempotent no-op
+    message = (
+        f"shadow run {audit_run_id} already ended on {sorted(set(existing))} but was "
+        f"finalized again as {terminal_event}"
+    )
+    logger.error(message)
+    try:
+        from operations import alerts
+
+        alerts.send_alert(f"*Shadow audit invariant violated*\n- {message}")
+    except Exception as exc:  # noqa: BLE001 -- alerting must not mask the finding
+        logger.error("could not alert on audit invariant violation: %s", exc)
+    raise AuditInvariantError(message)
+
+
 class ShadowAuditFailure(Exception):
     """Raised by handle_audit_failure() -- the caller-facing signal that
     an evaluation must be abandoned because its audit trail could not be

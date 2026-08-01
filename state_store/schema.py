@@ -401,6 +401,31 @@ MIGRATION_9_STATEMENTS = [
     SHADOW_AUDIT_EVENTS_CREATED_AT_INDEX,
 ]
 
+# ---------------------------------------------------------------------------
+# Migration 10 (CODEX-053): at most ONE terminal event per shadow_run_id,
+# enforced by the database rather than only by the code that writes it.
+#
+# The exactly-one-terminal-event invariant was previously an application
+# rule plus a reporting query -- which meant a second terminal event was
+# detectable after the fact but not prevented, and two concurrent writers
+# could both pass an application-level "has this run finished?" check.
+# A partial unique index makes the second write fail outright, so
+# shadow_audit.finalize_audit_run() can treat an IntegrityError as "this
+# run already has a terminal event" and decide (idempotent no-op for the
+# same event, AuditInvariantError for a conflicting one) from the durable
+# truth rather than from a racy read.
+# ---------------------------------------------------------------------------
+
+SHADOW_AUDIT_TERMINAL_ONCE_INDEX = """
+CREATE UNIQUE INDEX idx_shadow_audit_terminal_once
+    ON shadow_audit_events (shadow_run_id)
+    WHERE event_type IN ('SHADOW_COMPLETED', 'SHADOW_BLOCKED', 'SHADOW_ERROR')
+"""
+
+MIGRATION_10_STATEMENTS = [
+    SHADOW_AUDIT_TERMINAL_ONCE_INDEX,
+]
+
 # Every table this schema version creates -- used by export.py's
 # export_all() and by tests asserting the full table set exists.
 ALL_TABLES = [

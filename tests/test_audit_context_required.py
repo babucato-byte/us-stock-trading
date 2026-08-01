@@ -236,8 +236,11 @@ class TestMissingAuditContextBlocksTheOrder:
             cancel_gate_context_builder=_cancel_builder, conn=conn, broker=broker,
             instrument=_instrument(), audit_run_id=cancel_run, now=NOW,
         )
+        # CODEX-053: the run must also END. Pinning this at exactly the
+        # two approval events is what let the missing terminal event
+        # through the first time.
         types = [r["event_type"] for r in shadow_audit.read_events(shadow_run_id=cancel_run)]
-        assert types == ["GATE_APPROVED", "EXECUTION_PLANNED"]
+        assert types == ["GATE_APPROVED", "EXECUTION_PLANNED", "SHADOW_COMPLETED"]
 
 
 class TestValidAuditContextFlowsThroughTheLifecycle:

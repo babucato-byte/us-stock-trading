@@ -130,6 +130,21 @@ class KISBrokerAdapter:
                 exc, shadow_run_id=run_id, symbol=symbol, side="sell", stage=event_type,
             )
 
+    def _finalize(self, run_id, terminal_event, *, symbol, internal_order_id, reason_code,
+                   now, detail=None):
+        """CODEX-053: one finalizer, idempotent for the same terminal event
+        and refusing a conflicting one."""
+        try:
+            shadow_audit.finalize_audit_run(
+                audit_run_id=run_id, terminal_event=terminal_event,
+                internal_order_id=internal_order_id, action="sell", symbol=symbol, side="sell",
+                reason_code=reason_code, payload={"detail": detail} if detail else None, now=now,
+            )
+        except shadow_audit.ShadowAuditError as exc:
+            shadow_audit.handle_audit_failure(
+                exc, shadow_run_id=run_id, symbol=symbol, side="sell", stage="terminal",
+            )
+
     def _blocked(self, run_id, event_type, *, symbol, internal_order_id, reason_code, detail,
                   status_code, text, now):
         """Records the specific block event AND exactly one terminal
@@ -138,9 +153,8 @@ class KISBrokerAdapter:
         self._audit(run_id, event_type, shadow_audit.RESULT_BLOCKED, symbol=symbol,
                     internal_order_id=internal_order_id, reason_code=reason_code,
                     detail=detail, now=now)
-        self._audit(run_id, shadow_audit.SHADOW_BLOCKED, shadow_audit.RESULT_BLOCKED,
-                    symbol=symbol, internal_order_id=internal_order_id,
-                    reason_code=reason_code, now=now)
+        self._finalize(run_id, shadow_audit.SHADOW_BLOCKED, symbol=symbol,
+                       internal_order_id=internal_order_id, reason_code=reason_code, now=now)
         return BrokerResponse(
             status_code=status_code, text=text, data={"blocked_reason": detail}, dry_run=False,
         )
@@ -254,9 +268,9 @@ class KISBrokerAdapter:
                 )
             except KISAmbiguousResponseError as exc:
                 # Exactly one terminal event: SHADOW_ERROR.
-                self._audit(run_id, shadow_audit.SHADOW_ERROR, shadow_audit.RESULT_ERROR,
-                            symbol=symbol, internal_order_id=internal_order_id,
-                            reason_code="AMBIGUOUS_RESPONSE", detail=str(exc), now=current)
+                self._finalize(run_id, shadow_audit.SHADOW_ERROR, symbol=symbol,
+                               internal_order_id=internal_order_id,
+                               reason_code="AMBIGUOUS_RESPONSE", detail=str(exc), now=current)
                 # Propagate -- positions/lifecycle.py's _execute_exit()
                 # catches any Exception here and marks the exit intent
                 # SUBMISSION_UNKNOWN, exactly the UNKNOWN-never-auto-
@@ -285,9 +299,9 @@ class KISBrokerAdapter:
         if not approved:
             self._audit(run_id, shadow_audit.GATE_REJECTED, audit_result, symbol=symbol,
                         internal_order_id=internal_order_id, reason_code=result.status, now=current)
-        self._audit(run_id, shadow_audit.terminal_event_for(audit_result), audit_result,
-                    symbol=symbol, internal_order_id=internal_order_id,
-                    reason_code=result.status, now=current)
+        self._finalize(run_id, shadow_audit.terminal_event_for(audit_result), symbol=symbol,
+                       internal_order_id=internal_order_id, reason_code=result.status,
+                       now=current)
         return BrokerResponse(
             status_code=200 if result.status == "ACCEPTED" else 400,
             text=f"KIS order {result.execution_record.broker_order_id} status={result.status}",

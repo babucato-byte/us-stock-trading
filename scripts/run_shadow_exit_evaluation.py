@@ -173,8 +173,17 @@ def evaluate_position(*, position_id, record, broker, conn, exit_flags, now, eas
         return outcome
     finally:
         if not terminal_recorded:
-            _audit(run_id, shadow_audit.terminal_event_for(outcome["result"]), outcome["result"],
-                   symbol=symbol, reason_code=outcome["reason_code"], now=now)
+            try:
+                shadow_audit.finalize_audit_run(
+                    audit_run_id=run_id,
+                    terminal_event=shadow_audit.terminal_event_for(outcome["result"]),
+                    action="shadow_exit", symbol=symbol, side="sell",
+                    reason_code=outcome["reason_code"], now=now,
+                )
+            except shadow_audit.ShadowAuditError as exc:
+                shadow_audit.handle_audit_failure(
+                    exc, shadow_run_id=run_id, symbol=symbol, side="sell", stage="terminal",
+                )
 
 
 def run_once(*, broker=None, now=None, eastern_now=None, conn=None, clock=None):

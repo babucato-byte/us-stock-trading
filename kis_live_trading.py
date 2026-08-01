@@ -125,14 +125,32 @@ def _audit(run_id, event_type, result, *, symbol=None, signal_id=None, internal_
         )
 
 
+def _finalize(run_id, outcome, *, symbol, now):
+    """CODEX-053: terminal events go through shadow_audit.finalize_audit_run(),
+    which is idempotent for the same event and refuses a conflicting one --
+    so a run cannot end twice however many code paths think they own it."""
+    try:
+        shadow_audit.finalize_audit_run(
+            audit_run_id=run_id,
+            terminal_event=shadow_audit.terminal_event_for(outcome["result"]),
+            internal_order_id=outcome.get("internal_order_id"), action="buy", symbol=symbol,
+            side="buy", reason_code=outcome["reason_code"],
+            payload={"detail": outcome["detail"]} if outcome.get("detail") else None, now=now,
+        )
+    except shadow_audit.ShadowAuditError as exc:
+        shadow_audit.handle_audit_failure(
+            exc, shadow_run_id=run_id, symbol=symbol, side="buy", stage="terminal",
+        )
+
+
 def _audit_cycle_block(run_id, event_type, reason_code, detail, *, now):
     """A cycle-level structural block. Emits the specific block event AND
     exactly one terminal SHADOW_BLOCKED, so no run is ever left without a
     final outcome event."""
     _audit(run_id, event_type, shadow_audit.RESULT_BLOCKED, symbol=_CYCLE_LEVEL_SYMBOL,
            reason_code=reason_code, detail=detail, now=now)
-    _audit(run_id, shadow_audit.SHADOW_BLOCKED, shadow_audit.RESULT_BLOCKED,
-           symbol=_CYCLE_LEVEL_SYMBOL, reason_code=reason_code, now=now)
+    _finalize(run_id, {"result": shadow_audit.RESULT_BLOCKED, "reason_code": reason_code,
+                       "detail": detail}, symbol=_CYCLE_LEVEL_SYMBOL, now=now)
 
 
 def _build_instrument(symbol, allowed_symbols):
@@ -234,7 +252,8 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None):
             # path (block, approve, or unexpected exception) that leaves a
             # run without a recorded outcome.
             run_id = shadow_audit.new_run_id()
-            outcome = {"result": shadow_audit.RESULT_BLOCKED, "reason_code": None}
+            outcome = {"result": shadow_audit.RESULT_BLOCKED, "reason_code": None,
+                       "detail": None, "internal_order_id": None}
             terminal_recorded = False
             try:
                 if symbol not in rollout.allowed_symbols:
@@ -465,12 +484,12 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None):
                 except KISAmbiguousResponseError as exc:
                     results["blocked"].append((symbol, f"ambiguous KIS response, order status UNKNOWN: {exc}"))
                     shadow_mode.persist(_shadow_record("AMBIGUOUS", str(exc)))
+                    # The terminal SHADOW_ERROR is written once, by the
+                    # finally-block below. Writing it here as well gave
+                    # this run TWO terminal events.
                     outcome["result"] = shadow_audit.RESULT_ERROR
                     outcome["reason_code"] = "AMBIGUOUS_RESPONSE"
-                    _audit(run_id, shadow_audit.SHADOW_ERROR, shadow_audit.RESULT_ERROR, symbol=symbol,
-                           signal_id=signal.signal_id,
-                           internal_order_id=order_intent.internal_order_id,
-                           reason_code="AMBIGUOUS_RESPONSE", detail=str(exc), now=current)
+                    outcome["detail"] = str(exc)
                 except KISBrokerError as exc:
                     results["blocked"].append((symbol, f"KIS order rejected: {exc}"))
                     shadow_mode.persist(_shadow_record("REJECTED", str(exc)))
@@ -490,9 +509,7 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None):
                 results["blocked"].append((symbol, f"unexpected error: {exc}"))
             finally:
                 if not terminal_recorded:
-                    _audit(run_id, shadow_audit.terminal_event_for(outcome["result"]),
-                           outcome["result"], symbol=symbol,
-                           reason_code=outcome["reason_code"], now=current)
+                    _finalize(run_id, outcome, symbol=symbol, now=current)
     finally:
         conn.close()
 

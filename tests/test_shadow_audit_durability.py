@@ -247,11 +247,40 @@ class TestExactlyOneTerminalEventPerRun:
         report = shadow_audit.audit_integrity_report()
         assert report["runs_without_terminal_event"] == ["run-open"]
 
-    def test_two_terminal_events_is_reported(self):
+    def test_a_second_terminal_event_is_refused_by_the_database(self):
+        """CODEX-053: the invariant is ENFORCED now (migration 10's partial
+        unique index), not merely reported after the fact."""
         self._record("run-double", shadow_audit.SHADOW_COMPLETED, shadow_audit.RESULT_APPROVED)
-        self._record("run-double", shadow_audit.SHADOW_BLOCKED, shadow_audit.RESULT_BLOCKED)
-        report = shadow_audit.audit_integrity_report()
-        assert report["runs_with_multiple_terminal_events"] == ["run-double"]
+        with pytest.raises(shadow_audit.ShadowAuditError):
+            self._record("run-double", shadow_audit.SHADOW_BLOCKED, shadow_audit.RESULT_BLOCKED)
+        types = [r["event_type"] for r in shadow_audit.read_events(shadow_run_id="run-double")]
+        assert types == ["SHADOW_COMPLETED"]
+
+    def test_non_terminal_events_are_still_unrestricted(self):
+        self._record("run-many", shadow_audit.SIGNAL_RECEIVED, shadow_audit.RESULT_INFO)
+        self._record("run-many", shadow_audit.GATE_APPROVED, shadow_audit.RESULT_APPROVED)
+        self._record("run-many", shadow_audit.EXECUTION_PLANNED, shadow_audit.RESULT_APPROVED)
+        self._record("run-many", shadow_audit.SHADOW_COMPLETED, shadow_audit.RESULT_APPROVED)
+        assert len(shadow_audit.read_events(shadow_run_id="run-many")) == 4
+
+    def test_multiple_terminal_report_still_catches_pre_index_rows(self):
+        """The reporting half stays as defence-in-depth for rows written
+        before migration 10 existed -- simulated by dropping the index."""
+        conn = state_db.open_db()
+        try:
+            conn.execute("DROP INDEX idx_shadow_audit_terminal_once")
+            conn.commit()
+            for event in ("SHADOW_COMPLETED", "SHADOW_BLOCKED"):
+                conn.execute(
+                    "INSERT INTO shadow_audit_events (shadow_run_id, event_type, result, "
+                    "created_at) VALUES (?, ?, ?, ?)",
+                    ("legacy-run", event, "INFO", NOW.isoformat()),
+                )
+            conn.commit()
+            report = shadow_audit.audit_integrity_report(conn=conn)
+        finally:
+            conn.close()
+        assert report["runs_with_multiple_terminal_events"] == ["legacy-run"]
 
     def test_exactly_one_is_clean(self):
         self._record("run-ok", shadow_audit.SIGNAL_RECEIVED, shadow_audit.RESULT_INFO)
