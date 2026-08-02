@@ -34,6 +34,7 @@ Two gate evaluations are recorded per candidate:
 """
 
 import argparse
+import os
 import logging
 import sys
 import uuid
@@ -113,6 +114,37 @@ def _audit(run_id, event_type, result, *, symbol, signal_id=None, reason_code=No
         payload={"detail": detail} if detail else None, now=now,
     )
 
+
+
+
+def shadow_allowed_symbols(rollout):
+    """Which symbols Shadow may EVALUATE -- deliberately separate from
+    which symbols the live path may TRADE.
+
+    Oracle verification found Shadow silently doing nothing: the loop
+    skipped every candidate because it reused the live rollout allow-list,
+    and that list is empty in the read-only posture (correctly -- nothing
+    may be traded yet). But Shadow places no orders, so gating its
+    evaluation on a live-trading control makes the one tool meant to
+    observe candidates observe none of them.
+
+    SHADOW_ALLOWED_SYMBOLS governs evaluation:
+        unset  -> evaluate every candidate (the useful default; Shadow
+                  cannot place an order, so there is nothing to restrict)
+        "A,B"  -> evaluate only those
+        ""     -> same as unset
+
+    LIVE_ROLLOUT_ALLOWED_SYMBOLS still governs what the live path may
+    trade, and the Order Gate still enforces it inside every evaluation --
+    so a symbol Shadow evaluates but the rollout does not allow is
+    reported as blocked, which is exactly the information an operator
+    wants before enabling anything.
+    """
+    raw = os.environ.get("SHADOW_ALLOWED_SYMBOLS", "").strip()
+    if not raw:
+        return None
+    symbols = frozenset(part.strip().upper() for part in raw.split(",") if part.strip())
+    return symbols or None
 
 
 def _price_reason_of(exc):
@@ -342,9 +374,10 @@ def run_once(*, broker=None, rollout=None, watchlist=None, now=None, conn=None):
     owns_conn = conn is None
     conn = conn or state_db.open_db()
     outcomes = []
+    evaluable = shadow_allowed_symbols(rollout)
     try:
         for symbol in symbols:
-            if symbol not in rollout.allowed_symbols:
+            if evaluable is not None and symbol not in evaluable:
                 continue
             outcomes.append(_evaluate_symbol(
                 symbol=symbol, broker=broker, rollout=rollout, conn=conn,
