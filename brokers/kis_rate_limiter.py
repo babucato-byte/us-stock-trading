@@ -25,6 +25,16 @@ Categories are separated (TOKEN / READ / ORDER / CANCEL) because their
 policies genuinely differ -- most importantly, a rate-limited ORDER or
 CANCEL is NEVER retried automatically: KIS may have received it, and a
 blind re-send could double an order.
+
+Everything in this limiter's own temp namespace is classified before any
+request is paced through (see `_scan_namespace`). Two earlier findings
+came from files that were merely SKIPPED: a `.temp` suffix fell outside
+the `.tmp` filter, and a symlink was refused for deletion but then
+ignored, so in both cases the request went out. A file that carries this
+limiter's prefix but is not a temporary this limiter could have written
+is now a hard block -- it is evidence that something else is writing into
+the shared state directory, and that is exactly when a shared pacing
+budget cannot be trusted.
 """
 
 import errno
@@ -59,6 +69,21 @@ REASON_LOCK_CLOSE_FAILED = "KIS_RATE_LIMIT_LOCK_CLOSE_FAILED"
 REASON_LIMITER_INVALIDATED = "KIS_RATE_LIMIT_LIMITER_INVALIDATED"
 REASON_STALE_TEMP_CLEANUP_FAILED = "KIS_RATE_LIMIT_STALE_TEMP_CLEANUP_FAILED"
 REASON_TEMP_ARTIFACT_INVALID = "KIS_RATE_LIMIT_TEMP_ARTIFACT_INVALID"
+REASON_TEMP_ARTIFACT_LIVE = "KIS_RATE_LIMIT_TEMP_ARTIFACT_LIVE"
+REASON_ARTIFACT_SCAN_FAILED = "KIS_RATE_LIMIT_ARTIFACT_SCAN_FAILED"
+
+# How an entry of this limiter's own namespace was classified.
+ARTIFACT_VALID_STALE_TEMP = "VALID_STALE_TEMP"
+ARTIFACT_VALID_LIVE_TEMP = "VALID_LIVE_TEMP"
+ARTIFACT_INVALID = "INVALID_TEMP_ARTIFACT"
+ARTIFACT_UNRELATED = "UNRELATED"
+
+# Why an entry was rejected. Logged; deliberately coarse.
+DETAIL_MALFORMED_FILENAME = "malformed_filename"
+DETAIL_SYMLINK = "symlink"
+DETAIL_NON_REGULAR_FILE = "non_regular_file"
+DETAIL_UNSUPPORTED_FILE_TYPE = "unsupported_file_type"
+DETAIL_TYPE_CHANGED = "type_changed"
 
 STATE_VERSION = 1
 
@@ -87,12 +112,57 @@ _STATE_LOCK_TIMEOUT = 10.0
 
 
 # A temporary this module wrote: ".<state name>.<pid>.<32 hex>.tmp".
-# Matched exactly, so nothing else in the directory is ever a candidate.
-_TEMP_PATTERN = re.compile(r"^\.(?P<state>.+)\.(?P<pid>\d+)\.(?P<uuid>[0-9a-f]{32})\.tmp$")
+#
+# Always applied with fullmatch(). `$` alone would also accept a trailing
+# newline, and a filename may legally contain one, so ".rate.json.1.<hex>
+# .tmp\n" would have passed a `$`-anchored match and been treated as a
+# temporary of ours.
+_TEMP_PATTERN = re.compile(r"\.(?P<state>.+)\.(?P<pid>\d+)\.(?P<uuid>[0-9a-f]{32})\.tmp")
 
 
 def _temp_name(state_name, pid, token):
     return f".{state_name}.{pid}.{token}.tmp"
+
+
+def _namespace_prefix(state_name):
+    """Everything this limiter may ever have written starts with this."""
+    return f".{state_name}."
+
+
+def _file_type_detail(mode):
+    """None for a regular file, otherwise why the entry is not one.
+
+    Judged from an lstat(), so a symlink is reported as a symlink and its
+    target is never examined -- following it is what would let something
+    outside the state directory be read or unlinked.
+    """
+    if stat.S_ISLNK(mode):
+        return DETAIL_SYMLINK
+    if stat.S_ISREG(mode):
+        return None
+    if stat.S_ISDIR(mode) or stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode):
+        return DETAIL_NON_REGULAR_FILE
+    return DETAIL_UNSUPPORTED_FILE_TYPE
+
+
+def _mask_name(name):
+    """A filename carries no account data, but it is still an operator's
+    file name; logs get the shape and the length, not the whole string."""
+    if len(name) <= 20:
+        return f"<{len(name)} chars>"
+    return f"{name[:12]}...<{len(name)} chars>...{name[-6:]}"
+
+
+class _Artifact:
+    """One entry of this limiter's namespace, as seen during the scan."""
+
+    __slots__ = ("name", "classification", "detail", "info")
+
+    def __init__(self, name, classification, detail, info):
+        self.name = name
+        self.classification = classification
+        self.detail = detail
+        self.info = info
 
 
 def _pid_is_alive(pid):
@@ -154,6 +224,28 @@ class KISRateLimitTempCleanupError(KISRateLimitStateUnavailable):
     a permission problem, a read-only mount -- is the same reason the next
     real write will fail. Failing here surfaces it at once instead of
     letting the directory fill silently.
+    """
+
+
+class KISRateLimitTempArtifactError(KISRateLimitTempCleanupError):
+    """The state directory holds something in this limiter's own temp
+    namespace that this limiter could not have written, or that another
+    live process is in the middle of writing.
+
+    Skipping such an entry was the reported defect: a `.temp` suffix and a
+    symlink both fell through to "not mine, carry on", and the HTTP
+    request went out. The entry is left exactly as it is -- deleting a
+    file whose origin is unknown is not this module's call -- but nothing
+    is paced through while it is there.
+    """
+
+
+class KISRateLimitArtifactScanError(KISRateLimitTempCleanupError):
+    """The namespace could not be listed or stat()ed.
+
+    An unreadable directory is not an empty one: treating a failed scan as
+    "no artifacts" would restore precisely the bypass this scan exists to
+    close.
     """
 
 
@@ -304,10 +396,17 @@ class KisRateLimiter:
         if category not in CATEGORIES:
             category = CATEGORY_READ
         interval = min_interval_for(category)
+        path = self._resolve_path()
         if interval <= 0:
+            # Pacing is switched off for this category by configuration,
+            # so there is no budget to read, write or protect -- but an
+            # alien artifact in the namespace still means someone else is
+            # writing here, and that must not be silently tolerated just
+            # because the interval happens to be zero. Validation only:
+            # no lock, no cleanup, no reservation.
+            self._reject_invalid_artifacts(path, category)
             return 0.0
 
-        path = self._resolve_path()
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -421,8 +520,11 @@ class KisRateLimiter:
 
     def _wait_locked(self, path, category, interval):
         # Inside the lock, before anything else and before this lifecycle
-        # writes its own temporary.
-        self._cleanup_stale_temps(path, category)
+        # writes its own temporary: classify the whole namespace, refuse
+        # to continue if any entry is not ours, and only then clean up.
+        artifacts = self._scan_namespace(path, category)
+        self._enforce_artifacts(artifacts, category)
+        self._cleanup_stale_temps(path, artifacts, category)
         state = self._load_state(path, category)
         if True:
             has_entry = category in state
@@ -461,116 +563,279 @@ class KisRateLimiter:
             self._store_state(path, state, category)
             return slept
 
-    def _cleanup_stale_temps(self, path, category):
-        """Removes temporary files left by a writer that died before its
-        os.replace() landed.
+    # -- artifacts -------------------------------------------------------
 
-        Runs INSIDE the shared lock and BEFORE this lifecycle creates its
-        own temporary, so it can never race a live writer or delete the
-        file this call is about to make.
+    def _scan_namespace(self, path, category):
+        """Classifies every entry that belongs to this limiter's own temp
+        namespace, i.e. every name starting with ".<state file name>.".
 
-        Policy B from the directive: a temporary whose owner PID no longer
-        exists is removed immediately, so the very next healthy run leaves
-        the directory clean. A PID that still exists -- or that cannot be
-        checked -- is never touched, which also covers PID reuse: a reused
-        (live) PID reads as "not stale" and is kept.
+        Membership is decided by that prefix, NOT by the ".tmp" suffix.
+        Filtering on the suffix first was the reported bypass: a file
+        named ".<state>.<pid>.<uuid>.temp" is unmistakably about our state
+        file, yet it was skipped before anything looked at it.
 
-        Only this module's own exact pattern is considered. Anything else
-        in the directory, including another category's state, is ignored.
+        The one exception is a name that fully matches the temporary
+        pattern for a DIFFERENT state file. That can only happen when one
+        state file's name is a dotted prefix of another's, and it belongs
+        to that other limiter, not this one.
+
+        Nothing here follows a symlink and nothing here deletes: this is a
+        pure classification pass whose result the caller acts on.
         """
-        removed = 0
+        directory = path.parent
         try:
-            entries = list(path.parent.iterdir())
+            names = [entry.name for entry in directory.iterdir()]
+        except FileNotFoundError:
+            return []
         except OSError as exc:
             self._alert(category, "state directory could not be scanned")
-            raise KISRateLimitTempCleanupError(
+            raise KISRateLimitArtifactScanError(
                 "the KIS rate-limit state directory could not be scanned",
-                reason_code=REASON_STALE_TEMP_CLEANUP_FAILED,
+                reason_code=REASON_ARTIFACT_SCAN_FAILED,
                 detail=type(exc).__name__,
             ) from exc
 
-        for entry in entries:
-            name = entry.name
-            if not name.endswith(".tmp"):
+        prefix = _namespace_prefix(path.name)
+        artifacts = []
+        for name in sorted(names):
+            if not name.startswith(prefix):
+                continue                                  # ARTIFACT_UNRELATED
+            match = _TEMP_PATTERN.fullmatch(name)
+            if match is not None and match.group("state") != path.name:
+                continue                                  # another state file's
+            try:
+                info = os.lstat(str(directory / name))
+            except FileNotFoundError:
+                # It went away between listing and stat. There is nothing
+                # left to block on and nothing left to delete.
                 continue
-            match = _TEMP_PATTERN.match(name)
+            except OSError as exc:
+                self._alert(category, "a state directory entry could not be inspected")
+                raise KISRateLimitArtifactScanError(
+                    "a KIS rate-limit state directory entry could not be inspected",
+                    reason_code=REASON_ARTIFACT_SCAN_FAILED,
+                    detail=type(exc).__name__,
+                ) from exc
+
             if match is None:
-                # Not our shape at all -- a user's file, another tool's
-                # scratch. Never ours to delete.
-                if name.startswith(f".{path.name}.") :
-                    # ...but it DOES claim our prefix, so it is a
-                    # malformed artifact of ours that will never be
-                    # cleaned automatically. Surface it.
-                    self._alert(category, "malformed temporary artifact present")
-                    raise KISRateLimitTempCleanupError(
-                        "a malformed KIS rate-limit temporary artifact is present",
-                        reason_code=REASON_TEMP_ARTIFACT_INVALID, detail="malformed_name",
-                    )
-                continue
-            if match.group("state") != path.name:
-                # Another category's temporary. Its own limiter owns it.
+                # Our prefix, not our shape: a truncated name, a wrong
+                # suffix, a non-numeric pid, an extra suffix. Never
+                # deleted -- its origin is unknown -- but never ignored.
+                artifacts.append(_Artifact(
+                    name, ARTIFACT_INVALID, DETAIL_MALFORMED_FILENAME, info))
                 continue
 
-            try:
-                info = os.lstat(entry)
-            except FileNotFoundError:
-                continue
-            except OSError:
-                continue
-            # lstat, and regular files only: a symlink here must never be
-            # followed, or a deletion could land outside this directory.
-            if not stat.S_ISREG(info.st_mode):
+            type_detail = _file_type_detail(info.st_mode)
+            if type_detail is not None:
+                # Checked before the pid is even parsed: a symlink or a
+                # directory wearing a valid temp name is not a temporary
+                # this module wrote, whatever pid the name claims.
+                artifacts.append(_Artifact(
+                    name, ARTIFACT_INVALID, type_detail, info))
                 continue
 
             pid = int(match.group("pid"))
             if _pid_is_alive(pid):
-                continue
+                # Also covers a reused pid, and a pid we may not signal.
+                artifacts.append(_Artifact(
+                    name, ARTIFACT_VALID_LIVE_TEMP, "live_writer", info))
+            else:
+                artifacts.append(_Artifact(
+                    name, ARTIFACT_VALID_STALE_TEMP, "dead_writer", info))
+        return artifacts
 
-            # st_mtime is WALL time; _clock() may be monotonic.
-            if self._wall() - info.st_mtime < stale_temp_min_age():
-                # Optional extra caution; defaults to 0 so the next run
-                # after a crash really does clean up.
-                continue
+    def _enforce_artifacts(self, artifacts, category):
+        """Blocks the whole lifecycle if anything in the namespace is not
+        a temporary this limiter may clean up.
 
+        Runs to completion over the SCAN result before a single file is
+        removed. Cleaning the well-formed orphans first and only then
+        discovering an alien entry would leave the directory in a state
+        neither the operator nor the next run can reason about.
+        """
+        invalid = [a for a in artifacts if a.classification == ARTIFACT_INVALID]
+        if invalid:
+            # An unexplained writer in the shared state directory is not a
+            # transient condition: this limiter stops for good and an
+            # operator decides what the file is.
+            self._invalidated = True
+            self._alert_artifact(category, invalid[0], ARTIFACT_INVALID)
+            raise KISRateLimitTempArtifactError(
+                "an invalid KIS rate-limit temporary artifact is present",
+                reason_code=REASON_TEMP_ARTIFACT_INVALID,
+                detail=invalid[0].detail,
+            )
+
+        live = [a for a in artifacts if a.classification == ARTIFACT_VALID_LIVE_TEMP]
+        if live:
+            # A well-formed temporary owned by a LIVE pid. Writers hold
+            # the shared lock for their whole lifecycle, so no healthy
+            # writer's temporary can be visible from in here; seeing one
+            # means either a crashed writer whose pid has been reused or
+            # something writing without the lock. Neither is a state to
+            # pace a request through.
+            #
+            # Not invalidating: unlike an alien file this can resolve on
+            # its own, so a later run is allowed to try again.
+            self._alert_artifact(category, live[0], ARTIFACT_VALID_LIVE_TEMP)
+            raise KISRateLimitTempArtifactError(
+                "a KIS rate-limit temporary file owned by a live process is present",
+                reason_code=REASON_TEMP_ARTIFACT_LIVE, detail=live[0].detail,
+            )
+
+    def _cleanup_stale_temps(self, path, artifacts, category):
+        """Removes the temporaries left by writers that died before their
+        os.replace() landed.
+
+        Runs INSIDE the shared lock, AFTER the whole namespace has been
+        classified and cleared, and BEFORE this lifecycle creates its own
+        temporary -- so it can never race a live writer and never deletes
+        the file this call is about to make.
+
+        Policy B: a temporary whose owner pid no longer exists is removed
+        at once, so the very next healthy run leaves the directory clean.
+        `KIS_RATE_LIMIT_STALE_TEMP_MIN_AGE_SECONDS` restores Policy A by
+        also requiring the file to have aged; a temporary kept back by
+        that knob is a known-safe orphan awaiting its window, so it does
+        not block the request the way an alien entry does.
+        """
+        stale = [a for a in artifacts
+                 if a.classification == ARTIFACT_VALID_STALE_TEMP]
+        if not stale:
+            return 0
+
+        min_age = stale_temp_min_age()
+        removed = 0
+        dir_fd = None
+        try:
             try:
-                os.unlink(entry)
-            except FileNotFoundError:
-                continue
+                # Every unlink goes through this descriptor, so no part of
+                # the path can be swapped underneath us between the scan
+                # and the removal.
+                dir_fd = os.open(str(path.parent), os.O_RDONLY)
             except OSError as exc:
-                self._alert(category, "stale temporary file could not be removed")
+                self._alert(category, "state directory could not be opened for cleanup")
                 raise KISRateLimitTempCleanupError(
-                    "a stale KIS rate-limit temporary file could not be removed",
+                    "the KIS rate-limit state directory could not be opened",
                     reason_code=REASON_STALE_TEMP_CLEANUP_FAILED,
                     detail=type(exc).__name__,
                 ) from exc
-            removed += 1
 
-        if removed:
-            # The removal must be durable, or a crash could resurrect the
-            # very files we just reported as cleaned.
-            self._fsync_directory(path.parent, category,
-                                  reason_code=REASON_STALE_TEMP_CLEANUP_FAILED,
-                                  classification="stale cleanup could not be synced")
-            logger.info("removed %d stale KIS rate-limit temporary file(s)", removed)
-        return removed
+            for artifact in stale:
+                # st_mtime is WALL time; _clock() may be monotonic.
+                if self._wall() - artifact.info.st_mtime < min_age:
+                    continue
 
-    def _fsync_directory(self, directory, category, *, reason_code, classification):
-        dir_fd = None
-        try:
-            dir_fd = os.open(str(directory), os.O_RDONLY)
-            os.fsync(dir_fd)
-        except OSError as exc:
-            self._alert(category, classification)
-            raise KISRateLimitTempCleanupError(
-                "the KIS rate-limit state directory could not be synced",
-                reason_code=reason_code, detail=type(exc).__name__,
-            ) from exc
+                current = self._recheck_before_unlink(artifact, dir_fd, category)
+                if current is None:
+                    continue
+
+                try:
+                    os.unlink(artifact.name, dir_fd=dir_fd)
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    self._alert(category, "stale temporary file could not be removed")
+                    raise KISRateLimitTempCleanupError(
+                        "a stale KIS rate-limit temporary file could not be removed",
+                        reason_code=REASON_STALE_TEMP_CLEANUP_FAILED,
+                        detail=type(exc).__name__,
+                    ) from exc
+                removed += 1
+
+            if removed:
+                # The removal must be durable, or a crash could resurrect
+                # the very files we just reported as cleaned.
+                try:
+                    os.fsync(dir_fd)
+                except OSError as exc:
+                    self._alert(category, "stale cleanup could not be synced")
+                    raise KISRateLimitTempCleanupError(
+                        "the KIS rate-limit state directory could not be synced",
+                        reason_code=REASON_STALE_TEMP_CLEANUP_FAILED,
+                        detail=type(exc).__name__,
+                    ) from exc
+                logger.info("removed %d stale KIS rate-limit temporary file(s)", removed)
         finally:
             if dir_fd is not None:
                 try:
                     os.close(dir_fd)
                 except OSError:
                     pass
+        return removed
+
+    def _recheck_before_unlink(self, artifact, dir_fd, category):
+        """Re-stats the entry through the directory descriptor immediately
+        before it is unlinked, and requires the very same regular inode
+        the scan classified.
+
+        Closes the window in which a valid orphan is swapped for a symlink
+        after classification. unlink() never follows a symlink, so a
+        target outside the directory was never reachable, but a swapped
+        entry means someone else is writing here -- the same condition
+        `_enforce_artifacts` refuses to run through.
+
+        Returns the fresh stat, or None when the entry has already gone.
+        """
+        try:
+            current = os.lstat(artifact.name, dir_fd=dir_fd)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            self._alert(category, "a stale temporary file could not be re-inspected")
+            raise KISRateLimitArtifactScanError(
+                "a stale KIS rate-limit temporary file could not be re-inspected",
+                reason_code=REASON_ARTIFACT_SCAN_FAILED,
+                detail=type(exc).__name__,
+            ) from exc
+
+        if (not stat.S_ISREG(current.st_mode)
+                or current.st_ino != artifact.info.st_ino
+                or current.st_dev != artifact.info.st_dev):
+            self._invalidated = True
+            swapped = _Artifact(artifact.name, ARTIFACT_INVALID,
+                                DETAIL_TYPE_CHANGED, current)
+            self._alert_artifact(category, swapped, ARTIFACT_INVALID)
+            raise KISRateLimitTempArtifactError(
+                "a KIS rate-limit temporary file changed identity before cleanup",
+                reason_code=REASON_TEMP_ARTIFACT_INVALID,
+                detail=DETAIL_TYPE_CHANGED,
+            )
+        return current
+
+    def _reject_invalid_artifacts(self, path, category):
+        """The validation-only pass used when a category's interval is
+        zero. No lock is taken and no cleanup runs, so only the entries
+        that are permanently wrong -- never the transient ones -- are
+        considered."""
+        artifacts = self._scan_namespace(path, category)
+        self._enforce_artifacts(
+            [a for a in artifacts if a.classification == ARTIFACT_INVALID], category)
+
+    def _alert_artifact(self, category, artifact, classification):
+        """Operator-visible, and deliberately narrow: the category, how the
+        entry was classified, and a masked file name. Never a symlink
+        target, never a path, never anything from the account."""
+        logger.error(
+            "KIS rate-limit artifact refused: category=%s classification=%s "
+            "detail=%s name=%s transport_suppressed=true",
+            category, classification, artifact.detail, _mask_name(artifact.name),
+        )
+        try:
+            from operations import alerts
+
+            alerts.send_alert(
+                "*KIS rate-limit state directory holds an unexpected file*\n"
+                f"- category: {category}\n"
+                f"- classification: {classification}\n"
+                f"- detail: {artifact.detail}\n"
+                f"- name: {_mask_name(artifact.name)}\n"
+                "- effect: transport_suppressed=true; the request was NOT sent\n"
+                "- action: inspect the shared rate-limit state directory and "
+                "remove the file only after confirming what wrote it"
+            )
+        except Exception as exc:  # noqa: BLE001 -- alerting must not mask it
+            logger.debug("could not alert on a limiter artifact: %s", exc)
 
     def _load_state(self, path, category):
         """Reads the shared state. Absent is a first run; anything else

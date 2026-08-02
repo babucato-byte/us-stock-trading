@@ -27,6 +27,7 @@ from brokers.kis_rate_limiter import (
     CATEGORY_READ,
     STATE_VERSION,
     KisRateLimiter,
+    KISRateLimitTempArtifactError,
     KISRateLimitTempCleanupError,
 )
 
@@ -108,19 +109,36 @@ class TestDeadOwnerTempsAreRemoved:
         assert str(DEAD_PID) not in seen["temps_at_replace"][0]
 
 
-class TestLiveOwnersAreProtected:
+class TestLiveOwnersAreProtectedAndBlock:
+    """A live owner's temporary is never deleted -- and, since a healthy
+    writer holds the shared lock for its whole lifecycle, one being
+    visible from in here is an anomaly, so the request stops too."""
+
     def test_a_live_pid_temp_is_kept(self, state, paced):
         """Covers PID reuse too: a reused, live pid reads as not-stale."""
         mine = _temp(state, pid=os.getpid(), token="b" * 32)
-        KisRateLimiter(path=state).wait(category=CATEGORY_READ)
+        with pytest.raises(KISRateLimitTempArtifactError) as excinfo:
+            KisRateLimiter(path=state).wait(category=CATEGORY_READ)
+        assert excinfo.value.reason_code == "KIS_RATE_LIMIT_TEMP_ARTIFACT_LIVE"
         assert mine.exists(), "a live process's temporary was deleted"
 
     def test_a_live_pid_is_kept_even_when_old(self, state, paced, monkeypatch):
         monkeypatch.setenv("KIS_RATE_LIMIT_STALE_TEMP_MIN_AGE_SECONDS", "0")
         mine = _temp(state, pid=os.getpid(), token="c" * 32)
         os.utime(mine, (time.time() - 86400, time.time() - 86400))
-        KisRateLimiter(path=state).wait(category=CATEGORY_READ)
+        with pytest.raises(KISRateLimitTempArtifactError):
+            KisRateLimiter(path=state).wait(category=CATEGORY_READ)
         assert mine.exists()
+
+    def test_a_live_temp_does_not_invalidate_the_limiter(self, state, paced):
+        """Unlike an alien file this can resolve on its own, so the next
+        attempt must be allowed to look again."""
+        mine = _temp(state, pid=os.getpid(), token="f" * 32)
+        limiter = KisRateLimiter(path=state)
+        with pytest.raises(KISRateLimitTempArtifactError):
+            limiter.wait(category=CATEGORY_READ)
+        mine.unlink()
+        limiter.wait(category=CATEGORY_READ)          # same instance, recovers
 
     def test_a_recent_dead_temp_is_kept_when_an_age_is_required(self, state, paced,
                                                                 monkeypatch):
@@ -128,6 +146,19 @@ class TestLiveOwnersAreProtected:
         monkeypatch.setenv("KIS_RATE_LIMIT_STALE_TEMP_MIN_AGE_SECONDS", "3600")
         orphan = _temp(state)
         KisRateLimiter(path=state).wait(category=CATEGORY_READ)
+        assert orphan.exists()
+
+    def test_an_age_retained_orphan_still_allows_the_request(self, state, paced,
+                                                             monkeypatch):
+        """A well-formed orphan whose owner is gone is understood, not
+        alien: holding it back for the configured age must not also stop
+        trading."""
+        monkeypatch.setenv("KIS_RATE_LIMIT_STALE_TEMP_MIN_AGE_SECONDS", "3600")
+        orphan = _temp(state)
+        before = json.loads(state.read_text(encoding="utf-8"))[CATEGORY_READ]
+        KisRateLimiter(path=state).wait(category=CATEGORY_READ)
+        after = json.loads(state.read_text(encoding="utf-8"))[CATEGORY_READ]
+        assert after > before
         assert orphan.exists()
 
     def test_an_aged_dead_temp_is_removed_under_the_same_policy(self, state, paced,
@@ -183,22 +214,30 @@ class TestOnlyOurOwnFilesAreTouched:
             KisRateLimiter(path=state).wait(category=CATEGORY_READ)
 
     def test_a_symlink_is_never_followed_or_deleted(self, state, paced, tmp_path):
-        """A symlink here could otherwise delete a file outside the
-        state directory."""
+        """A symlink here could otherwise delete a file outside the state
+        directory. Refusing to delete it is not enough on its own -- it is
+        not a temporary this module wrote, so nothing may be paced through
+        while it is there."""
         outside = tmp_path.parent / "precious.txt"
         outside.write_text("do not delete", encoding="utf-8")
         link = state.with_name(f".{state.name}.{DEAD_PID}.{'d' * 32}.tmp")
         os.symlink(outside, link)
 
-        KisRateLimiter(path=state).wait(category=CATEGORY_READ)
+        with pytest.raises(KISRateLimitTempArtifactError) as excinfo:
+            KisRateLimiter(path=state).wait(category=CATEGORY_READ)
+        assert excinfo.value.reason_code == "KIS_RATE_LIMIT_TEMP_ARTIFACT_INVALID"
+        assert excinfo.value.detail == "symlink"
         assert outside.exists(), "a symlink target outside the directory was deleted"
+        assert outside.read_text(encoding="utf-8") == "do not delete"
         assert os.path.islink(link), "the symlink itself was removed"
         link.unlink()
 
     def test_a_directory_named_like_a_temp_is_left_alone(self, state, paced):
         fake = state.with_name(f".{state.name}.{DEAD_PID}.{'e' * 32}.tmp")
         fake.mkdir()
-        KisRateLimiter(path=state).wait(category=CATEGORY_READ)
+        with pytest.raises(KISRateLimitTempArtifactError) as excinfo:
+            KisRateLimiter(path=state).wait(category=CATEGORY_READ)
+        assert excinfo.value.detail == "non_regular_file"
         assert fake.is_dir()
         fake.rmdir()
 
@@ -249,12 +288,26 @@ class TestCleanupFailuresBlock:
             broker.get_open_orders()
         assert session.calls == [], "a request went out despite a cleanup failure"
 
-    def test_a_directory_fsync_failure_after_cleanup_blocks(self, state, paced,
-                                                            monkeypatch):
+    def test_a_directory_handle_failure_during_cleanup_blocks(self, state, paced,
+                                                              monkeypatch):
+        """Every unlink goes through a directory descriptor; without one
+        the cleanup cannot be done safely at all."""
         _temp(state)
         monkeypatch.setattr(
             kis_rate_limiter.os, "open",
             lambda *a, **k: (_ for _ in ()).throw(OSError(errno.EACCES, "no dir fd")))
+        with pytest.raises(KISRateLimitTempCleanupError) as excinfo:
+            KisRateLimiter(path=state).wait(category=CATEGORY_READ)
+        assert excinfo.value.reason_code == "KIS_RATE_LIMIT_STALE_TEMP_CLEANUP_FAILED"
+
+    def test_a_directory_fsync_failure_after_cleanup_blocks(self, state, paced,
+                                                            monkeypatch):
+        """The removal has happened but is not durable, so the request
+        must not go out on the strength of it."""
+        _temp(state)
+        monkeypatch.setattr(
+            kis_rate_limiter.os, "fsync",
+            lambda *a, **k: (_ for _ in ()).throw(OSError(errno.EIO, "no fsync")))
         with pytest.raises(KISRateLimitTempCleanupError) as excinfo:
             KisRateLimiter(path=state).wait(category=CATEGORY_READ)
         assert excinfo.value.reason_code == "KIS_RATE_LIMIT_STALE_TEMP_CLEANUP_FAILED"
