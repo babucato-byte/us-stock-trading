@@ -35,6 +35,12 @@ logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 DEFAULT_REFRESH_SKEW_SECONDS = 300.0
+# ORACLE-HIGH-04: a cache whose created_at is in the FUTURE was used
+# verbatim. That trusts a stepped clock, a corrupted file, or a token
+# copied in from somewhere else. Small skew is tolerated; more is not.
+DEFAULT_MAX_CLOCK_SKEW_SECONDS = 5.0
+# KIS tokens last 24h; anything claiming much more is not a KIS token.
+DEFAULT_MAX_LIFETIME_SECONDS = 90000.0
 _LOCK_TIMEOUT_SECONDS = 30.0
 
 REASON_TOKEN_UNAVAILABLE = "KIS_TOKEN_UNAVAILABLE"
@@ -61,6 +67,37 @@ def refresh_skew_seconds():
     except ValueError:
         return DEFAULT_REFRESH_SKEW_SECONDS
     return value if value >= 0 else DEFAULT_REFRESH_SKEW_SECONDS
+
+
+def max_clock_skew_seconds():
+    raw = os.environ.get("KIS_TOKEN_MAX_CLOCK_SKEW_SECONDS", "").strip()
+    if not raw:
+        return DEFAULT_MAX_CLOCK_SKEW_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_MAX_CLOCK_SKEW_SECONDS
+    return value if value >= 0 else DEFAULT_MAX_CLOCK_SKEW_SECONDS
+
+
+def max_lifetime_seconds():
+    raw = os.environ.get("KIS_TOKEN_MAX_LIFETIME_SECONDS", "").strip()
+    if not raw:
+        return DEFAULT_MAX_LIFETIME_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_MAX_LIFETIME_SECONDS
+    return value if value > 0 else DEFAULT_MAX_LIFETIME_SECONDS
+
+
+def _finite_number(value):
+    """A usable timestamp: a real number, not a bool, not NaN, not inf."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if value != value:            # NaN
+        return False
+    return value not in (float("inf"), float("-inf"))
 
 
 def app_key_fingerprint(app_key):
@@ -120,16 +157,40 @@ class KISTokenCache:
 
         token = data.get("access_token")
         expires_at = data.get("expires_at")
+        created_at = data.get("created_at")
         if not isinstance(token, str) or not token.strip():
             return None
-        if not isinstance(expires_at, (int, float)):
+        if not _finite_number(expires_at) or not _finite_number(created_at):
+            # ORACLE-HIGH-04: created_at is REQUIRED and must be a real
+            # number. It used not to be checked at all.
+            logger.warning("KIS token cache has unusable time fields -- treating as a miss")
+            return None
+
+        now = self._clock()
+        skew = max_clock_skew_seconds()
+        if created_at > now + skew:
+            # Issued in the future: a stepped clock, a corrupt file, or a
+            # token copied from another host. Never reuse it.
+            logger.warning(
+                "KIS token cache was created %.1fs in the future -- refusing it",
+                created_at - now,
+            )
+            self._alert_invalid("created_at is in the future")
+            return None
+        if expires_at <= created_at:
+            logger.warning("KIS token cache expires before it was created -- refusing it")
+            self._alert_invalid("expires_at <= created_at")
+            return None
+        if expires_at - created_at > max_lifetime_seconds():
+            logger.warning("KIS token cache claims an implausible lifetime -- refusing it")
+            self._alert_invalid("lifetime exceeds the maximum")
             return None
         for field, expected in identity.items():
             if str(data.get(field, "")) != str(expected):
                 # A different credential or environment. Not an error --
                 # just not ours, so it must not be reused.
                 return None
-        if self._clock() >= float(expires_at) - refresh_skew_seconds():
+        if now >= float(expires_at) - refresh_skew_seconds():
             return None
         return {
             "access_token": token,
@@ -237,6 +298,20 @@ class KISTokenCache:
                 if time.monotonic() >= deadline:
                     return False
                 self._sleeper(0.05)
+
+    def _alert_invalid(self, reason):
+        """Operator-visible, and deliberately says nothing about the token
+        itself -- only why the cache was rejected."""
+        try:
+            from operations import alerts
+
+            alerts.send_alert(
+                "*KIS token cache rejected*\n"
+                f"- reason: {reason}\n"
+                "- action: a new token will be issued; check the host clock if this repeats"
+            )
+        except Exception as exc:  # noqa: BLE001 -- alerting must not block auth
+            logger.debug("could not alert on an invalid token cache: %s", exc)
 
     def invalidate(self):
         path = self._resolve_path()

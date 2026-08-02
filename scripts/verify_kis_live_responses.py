@@ -40,6 +40,7 @@ from brokers.kis_broker import (  # noqa: E402
     KISPriceUnavailableError,
 )
 from execution.secret_redaction import install_logging_redaction  # noqa: E402
+from domain.exchange import supported_kis_order_exchange_codes  # noqa: E402
 from market_data.exchange_registry import (  # noqa: E402
     ExchangeResolutionError,
     build_kis_instrument,
@@ -124,6 +125,48 @@ def check_safety_posture(broker, results):
                           f"env={getattr(config, 'kis_env', '?')}")
 
 
+def check_rate_limit_state(results):
+    """ORACLE-HIGH-02: the shared pacing budget must be absent or valid.
+    A corrupt one used to be silently ignored."""
+    path = kis_rate_limiter.state_file()
+    if not path.exists():
+        results.record("rate_limit_state_health", True, detail=f"{path} (absent -- first run)")
+        return
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        results.record("rate_limit_state_health", False,
+                       reason_code=kis_rate_limiter.REASON_STATE_INVALID,
+                       detail=type(exc).__name__)
+        return
+    if not isinstance(state, dict):
+        results.record("rate_limit_state_health", False,
+                       reason_code=kis_rate_limiter.REASON_STATE_INVALID,
+                       detail=f"state is {type(state).__name__}, not an object")
+        return
+    import time as _time
+
+    now = _time.time()
+    skew = kis_rate_limiter.max_clock_skew()
+    problems = []
+    for category, stamp in state.items():
+        if not isinstance(stamp, (int, float)) or isinstance(stamp, bool) \
+                or stamp != stamp:
+            problems.append(f"{category}=unusable")
+        elif stamp > now + skew:
+            problems.append(f"{category} is {stamp - now:.0f}s in the future")
+    results.record("rate_limit_state_health", not problems,
+                   reason_code=None if not problems else kis_rate_limiter.REASON_STATE_INVALID,
+                   detail=", ".join(problems) or f"{len(state)} category timestamp(s) sane")
+
+
+def check_exchange_coverage(results):
+    """ORACLE-HIGH-01: account reads must sweep every supported venue."""
+    codes = supported_kis_order_exchange_codes()
+    results.record("exchange_coverage", len(codes) >= 3,
+                   detail=f"account reads sweep {list(codes)}")
+
+
 def check_token_cache(results):
     path = kis_token_cache.cache_file()
     existed = path.exists()
@@ -139,6 +182,26 @@ def check_token_cache(results):
         results.record("token_cache_stores_no_secret", not leaked,
                        reason_code=None if not leaked else "TOKEN_CACHE_LEAK",
                        detail=f"fields={sorted(stored)}")
+        # ORACLE-HIGH-04: a future-dated cache used to be trusted.
+        import time as _time
+
+        now = _time.time()
+        created = stored.get("created_at")
+        expires = stored.get("expires_at")
+        skew = kis_token_cache.max_clock_skew_seconds()
+        problems = []
+        if not isinstance(created, (int, float)) or isinstance(created, bool):
+            problems.append("created_at missing or non-numeric")
+        elif created > now + skew:
+            problems.append(f"created_at is {created - now:.0f}s in the future")
+        if isinstance(created, (int, float)) and isinstance(expires, (int, float)):
+            if expires <= created:
+                problems.append("expires_at <= created_at")
+            elif expires - created > kis_token_cache.max_lifetime_seconds():
+                problems.append("lifetime exceeds the maximum")
+        results.record("token_cache_clock_validity", not problems,
+                       reason_code=None if not problems else "TOKEN_CACHE_CLOCK_INVALID",
+                       detail=", ".join(problems) or "created_at/expires_at consistent")
 
 
 def check_symbol(broker, symbol, results):
@@ -249,6 +312,8 @@ def main(argv=None):
                    detail=f"{len(FORBIDDEN_METHODS)} state-mutating methods unreachable")
 
     check_safety_posture(broker, results)
+    check_exchange_coverage(results)
+    check_rate_limit_state(results)
     check_token_cache(results)
 
     interval = kis_rate_limiter.min_interval_for(kis_rate_limiter.CATEGORY_READ)
