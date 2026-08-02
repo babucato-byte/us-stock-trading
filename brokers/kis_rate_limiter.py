@@ -32,6 +32,8 @@ import fcntl
 import json
 import logging
 import os
+import re
+import stat
 import time
 import uuid
 from pathlib import Path
@@ -55,6 +57,8 @@ REASON_PERSISTENCE = "KIS_RATE_LIMIT_PERSISTENCE"
 REASON_LOCK_RELEASE_FAILED = "KIS_RATE_LIMIT_LOCK_RELEASE_FAILED"
 REASON_LOCK_CLOSE_FAILED = "KIS_RATE_LIMIT_LOCK_CLOSE_FAILED"
 REASON_LIMITER_INVALIDATED = "KIS_RATE_LIMIT_LIMITER_INVALIDATED"
+REASON_STALE_TEMP_CLEANUP_FAILED = "KIS_RATE_LIMIT_STALE_TEMP_CLEANUP_FAILED"
+REASON_TEMP_ARTIFACT_INVALID = "KIS_RATE_LIMIT_TEMP_ARTIFACT_INVALID"
 
 STATE_VERSION = 1
 
@@ -78,6 +82,33 @@ DEFAULT_MAX_BACKOFF = 15.0
 RETRYABLE_CATEGORIES = frozenset({CATEGORY_READ})
 
 _STATE_LOCK_TIMEOUT = 10.0
+
+
+
+
+# A temporary this module wrote: ".<state name>.<pid>.<32 hex>.tmp".
+# Matched exactly, so nothing else in the directory is ever a candidate.
+_TEMP_PATTERN = re.compile(r"^\.(?P<state>.+)\.(?P<pid>\d+)\.(?P<uuid>[0-9a-f]{32})\.tmp$")
+
+
+def _temp_name(state_name, pid, token):
+    return f".{state_name}.{pid}.{token}.tmp"
+
+
+def _pid_is_alive(pid):
+    """True when a process with this pid exists. Used only to REFUSE
+    deletion -- a live pid means "not stale", never "delete it"."""
+    if pid <= 0:
+        return True                      # unusable: treat as live, i.e. keep
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True                      # exists, owned by someone else
+    except OSError:
+        return True                      # unknown: keep
+    return True
 
 
 class KISRateLimitStateInvalid(Exception):
@@ -114,6 +145,16 @@ class KISRateLimitStateUnavailable(Exception):
         super().__init__(message)
         self.reason_code = reason_code
         self.detail = detail
+
+
+class KISRateLimitTempCleanupError(KISRateLimitStateUnavailable):
+    """A crashed writer's temporary file could not be cleaned up.
+
+    Left alone these accumulate, and the reason they cannot be removed --
+    a permission problem, a read-only mount -- is the same reason the next
+    real write will fail. Failing here surfaces it at once instead of
+    letting the directory fill silently.
+    """
 
 
 class KISRateLimitLockReleaseError(KISRateLimitStateUnavailable):
@@ -182,6 +223,15 @@ def base_backoff():
 
 def max_backoff():
     return _float_env("KIS_RATE_LIMIT_MAX_BACKOFF_SECONDS", DEFAULT_MAX_BACKOFF)
+
+
+def stale_temp_min_age():
+    """Extra caution before removing a dead writer's temporary. Defaults
+    to 0: the owner PID is already gone and we hold the shared lock, so
+    the next healthy run should leave the directory clean (the directive's
+    "artifact 0 after the next run"). Raise it to also require the file to
+    have aged."""
+    return _float_env("KIS_RATE_LIMIT_STALE_TEMP_MIN_AGE_SECONDS", 0.0)
 
 
 def max_clock_skew():
@@ -370,6 +420,9 @@ class KisRateLimiter:
                 self._sleeper(0.05)
 
     def _wait_locked(self, path, category, interval):
+        # Inside the lock, before anything else and before this lifecycle
+        # writes its own temporary.
+        self._cleanup_stale_temps(path, category)
         state = self._load_state(path, category)
         if True:
             has_entry = category in state
@@ -407,6 +460,117 @@ class KisRateLimiter:
             # The reservation must be DURABLE before the request goes out.
             self._store_state(path, state, category)
             return slept
+
+    def _cleanup_stale_temps(self, path, category):
+        """Removes temporary files left by a writer that died before its
+        os.replace() landed.
+
+        Runs INSIDE the shared lock and BEFORE this lifecycle creates its
+        own temporary, so it can never race a live writer or delete the
+        file this call is about to make.
+
+        Policy B from the directive: a temporary whose owner PID no longer
+        exists is removed immediately, so the very next healthy run leaves
+        the directory clean. A PID that still exists -- or that cannot be
+        checked -- is never touched, which also covers PID reuse: a reused
+        (live) PID reads as "not stale" and is kept.
+
+        Only this module's own exact pattern is considered. Anything else
+        in the directory, including another category's state, is ignored.
+        """
+        removed = 0
+        try:
+            entries = list(path.parent.iterdir())
+        except OSError as exc:
+            self._alert(category, "state directory could not be scanned")
+            raise KISRateLimitTempCleanupError(
+                "the KIS rate-limit state directory could not be scanned",
+                reason_code=REASON_STALE_TEMP_CLEANUP_FAILED,
+                detail=type(exc).__name__,
+            ) from exc
+
+        for entry in entries:
+            name = entry.name
+            if not name.endswith(".tmp"):
+                continue
+            match = _TEMP_PATTERN.match(name)
+            if match is None:
+                # Not our shape at all -- a user's file, another tool's
+                # scratch. Never ours to delete.
+                if name.startswith(f".{path.name}.") :
+                    # ...but it DOES claim our prefix, so it is a
+                    # malformed artifact of ours that will never be
+                    # cleaned automatically. Surface it.
+                    self._alert(category, "malformed temporary artifact present")
+                    raise KISRateLimitTempCleanupError(
+                        "a malformed KIS rate-limit temporary artifact is present",
+                        reason_code=REASON_TEMP_ARTIFACT_INVALID, detail="malformed_name",
+                    )
+                continue
+            if match.group("state") != path.name:
+                # Another category's temporary. Its own limiter owns it.
+                continue
+
+            try:
+                info = os.lstat(entry)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                continue
+            # lstat, and regular files only: a symlink here must never be
+            # followed, or a deletion could land outside this directory.
+            if not stat.S_ISREG(info.st_mode):
+                continue
+
+            pid = int(match.group("pid"))
+            if _pid_is_alive(pid):
+                continue
+
+            # st_mtime is WALL time; _clock() may be monotonic.
+            if self._wall() - info.st_mtime < stale_temp_min_age():
+                # Optional extra caution; defaults to 0 so the next run
+                # after a crash really does clean up.
+                continue
+
+            try:
+                os.unlink(entry)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                self._alert(category, "stale temporary file could not be removed")
+                raise KISRateLimitTempCleanupError(
+                    "a stale KIS rate-limit temporary file could not be removed",
+                    reason_code=REASON_STALE_TEMP_CLEANUP_FAILED,
+                    detail=type(exc).__name__,
+                ) from exc
+            removed += 1
+
+        if removed:
+            # The removal must be durable, or a crash could resurrect the
+            # very files we just reported as cleaned.
+            self._fsync_directory(path.parent, category,
+                                  reason_code=REASON_STALE_TEMP_CLEANUP_FAILED,
+                                  classification="stale cleanup could not be synced")
+            logger.info("removed %d stale KIS rate-limit temporary file(s)", removed)
+        return removed
+
+    def _fsync_directory(self, directory, category, *, reason_code, classification):
+        dir_fd = None
+        try:
+            dir_fd = os.open(str(directory), os.O_RDONLY)
+            os.fsync(dir_fd)
+        except OSError as exc:
+            self._alert(category, classification)
+            raise KISRateLimitTempCleanupError(
+                "the KIS rate-limit state directory could not be synced",
+                reason_code=reason_code, detail=type(exc).__name__,
+            ) from exc
+        finally:
+            if dir_fd is not None:
+                try:
+                    os.close(dir_fd)
+                except OSError:
+                    pass
 
     def _load_state(self, path, category):
         """Reads the shared state. Absent is a first run; anything else
@@ -456,7 +620,8 @@ class KisRateLimiter:
         """
         payload = dict(state)
         payload["version"] = STATE_VERSION
-        temp_path = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+        temp_path = path.with_name(
+            _temp_name(path.name, os.getpid(), uuid.uuid4().hex))
 
         def _fail(stage, exc):
             # Best-effort cleanup; a leftover temp must not mask the
@@ -520,6 +685,7 @@ class KisRateLimiter:
                     os.close(dir_fd)
                 except OSError:
                     pass
+
 
     # -- retry -----------------------------------------------------------
 
