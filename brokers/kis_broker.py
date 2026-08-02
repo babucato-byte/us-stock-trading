@@ -67,6 +67,7 @@ from typing import List, NamedTuple, Optional
 
 import requests
 
+from brokers import kis_rate_limiter, kis_token_cache
 from brokers.kis_config import KISConfig, KISConfigError
 from domain.account_snapshot import AccountSnapshot
 from domain.execution_event import ExecutionRecord
@@ -288,8 +289,11 @@ def _order_excg_for(exchange: str) -> str:
 
 
 class KISBroker:
-    def __init__(self, config: Optional[KISConfig] = None, session=None, now_fn=None):
+    def __init__(self, config: Optional[KISConfig] = None, session=None, now_fn=None,
+                 limiter=None, token_cache=None):
         self.config = config or KISConfig()
+        self._limiter = limiter
+        self._token_cache = token_cache
         self.session = session or requests.Session()
         self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
         self._access_token = None
@@ -312,6 +316,23 @@ class KISBroker:
                 and self._now() < self._token_expires_at:
             return self._access_token
         self.config.validate_credentials()
+        # MEDIUM: the in-memory cache above only helps WITHIN one process.
+        # Each systemd unit is its own process, and KIS issues at most one
+        # token a minute (EGW00133, hit for real on Oracle), so the token
+        # is shared through a locked file. issue_fn below runs at most
+        # once, inside that lock, after a second cache check.
+        cache = self._token_cache or kis_token_cache.get_cache()
+        token = cache.get_or_issue(self.config, self._issue_token)
+        self._access_token = token
+        return token
+
+    def _issue_token(self):
+        """Performs the actual token request. Returns
+        (token, token_type, expires_in) for the cache to persist."""
+        # HIGH-2/MEDIUM: KIS issues at most one token a minute; pace it in
+        # its own category so a read burst cannot consume that budget.
+        (self._limiter or kis_rate_limiter.get_limiter()).wait(
+            category=kis_rate_limiter.CATEGORY_TOKEN)
         try:
             response = self.session.request(
                 "POST", f"{self.config.base_url}{TOKEN_PATH}",
@@ -335,12 +356,12 @@ class KISBroker:
             expires_in = int(body.get("expires_in", 0))
         except (ValueError, KeyError, TypeError) as exc:
             raise KISBrokerError(f"KIS token response malformed: {redact_text(str(exc))}") from exc
-        self._access_token = token
         # Refresh 60s early so a call started right at expiry never races
         # a mid-flight 401.
-        self._token_expires_at = self._now().timestamp() + max(expires_in - 60, 0)
-        self._token_expires_at = datetime.fromtimestamp(self._token_expires_at, tz=timezone.utc)
-        return self._access_token
+        self._token_expires_at = datetime.fromtimestamp(
+            self._now().timestamp() + max(expires_in - 60, 0), tz=timezone.utc,
+        )
+        return token, body.get("token_type") or "Bearer", expires_in
 
     def _auth_headers(self, tr_id, *, tr_cont=""):
         token = self._ensure_token()
@@ -355,19 +376,41 @@ class KISBroker:
         }
 
     def _get(self, path, tr_id, params):
-        try:
-            response = self.session.request(
-                "GET", f"{self.config.base_url}{path}", headers=self._auth_headers(tr_id),
-                params=params, timeout=10,
-            )
-        except requests.exceptions.RequestException as exc:
-            raise KISBrokerError(f"KIS GET {path} failed (network): {redact_text(str(exc))}") from exc
-        if response.status_code != 200:
-            raise KISBrokerError(f"KIS GET {path} failed: HTTP {response.status_code} {redact_text(response.text)}")
-        try:
-            return response.json()
-        except ValueError as exc:
-            raise KISBrokerError(f"KIS GET {path} response not JSON: {redact_text(str(exc))}") from exc
+        """HIGH-2: every read is paced by the shared limiter, and a KIS
+        per-second rate limit (EGW00201) is retried with backoff rather
+        than surfacing as a hard failure. Reads are safe to repeat --
+        orders and cancels deliberately are not, and are never retried."""
+        limiter = self._limiter or kis_rate_limiter.get_limiter()
+
+        def _attempt():
+            try:
+                response = self.session.request(
+                    "GET", f"{self.config.base_url}{path}",
+                    headers=self._auth_headers(tr_id), params=params, timeout=10,
+                )
+            except requests.exceptions.RequestException as exc:
+                raise KISBrokerError(
+                    f"KIS GET {path} failed (network): {redact_text(str(exc))}"
+                ) from exc
+            body = None
+            try:
+                body = response.json()
+            except ValueError:
+                body = None
+            if kis_rate_limiter.is_rate_limited(body):
+                raise kis_rate_limiter.KISRateLimitSignal()
+            if response.status_code != 200:
+                raise KISBrokerError(
+                    f"KIS GET {path} failed: HTTP {response.status_code} "
+                    f"{redact_text(response.text)}"
+                )
+            if body is None:
+                raise KISBrokerError(f"KIS GET {path} response not JSON")
+            return body
+
+        return limiter.call_with_retry(
+            _attempt, category=kis_rate_limiter.CATEGORY_READ, describe=path,
+        )
 
     # -- read-only --------------------------------------------------------
 
@@ -554,6 +597,10 @@ class KISBroker:
             "ORD_SVR_DVSN_CD": "0", "ORD_DVSN": "00",
         }
         current = self._now()
+        # HIGH-2: paced, but NEVER retried -- a rate-limited order may or
+        # may not have reached KIS, and re-sending could double it.
+        (self._limiter or kis_rate_limiter.get_limiter()).wait(
+            category=kis_rate_limiter.CATEGORY_ORDER)
         try:
             response = self.session.request(
                 "POST", f"{self.config.base_url}{ORDER_PATH}", headers=self._auth_headers(tr_id),
@@ -613,6 +660,9 @@ class KISBroker:
             "OVRS_ORD_UNPR": "0", "MGCO_APTM_ODNO": "", "ORD_SVR_DVSN_CD": "0",
         }
         current = self._now()
+        # HIGH-2: paced, never retried -- same ambiguity as an order.
+        (self._limiter or kis_rate_limiter.get_limiter()).wait(
+            category=kis_rate_limiter.CATEGORY_CANCEL)
         try:
             response = self.session.request(
                 "POST", f"{self.config.base_url}{CANCEL_PATH}", headers=self._auth_headers(tr_id),

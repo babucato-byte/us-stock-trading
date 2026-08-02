@@ -203,20 +203,28 @@ def build_snapshot(*, broker, conn, account_id, symbol=None, now=None,
 
     current = now or datetime.now(timezone.utc)
 
+    def _unavailable(stage, exc):
+        """HIGH-2: keep the specific reason. A rate-limited read must be
+        legible as KIS_RATE_LIMIT, not as a generic unavailability -- the
+        operator response is different (wait) from a real outage."""
+        error = ReconciliationUnavailableError(f"{stage}: {exc}")
+        error.reason_code = getattr(exc, "reason_code", None) or "KIS_UNAVAILABLE"
+        return error
+
     try:
         kis_positions = broker.get_positions()
     except Exception as exc:
-        raise ReconciliationUnavailableError(f"KIS position read failed: {exc}") from exc
+        raise _unavailable("KIS position read failed", exc) from exc
     try:
         kis_open_orders = broker.get_open_orders()
     except Exception as exc:
-        raise ReconciliationUnavailableError(f"KIS open-order read failed: {exc}") from exc
+        raise _unavailable("KIS open-order read failed", exc) from exc
     try:
         kis_fills = broker.get_fills(
             start_date=current.strftime("%Y%m%d"), end_date=current.strftime("%Y%m%d"),
         )
     except Exception as exc:
-        raise ReconciliationUnavailableError(f"KIS fill-history read failed: {exc}") from exc
+        raise _unavailable("KIS fill-history read failed", exc) from exc
 
     if internal_positions is None:
         internal_positions = load_internal_positions(now=current)

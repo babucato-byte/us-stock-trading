@@ -26,3 +26,32 @@ def _isolate_health_and_kill_switch_state_files(monkeypatch, tmp_path):
 
     monkeypatch.delenv("KILL_SWITCH_STATE_FILE", raising=False)
     monkeypatch.setattr(kss, "STATE_FILE", tmp_path / "KILL_SWITCH_STATE.json")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_kis_rate_limiter(monkeypatch, tmp_path):
+    """HIGH-2: the KIS rate limiter paces every read by a real 3 seconds
+    and records the budget in a shared file at the repo root. Without
+    this, every unrelated KIS test would genuinely sleep and would drop a
+    rate-limit state file into the repository.
+
+    Only the WAITING is neutralized, and only for tests that are not about
+    pacing: tests/test_kis_rate_limiting.py injects its own limiter with a
+    virtual clock and asserts the real intervals there.
+    """
+    from brokers import kis_rate_limiter, kis_token_cache
+
+    monkeypatch.setenv("KIS_RATE_LIMIT_STATE_FILE", str(tmp_path / "KIS_RATE_LIMIT.json"))
+    # MEDIUM: same reasoning for the shared token cache -- an unisolated
+    # test would read/write a real token file at the repo root.
+    monkeypatch.setenv("KIS_TOKEN_CACHE_FILE", str(tmp_path / "KIS_TOKEN_CACHE.json"))
+    monkeypatch.setenv("KIS_READ_MIN_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("KIS_TOKEN_MIN_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("KIS_ORDER_MIN_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("KIS_RATE_LIMIT_BASE_BACKOFF_SECONDS", "0")
+    monkeypatch.setenv("KIS_RATE_LIMIT_MAX_BACKOFF_SECONDS", "0")
+    kis_rate_limiter.reset_limiter()
+    kis_token_cache.reset_cache()
+    yield
+    kis_rate_limiter.reset_limiter()
+    kis_token_cache.reset_cache()
