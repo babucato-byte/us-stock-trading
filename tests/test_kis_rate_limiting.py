@@ -179,8 +179,10 @@ class TestCrossProcessSharing:
         blob = (tmp_path / "rate.json").read_text(encoding="utf-8")
         state = json.loads(blob)
         # Structurally incapable of holding a secret: the only keys are
-        # category names and every value is a timestamp.
-        assert set(state) <= set(kis_rate_limiter.CATEGORIES)
+        # category names plus the schema version, and every value is a
+        # number.
+        assert set(state) <= set(kis_rate_limiter.CATEGORIES) | {"version"}
+        assert state["version"] == kis_rate_limiter.STATE_VERSION
         assert all(isinstance(v, (int, float)) for v in state.values()), state
         for forbidden in ("appkey", "appsecret", "bearer", "cano", "access_token"):
             assert forbidden not in blob.lower()

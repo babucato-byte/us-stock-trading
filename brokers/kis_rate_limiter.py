@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,11 @@ REASON_STATE_INVALID = "KIS_RATE_LIMIT_STATE_INVALID"
 REASON_STATE_UNAVAILABLE = "KIS_RATE_LIMIT_STATE_UNAVAILABLE"
 REASON_LOCK_FAILED = "KIS_RATE_LIMIT_LOCK_FAILED"
 REASON_PERSISTENCE = "KIS_RATE_LIMIT_PERSISTENCE"
+REASON_LOCK_RELEASE_FAILED = "KIS_RATE_LIMIT_LOCK_RELEASE_FAILED"
+REASON_LOCK_CLOSE_FAILED = "KIS_RATE_LIMIT_LOCK_CLOSE_FAILED"
+REASON_LIMITER_INVALIDATED = "KIS_RATE_LIMIT_LIMITER_INVALIDATED"
+
+STATE_VERSION = 1
 
 # ORACLE-HIGH-02: a state timestamp further ahead than this means the
 # file is corrupt or the clock moved; either way the pacing budget is
@@ -108,6 +114,18 @@ class KISRateLimitStateUnavailable(Exception):
         super().__init__(message)
         self.reason_code = reason_code
         self.detail = detail
+
+
+class KISRateLimitLockReleaseError(KISRateLimitStateUnavailable):
+    """The shared lock could not be released or closed.
+
+    Previously this was swallowed -- the state had been written, so the
+    code released what it could, logged nothing useful, and made the HTTP
+    request anyway. A lock that is still held blocks every other process
+    from pacing itself, so continuing turns one filesystem fault into a
+    system-wide stall while THIS process keeps talking to KIS. The
+    reservation is only durable when the whole lifecycle closed cleanly.
+    """
 
 
 class KISRateLimitError(Exception):
@@ -211,6 +229,9 @@ class KisRateLimiter:
         self._clock = clock or time.monotonic
         self._sleeper = sleeper or time.sleep
         self._wall = time.time
+        # Set when a lock could not be released or closed. The handle's
+        # state is then unknown, so this limiter refuses further work.
+        self._invalidated = False
 
     # -- state file ------------------------------------------------------
 
@@ -220,38 +241,16 @@ class KisRateLimiter:
     def _lock_path(self, path):
         return path.with_name(path.name + ".lock")
 
-    def _read_state(self, handle, *, is_new_file):
-        """Classifies the shared state as ABSENT or VALID or CORRUPT.
-
-        Only a file that did not exist counts as a legitimate first run.
-        An existing file that is empty, truncated, or the wrong JSON type
-        is corrupt, and corrupt is NOT the same as "no budget used".
-        """
-        try:
-            handle.seek(0)
-            raw = handle.read()
-        except OSError as exc:
-            raise KISRateLimitStateUnavailable(
-                "the shared KIS rate-limit state could not be read",
-                detail=type(exc).__name__)
-        if not raw.strip():
-            if is_new_file:
-                return {}
-            raise KISRateLimitStateInvalid(
-                "KIS rate-limit state file exists but is empty", detail="empty")
-        try:
-            data = json.loads(raw)
-        except ValueError:
-            raise KISRateLimitStateInvalid(
-                "KIS rate-limit state is not valid JSON", detail="truncated_or_malformed")
-        if not isinstance(data, dict):
-            raise KISRateLimitStateInvalid(
-                "KIS rate-limit state is not an object",
-                detail=type(data).__name__)
-        return data
-
     def wait(self, *, category):
-        """Blocks until this process may issue a request of `category`."""
+        """Reserves this process's next slot, durably, and returns only
+        when the WHOLE lifecycle succeeded: state persisted atomically,
+        lock released, handle closed. The caller may issue its HTTP
+        request only after this returns."""
+        if self._invalidated:
+            raise KISRateLimitStateUnavailable(
+                "this KIS rate limiter was invalidated by an earlier lock failure",
+                reason_code=REASON_LIMITER_INVALIDATED, detail="invalidated",
+            )
         if category not in CATEGORIES:
             category = CATEGORY_READ
         interval = min_interval_for(category)
@@ -277,6 +276,9 @@ class KisRateLimiter:
                 reason_code=REASON_LOCK_FAILED, detail=type(exc).__name__,
             ) from exc
 
+        acquired = False
+        primary = None
+        slept = 0.0
         try:
             if not self._acquire(lock_handle):
                 self._alert(category, "lock could not be acquired")
@@ -284,15 +286,59 @@ class KisRateLimiter:
                     "the shared KIS rate-limit lock could not be acquired",
                     reason_code=REASON_LOCK_FAILED, detail="lock_timeout",
                 )
+            acquired = True
             try:
-                return self._wait_locked(path, category, interval)
-            finally:
-                try:
-                    fcntl.flock(lock_handle, fcntl.LOCK_UN)
-                except OSError:
-                    pass
+                slept = self._wait_locked(path, category, interval)
+            except BaseException as exc:
+                primary = exc
+                raise
         finally:
+            # The release is part of the lifecycle, not cleanup. Its
+            # failure is reported, and it must not silently mask the
+            # error that got us here.
+            release_error = self._release(lock_handle, acquired, category)
+            if release_error is not None and primary is None:
+                raise release_error
+            if release_error is not None:
+                # A persistence failure outranks a release failure -- the
+                # caller needs the original cause -- but the release
+                # problem is still surfaced to an operator.
+                logger.error(
+                    "the shared KIS rate-limit lock also failed to release (%s)",
+                    release_error.reason_code,
+                )
+        return slept
+
+    def _release(self, lock_handle, acquired, category):
+        """Unlocks and closes. Returns the error to raise, or None.
+
+        A failure here invalidates this limiter: the handle's state is
+        unknown, so no further request may be paced through it.
+        """
+        error = None
+        if acquired:
+            try:
+                fcntl.flock(lock_handle, fcntl.LOCK_UN)
+            except OSError as exc:
+                self._invalidated = True
+                self._alert(category, "lock could not be released")
+                error = KISRateLimitLockReleaseError(
+                    "the shared KIS rate-limit lock could not be released",
+                    reason_code=REASON_LOCK_RELEASE_FAILED,
+                    detail=type(exc).__name__,
+                )
+        try:
             lock_handle.close()
+        except OSError as exc:
+            self._invalidated = True
+            self._alert(category, "lock handle could not be closed")
+            if error is None:
+                error = KISRateLimitLockReleaseError(
+                    "the shared KIS rate-limit lock handle could not be closed",
+                    reason_code=REASON_LOCK_CLOSE_FAILED,
+                    detail=type(exc).__name__,
+                )
+        return error
 
     def _alert(self, category, classification):
         """Operator-visible. Carries the category and a CLASSIFICATION --
@@ -324,28 +370,8 @@ class KisRateLimiter:
                 self._sleeper(0.05)
 
     def _wait_locked(self, path, category, interval):
-        is_new_file = not path.exists()
-        try:
-            handle = open(path, "r+") if not is_new_file else open(path, "w+")
-        except FileNotFoundError:
-            is_new_file = True
-            try:
-                handle = open(path, "w+")
-            except OSError as exc:
-                self._alert(category, "state file could not be created")
-                raise KISRateLimitStateUnavailable(
-                    "the shared KIS rate-limit state could not be created",
-                    detail=type(exc).__name__,
-                ) from exc
-        except OSError as exc:
-            self._alert(category, "state file could not be opened")
-            raise KISRateLimitStateUnavailable(
-                "the shared KIS rate-limit state could not be opened",
-                detail=type(exc).__name__,
-            ) from exc
-
-        with handle:
-            state = self._read_state(handle, is_new_file=is_new_file)
+        state = self._load_state(path, category)
+        if True:
             has_entry = category in state
             last = state.get(category)
             now = self._wall()
@@ -378,23 +404,122 @@ class KisRateLimiter:
                     self._sleeper(slept)
                     now = self._wall()
             state[category] = now
+            # The reservation must be DURABLE before the request goes out.
+            self._store_state(path, state, category)
+            return slept
+
+    def _load_state(self, path, category):
+        """Reads the shared state. Absent is a first run; anything else
+        unreadable or malformed is fail-closed."""
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return {}
+        except OSError as exc:
+            self._alert(category, "state file could not be read")
+            raise KISRateLimitStateUnavailable(
+                "the shared KIS rate-limit state could not be read",
+                detail=type(exc).__name__,
+            ) from exc
+        if not raw.strip():
+            # The file EXISTS and is empty. With atomic replace this can
+            # only mean corruption -- a partial write is impossible.
+            raise KISRateLimitStateInvalid(
+                "KIS rate-limit state file exists but is empty", detail="empty")
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            raise KISRateLimitStateInvalid(
+                "KIS rate-limit state is not valid JSON",
+                detail="truncated_or_malformed")
+        if not isinstance(data, dict):
+            raise KISRateLimitStateInvalid(
+                "KIS rate-limit state is not an object", detail=type(data).__name__)
+        version = data.pop("version", STATE_VERSION)
+        if version != STATE_VERSION:
+            raise KISRateLimitStateInvalid(
+                "KIS rate-limit state has an unsupported version",
+                detail=f"version={version!r}")
+        return data
+
+    def _store_state(self, path, state, category):
+        """Writes the state ATOMICALLY: a temporary file in the same
+        directory, fsynced, then os.replace()d over the target, then the
+        directory itself fsynced.
+
+        Rewriting the file in place could leave a truncated or empty
+        state behind a crash -- which the reader would then have to treat
+        as corruption, stalling every service. With replace(), a reader
+        sees either the whole previous state or the whole new one, never
+        a partial one, and the previous state survives any failure before
+        the replace.
+        """
+        payload = dict(state)
+        payload["version"] = STATE_VERSION
+        temp_path = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+
+        def _fail(stage, exc):
+            # Best-effort cleanup; a leftover temp must not mask the
+            # original fault, and must not become the reported error.
             try:
-                handle.seek(0)
-                handle.truncate()
-                json.dump(state, handle)
+                os.unlink(temp_path)
+            except OSError as cleanup_exc:
+                logger.warning(
+                    "could not remove the KIS rate-limit temporary state (%s)",
+                    type(cleanup_exc).__name__,
+                )
+            self._alert(category, f"state could not be persisted ({stage})")
+            raise KISRateLimitStateUnavailable(
+                "the shared KIS rate-limit state could not be persisted",
+                reason_code=REASON_PERSISTENCE, detail=type(exc).__name__,
+            ) from exc
+
+        try:
+            handle = open(temp_path, "w", encoding="utf-8")
+        except OSError as exc:
+            self._alert(category, "state could not be persisted (create)")
+            raise KISRateLimitStateUnavailable(
+                "the shared KIS rate-limit state could not be persisted",
+                reason_code=REASON_PERSISTENCE, detail=type(exc).__name__,
+            ) from exc
+        try:
+            with handle:
+                json.dump(payload, handle)
                 handle.flush()
                 os.fsync(handle.fileno())
-            except OSError as exc:
-                # The budget must be durably recorded BEFORE the request
-                # goes out. An unwritable state (read-only filesystem, a
-                # failed fsync) means the next process would not see this
-                # request at all, so it is not made.
-                self._alert(category, "state could not be persisted")
-                raise KISRateLimitStateUnavailable(
-                    "the shared KIS rate-limit state could not be persisted",
-                    reason_code=REASON_PERSISTENCE, detail=type(exc).__name__,
-                ) from exc
-            return slept
+        except OSError as exc:
+            _fail("write", exc)
+        except ValueError as exc:            # unserializable state
+            _fail("serialize", exc)
+
+        try:
+            os.chmod(temp_path, 0o600)
+        except OSError as exc:
+            _fail("chmod", exc)
+
+        try:
+            os.replace(temp_path, path)
+        except OSError as exc:
+            _fail("replace", exc)
+
+        # The rename itself must be durable, or a crash could resurrect
+        # the old state while this process believes the new one is live.
+        dir_fd = None
+        try:
+            dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            os.fsync(dir_fd)
+        except OSError as exc:
+            self._alert(category, "state could not be persisted (directory fsync)")
+            raise KISRateLimitStateUnavailable(
+                "the shared KIS rate-limit state directory could not be synced",
+                reason_code=REASON_PERSISTENCE, detail=type(exc).__name__,
+            ) from exc
+        finally:
+            if dir_fd is not None:
+                try:
+                    os.close(dir_fd)
+                except OSError:
+                    pass
 
     # -- retry -----------------------------------------------------------
 
