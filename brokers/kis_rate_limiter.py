@@ -48,6 +48,9 @@ CATEGORIES = (CATEGORY_TOKEN, CATEGORY_READ, CATEGORY_ORDER, CATEGORY_CANCEL)
 RATE_LIMIT_MSG_CD = "EGW00201"
 REASON_KIS_RATE_LIMIT = "KIS_RATE_LIMIT"
 REASON_STATE_INVALID = "KIS_RATE_LIMIT_STATE_INVALID"
+REASON_STATE_UNAVAILABLE = "KIS_RATE_LIMIT_STATE_UNAVAILABLE"
+REASON_LOCK_FAILED = "KIS_RATE_LIMIT_LOCK_FAILED"
+REASON_PERSISTENCE = "KIS_RATE_LIMIT_PERSISTENCE"
 
 # ORACLE-HIGH-02: a state timestamp further ahead than this means the
 # file is corrupt or the clock moved; either way the pacing budget is
@@ -84,6 +87,26 @@ class KISRateLimitStateInvalid(Exception):
     def __init__(self, message, *, detail=None):
         super().__init__(message)
         self.reason_code = REASON_STATE_INVALID
+        self.detail = detail
+
+
+class KISRateLimitStateUnavailable(Exception):
+    """The SHARED pacing state could not be reached at all -- a permission
+    error, an unwritable directory, a failed lock, a read-only filesystem.
+
+    There used to be a local-sleep fallback here. That was the bug: every
+    service hitting the same permission error would take the same local
+    nap and then all fire together, which is precisely the burst the
+    shared budget exists to prevent. Cross-process pacing that cannot be
+    shared is not pacing, so the request does not go out.
+
+    The message deliberately carries a classification, not the raw OS
+    error or the absolute path.
+    """
+
+    def __init__(self, message, *, reason_code=REASON_STATE_UNAVAILABLE, detail=None):
+        super().__init__(message)
+        self.reason_code = reason_code
         self.detail = detail
 
 
@@ -208,8 +231,9 @@ class KisRateLimiter:
             handle.seek(0)
             raw = handle.read()
         except OSError as exc:
-            raise KISRateLimitStateInvalid(
-                "KIS rate-limit state could not be read", detail=type(exc).__name__)
+            raise KISRateLimitStateUnavailable(
+                "the shared KIS rate-limit state could not be read",
+                detail=type(exc).__name__)
         if not raw.strip():
             if is_new_file:
                 return {}
@@ -238,19 +262,28 @@ class KisRateLimiter:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            logger.warning("cannot prepare the rate-limit state dir (%s) -- pacing locally", exc)
-            return self._wait_without_shared_state(interval)
+            self._alert(category, "state directory unavailable")
+            raise KISRateLimitStateUnavailable(
+                "the shared KIS rate-limit state directory is unavailable",
+                detail=type(exc).__name__,
+            ) from exc
 
         try:
             lock_handle = open(self._lock_path(path), "a+")
         except OSError as exc:
-            raise KISRateLimitStateInvalid(
-                "cannot open the KIS rate-limit lock", detail=type(exc).__name__) from exc
+            self._alert(category, "lock file unavailable")
+            raise KISRateLimitStateUnavailable(
+                "the shared KIS rate-limit lock could not be opened",
+                reason_code=REASON_LOCK_FAILED, detail=type(exc).__name__,
+            ) from exc
 
         try:
             if not self._acquire(lock_handle):
-                logger.warning("rate-limit lock timed out -- pacing locally")
-                return self._wait_without_shared_state(interval)
+                self._alert(category, "lock could not be acquired")
+                raise KISRateLimitStateUnavailable(
+                    "the shared KIS rate-limit lock could not be acquired",
+                    reason_code=REASON_LOCK_FAILED, detail="lock_timeout",
+                )
             try:
                 return self._wait_locked(path, category, interval)
             finally:
@@ -260,6 +293,22 @@ class KisRateLimiter:
                     pass
         finally:
             lock_handle.close()
+
+    def _alert(self, category, classification):
+        """Operator-visible. Carries the category and a CLASSIFICATION --
+        never the path, the OS error text, or anything from the account."""
+        try:
+            from operations import alerts
+
+            alerts.send_alert(
+                "*KIS shared rate limiter unavailable*\n"
+                f"- category: {category}\n"
+                f"- problem: {classification}\n"
+                "- effect: the request was NOT sent; this cycle fails\n"
+                "- action: restore access to the shared rate-limit state"
+            )
+        except Exception as exc:  # noqa: BLE001 -- alerting must not mask it
+            logger.debug("could not alert on limiter unavailability: %s", exc)
 
     def _acquire(self, handle):
         deadline = self._clock() + _STATE_LOCK_TIMEOUT
@@ -280,10 +329,20 @@ class KisRateLimiter:
             handle = open(path, "r+") if not is_new_file else open(path, "w+")
         except FileNotFoundError:
             is_new_file = True
-            handle = open(path, "w+")
+            try:
+                handle = open(path, "w+")
+            except OSError as exc:
+                self._alert(category, "state file could not be created")
+                raise KISRateLimitStateUnavailable(
+                    "the shared KIS rate-limit state could not be created",
+                    detail=type(exc).__name__,
+                ) from exc
         except OSError as exc:
-            raise KISRateLimitStateInvalid(
-                "cannot open the KIS rate-limit state", detail=type(exc).__name__) from exc
+            self._alert(category, "state file could not be opened")
+            raise KISRateLimitStateUnavailable(
+                "the shared KIS rate-limit state could not be opened",
+                detail=type(exc).__name__,
+            ) from exc
 
         with handle:
             state = self._read_state(handle, is_new_file=is_new_file)
@@ -326,14 +385,16 @@ class KisRateLimiter:
                 handle.flush()
                 os.fsync(handle.fileno())
             except OSError as exc:
-                logger.warning("could not record the rate-limit timestamp: %s", exc)
+                # The budget must be durably recorded BEFORE the request
+                # goes out. An unwritable state (read-only filesystem, a
+                # failed fsync) means the next process would not see this
+                # request at all, so it is not made.
+                self._alert(category, "state could not be persisted")
+                raise KISRateLimitStateUnavailable(
+                    "the shared KIS rate-limit state could not be persisted",
+                    reason_code=REASON_PERSISTENCE, detail=type(exc).__name__,
+                ) from exc
             return slept
-
-    def _wait_without_shared_state(self, interval):
-        """Degraded mode: still pace, just without cross-process sharing.
-        Never "give up and fire immediately"."""
-        self._sleeper(interval)
-        return interval
 
     # -- retry -----------------------------------------------------------
 
