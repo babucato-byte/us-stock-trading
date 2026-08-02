@@ -47,6 +47,12 @@ CATEGORIES = (CATEGORY_TOKEN, CATEGORY_READ, CATEGORY_ORDER, CATEGORY_CANCEL)
 # KIS's own rate-limit code, seen on Oracle.
 RATE_LIMIT_MSG_CD = "EGW00201"
 REASON_KIS_RATE_LIMIT = "KIS_RATE_LIMIT"
+REASON_STATE_INVALID = "KIS_RATE_LIMIT_STATE_INVALID"
+
+# ORACLE-HIGH-02: a state timestamp further ahead than this means the
+# file is corrupt or the clock moved; either way the pacing budget is
+# unknowable and requests must stop, not proceed.
+DEFAULT_MAX_CLOCK_SKEW = 5.0
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -63,6 +69,22 @@ DEFAULT_MAX_BACKOFF = 15.0
 RETRYABLE_CATEGORIES = frozenset({CATEGORY_READ})
 
 _STATE_LOCK_TIMEOUT = 10.0
+
+
+class KISRateLimitStateInvalid(Exception):
+    """ORACLE-HIGH-02: the shared pacing state could not be trusted.
+
+    An independent probe showed an empty file, a truncated JSON file and a
+    future timestamp each granting a READ immediately with no wait -- the
+    cross-process budget silently disabled exactly when it was already
+    misbehaving. Anything but "absent" or "valid" now stops the request:
+    a corrupt budget is not a zero budget.
+    """
+
+    def __init__(self, message, *, detail=None):
+        super().__init__(message)
+        self.reason_code = REASON_STATE_INVALID
+        self.detail = detail
 
 
 class KISRateLimitError(Exception):
@@ -121,6 +143,10 @@ def max_backoff():
     return _float_env("KIS_RATE_LIMIT_MAX_BACKOFF_SECONDS", DEFAULT_MAX_BACKOFF)
 
 
+def max_clock_skew():
+    return _float_env("KIS_RATE_LIMIT_MAX_CLOCK_SKEW_SECONDS", DEFAULT_MAX_CLOCK_SKEW)
+
+
 def state_file():
     override = os.environ.get("KIS_RATE_LIMIT_STATE_FILE", "").strip()
     if override:
@@ -171,23 +197,34 @@ class KisRateLimiter:
     def _lock_path(self, path):
         return path.with_name(path.name + ".lock")
 
-    def _read_state(self, handle):
-        """A corrupt or unreadable state file must not disable pacing --
-        it is treated as "we know nothing", which makes the next request
-        wait a full interval rather than fire immediately."""
+    def _read_state(self, handle, *, is_new_file):
+        """Classifies the shared state as ABSENT or VALID or CORRUPT.
+
+        Only a file that did not exist counts as a legitimate first run.
+        An existing file that is empty, truncated, or the wrong JSON type
+        is corrupt, and corrupt is NOT the same as "no budget used".
+        """
         try:
             handle.seek(0)
             raw = handle.read()
-        except OSError:
-            return None
+        except OSError as exc:
+            raise KISRateLimitStateInvalid(
+                "KIS rate-limit state could not be read", detail=type(exc).__name__)
         if not raw.strip():
-            return None
+            if is_new_file:
+                return {}
+            raise KISRateLimitStateInvalid(
+                "KIS rate-limit state file exists but is empty", detail="empty")
         try:
             data = json.loads(raw)
         except ValueError:
-            logger.warning("KIS rate-limit state is corrupt -- pacing conservatively")
-            return None
-        return data if isinstance(data, dict) else None
+            raise KISRateLimitStateInvalid(
+                "KIS rate-limit state is not valid JSON", detail="truncated_or_malformed")
+        if not isinstance(data, dict):
+            raise KISRateLimitStateInvalid(
+                "KIS rate-limit state is not an object",
+                detail=type(data).__name__)
+        return data
 
     def wait(self, *, category):
         """Blocks until this process may issue a request of `category`."""
@@ -207,8 +244,8 @@ class KisRateLimiter:
         try:
             lock_handle = open(self._lock_path(path), "a+")
         except OSError as exc:
-            logger.warning("cannot open the rate-limit lock (%s) -- pacing locally", exc)
-            return self._wait_without_shared_state(interval)
+            raise KISRateLimitStateInvalid(
+                "cannot open the KIS rate-limit lock", detail=type(exc).__name__) from exc
 
         try:
             if not self._acquire(lock_handle):
@@ -238,25 +275,47 @@ class KisRateLimiter:
                 self._sleeper(0.05)
 
     def _wait_locked(self, path, category, interval):
+        is_new_file = not path.exists()
         try:
-            handle = open(path, "r+")
+            handle = open(path, "r+") if not is_new_file else open(path, "w+")
         except FileNotFoundError:
+            is_new_file = True
             handle = open(path, "w+")
         except OSError as exc:
-            logger.warning("cannot open the rate-limit state (%s) -- pacing locally", exc)
-            return self._wait_without_shared_state(interval)
+            raise KISRateLimitStateInvalid(
+                "cannot open the KIS rate-limit state", detail=type(exc).__name__) from exc
 
         with handle:
-            state = self._read_state(handle) or {}
+            state = self._read_state(handle, is_new_file=is_new_file)
+            has_entry = category in state
             last = state.get(category)
             now = self._wall()
             slept = 0.0
-            if isinstance(last, (int, float)):
+            if has_entry:
+                # An entry that is explicitly null is corruption, not the
+                # same as never having recorded this category.
+                if not isinstance(last, (int, float)) or isinstance(last, bool) \
+                        or last != last or last in (float("inf"), float("-inf")) \
+                        or last < 0:
+                    # NaN, infinity, negative and non-numeric are all
+                    # corruption, not "a long time ago".
+                    raise KISRateLimitStateInvalid(
+                        f"KIS rate-limit timestamp for {category} is not a usable time",
+                        detail=repr(last))
                 elapsed = now - last
-                # A clock that jumped backwards (NTP step) must not grant a
-                # free burst; treat it as "no information".
-                if 0 <= elapsed < interval:
-                    slept = interval - elapsed
+                if elapsed < -max_clock_skew():
+                    # The recorded time is in the FUTURE. Waiting it out
+                    # could block for hours and proceeding would bypass
+                    # pacing entirely, so stop and let an operator fix the
+                    # clock or the file.
+                    raise KISRateLimitStateInvalid(
+                        f"KIS rate-limit timestamp for {category} is "
+                        f"{abs(elapsed):.1f}s in the future",
+                        detail="future_timestamp")
+                if elapsed < interval:
+                    # Covers small negative skew too: within tolerance we
+                    # wait the FULL interval rather than assume freshness.
+                    slept = interval - max(elapsed, 0.0)
                     self._sleeper(slept)
                     now = self._wall()
             state[category] = now

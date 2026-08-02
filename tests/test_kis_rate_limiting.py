@@ -115,13 +115,19 @@ class TestPacing:
         limiter.wait(category=CATEGORY_TOKEN)
         assert clock.slept == [60.0]
 
-    def test_a_backwards_clock_does_not_grant_a_burst(self, limiter, clock, tmp_path):
+    def test_a_future_timestamp_blocks_rather_than_bursting(self, limiter, clock, tmp_path):
+        """ORACLE-HIGH-02 corrected this test's own expectation. It used
+        to accept "does not crash"; an independent probe then showed the
+        call returning immediately with no wait, which silently disables
+        pacing. A future timestamp is now a hard stop."""
         limiter.wait(category=CATEGORY_READ)
         state = tmp_path / "rate.json"
         state.write_text(json.dumps({CATEGORY_READ: clock.now + 500}), encoding="utf-8")
-        # A future timestamp (NTP step) must not be treated as "0 elapsed,
-        # go ahead"; it is simply not a usable interval.
-        limiter.wait(category=CATEGORY_READ)
+        before = list(clock.slept)
+        with pytest.raises(kis_rate_limiter.KISRateLimitStateInvalid) as excinfo:
+            limiter.wait(category=CATEGORY_READ)
+        assert excinfo.value.detail == "future_timestamp"
+        assert clock.slept == before, "a request was allowed through"
 
 
 class TestCrossProcessSharing:
@@ -153,15 +159,19 @@ class TestCrossProcessSharing:
             instance.wait(category=CATEGORY_READ)
         assert clock.now - start == 9.0, "four processes did not serialize"
 
-    def test_a_corrupt_state_file_paces_conservatively(self, tmp_path, clock, monkeypatch):
-        """Fail-closed: an unreadable budget means wait, not fire away."""
+    def test_a_corrupt_state_file_blocks_the_request(self, tmp_path, clock, monkeypatch):
+        """ORACLE-HIGH-02: this test previously asserted only that the
+        file was rewritten, which the probe showed happened WITHOUT any
+        wait -- corrupt state was indistinguishable from a fresh budget.
+        Corrupt now stops the request outright."""
         monkeypatch.setenv("KIS_READ_MIN_INTERVAL_SECONDS", "3.0")
         path = tmp_path / "rate.json"
         path.write_text("{not json", encoding="utf-8")
         instance = KisRateLimiter(path=path, clock=clock.time, sleeper=clock.sleep)
         instance._wall = clock.time
-        instance.wait(category=CATEGORY_READ)
-        assert path.read_text(encoding="utf-8").strip().startswith("{")
+        with pytest.raises(kis_rate_limiter.KISRateLimitStateInvalid):
+            instance.wait(category=CATEGORY_READ)
+        assert clock.slept == []
 
     def test_the_state_file_holds_no_secret(self, limiter, tmp_path):
         limiter.wait(category=CATEGORY_READ)
