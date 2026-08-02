@@ -46,6 +46,7 @@ from typing import Optional, Union
 import shadow_audit
 from brokers.kis_broker import KISAmbiguousResponseError, KISBroker, KISBrokerError
 from domain.instrument import build_instrument
+from market_data.exchange_registry import build_kis_instrument
 from domain.order_intent import OrderIntent, OrderIntentError
 from execution import execution_engine, idempotency, order_gate
 from execution.execution_engine import ExecutionEngineError
@@ -103,11 +104,13 @@ class KISBrokerAdapter:
         self._is_regular_session_fn = is_regular_session_fn or (lambda: True)
         self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
         self._kis_validation = KISValidationProvider(
-            self.kis_broker, instrument_lookup=lambda s: build_instrument(s, exchange="NASDAQ"),
+            self.kis_broker, instrument_lookup=self._instrument,
         )
 
     def _instrument(self, symbol):
-        return build_instrument(symbol, exchange="NASDAQ")
+        """HIGH-1: resolved, never assumed -- see domain/exchange.py."""
+        instrument, _record = build_kis_instrument(symbol)
+        return instrument
 
     def _audit(self, run_id, event_type, result, *, symbol, internal_order_id=None,
                 reason_code=None, detail=None, now):

@@ -48,6 +48,11 @@ import kis_live_trading as klt  # noqa: E402
 import paper_strategy_order as pso  # noqa: E402
 import risk_config  # noqa: E402
 import shadow_audit  # noqa: E402
+from brokers.kis_broker import KISPriceUnavailableError  # noqa: E402
+from market_data.exchange_registry import (  # noqa: E402
+    ExchangeResolutionError,
+    build_kis_instrument,
+)
 import shadow_mode  # noqa: E402
 from brokers.kis_broker import KISBroker, KISBrokerError  # noqa: E402
 from config import scalping_strategy_v1_config as strat_cfg  # noqa: E402
@@ -109,6 +114,29 @@ def _audit(run_id, event_type, result, *, symbol, signal_id=None, reason_code=No
     )
 
 
+
+def _price_reason_of(exc):
+    """HIGH-1: unwrap the broker's specific price reason if it survived
+    the market-data wrapper; otherwise stay with the generic code."""
+    cause = getattr(exc, "__cause__", None)
+    if isinstance(cause, KISPriceUnavailableError):
+        return cause.reason_code
+    return "PRICE_UNAVAILABLE"
+
+
+def _price_detail(exc, exchange_record=None):
+    """Operator-facing detail: venue and requested code only -- never a
+    raw response, account number or token."""
+    cause = getattr(exc, "__cause__", None)
+    if isinstance(cause, KISPriceUnavailableError):
+        return str(cause.diagnostic())
+    if exchange_record is not None:
+        return (f"{exchange_record.symbol} canonical_exchange="
+                f"{exchange_record.exchange.value} "
+                f"kis_exchange_code={exchange_record.kis_exchange_code}: {exc}")
+    return str(exc)
+
+
 def _evaluate_symbol(*, symbol, broker, rollout, conn, kis_validation, deployed_commit,
                      validated_commit, allowed_account_no, is_regular_session, now):
     """Returns a dict describing what the live path WOULD have done. No
@@ -128,7 +156,8 @@ def _evaluate_symbol(*, symbol, broker, rollout, conn, kis_validation, deployed_
                reason_code="SCORE_THRESHOLD_MET", now=now)
 
         try:
-            instrument = build_instrument(symbol, exchange="NASDAQ")
+            # HIGH-1: resolve the venue instead of assuming NASDAQ.
+            instrument, exchange_record = build_kis_instrument(symbol)
             signal = build_signal(
                 strategy_id="PAPER_STRATEGY_ORDER_SCORE_V1", strategy_version="v1",
                 config_version="live_rollout_v1", code_commit=deployed_commit, symbol=symbol,
@@ -136,6 +165,12 @@ def _evaluate_symbol(*, symbol, broker, rollout, conn, kis_validation, deployed_
                 score=analysis["score"], entry_reason="score_threshold_breakout",
                 valid_for_seconds=klt.SIGNAL_VALID_SECONDS, now=now,
             )
+        except ExchangeResolutionError as exc:
+            # HIGH-1: fail closed. No default venue, no transport.
+            outcome["reason_code"] = exc.reason_code
+            _audit(run_id, shadow_audit.INSTRUMENT_BLOCKED, shadow_audit.RESULT_BLOCKED,
+                   symbol=symbol, reason_code=exc.reason_code, detail=str(exc), now=now)
+            return outcome
         except (InstrumentError, SignalError) as exc:
             outcome["reason_code"] = "INSTRUMENT_INVALID"
             _audit(run_id, shadow_audit.INSTRUMENT_BLOCKED, shadow_audit.RESULT_BLOCKED,
@@ -145,10 +180,14 @@ def _evaluate_symbol(*, symbol, broker, rollout, conn, kis_validation, deployed_
         try:
             kis_quote = kis_validation.get_price_quote(symbol)
         except MarketDataProviderError as exc:
-            outcome["reason_code"] = "PRICE_UNAVAILABLE"
+            # HIGH-1: keep the specific reason when the broker gave one --
+            # an empty price on a successful call means the exchange code
+            # is probably wrong, which a flat PRICE_UNAVAILABLE hides.
+            reason = getattr(exc, "reason_code", None) or _price_reason_of(exc)
+            outcome["reason_code"] = reason
             _audit(run_id, shadow_audit.PRICE_DEVIATION_BLOCKED, shadow_audit.RESULT_BLOCKED,
-                   symbol=symbol, signal_id=signal.signal_id, reason_code="PRICE_UNAVAILABLE",
-                   detail=str(exc), now=now)
+                   symbol=symbol, signal_id=signal.signal_id, reason_code=reason,
+                   detail=_price_detail(exc, exchange_record), now=now)
             return outcome
 
         try:
@@ -297,7 +336,8 @@ def run_once(*, broker=None, rollout=None, watchlist=None, now=None, conn=None):
     )
     symbols = watchlist if watchlist is not None else pso.load_watchlist()
     kis_validation = KISValidationProvider(
-        broker, instrument_lookup=lambda s: build_instrument(s, exchange="NASDAQ"),
+        # HIGH-1: the provider resolves each symbol's real venue too.
+        broker, instrument_lookup=lambda s: build_kis_instrument(s)[0],
     )
     owns_conn = conn is None
     conn = conn or state_db.open_db()

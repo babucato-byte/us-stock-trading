@@ -52,6 +52,10 @@ from domain.instrument import Instrument, InstrumentError, build_instrument
 from domain.order_intent import OrderIntent, OrderIntentError
 from domain.signal import Signal, SignalError, build_signal
 from execution import execution_engine, order_gate
+from market_data.exchange_registry import (
+    ExchangeResolutionError,
+    build_kis_instrument,
+)
 from execution.execution_engine import ExecutionEngineError
 from execution.order_repository import FatalRepositoryConnectionError
 from market_data.kis_validation_provider import (
@@ -158,8 +162,15 @@ def _build_instrument(symbol, allowed_symbols):
     """See module docstring's RESIDUAL RISK note. `symbol` must already
     be on `allowed_symbols` (checked by the caller before this is
     invoked) -- leveraged/inverse/otc are trusted-False for exactly that
-    reason, not independently detected."""
-    return build_instrument(symbol, exchange="NASDAQ")
+    reason, not independently detected.
+
+    HIGH-1: the venue is RESOLVED, never assumed. This used to hardcode
+    NASDAQ, which made every NYSE/AMEX name unpriceable (KIS answers a
+    wrong-exchange quote with rt_cd=0 and an empty price). An unresolved
+    symbol raises, so the caller blocks with EXCHANGE_UNKNOWN and places
+    no order."""
+    instrument, _record = build_kis_instrument(symbol)
+    return instrument
 
 
 def _get_deployed_commit():

@@ -34,6 +34,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import shadow_audit  # noqa: E402
+from brokers.kis_broker import KISPriceUnavailableError  # noqa: E402
+from market_data.exchange_registry import (  # noqa: E402
+    ExchangeResolutionError,
+    build_kis_instrument,
+)
 from brokers.kis_broker import KISBroker, KISBrokerError  # noqa: E402
 from clock import DEFAULT_CLOCK  # noqa: E402
 from config.live_exit_flags import LiveExitFlags  # noqa: E402
@@ -114,7 +119,20 @@ def evaluate_position(*, position_id, record, broker, conn, exit_flags, now, eas
             return outcome
 
         try:
-            current_price = broker.get_current_price(build_instrument(symbol, exchange="NASDAQ"))
+            # HIGH-1: resolve the venue instead of assuming NASDAQ.
+            instrument, _exchange_record = build_kis_instrument(symbol)
+            current_price = broker.get_current_price(instrument)
+        except ExchangeResolutionError as exc:
+            outcome["reason_code"] = exc.reason_code
+            _audit(run_id, shadow_audit.INSTRUMENT_BLOCKED, shadow_audit.RESULT_BLOCKED,
+                   symbol=symbol, reason_code=exc.reason_code, detail=str(exc), now=now)
+            return outcome
+        except KISPriceUnavailableError as exc:
+            outcome["reason_code"] = exc.reason_code
+            _audit(run_id, shadow_audit.PRICE_DEVIATION_BLOCKED, shadow_audit.RESULT_BLOCKED,
+                   symbol=symbol, reason_code=exc.reason_code,
+                   detail=str(exc.diagnostic()), now=now)
+            return outcome
         except (KISBrokerError, Exception) as exc:  # noqa: BLE001 -- any read failure blocks
             outcome["reason_code"] = "PRICE_UNAVAILABLE"
             _audit(run_id, shadow_audit.PRICE_DEVIATION_BLOCKED, shadow_audit.RESULT_BLOCKED,

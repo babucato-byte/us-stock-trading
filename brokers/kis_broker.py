@@ -72,6 +72,12 @@ from domain.account_snapshot import AccountSnapshot
 from domain.execution_event import ExecutionRecord
 from domain.order_intent import OrderIntent
 from domain.position import Position
+from domain.exchange import (
+    USExchange,
+    UnsupportedExchangeError,
+    to_kis_exchange_code,
+    to_kis_order_exchange_code,
+)
 from execution.secret_redaction import redact_text, safe_repr
 
 TOKEN_PATH = "/oauth2/tokenP"
@@ -113,8 +119,33 @@ TR_ID_CANCEL = {"live": "TTTT1004U", "paper": "VTTT1004U"}
 # ("NASD"/"NYSE"/"AMEX", not "NAS"/"NYS"/"AMS"). Conflating the two was a
 # real bug this comparison caught: order submission/orderable-amount
 # calls were sending the wrong-format exchange code.
-_EXCHANGE_TO_EXCD = {"NASDAQ": "NAS", "NYSE": "NYS", "AMEX": "AMS"}
-_EXCHANGE_TO_ORDER_EXCG_CD = {"NASDAQ": "NASD", "NYSE": "NYSE", "AMEX": "AMEX"}
+# HIGH-1: both tables now live in domain/exchange.py so that price,
+# order, cancel and response-normalization cannot drift apart. The names
+# below remain as thin views for readability; nothing writes to them.
+# These stay in the wire vocabulary an operator reads in KIS's own docs
+# ("AMEX", not the canonical USExchange.NYSE_AMERICAN). They are derived
+# from the central tables, so a change there shows up here, but lookups
+# go through normalize_exchange() below -- which accepts either spelling.
+_EXCHANGE_TO_EXCD = {
+    "NASDAQ": to_kis_exchange_code(USExchange.NASDAQ),
+    "NYSE": to_kis_exchange_code(USExchange.NYSE),
+    "AMEX": to_kis_exchange_code(USExchange.NYSE_AMERICAN),
+}
+_EXCHANGE_TO_ORDER_EXCG_CD = {
+    "NASDAQ": to_kis_order_exchange_code(USExchange.NASDAQ),
+    "NYSE": to_kis_order_exchange_code(USExchange.NYSE),
+    "AMEX": to_kis_order_exchange_code(USExchange.NYSE_AMERICAN),
+}
+
+# HIGH-1: KIS answers a wrong-exchange price query with SUCCESS and an
+# empty price rather than an error (verified on Oracle: BBVA/EXCD=NAS ->
+# rt_cd=0, last=''). These reason codes let an operator tell that apart
+# from a genuinely unavailable quote, instead of seeing one flat
+# "PRICE_UNAVAILABLE" for both.
+REASON_PRICE_FIELD_EMPTY = "PRICE_FIELD_EMPTY"
+REASON_PRICE_EXCHANGE_MISMATCH_SUSPECTED = "PRICE_EXCHANGE_MISMATCH_SUSPECTED"
+REASON_PRICE_RESPONSE_MALFORMED = "PRICE_RESPONSE_MALFORMED"
+REASON_PRICE_NOT_AVAILABLE = "PRICE_NOT_AVAILABLE"
 
 # -- CODEX-052: verification status ------------------------------------
 # See the module docstring for what the two axes mean. Nothing here is a
@@ -195,6 +226,44 @@ class KISBrokerError(Exception):
     증권사로 자동 우회 주문하지 않는다")."""
 
 
+class KISPriceUnavailableError(KISBrokerError):
+    """A price could not be established. `reason_code` distinguishes an
+    empty field on an otherwise successful response (the exchange-code
+    signature) from a malformed or absent one."""
+
+    def __init__(self, message, *, reason_code, symbol=None, exchange=None,
+                 kis_exchange_code=None, success_code=None, price_field="last"):
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.symbol = symbol
+        self.exchange = exchange
+        self.kis_exchange_code = kis_exchange_code
+        self.success_code = success_code
+        self.price_field = price_field
+
+    def diagnostic(self):
+        """Operator-facing detail: symbol and venue only. Never the raw
+        response, the account number or a token."""
+        return {
+            "symbol": self.symbol,
+            "canonical_exchange": self.exchange,
+            "requested_kis_exchange_code": self.kis_exchange_code,
+            "price_field": self.price_field,
+            "response_success_code": self.success_code,
+            "reason_code": self.reason_code,
+        }
+
+# -- CODEX-052: verification status ------------------------------------
+# See the module docstring for what the two axes mean. Nothing here is a
+# runtime switch; it is the authoritative record of HOW each wire-format
+# value was established, so an operator can tell "confirmed against KIS's
+# own examples" apart from "confirmed against a real KIS response".
+REFERENCE_VERIFIED = "REFERENCE_VERIFIED"
+REFERENCE_UNVERIFIED = "REFERENCE_UNVERIFIED"
+LIVE_RESPONSE_CONFIRMED = "LIVE_RESPONSE_CONFIRMED"
+LIVE_RESPONSE_PENDING = "LIVE_RESPONSE_PENDING"
+
+
 class KISAmbiguousResponseError(KISBrokerError):
     """Raised specifically for timeouts/connection errors/non-parseable
     responses to a state-mutating call (order/cancel) -- the caller
@@ -203,17 +272,19 @@ class KISAmbiguousResponseError(KISBrokerError):
 
 
 def _excd_for(exchange: str) -> str:
-    excd = _EXCHANGE_TO_EXCD.get(exchange)
-    if excd is None:
-        raise KISBrokerError(f"no KIS exchange code mapping for exchange={exchange!r}")
-    return excd
+    try:
+        return to_kis_exchange_code(exchange)
+    except UnsupportedExchangeError as exc:
+        raise KISBrokerError(f"no KIS exchange code mapping for exchange={exchange!r}") from exc
 
 
 def _order_excg_for(exchange: str) -> str:
-    excg = _EXCHANGE_TO_ORDER_EXCG_CD.get(exchange)
-    if excg is None:
-        raise KISBrokerError(f"no KIS order-exchange code mapping for exchange={exchange!r}")
-    return excg
+    try:
+        return to_kis_order_exchange_code(exchange)
+    except UnsupportedExchangeError as exc:
+        raise KISBrokerError(
+            f"no KIS order-exchange code mapping for exchange={exchange!r}"
+        ) from exc
 
 
 class KISBroker:
@@ -306,23 +377,57 @@ class KISBroker:
         CODEX-052: the `output.last` field name is REFERENCE_VERIFIED
         (chk_price.py's own field comment `'last': '현재가'`) but still
         LIVE_RESPONSE_PENDING -- no real KIS quote response has been read
-        yet. See VERIFICATION_MATRIX at the top of this module."""
+        yet. See VERIFICATION_MATRIX at the top of this module.
+
+        HIGH-1: a wrong-exchange query does NOT fail here -- KIS answers
+        rt_cd=0 with `last=''`. That case is reported as
+        PRICE_EXCHANGE_MISMATCH_SUSPECTED rather than a flat "price
+        unavailable", so the log points at the exchange code."""
         self.config.validate_read_allowed()
+        excd = _excd_for(instrument.exchange)
         body = self._get(PRICE_PATH, TR_ID_PRICE, {
-            "AUTH": "", "EXCD": _excd_for(instrument.exchange), "SYMB": instrument.kis_symbol,
+            "AUTH": "", "EXCD": excd, "SYMB": instrument.kis_symbol,
         })
-        output = body.get("output") or {}
+        success_code = body.get("rt_cd")
+        output = body.get("output")
+
+        def _fail(reason, message):
+            raise KISPriceUnavailableError(
+                message, reason_code=reason, symbol=instrument.kis_symbol,
+                exchange=instrument.exchange, kis_exchange_code=excd,
+                success_code=success_code, price_field="last",
+            )
+
+        if not isinstance(output, dict):
+            _fail(REASON_PRICE_RESPONSE_MALFORMED,
+                  f"KIS price response has no usable 'output' object: {safe_repr(output)}")
+
+        if "last" not in output:
+            _fail(REASON_PRICE_RESPONSE_MALFORMED,
+                  "KIS price response is missing the 'last' field entirely")
+
         raw_price = output.get("last")
+        if isinstance(raw_price, str) and not raw_price.strip():
+            # The signature of an exchange-code mismatch: the call
+            # SUCCEEDED and the field exists, it is simply empty. Only
+            # claim a mismatch when the venue is one we resolved.
+            reason = (REASON_PRICE_EXCHANGE_MISMATCH_SUSPECTED
+                      if str(success_code) == "0" else REASON_PRICE_FIELD_EMPTY)
+            _fail(reason,
+                  f"KIS returned an empty price for {instrument.kis_symbol} on "
+                  f"EXCD={excd} (rt_cd={success_code}) -- the symbol is most "
+                  f"likely not listed on {instrument.exchange}")
+
         try:
             price = float(raw_price)
         except (TypeError, ValueError):
             # CODEX-050: never interpolate a RAW KIS response into an
             # error -- safe_repr() redacts the structure first.
-            raise KISBrokerError(
-                f"KIS price response missing/invalid 'last' field: {safe_repr(output)}"
-            )
+            _fail(REASON_PRICE_RESPONSE_MALFORMED,
+                  f"KIS price response has an unparseable 'last' field: {safe_repr(output)}")
         if not math.isfinite(price) or price <= 0:
-            raise KISBrokerError(f"KIS price response has a non-positive/non-finite price: {price!r}")
+            _fail(REASON_PRICE_NOT_AVAILABLE,
+                  f"KIS price response has a non-positive/non-finite price: {price!r}")
         return price
 
     def get_account_snapshot(self, *, source_label="kis_balance") -> AccountSnapshot:
