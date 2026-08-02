@@ -128,3 +128,27 @@ def to_kis_order_exchange_code(exchange) -> str:
 
 def supported_exchanges():
     return tuple(USExchange)
+
+
+def supported_kis_order_exchange_codes():
+    """ORACLE-HIGH-01: the venues an ACCOUNT-WIDE read must sweep.
+
+    KIS's balance / open-order / fill endpoints take a single
+    OVRS_EXCG_CD, so one call sees one venue. Every one of those calls
+    used to pass "NASD", which silently hid NYSE and AMEX positions,
+    orders and fills from reconciliation -- a partial account state read
+    as the whole account state.
+
+    Derived from the canonical table so a new venue is swept the moment
+    it is supported. Order matters only for reproducible logs.
+    """
+    return tuple(to_kis_order_exchange_code(exchange) for exchange in USExchange)
+
+
+def exchange_for_kis_order_code(code):
+    """Inverse of to_kis_order_exchange_code() -- lets a read that swept
+    several venues label each row with the venue it came from."""
+    for exchange in USExchange:
+        if to_kis_order_exchange_code(exchange) == code:
+            return exchange
+    raise UnsupportedExchangeError(f"unknown KIS order-exchange code: {code!r}")

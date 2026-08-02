@@ -76,6 +76,8 @@ from domain.position import Position
 from domain.exchange import (
     USExchange,
     UnsupportedExchangeError,
+    exchange_for_kis_order_code,
+    supported_kis_order_exchange_codes,
     to_kis_exchange_code,
     to_kis_order_exchange_code,
 )
@@ -225,6 +227,35 @@ class KISBrokerError(Exception):
     non-success KIS response body. Callers must treat this as a hard
     block; there is no fallback broker (spec §2: "장애 시 Alpaca나 다른
     증권사로 자동 우회 주문하지 않는다")."""
+
+
+class KISAccountSweepError(KISBrokerError):
+    """ORACLE-HIGH-01: one venue leg of an account-wide read failed, so
+    the result would be a PARTIAL account. Callers must treat it as
+    unavailable -- never as "these are all the positions/orders/fills"."""
+
+    def __init__(self, message, *, exchange_code=None):
+        super().__init__(message)
+        self.exchange_code = exchange_code
+        self.reason_code = "KIS_EXCHANGE_LEG_FAILED"
+
+
+def _merge_rows(legs, tag, *, key_field):
+    """Concatenates every venue leg's rows, dropping duplicates by broker
+    order id. KIS can echo the same order under more than one filter, and
+    a duplicated open order would look like two live orders to
+    reconciliation."""
+    merged = []
+    seen = set()
+    for code, body in legs:
+        for row in tag(body.get("output") or [], code):
+            identifier = (row or {}).get(key_field) if isinstance(row, dict) else None
+            if identifier:
+                if identifier in seen:
+                    continue
+                seen.add(identifier)
+            merged.append(row)
+    return merged
 
 
 class KISPriceUnavailableError(KISBrokerError):
@@ -473,15 +504,72 @@ class KISBroker:
                   f"KIS price response has a non-positive/non-finite price: {price!r}")
         return price
 
+
+    # -- account-wide reads span every supported venue ------------------
+
+    def _sweep_exchanges(self, path, tr_id, base_params, *, describe):
+        """ORACLE-HIGH-01: KIS account reads filter by ONE OVRS_EXCG_CD, so
+        a single call sees a single venue. Every account read here used to
+        pass "NASD", which hid NYSE and AMEX rows -- reconciliation then
+        compared a partial account against full internal state.
+
+        Sweeps every supported venue and yields (code, body) pairs. A leg
+        that fails aborts the whole sweep: a partial account must never be
+        mistaken for a complete one, so the caller gets an exception, not
+        a short list.
+        """
+        results = []
+        for code in supported_kis_order_exchange_codes():
+            params = dict(base_params)
+            params["OVRS_EXCG_CD"] = code
+            try:
+                # Each leg goes through the shared READ limiter, so the
+                # sweep is paced like any other consecutive reads.
+                body = self._get(path, tr_id, params)
+            except kis_rate_limiter.KISRateLimitStateInvalid:
+                # A local pacing-state fault is not a venue failure; it
+                # must reach the caller with its own reason code, and no
+                # further leg may be attempted.
+                raise
+            except Exception as exc:
+                error = KISAccountSweepError(
+                    f"{describe} failed for exchange {code}: {exc}",
+                    exchange_code=code,
+                )
+                error.reason_code = getattr(exc, "reason_code", None) or "KIS_EXCHANGE_LEG_FAILED"
+                raise error from exc
+            results.append((code, body))
+        return results
+
+    @staticmethod
+    def _tag_rows(rows, code):
+        """Preserves which venue each row came from, so a merged result
+        never loses the distinction the sweep just established."""
+        tagged = []
+        for row in rows or []:
+            if isinstance(row, dict):
+                row = dict(row)
+                row.setdefault("kis_exchange_code", code)
+                try:
+                    row.setdefault(
+                        "canonical_exchange", exchange_for_kis_order_code(code).value)
+                except UnsupportedExchangeError:  # pragma: no cover
+                    pass
+            tagged.append(row)
+        return tagged
+
     def get_account_snapshot(self, *, source_label="kis_balance") -> AccountSnapshot:
         self.config.validate_read_allowed()
         tr_id = TR_ID_BALANCE[self._env_key()]
-        body = self._get(BALANCE_PATH, tr_id, {
+        legs = self._sweep_exchanges(BALANCE_PATH, tr_id, {
             "CANO": self.config.account_no, "ACNT_PRDT_CD": self.config.account_product_cd,
-            "OVRS_EXCG_CD": "NASD", "TR_CRCY_CD": "USD",
-            "CTX_AREA_FK200": "", "CTX_AREA_NK200": "",
-        })
-        summary_rows = body.get("output2") or {}
+            "TR_CRCY_CD": "USD", "CTX_AREA_FK200": "", "CTX_AREA_NK200": "",
+        }, describe="KIS balance read")
+        # Cash is an ACCOUNT-level figure: every venue leg reports the same
+        # USD deposit, so summing would triple it. Take the first leg's
+        # summary -- but only after every leg succeeded, so a hidden venue
+        # cannot make a partial read look complete.
+        summary_rows = legs[0][1].get("output2") or {} if legs else {}
         if isinstance(summary_rows, list):
             summary_rows = summary_rows[0] if summary_rows else {}
         try:
@@ -516,12 +604,22 @@ class KISBroker:
     def get_positions(self) -> List[Position]:
         self.config.validate_read_allowed()
         tr_id = TR_ID_BALANCE[self._env_key()]
-        body = self._get(BALANCE_PATH, tr_id, {
+        legs = self._sweep_exchanges(BALANCE_PATH, tr_id, {
             "CANO": self.config.account_no, "ACNT_PRDT_CD": self.config.account_product_cd,
-            "OVRS_EXCG_CD": "NASD", "TR_CRCY_CD": "USD",
-            "CTX_AREA_FK200": "", "CTX_AREA_NK200": "",
-        })
-        rows = body.get("output1") or []
+            "TR_CRCY_CD": "USD", "CTX_AREA_FK200": "", "CTX_AREA_NK200": "",
+        }, describe="KIS position read")
+        rows = []
+        seen_symbols = set()
+        for code, body in legs:
+            for row in self._tag_rows(body.get("output1") or [], code):
+                # A symbol lists on exactly one venue; if two legs report
+                # the same one, keep the first rather than double-count.
+                key = (row or {}).get("ovrs_pdno", "")
+                if key and key in seen_symbols:
+                    continue
+                if key:
+                    seen_symbols.add(key)
+                rows.append(row)
         current = self._now()
         positions = []
         for row in rows:
@@ -543,23 +641,23 @@ class KISBroker:
 
     def get_open_orders(self) -> list:
         self.config.validate_read_allowed()
-        body = self._get(NCCS_PATH, TR_ID_NCCS[self._env_key()], {
+        legs = self._sweep_exchanges(NCCS_PATH, TR_ID_NCCS[self._env_key()], {
             "CANO": self.config.account_no, "ACNT_PRDT_CD": self.config.account_product_cd,
-            "OVRS_EXCG_CD": "NASD", "SORT_SQN": "DS", "CTX_AREA_FK200": "", "CTX_AREA_NK200": "",
-        })
-        return body.get("output") or []
+            "SORT_SQN": "DS", "CTX_AREA_FK200": "", "CTX_AREA_NK200": "",
+        }, describe="KIS open-order read")
+        return _merge_rows(legs, self._tag_rows, key_field="odno")
 
     def get_fills(self, *, start_date: str, end_date: str) -> list:
         """`start_date`/`end_date` are KIS's own YYYYMMDD format."""
         self.config.validate_read_allowed()
         tr_id = TR_ID_CCNL[self._env_key()]
-        body = self._get(CCNL_PATH, tr_id, {
+        legs = self._sweep_exchanges(CCNL_PATH, tr_id, {
             "CANO": self.config.account_no, "ACNT_PRDT_CD": self.config.account_product_cd,
             "PDNO": "%", "ORD_STRT_DT": start_date, "ORD_END_DT": end_date,
-            "SLL_BUY_DVSN": "00", "CCLD_NCCS_DVSN": "00", "OVRS_EXCG_CD": "NASD",
+            "SLL_BUY_DVSN": "00", "CCLD_NCCS_DVSN": "00",
             "SORT_SQN": "DS", "CTX_AREA_NK200": "", "CTX_AREA_FK200": "",
-        })
-        return body.get("output") or []
+        }, describe="KIS fill-history read")
+        return _merge_rows(legs, self._tag_rows, key_field="odno")
 
     # -- order submission ---------------------------------------------
 
@@ -624,6 +722,19 @@ class KISBroker:
         rt_cd = body.get("rt_cd")
         output = body.get("output") or {}
         broker_order_id = output.get("ODNO")
+        if kis_rate_limiter.is_rate_limited(body):
+            # ORACLE-HIGH-03: a rate-limited ORDER is AMBIGUOUS, not a
+            # confirmed rejection. EGW00201 says the gateway shed load; it
+            # does not say the order never reached the matching engine.
+            # Recording REJECTED would durably assert something KIS never
+            # confirmed, and the order would then be invisible to
+            # reconciliation. It is never auto-retried either -- the
+            # caller must reconcile against KIS's own order history.
+            raise KISAmbiguousResponseError(
+                "KIS order submission ambiguous: rate limited "
+                f"({kis_rate_limiter.RATE_LIMIT_MSG_CD}); the order may or may not have "
+                "been accepted -- manual reconciliation required"
+            )
         if rt_cd != "0" or not broker_order_id:
             return ExecutionRecord(
                 internal_order_id=order_intent.internal_order_id, broker="kis",
@@ -680,6 +791,14 @@ class KISBroker:
             raise KISAmbiguousResponseError(
                 f"KIS cancel response not JSON (ambiguous): {redact_text(str(exc))}"
             ) from exc
+        if kis_rate_limiter.is_rate_limited(body):
+            # ORACLE-HIGH-03: same ambiguity on the cancel side. A cancel
+            # KIS may have accepted must not be recorded as refused.
+            raise KISAmbiguousResponseError(
+                "KIS cancel ambiguous: rate limited "
+                f"({kis_rate_limiter.RATE_LIMIT_MSG_CD}); the cancel may or may not have "
+                "been accepted -- manual reconciliation required"
+            )
         rt_cd = body.get("rt_cd")
         status = "CANCELLED" if rt_cd == "0" else "REJECTED"
         return ExecutionRecord(

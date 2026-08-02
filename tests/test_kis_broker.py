@@ -257,13 +257,23 @@ class TestAccountAndPositions:
         assert call[2]["params"]["OVRS_EXCG_CD"] == "NASD"
 
     def test_get_open_orders(self):
+        """ORACLE-HIGH-01: an account read sweeps every supported venue.
+        The same stub answers all three legs, so the identical order must
+        be deduplicated by broker order id rather than counted three
+        times."""
         session = _FakeSession()
         session.queue("/oauth2/tokenP", TOKEN_OK)
         session.queue(
             "/uapi/overseas-stock/v1/trading/inquire-nccs",
             _StubResponse(200, {"output": [{"odno": "1"}]}),
         )
-        assert _broker(session=session).get_open_orders() == [{"odno": "1"}]
+        orders = _broker(session=session).get_open_orders()
+        assert len(orders) == 1
+        assert orders[0]["odno"] == "1"
+        assert orders[0]["kis_exchange_code"] == "NASD"
+        sent = [kw["params"]["OVRS_EXCG_CD"] for _m, url, kw in session.requests
+                if "inquire-nccs" in url]
+        assert sent == ["NASD", "NYSE", "AMEX"], sent
 
     def test_get_fills(self):
         session = _FakeSession()
@@ -272,7 +282,13 @@ class TestAccountAndPositions:
             "/uapi/overseas-stock/v1/trading/inquire-ccnl",
             _StubResponse(200, {"output": [{"odno": "2"}]}),
         )
-        assert _broker(session=session).get_fills(start_date="20260701", end_date="20260729") == [{"odno": "2"}]
+        fills = _broker(session=session).get_fills(
+            start_date="20260701", end_date="20260729")
+        assert len(fills) == 1
+        assert fills[0]["odno"] == "2"
+        sent = [kw["params"]["OVRS_EXCG_CD"] for _m, url, kw in session.requests
+                if "inquire-ccnl" in url]
+        assert sent == ["NASD", "NYSE", "AMEX"], sent
 
 
 class TestSubmitOrderGate:
