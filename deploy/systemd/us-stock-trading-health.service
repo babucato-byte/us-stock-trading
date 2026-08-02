@@ -1,8 +1,11 @@
 # CODEX-049: US Stock Trading -- durable-state health report
 #
-# Paths assume the deployment layout the Oracle runbook describes
-# (/home/ubuntu/trading-release). Adjust WorkingDirectory / ExecStart /
-# ReadWritePaths together if the release directory differs.
+# LOW: paths are TEMPLATED, not hardcoded. scripts/install_oracle_
+# services.sh substitutes @TRADING_RELEASE_ROOT@, @TRADING_SHARED_ROOT@,
+# @TRADING_ENV_FILE@ and @TRADING_LOG_DIR@ at install time, so one unit
+# file fits any release layout. A unit installed with an unsubstituted
+# placeholder fails its ConditionPathExists rather than running against
+# a wrong path.
 # Makes no KIS call at all: reports on schema version, reconciliation
 # freshness, UNKNOWN orders, shadow-audit integrity, log corruption
 # and whether the live unit is still disabled. Exits 2 when unhealthy.
@@ -11,16 +14,16 @@ Description=US Stock Trading -- durable-state health report
 After=network-online.target us-stock-trading-migrate.service
 Wants=network-online.target
 Requires=us-stock-trading-migrate.service
-ConditionPathExists=/home/ubuntu/trading-release/venv/bin/python
-ConditionPathExists=/etc/us-stock-trading/live-readonly.env
-ConditionPathExists=/home/ubuntu/trading-release/scripts/run_health_report.py
+ConditionPathExists=@TRADING_RELEASE_ROOT@/venv/bin/python
+ConditionPathExists=@TRADING_ENV_FILE@
+ConditionPathExists=@TRADING_RELEASE_ROOT@/scripts/run_health_report.py
 
 [Service]
 Type=oneshot
 User=ubuntu
 Group=trading
-WorkingDirectory=/home/ubuntu/trading-release
-EnvironmentFile=/etc/us-stock-trading/live-readonly.env
+WorkingDirectory=@TRADING_RELEASE_ROOT@
+EnvironmentFile=@TRADING_ENV_FILE@
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=300
@@ -29,8 +32,8 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=false
-ReadWritePaths=/home/ubuntu/trading-release /var/log/us-stock-trading
-ExecStart=/home/ubuntu/trading-release/venv/bin/python /home/ubuntu/trading-release/scripts/run_health_report.py
+ReadWritePaths=@TRADING_RELEASE_ROOT@ @TRADING_SHARED_ROOT@ @TRADING_LOG_DIR@
+ExecStart=@TRADING_RELEASE_ROOT@/venv/bin/python @TRADING_RELEASE_ROOT@/scripts/run_health_report.py
 
 [Install]
 WantedBy=multi-user.target

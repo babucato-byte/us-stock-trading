@@ -1,29 +1,32 @@
 # CODEX-049: US Stock Trading -- KIS live buy-entry cycle (DISABLED by default)
 #
-# Paths assume the deployment layout the Oracle runbook describes
-# (/home/ubuntu/trading-release). Adjust WorkingDirectory / ExecStart /
-# ReadWritePaths together if the release directory differs.
+# LOW: paths are TEMPLATED, not hardcoded. scripts/install_oracle_
+# services.sh substitutes @TRADING_RELEASE_ROOT@, @TRADING_SHARED_ROOT@,
+# @TRADING_ENV_FILE@ and @TRADING_LOG_DIR@ at install time, so one unit
+# file fits any release layout. A unit installed with an unsubstituted
+# placeholder fails its ConditionPathExists rather than running against
+# a wrong path.
 # INSTALLED BUT DELIBERATELY NOT ENABLED.
 # scripts/install_oracle_services.sh never enables this unit and
 # actively disables it if it is ever found enabled. The preflight
 # below refuses to start it while the read-only posture is in force,
 # so a first real order needs BOTH an explicit operator start AND a
-# reviewed change to /etc/us-stock-trading/live-readonly.env.
+# reviewed change to @TRADING_ENV_FILE@.
 [Unit]
 Description=US Stock Trading -- KIS live buy-entry cycle (DISABLED by default)
 After=network-online.target us-stock-trading-migrate.service us-stock-trading-reconcile.service
 Wants=network-online.target
 Requires=us-stock-trading-migrate.service us-stock-trading-reconcile.service
-ConditionPathExists=/home/ubuntu/trading-release/venv/bin/python
-ConditionPathExists=/etc/us-stock-trading/live-readonly.env
-ConditionPathExists=/home/ubuntu/trading-release/scripts/run_live_buy_entry.py
+ConditionPathExists=@TRADING_RELEASE_ROOT@/venv/bin/python
+ConditionPathExists=@TRADING_ENV_FILE@
+ConditionPathExists=@TRADING_RELEASE_ROOT@/scripts/run_live_buy_entry.py
 
 [Service]
 Type=oneshot
 User=ubuntu
 Group=trading
-WorkingDirectory=/home/ubuntu/trading-release
-EnvironmentFile=/etc/us-stock-trading/live-readonly.env
+WorkingDirectory=@TRADING_RELEASE_ROOT@
+EnvironmentFile=@TRADING_ENV_FILE@
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=300
@@ -32,9 +35,9 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=false
-ReadWritePaths=/home/ubuntu/trading-release /var/log/us-stock-trading
-ExecStartPre=/home/ubuntu/trading-release/venv/bin/python /home/ubuntu/trading-release/scripts/preflight_kis_live.py
-ExecStart=/home/ubuntu/trading-release/venv/bin/python /home/ubuntu/trading-release/scripts/run_live_buy_entry.py
+ReadWritePaths=@TRADING_RELEASE_ROOT@ @TRADING_SHARED_ROOT@ @TRADING_LOG_DIR@
+ExecStartPre=@TRADING_RELEASE_ROOT@/venv/bin/python @TRADING_RELEASE_ROOT@/scripts/preflight_kis_live.py
+ExecStart=@TRADING_RELEASE_ROOT@/venv/bin/python @TRADING_RELEASE_ROOT@/scripts/run_live_buy_entry.py
 
 [Install]
 WantedBy=multi-user.target

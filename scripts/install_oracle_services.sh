@@ -12,11 +12,22 @@
 # Idempotent: safe to re-run after a redeploy.
 #
 # Usage (on the Oracle host, as a user with sudo):
-#   sudo RELEASE_DIR=/home/ubuntu/trading-release scripts/install_oracle_services.sh
+#   sudo TRADING_RELEASE_ROOT=/home/ubuntu/releases/us-stock-trading/current-readonly \
+#        TRADING_SHARED_ROOT=/home/ubuntu/releases/us-stock-trading/shared \
+#        scripts/install_oracle_services.sh
+#
+# Unit files ship as TEMPLATES: @TRADING_RELEASE_ROOT@, @TRADING_SHARED_ROOT@,
+# @TRADING_ENV_FILE@ and @TRADING_LOG_DIR@ are substituted here, so no unit
+# carries a hardcoded deployment path.
 #
 set -euo pipefail
 
-RELEASE_DIR="${RELEASE_DIR:-/home/ubuntu/trading-release}"
+# LOW: the release layout is an INPUT, not a constant baked into ten
+# unit files. TRADING_RELEASE_ROOT/TRADING_SHARED_ROOT are the documented
+# names; RELEASE_DIR/SHARED_DIR remain accepted so an existing runbook
+# invocation keeps working.
+RELEASE_DIR="${TRADING_RELEASE_ROOT:-${RELEASE_DIR:-/home/ubuntu/releases/us-stock-trading/current-readonly}}"
+SHARED_DIR="${TRADING_SHARED_ROOT:-${SHARED_DIR:-/home/ubuntu/releases/us-stock-trading/shared}}"
 ENV_DIR="${ENV_DIR:-/etc/us-stock-trading}"
 ENV_FILE="${ENV_FILE:-${ENV_DIR}/live-readonly.env}"
 LOG_DIR="${LOG_DIR:-/var/log/us-stock-trading}"
@@ -73,6 +84,7 @@ echo "release dir : ${RELEASE_DIR}"
 echo "env file    : ${ENV_FILE}"
 echo "log dir     : ${LOG_DIR}"
 echo "unit dir    : ${UNIT_DIR}"
+echo "shared dir  : ${SHARED_DIR}"
 
 # ---------------------------------------------------------------------
 # 1. Sanity: every file the units reference must actually exist.
@@ -105,6 +117,8 @@ run usermod -a -G "${SERVICE_GROUP}" "${SERVICE_USER}"
 
 run install -d -m 0750 -o root -g "${SERVICE_GROUP}" "${ENV_DIR}"
 run install -d -m 0770 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${LOG_DIR}"
+run install -d -m 0770 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${SHARED_DIR}/state"
+run install -d -m 0770 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${SHARED_DIR}/logs"
 
 if [ ! -f "${ENV_FILE}" ]; then
     echo "ERROR: ${ENV_FILE} does not exist." >&2
@@ -133,9 +147,29 @@ fi
 # ---------------------------------------------------------------------
 # 4. Install the units.
 # ---------------------------------------------------------------------
+render_unit() {
+    # Substitutes every deployment path into a unit template. Fails loudly
+    # if any placeholder survives -- an unsubstituted unit must never be
+    # installed.
+    local src="$1" dest="$2"
+    sed -e "s#@TRADING_RELEASE_ROOT@#${RELEASE_DIR}#g" \
+        -e "s#@TRADING_SHARED_ROOT@#${SHARED_DIR}#g" \
+        -e "s#@TRADING_ENV_FILE@#${ENV_FILE}#g" \
+        -e "s#@TRADING_LOG_DIR@#${LOG_DIR}#g" \
+        "${src}" > "${dest}"
+    if grep -q "@TRADING_[A-Z_]*@" "${dest}"; then
+        echo "ERROR: ${dest} still contains an unsubstituted placeholder:" >&2
+        grep -o "@TRADING_[A-Z_]*@" "${dest}" | sort -u >&2
+        exit 1
+    fi
+}
+
+RENDER_DIR="$(mktemp -d)"
+trap 'rm -rf "${RENDER_DIR}"' EXIT
+
 for unit in "${SERVICE_UNITS[@]}" "${TIMER_UNITS[@]}"; do
-    run install -m 0644 -o root -g root \
-        "${RELEASE_DIR}/deploy/systemd/${unit}" "${UNIT_DIR}/${unit}"
+    render_unit "${RELEASE_DIR}/deploy/systemd/${unit}" "${RENDER_DIR}/${unit}"
+    run install -m 0644 -o root -g root "${RENDER_DIR}/${unit}" "${UNIT_DIR}/${unit}"
 done
 
 run systemctl daemon-reload

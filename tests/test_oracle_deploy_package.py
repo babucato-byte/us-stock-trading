@@ -60,11 +60,35 @@ PREFLIGHT_UNITS = [
 ]
 
 
+# LOW: unit files ship as TEMPLATES so one file fits any release layout.
+# These are the values scripts/install_oracle_services.sh substitutes by
+# default; the hardening assertions below run against the RENDERED unit,
+# which is what systemd actually gets.
+RELEASE_ROOT = "/home/ubuntu/releases/us-stock-trading/current-readonly"
+SHARED_ROOT = "/home/ubuntu/releases/us-stock-trading/shared"
+UNIT_ENV_FILE = "/etc/us-stock-trading/live-readonly.env"
+UNIT_LOG_DIR = "/var/log/us-stock-trading"
+
+UNIT_PLACEHOLDERS = {
+    "@TRADING_RELEASE_ROOT@": RELEASE_ROOT,
+    "@TRADING_SHARED_ROOT@": SHARED_ROOT,
+    "@TRADING_ENV_FILE@": UNIT_ENV_FILE,
+    "@TRADING_LOG_DIR@": UNIT_LOG_DIR,
+}
+
+
+def _render_unit(name):
+    text = (UNIT_DIR / name).read_text(encoding="utf-8")
+    for placeholder, value in UNIT_PLACEHOLDERS.items():
+        text = text.replace(placeholder, value)
+    return text
+
+
 def _parse_unit(name):
     parser = configparser.ConfigParser(strict=False)
     # systemd allows repeated keys (e.g. several ExecStartPre lines);
     # configparser's strict mode does not, hence strict=False.
-    parser.read(UNIT_DIR / name, encoding="utf-8")
+    parser.read_string(_render_unit(name))
     return parser
 
 
@@ -118,19 +142,19 @@ class TestServiceHardening:
         assert service.get("ProtectHome") is not None
         assert service.get("User") == "ubuntu"
         assert service.get("Group") == "trading"
-        assert service.get("WorkingDirectory") == "/home/ubuntu/trading-release"
+        assert service.get("WorkingDirectory") == RELEASE_ROOT
 
     @pytest.mark.parametrize("unit", SERVICE_UNITS)
     def test_read_write_paths_cover_the_data_and_log_locations(self, unit):
         paths = _parse_unit(unit)["Service"]["ReadWritePaths"].split()
-        assert "/home/ubuntu/trading-release" in paths
+        assert RELEASE_ROOT in paths
         assert "/var/log/us-stock-trading" in paths
 
     @pytest.mark.parametrize("unit", SERVICE_UNITS)
     def test_preconditions_guard_missing_files(self, unit):
-        raw = (UNIT_DIR / unit).read_text(encoding="utf-8")
+        raw = _render_unit(unit)
         conditions = re.findall(r"^ConditionPathExists=(.+)$", raw, flags=re.MULTILINE)
-        assert "/etc/us-stock-trading/live-readonly.env" in conditions
+        assert UNIT_ENV_FILE in conditions
         assert any(c.endswith("venv/bin/python") for c in conditions)
 
 
@@ -639,3 +663,49 @@ class TestRunbookMatchesTheRepository:
         text = RUNBOOK.read_text(encoding="utf-8")
         for unit in SERVICE_UNITS + TIMER_UNITS:
             assert unit in text, f"runbook does not mention the {unit} unit"
+
+
+class TestUnitPathsAreTemplated:
+    """LOW: the release layout must be an installer input, not a constant
+    baked into ten unit files. Oracle verification found every unit
+    pointing at /home/ubuntu/trading-release while the actual release
+    lived under ~/releases/us-stock-trading/<commit>."""
+
+    @pytest.mark.parametrize("unit", SERVICE_UNITS + TIMER_UNITS)
+    def test_no_unit_hardcodes_a_deployment_path(self, unit):
+        raw = (UNIT_DIR / unit).read_text(encoding="utf-8")
+        assert "/home/ubuntu/trading-release" not in raw
+        assert "/home/ubuntu/releases" not in raw, (
+            "even the NEW layout must not be hardcoded -- it is substituted"
+        )
+
+    @pytest.mark.parametrize("unit", SERVICE_UNITS + TIMER_UNITS)
+    def test_every_placeholder_is_one_the_installer_substitutes(self, unit):
+        raw = (UNIT_DIR / unit).read_text(encoding="utf-8")
+        used = set(re.findall(r"@TRADING_[A-Z_]+@", raw))
+        unknown = used - set(UNIT_PLACEHOLDERS)
+        assert unknown == set(), f"{unit} uses placeholders the installer will not fill: {unknown}"
+
+    @pytest.mark.parametrize("unit", SERVICE_UNITS)
+    def test_rendering_leaves_no_placeholder_behind(self, unit):
+        assert "@TRADING_" not in _render_unit(unit)
+
+    def test_the_installer_substitutes_and_refuses_leftovers(self):
+        script = (SCRIPTS_DIR / "install_oracle_services.sh").read_text(encoding="utf-8")
+        for placeholder in UNIT_PLACEHOLDERS:
+            assert placeholder in script, f"the installer never substitutes {placeholder}"
+        # It must also FAIL rather than install a half-rendered unit.
+        assert "still contains an unsubstituted placeholder" in script
+
+    def test_the_installer_accepts_the_documented_root_variables(self):
+        script = (SCRIPTS_DIR / "install_oracle_services.sh").read_text(encoding="utf-8")
+        assert "TRADING_RELEASE_ROOT" in script
+        assert "TRADING_SHARED_ROOT" in script
+
+    @pytest.mark.parametrize("unit", SERVICE_UNITS)
+    def test_shared_state_is_writable_by_the_service(self, unit):
+        """The release directory is read-only in the new layout; the state
+        the services write lives under the shared root, so that must be in
+        ReadWritePaths or every write fails under ProtectSystem."""
+        paths = _parse_unit(unit)["Service"]["ReadWritePaths"].split()
+        assert SHARED_ROOT in paths, paths
