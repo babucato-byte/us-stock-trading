@@ -240,20 +240,63 @@ class KISAccountSweepError(KISBrokerError):
         self.reason_code = "KIS_EXCHANGE_LEG_FAILED"
 
 
-def _merge_rows(legs, tag, *, key_field):
-    """Concatenates every venue leg's rows, dropping duplicates by broker
-    order id. KIS can echo the same order under more than one filter, and
-    a duplicated open order would look like two live orders to
-    reconciliation."""
+# Keys this module adds to a row; excluded from identity so tagging can
+# never change what counts as the same record.
+_TAG_KEYS = ("kis_exchange_code", "canonical_exchange")
+
+
+def _order_identity(row, code):
+    """An ORDER is identified by its number, scoped to its venue -- two
+    venues could in principle issue the same odno."""
+    for field in ("odno", "ODNO"):
+        value = row.get(field)
+        if value:
+            return (code, str(value))
+    return None
+
+
+def _execution_identity(row, code):
+    """An EXECUTION is NOT identified by its order number.
+
+    A partially-filled order produces several fill rows sharing one odno:
+
+        odno=1001 qty=2
+        odno=1001 qty=3      -> 5 filled, not 2
+
+    Deduplicating those by odno silently discards fills, which corrupts
+    filled quantity, remaining quantity, position size, sellable size and
+    every reconciliation decision downstream. This module previously did
+    exactly that, undoing CODEX-045.
+
+    KIS gives no documented per-execution id here, so identity is the
+    whole row (plus its venue). Any field that differs between two
+    executions -- sequence, time, quantity, price -- keeps them apart,
+    while a row repeated verbatim by pagination collapses to one.
+
+    RESIDUAL RISK: two genuinely distinct executions with identical venue,
+    order number, timestamp, quantity and price and no sequence field
+    would merge. Nothing in the response distinguishes them, so this is
+    recorded rather than guessed at.
+    """
+    payload = tuple(sorted(
+        (key, str(value)) for key, value in row.items() if key not in _TAG_KEYS
+    ))
+    return (code, payload)
+
+
+def _merge_rows(legs, tag, *, identity):
+    """Concatenates every venue leg's rows, dropping only rows the given
+    identity function says are the SAME record."""
     merged = []
     seen = set()
     for code, body in legs:
         for row in tag(body.get("output") or [], code):
-            identifier = (row or {}).get(key_field) if isinstance(row, dict) else None
-            if identifier:
-                if identifier in seen:
-                    continue
-                seen.add(identifier)
+            if isinstance(row, dict):
+                key = identity(row, code)
+                if key is not None:
+                    if key in seen:
+                        continue
+                    seen.add(key)
             merged.append(row)
     return merged
 
@@ -526,7 +569,8 @@ class KISBroker:
                 # Each leg goes through the shared READ limiter, so the
                 # sweep is paced like any other consecutive reads.
                 body = self._get(path, tr_id, params)
-            except kis_rate_limiter.KISRateLimitStateInvalid:
+            except (kis_rate_limiter.KISRateLimitStateInvalid,
+                    kis_rate_limiter.KISRateLimitStateUnavailable):
                 # A local pacing-state fault is not a venue failure; it
                 # must reach the caller with its own reason code, and no
                 # further leg may be attempted.
@@ -614,10 +658,12 @@ class KISBroker:
             for row in self._tag_rows(body.get("output1") or [], code):
                 # A symbol lists on exactly one venue; if two legs report
                 # the same one, keep the first rather than double-count.
-                key = (row or {}).get("ovrs_pdno", "")
-                if key and key in seen_symbols:
+                # Scoped by venue so an identical ticker on two venues is
+                # not silently collapsed.
+                key = (code, (row or {}).get("ovrs_pdno", ""))
+                if key[1] and key in seen_symbols:
                     continue
-                if key:
+                if key[1]:
                     seen_symbols.add(key)
                 rows.append(row)
         current = self._now()
@@ -645,7 +691,7 @@ class KISBroker:
             "CANO": self.config.account_no, "ACNT_PRDT_CD": self.config.account_product_cd,
             "SORT_SQN": "DS", "CTX_AREA_FK200": "", "CTX_AREA_NK200": "",
         }, describe="KIS open-order read")
-        return _merge_rows(legs, self._tag_rows, key_field="odno")
+        return _merge_rows(legs, self._tag_rows, identity=_order_identity)
 
     def get_fills(self, *, start_date: str, end_date: str) -> list:
         """`start_date`/`end_date` are KIS's own YYYYMMDD format."""
@@ -657,7 +703,8 @@ class KISBroker:
             "SLL_BUY_DVSN": "00", "CCLD_NCCS_DVSN": "00",
             "SORT_SQN": "DS", "CTX_AREA_NK200": "", "CTX_AREA_FK200": "",
         }, describe="KIS fill-history read")
-        return _merge_rows(legs, self._tag_rows, key_field="odno")
+        # Per-EXECUTION identity: several fills share one odno.
+        return _merge_rows(legs, self._tag_rows, identity=_execution_identity)
 
     # -- order submission ---------------------------------------------
 

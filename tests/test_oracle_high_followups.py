@@ -127,11 +127,19 @@ class TestAccountReadsSweepEveryVenue:
         orders = KISBroker(session=session).get_open_orders()
         assert sorted(o["odno"] for o in orders) == ["A", "B", "C"]
 
-    def test_duplicate_rows_are_merged_not_counted_twice(self, env):
-        """KIS can echo the same order under more than one filter; two
-        copies would look like two live orders to reconciliation."""
-        same = {"rt_cd": "0", "output": [{"odno": "DUP"}]}
-        session = _SweepSession(per_venue={"NASD": same, "NYSE": same, "AMEX": same})
+    def test_a_row_repeated_within_one_venue_is_merged(self, env):
+        """Pagination can echo the same order inside ONE venue's response;
+        two copies would look like two live orders to reconciliation.
+
+        Across venues is a different matter -- see
+        test_the_same_order_number_on_two_venues_is_two_orders: KIS filters
+        by venue, so the same odno arriving under two different filters is
+        two orders, and identity is (venue, odno) per the directive."""
+        session = _SweepSession(per_venue={
+            "NASD": {"rt_cd": "0", "output": [{"odno": "DUP"}, {"odno": "DUP"}]},
+            "NYSE": {"rt_cd": "0", "output": []},
+            "AMEX": {"rt_cd": "0", "output": []},
+        })
         orders = KISBroker(session=session).get_open_orders()
         assert len(orders) == 1
 

@@ -67,6 +67,29 @@ class _FakeSession:
 TOKEN_OK = _StubResponse(200, {"access_token": "tok-1", "expires_in": 3600})
 
 
+class _VenueSession(_FakeSession):
+    """ORACLE-HIGH-1: account reads sweep NASD/NYSE/AMEX, and KIS filters
+    by venue, so each leg gets its OWN body. Answering all three with one
+    body would model an API that does not exist."""
+
+    def __init__(self, path, per_venue):
+        super().__init__()
+        self.queue("/oauth2/tokenP", TOKEN_OK)
+        self._path = path
+        self._per_venue = per_venue
+
+    def request(self, method, url, **kwargs):
+        self.requests.append((method, url, kwargs))
+        if url.endswith("/oauth2/tokenP"):
+            return TOKEN_OK
+        if url.endswith(self._path):
+            code = (kwargs.get("params") or {}).get("OVRS_EXCG_CD")
+            return _StubResponse(200, self._per_venue.get(
+                code, {"rt_cd": "0", "output": [], "output1": [], "output2": {}}))
+        raise AssertionError(f"no stubbed response for {method} {url}")
+
+
+
 def _config(**overrides):
     kwargs = dict(
         kis_env="paper", app_key="key", app_secret="secret", account_no="12345678",
@@ -219,15 +242,14 @@ class TestAccountAndPositions:
         assert snap.source == "kis_balance"
 
     def test_get_positions_filters_zero_quantity(self):
-        session = _FakeSession()
-        session.queue("/oauth2/tokenP", TOKEN_OK)
-        session.queue(
-            "/uapi/overseas-stock/v1/trading/inquire-balance",
-            _StubResponse(200, {"output1": [
-                {"ovrs_pdno": "AAPL", "ovrs_cblc_qty": "2", "pchs_avg_pric": "150.0", "evlu_pfls_amt": "10.0"},
-                {"ovrs_pdno": "MSFT", "ovrs_cblc_qty": "0", "pchs_avg_pric": "0", "evlu_pfls_amt": "0"},
-            ], "output2": {}}),
-        )
+        session = _VenueSession("/uapi/overseas-stock/v1/trading/inquire-balance", {
+            "NASD": {"rt_cd": "0", "output1": [
+                {"ovrs_pdno": "AAPL", "ovrs_cblc_qty": "2", "pchs_avg_pric": "150.0",
+                 "evlu_pfls_amt": "10.0"},
+                {"ovrs_pdno": "MSFT", "ovrs_cblc_qty": "0", "pchs_avg_pric": "0",
+                 "evlu_pfls_amt": "0"},
+            ], "output2": {}},
+        })
         positions = _broker(session=session).get_positions()
         assert len(positions) == 1
         assert positions[0].symbol == "AAPL"
@@ -261,12 +283,9 @@ class TestAccountAndPositions:
         The same stub answers all three legs, so the identical order must
         be deduplicated by broker order id rather than counted three
         times."""
-        session = _FakeSession()
-        session.queue("/oauth2/tokenP", TOKEN_OK)
-        session.queue(
-            "/uapi/overseas-stock/v1/trading/inquire-nccs",
-            _StubResponse(200, {"output": [{"odno": "1"}]}),
-        )
+        session = _VenueSession("/uapi/overseas-stock/v1/trading/inquire-nccs", {
+            "NASD": {"rt_cd": "0", "output": [{"odno": "1"}]},
+        })
         orders = _broker(session=session).get_open_orders()
         assert len(orders) == 1
         assert orders[0]["odno"] == "1"
@@ -276,12 +295,9 @@ class TestAccountAndPositions:
         assert sent == ["NASD", "NYSE", "AMEX"], sent
 
     def test_get_fills(self):
-        session = _FakeSession()
-        session.queue("/oauth2/tokenP", TOKEN_OK)
-        session.queue(
-            "/uapi/overseas-stock/v1/trading/inquire-ccnl",
-            _StubResponse(200, {"output": [{"odno": "2"}]}),
-        )
+        session = _VenueSession("/uapi/overseas-stock/v1/trading/inquire-ccnl", {
+            "NASD": {"rt_cd": "0", "output": [{"odno": "2"}]},
+        })
         fills = _broker(session=session).get_fills(
             start_date="20260701", end_date="20260729")
         assert len(fills) == 1
