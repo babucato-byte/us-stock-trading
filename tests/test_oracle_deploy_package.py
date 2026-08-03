@@ -292,14 +292,31 @@ class TestInstallerScript:
         result = subprocess.run(["bash", "-n", str(installer)], capture_output=True, text=True)
         assert result.returncode == 0, result.stderr
 
-    def test_installer_enables_only_the_readonly_timers(self):
+    def test_installer_enables_nothing_at_all(self):
+        """It used to `enable --now` four timers. Arming the Shadow timer
+        is a reviewed decision, and the old ordering meant a failing
+        installer still left them running -- so installation and
+        activation are separate programs now."""
         raw = (SCRIPTS_DIR / "install_oracle_services.sh").read_text(encoding="utf-8")
-        enable_block = re.search(r"ENABLE_TIMERS=\((.*?)\)", raw, flags=re.DOTALL)
-        assert enable_block, "installer has no ENABLE_TIMERS list"
-        enabled = enable_block.group(1).split()
-        assert set(enabled) == set(TIMER_UNITS)
-        # The live unit must never appear in anything the installer enables.
-        assert "us-stock-trading-live.service" not in enabled
+        assert "ENABLE_TIMERS" not in raw
+        code = [l.strip() for l in raw.splitlines() if not l.strip().startswith("#")]
+        assert not [l for l in code if "enable --now" in l], (
+            "the installer still arms a timer")
+        for stripped in code:
+            if not stripped.startswith("run "):
+                continue
+            assert " enable " not in f" {stripped} ", stripped
+            assert " start " not in f" {stripped} ", stripped
+
+    def test_a_separate_script_owns_timer_activation(self):
+        activator = SCRIPTS_DIR / "enable_oracle_shadow_timer.sh"
+        assert activator.is_file()
+        result = subprocess.run(["bash", "-n", str(activator)], capture_output=True,
+                                text=True)
+        assert result.returncode == 0, result.stderr
+        raw = activator.read_text(encoding="utf-8")
+        assert "ALLOW_SHADOW_TIMER_ENABLE" in raw
+        assert "us-stock-trading-shadow.timer" in raw
 
     def test_installer_never_enables_or_starts_the_live_service(self):
         raw = (SCRIPTS_DIR / "install_oracle_services.sh").read_text(encoding="utf-8")
@@ -311,8 +328,8 @@ class TestInstallerScript:
                 continue
             assert "systemctl enable" not in stripped, f"installer enables the live unit: {stripped}"
             assert "systemctl start" not in stripped, f"installer starts the live unit: {stripped}"
-        assert "systemctl disable us-stock-trading-live.service" in raw
-        assert "systemctl stop us-stock-trading-live.service" in raw
+        assert 'disable "${LIVE_UNIT}"' in raw
+        assert 'stop "${LIVE_UNIT}"' in raw
 
     def test_installer_never_flips_a_live_order_flag(self):
         raw = (SCRIPTS_DIR / "install_oracle_services.sh").read_text(encoding="utf-8")
@@ -327,13 +344,24 @@ class TestInstallerScript:
                     f"installer assigns {flag}: {stripped}"
                 )
 
-    def test_installer_runs_migration_and_preflight_before_enabling_anything(self):
+    def test_installer_runs_migration_and_preflight_before_installing_anything(self):
+        """The installer no longer enables anything, so the ordering that
+        matters is now migration/preflight BEFORE the unit files reach
+        the host -- a refused posture must leave nothing half-applied."""
         raw = (SCRIPTS_DIR / "install_oracle_services.sh").read_text(encoding="utf-8")
         migrate_at = raw.index("run_migrations.py")
         preflight_at = raw.rindex("preflight_kis_live.py")
-        enable_at = raw.index('systemctl enable --now "${timer}"')
-        assert migrate_at < enable_at
-        assert preflight_at < enable_at
+        install_at = raw.index('install -m 0644 -o root -g root "${RENDER_DIR}/${unit}"')
+        reload_at = raw.index("daemon-reload")
+        assert migrate_at < install_at
+        assert preflight_at < install_at
+        assert install_at < reload_at
+
+    def test_installer_verifies_the_live_unit_before_touching_the_host(self):
+        raw = (SCRIPTS_DIR / "install_oracle_services.sh").read_text(encoding="utf-8")
+        sandbox_at = raw.index('if [ "${sandbox_state}" != "static" ]')
+        install_at = raw.index('install -m 0644 -o root -g root "${RENDER_DIR}/${unit}"')
+        assert sandbox_at < install_at
 
     def test_installer_refuses_a_live_enabled_environment_file(self):
         raw = (SCRIPTS_DIR / "install_oracle_services.sh").read_text(encoding="utf-8")
@@ -645,7 +673,7 @@ class TestRunbookMatchesTheRepository:
             "### 15.2 사전 검증",
             "### 15.3 단독 실행 확인",
             "### 15.4 시작·확인",
-            "### 15.5 live 서비스가 비활성인지 확인",
+            "### 15.5 live 서비스가 enable 불가 상태인지 확인",
             "### 15.7 정지",
             "## 16. 실주문 비활성 상태 최종 확인",
             "## 롤백 절차",
