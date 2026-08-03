@@ -317,9 +317,29 @@ Shadow Mode 진입점은 `scripts/run_shadow_mode.py`다. 이 스크립트는
   `shadow_audit_events` 테이블. 매수 경로와 **매도 경로 모두** 기록하며, 모든 run은
   `SHADOW_COMPLETED` 또는 `SHADOW_ERROR`로 반드시 종료된다. 계좌번호·비밀정보는
   `execution/secret_redaction.py`가 기록 직전에 마스킹한다.
-- 구조화 레코드(**조건부 기록됨**): `shadow_mode.py` JSONL — `SHADOW_MODE_LOG_FILE`
-  (`shadow-YYYY-MM-DD.jsonl`, 일자 회전 + `SHADOW_AUDIT_MAX_FILE_MB` 크기 회전 +
-  `SHADOW_AUDIT_RETENTION_DAYS` 보관, append마다 `fsync`).
+- 구조화 레코드(**조건부 기록됨**): `shadow_mode.py` JSONL. 경로는 **반드시 설정해야 하며
+  기본값이 없다.**
+
+```env
+# 권장: 일자 회전이 필요한 운영 배포
+SHADOW_MODE_LOG_DIR=/home/ubuntu/releases/us-stock-trading/shared/logs
+# 또는 단일 파일 고정
+SHADOW_MODE_LOG_FILE=/home/ubuntu/releases/us-stock-trading/shared/logs/shadow-mode.jsonl
+```
+
+```text
+SHADOW_MODE_LOG_DIR  설정 -> <dir>/shadow-YYYY-MM-DD.jsonl 일자 회전
+                             + SHADOW_AUDIT_MAX_FILE_MB 크기 회전
+                             + SHADOW_AUDIT_RETENTION_DAYS 보관, append마다 fsync
+SHADOW_MODE_LOG_FILE 설정 -> 정확히 그 파일 하나 (회전 없음)
+둘 다 미설정          -> JSONL 비활성. DB만 사용하며 시작 로그에
+                             shadow_audit_backend=database jsonl_enabled=false 를 남긴다
+```
+
+**release root fallback은 제거되었다.** 예전에는 두 변수가 모두 없으면 `shadow_mode.py`가
+자기 디렉터리(= release 루트)에 `shadow-YYYY-MM-DD.jsonl`을 만들었고, 2026-08-04 검증에서
+실제로 저장소 루트에 파일이 생성되는 것이 확인됐다. 이제 미설정 시에는 어디에도 쓰지 않는다
+— release 루트에도, 현재 작업 디렉터리에도 쓰지 않는다.
 
 > **JSONL 파일이 아예 없을 수 있다 — 그것이 정상 동작인 경우가 있다.**
 > JSONL 레코드는 후보가 **Order Gate 평가까지 도달한 경우에만** 기록된다. 게이트 이전에
@@ -422,19 +442,45 @@ sudo RELEASE_DIR=/home/ubuntu/trading-release scripts/install_oracle_services.sh
 
 이 스크립트는 순서대로 다음을 수행한다.
 
+**설치와 활성화는 별개의 두 단계다.**
+
 ```text
-모든 entrypoint/unit 파일 존재 확인
-trading 그룹·로그 디렉터리 생성
-환경파일 권한 root:trading 0640 적용
-환경파일의 실주문 플래그가 켜져 있으면 설치 거부
-unit 파일 복사 + daemon-reload
-scripts/run_migrations.py 실행
-scripts/preflight_kis_live.py 실행
-reconcile/shadow/shadow-exit/health timer만 enable
-us-stock-trading-live.service disable + stop
+단계 A  scripts/install_oracle_services.sh
+        -> unit 설치만. timer는 전부 disabled + inactive로 남는다.
+
+단계 B  scripts/enable_oracle_shadow_timer.sh   (별도 승인 필요)
+        -> Shadow timer 하나만 활성화한다.
 ```
 
-`us-stock-trading-live.service`는 **절대 enable/start 하지 않는다**.
+예전에는 설치 스크립트가 네 timer를 `enable --now`로 함께 켰다. Shadow timer 기동은
+검토를 거쳐 내리는 결정이지 파일 복사의 부수효과가 아니며, 더 나쁘게는 마지막 안전
+검증이 그 enable 뒤에 있어서 스크립트가 exit 1로 끝나도 timer 네 개는 이미 켜진 채
+남았다. 이제 설치 스크립트는 **아무것도 enable/start 하지 않는다.**
+
+단계 A가 수행하는 일 (호스트를 건드리기 전에 끝나는 검증이 먼저다):
+
+```text
+ 1. 경로·사용자·권한 검증  (shared/state는 0700 ubuntu:ubuntu로 교정 후 실측 검증)
+ 2. unit 렌더링
+ 3. placeholder 잔존 검사
+ 4. systemd-analyze verify
+ 5. live unit에 [Install] 섹션이 없는지 검사
+ 6. 격리 sandbox에서 live unit is-enabled=static 확인
+ 7. 격리 sandbox에서 enable 시 symlink 0개 확인
+ 8. 환경파일의 실주문 플래그 검사
+ 9. run_migrations.py + preflight_kis_live.py
+10. unit 파일 설치
+11. daemon-reload
+12. live unit disable + stop
+13. 모든 trading timer disable + stop
+14. 최종 상태 검증 (하나라도 다르면 exit 1)
+```
+
+검증이 전부 끝나기 전에는 어떤 timer도 enable/start되지 않는다. 따라서 단계 A가
+실패해도 호스트는 안전 상태로 남는다.
+
+`us-stock-trading-live.service`는 **절대 enable/start 하지 않는다**. `[Install]` 섹션이
+없으므로 `systemctl enable`로 부팅 symlink를 만들 수 없다.
 
 ### 15.2 사전 검증 (수동 실행 가능)
 
@@ -469,13 +515,16 @@ python3 scripts/run_health_report.py --json                     # exit 0 / 2(문
 
 ### 15.4 시작·확인
 
+단계 A 직후에는 timer가 모두 꺼져 있으므로, 각 서비스는 손으로 한 번씩 실행해 동작을
+확인한다(아래 `start`는 oneshot service 1회 실행이며 timer를 켜지 않는다).
+
 ```bash
 sudo systemctl start us-stock-trading-reconcile.service
 sudo systemctl start us-stock-trading-shadow.service
 sudo systemctl start us-stock-trading-shadow-exit.service
 sudo systemctl start us-stock-trading-health.service
 
-systemctl list-timers | grep us-stock-trading
+systemctl list-timers | grep us-stock-trading   # 단계 B 이전에는 비어 있다
 journalctl -u us-stock-trading-reconcile.service -n 50 --no-pager
 journalctl -u us-stock-trading-shadow.service -n 50 --no-pager
 journalctl -u us-stock-trading-shadow-exit.service -n 50 --no-pager
@@ -498,15 +547,73 @@ print('shadow records:', len(records), 'corrupt lines:', corruption)
 `corrupt lines`가 비어 있지 않으면 감사 기록 경로가 깨진 것이므로 다음 단계로 진행하지
 않는다.
 
-### 15.5 live 서비스가 비활성인지 확인 (필수)
+### 15.5 live 서비스가 enable 불가 상태인지 확인 (필수)
 
 ```bash
-systemctl is-enabled us-stock-trading-live.service   # disabled 이어야 한다
+systemctl is-enabled us-stock-trading-live.service   # static 이어야 한다
 systemctl is-active  us-stock-trading-live.service   # inactive 이어야 한다
 ```
 
-`enabled`가 나오면 즉시 `sudo systemctl disable --now us-stock-trading-live.service`를
-실행하고 원인을 조사한다. `run_health_report.py`도 매 15분 이 조건을 확인한다.
+기대값은 **`static`**이다. `disabled`가 아니다.
+
+`us-stock-trading-live.service`에는 `[Install]` 섹션이 없다. systemd는 그런 unit을
+`static`으로 보고하며, `systemctl enable`을 해도 `multi-user.target.wants/` 아래
+symlink를 만들지 못한다 — 즉 **부팅 자동기동 경로 자체가 존재하지 않는다.**
+
+```text
+static    정상. [Install] 섹션이 없어 enable 대상이 아님
+disabled  이상. [Install] 섹션이 되살아났다는 뜻 -> unit 파일을 확인한다
+enabled   이상. 즉시 sudo systemctl disable --now 후 원인 조사
+```
+
+`disabled`를 정상으로 보면 안 된다. 목표는 "지금 꺼져 있다"가 아니라
+"구조적으로 켤 수 없다"이다. `run_health_report.py`도 매 15분 이 조건을 확인한다.
+
+의도한 대로인지 직접 확인하려면(호스트를 건드리지 않는다):
+
+```bash
+SANDBOX=$(mktemp -d); mkdir -p "$SANDBOX/etc/systemd/system"
+cp /etc/systemd/system/us-stock-trading-live.service "$SANDBOX/etc/systemd/system/"
+systemctl --root="$SANDBOX" is-enabled us-stock-trading-live.service   # static
+systemctl --root="$SANDBOX" enable     us-stock-trading-live.service   # 경고, symlink 미생성
+find "$SANDBOX" -type l | wc -l                                       # 0 이어야 한다
+rm -rf "$SANDBOX"
+```
+
+### 15.5b Shadow timer 활성화 (단계 B — 별도 승인)
+
+단계 A는 timer를 켜지 않는다. Shadow timer는 이 스크립트로만 켠다.
+
+```bash
+sudo ALLOW_SHADOW_TIMER_ENABLE=true \
+     TRADING_RELEASE_ROOT=~/releases/us-stock-trading/<commit> \
+     TRADING_SHARED_ROOT=~/releases/us-stock-trading/shared \
+     scripts/enable_oracle_shadow_timer.sh
+```
+
+`ALLOW_SHADOW_TIMER_ENABLE`이 정확히 `true`가 아니면 exit 1이다. 스크립트는 다음을 모두
+확인한 뒤에만 enable + start를 수행한다.
+
+```text
+DEPLOYED_COMMIT == VALIDATED_COMMIT == release HEAD
+KIS_LIVE_ORDER_ENABLED=false / LIVE_ROLLOUT_ENABLED=false / ENTRY_DISABLED=true
+live unit: static + inactive
+shared/state: 0700 ubuntu:ubuntu
+preflight PASS
+reconciliation snapshot clean
+UNKNOWN 주문 0건
+HALT false
+```
+
+중간에 실패하면 `stop` + `disable`로 되돌린다. 종료 시 상태는 둘 중 하나뿐이다.
+
+```text
+성공  enabled + active
+실패  disabled + inactive
+```
+
+`enabled + inactive`나 `enabled + failed`는 남지 않는다. 이 스크립트는 Shadow timer
+하나만 대상으로 하며 live service나 다른 timer를 켜는 기능이 없다.
 
 ### 15.6 기존 서비스 경로 전환
 
