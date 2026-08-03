@@ -81,12 +81,22 @@ EXECUTION_PLANNED = "EXECUTION_PLANNED"
 SHADOW_COMPLETED = "SHADOW_COMPLETED"
 SHADOW_BLOCKED = "SHADOW_BLOCKED"
 SHADOW_ERROR = "SHADOW_ERROR"
+# An evaluation that stopped before the Order Gate ran. Records which
+# pre-gate checks were reached and how far each got, so a candidate
+# blocked early still leaves an answerable trail instead of a bare
+# "hypothetical=None". It never carries a gate verdict -- the gate did
+# not run, and inventing one would be worse than recording nothing.
+HYPOTHETICAL_INCOMPLETE = "HYPOTHETICAL_INCOMPLETE"
+# The KIS pipeline was not handed this candidate at all: its venue has
+# no KIS order exchange code. It stays in the analysis output.
+KIS_PIPELINE_EXCLUDED = "KIS_PIPELINE_EXCLUDED"
 
 EVENT_TYPES = frozenset({
     SIGNAL_RECEIVED, CONFIG_BLOCKED, SIGNAL_EXPIRED, INSTRUMENT_BLOCKED,
     PRICE_DEVIATION_BLOCKED, CASH_BLOCKED, RECONCILIATION_BLOCKED, UNKNOWN_ORDER_BLOCKED,
     DUPLICATE_BLOCKED, HALT_BLOCKED, GATE_REJECTED, GATE_APPROVED, EXECUTION_PLANNED,
-    SHADOW_COMPLETED, SHADOW_BLOCKED, SHADOW_ERROR,
+    SHADOW_COMPLETED, SHADOW_BLOCKED, SHADOW_ERROR, HYPOTHETICAL_INCOMPLETE,
+    KIS_PIPELINE_EXCLUDED,
 })
 
 # CODEX-048: every run ends in EXACTLY ONE of these -- not zero (an

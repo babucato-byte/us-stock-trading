@@ -101,7 +101,12 @@ class TestUnitFilesExist:
     def test_unit_file_parses(self, unit):
         parser = _parse_unit(unit)
         assert parser.has_section("Unit")
-        assert parser.has_section("Install")
+
+    @pytest.mark.parametrize(
+        "unit", [u for u in SERVICE_UNITS + TIMER_UNITS
+                 if u != "us-stock-trading-live.service"])
+    def test_every_unit_but_the_live_one_is_enableable(self, unit):
+        assert _parse_unit(unit).has_section("Install")
 
     @pytest.mark.parametrize("unit", SERVICE_UNITS)
     def test_service_section_present(self, unit):

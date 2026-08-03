@@ -255,6 +255,72 @@ def resolve_exchange(symbol):
     return get_registry().resolve(symbol)
 
 
+class ExcludedSymbol:
+    """A candidate the KIS pipeline must not be handed, and why.
+
+    Kept as a record rather than dropped silently: the symbol stays in
+    the analysis output, and an operator has to be able to see that it
+    was analysed and then held back, not that it never appeared.
+    """
+
+    __slots__ = ("symbol", "reason_code", "detail")
+
+    def __init__(self, symbol, reason_code, detail):
+        self.symbol = symbol
+        self.reason_code = reason_code
+        self.detail = detail
+
+    def as_dict(self):
+        """Audit-safe: symbol, reason and venue text only."""
+        return {"symbol": self.symbol, "reason_code": self.reason_code,
+                "detail": self.detail}
+
+    def __repr__(self):  # pragma: no cover -- diagnostics only
+        return f"ExcludedSymbol({self.symbol}, {self.reason_code})"
+
+
+def partition_kis_executable(symbols, *, registry=None):
+    """Splits analysis candidates into the ones the KIS pipeline may
+    evaluate and the ones it must not receive at all.
+
+    Oracle verification produced a day whose only candidate was IXN, an
+    ARCA listing. The KIS order exchange code space is NASD / NYSE /
+    AMEX; ARCA has no code there, so the evaluation could only ever end
+    in UNSUPPORTED_EXCHANGE -- after spending a scored analysis pass on
+    it. The analysis side is deliberately broader than the executable
+    side, so the split belongs here, in front of the KIS pipeline,
+    rather than as an exception thrown from inside it.
+
+    Returns (executable, excluded):
+        executable -- [(symbol, ExchangeRecord)], venue already resolved
+                      so the caller does not resolve it a second time
+        excluded   -- [ExcludedSymbol], in the order the symbols arrived
+
+    Nothing is removed from any analysis artefact by this function; it
+    only decides what the KIS pipeline is handed.
+    """
+    resolver = registry or get_registry()
+    executable, excluded = [], []
+    for raw in symbols:
+        symbol = (raw or "").strip().upper()
+        if not symbol:
+            continue
+        record, error = resolver.try_resolve(symbol)
+        if error is not None:
+            excluded.append(ExcludedSymbol(symbol, error.reason_code, str(error)))
+            continue
+        executable.append((symbol, record))
+    return executable, excluded
+
+
+def supported_analysis_exchanges():
+    """The venue names a candidate may carry and still be executable --
+    for operator-facing messages and documentation."""
+    from domain.exchange import USExchange
+
+    return tuple(exchange.value for exchange in USExchange)
+
+
 def build_kis_instrument(symbol, *, registry=None):
     """The ONLY sanctioned way to build an Instrument for a KIS call.
 

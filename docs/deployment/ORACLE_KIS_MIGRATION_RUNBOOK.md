@@ -311,32 +311,61 @@ Shadow Mode 진입점은 `scripts/run_shadow_mode.py`다. 이 스크립트는
   평가된다. 운영자가 활성화 전에 실제로 알아야 하는 질문("다른 검사는 통과했겠는가")에
   답하는 것이 이 기록이다.
 
-기록 대상은 두 곳이다.
+기록 대상은 두 곳이지만 **둘의 커버리지가 다르다. 권위 있는 기록은 DB다.**
 
-- 구조화 레코드: `shadow_mode.py` JSONL (`shadow-YYYY-MM-DD.jsonl`, 일자 회전 +
-  `SHADOW_AUDIT_MAX_FILE_MB` 크기 회전 + `SHADOW_AUDIT_RETENTION_DAYS` 보관, append마다
-  `fsync`).
-- 감사 이벤트: `shadow_audit.py` SQLite `shadow_audit_events` 테이블. 매수 경로와 **매도
-  경로 모두** 기록하며, 모든 run은 `SHADOW_COMPLETED` 또는 `SHADOW_ERROR`로 반드시
-  종료된다. 계좌번호·비밀정보는 `execution/secret_redaction.py`가 기록 직전에 마스킹한다.
+- 감사 이벤트(**항상 기록됨 — 이쪽을 먼저 본다**): `shadow_audit.py` SQLite
+  `shadow_audit_events` 테이블. 매수 경로와 **매도 경로 모두** 기록하며, 모든 run은
+  `SHADOW_COMPLETED` 또는 `SHADOW_ERROR`로 반드시 종료된다. 계좌번호·비밀정보는
+  `execution/secret_redaction.py`가 기록 직전에 마스킹한다.
+- 구조화 레코드(**조건부 기록됨**): `shadow_mode.py` JSONL — `SHADOW_MODE_LOG_FILE`
+  (`shadow-YYYY-MM-DD.jsonl`, 일자 회전 + `SHADOW_AUDIT_MAX_FILE_MB` 크기 회전 +
+  `SHADOW_AUDIT_RETENTION_DAYS` 보관, append마다 `fsync`).
+
+> **JSONL 파일이 아예 없을 수 있다 — 그것이 정상 동작인 경우가 있다.**
+> JSONL 레코드는 후보가 **Order Gate 평가까지 도달한 경우에만** 기록된다. 게이트 이전에
+> 차단되면(거래소 미지원, 가격 조회 실패, 계좌 조회 실패, 잔고 부족, 주문 의도 무효,
+> reconciliation 불가) JSONL은 생성되지 않고 **DB에만** 남는다.
+> 실제로 2026-08-03 Oracle read-only 검증에서 `SHADOW_MODE_LOG_FILE`은 생성되지 않았고
+> (후보 IXN=ARCA 미지원, AAPL=잔고 0), 모든 기록은 `shadow_audit_events`에 있었다.
+> **JSONL이 비었다는 이유로 "후보 없음"으로 판단하면 안 된다.** 반드시 DB를 조회한다.
+
+게이트 이전 차단 시 DB에는 다음 두 종류의 이벤트가 남는다.
+
+- `KIS_PIPELINE_EXCLUDED` — 거래소가 KIS 주문 코드공간(NASD/NYSE/AMEX) 밖이라 KIS
+  파이프라인에 아예 전달되지 않은 후보. 분석 산출물에는 그대로 남는다. payload에
+  `kis_pipeline=false`와 지원 거래소 목록이 들어간다.
+- `HYPOTHETICAL_INCOMPLETE` — 게이트 이전에 멈춘 후보. payload의
+  `pre_gate_stages_passed` / `blocked_at` / `blocked_reason` /
+  `pre_gate_stages_not_evaluated`로 "어디까지 통과했는지"를 알 수 있다.
+  **`order_gate_evaluated=false`가 항상 함께 기록된다** — 게이트는 실행되지 않았고,
+  게이트 판정을 추정해 기록하지 않는다.
 
 ```bash
 cd ~/trading-release
 source venv/bin/activate
 python3 scripts/run_shadow_mode.py --log-level INFO
 
-# JSONL 레코드 수와 감사 이벤트 확인
+# 감사 이벤트(권위 기록) 확인 -- JSONL이 0건이어도 여기가 비어 있으면 안 된다
 python3 -c "
 import shadow_audit, shadow_mode
 records, corruption = shadow_mode.read_all_with_integrity()
-print('shadow records:', len(records), 'corrupt lines:', corruption)
+print('shadow JSONL records:', len(records), '(0 may be correct -- see above)')
+print('corrupt JSONL lines:', corruption)
 print('audit events:', len(shadow_audit.read_events()))
 print('runs without a terminal event:', shadow_audit.runs_without_terminal_event())
 "
+
+# 게이트 이전 차단 후보가 어디까지 갔는지 (DB에만 있는 정보)
+sqlite3 "$STATE_STORE_DB_FILE" \
+  "select symbol, event_type, reason_code, payload from shadow_audit_events
+   where event_type in ('KIS_PIPELINE_EXCLUDED','HYPOTHETICAL_INCOMPLETE')
+   order by rowid desc limit 20;"
 ```
 
 `corrupt lines`가 비어 있지 않거나 `runs without a terminal event`가 비어 있지 않으면 감사
 기록 경로 자체가 깨진 것이므로 원인을 파악하기 전까지 다음 단계로 진행하지 않는다.
+반면 `shadow JSONL records: 0`은 그 자체로는 이상이 아니다 — 위 설명대로 게이트 도달
+여부에 달려 있으며, `audit events`가 0인 경우에만 문제다.
 
 ## 15. 서비스 설치 및 경로 전환
 

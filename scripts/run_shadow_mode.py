@@ -53,6 +53,8 @@ from brokers.kis_broker import KISPriceUnavailableError  # noqa: E402
 from market_data.exchange_registry import (  # noqa: E402
     ExchangeResolutionError,
     build_kis_instrument,
+    partition_kis_executable,
+    supported_analysis_exchanges,
 )
 import shadow_mode  # noqa: E402
 from brokers.kis_broker import KISBroker, KISBrokerError  # noqa: E402
@@ -107,12 +109,79 @@ def _fail_stop(stage, exc):
 
 
 def _audit(run_id, event_type, result, *, symbol, signal_id=None, reason_code=None,
-           detail=None, now):
+           detail=None, payload=None, now):
+    body = dict(payload) if payload else None
+    if detail:
+        body = body or {}
+        body["detail"] = detail
     shadow_audit.record_event(
         shadow_run_id=run_id, event_type=event_type, result=result, symbol=symbol,
         side="buy", signal_id=signal_id, reason_code=reason_code,
-        payload={"detail": detail} if detail else None, now=now,
+        payload=body, now=now,
     )
+
+
+# The pre-gate checks, in the order the evaluation performs them. The
+# Order Gate is deliberately NOT in this list: it is the one step whose
+# verdict is never inferred.
+STAGE_EXCHANGE = "EXCHANGE"
+STAGE_PRICE = "PRICE"
+STAGE_ACCOUNT_READ = "ACCOUNT_READ"
+STAGE_CASH = "CASH"
+STAGE_ORDER_INTENT = "ORDER_INTENT"
+STAGE_RECONCILIATION = "RECONCILIATION"
+
+PRE_GATE_STAGES = (
+    STAGE_EXCHANGE, STAGE_PRICE, STAGE_ACCOUNT_READ,
+    STAGE_CASH, STAGE_ORDER_INTENT, STAGE_RECONCILIATION,
+)
+
+
+class _PreGateProgress:
+    """How far a candidate got before the Order Gate.
+
+    Oracle verification found every candidate reporting
+    `hypothetical=None`: one was an ARCA listing, the rest ran into an
+    unfunded account, and both stop the evaluation before the gate. The
+    log then answered "what did the live path decide?" with nothing at
+    all -- not "would have been approved", not "would have been
+    rejected", just silence, which is the least useful thing to record
+    about a day's candidates.
+
+    This tracks the checks that DID run and reports them as an audit
+    event. It runs no check of its own, calls no broker method and
+    reaches no gate verdict: it only writes down what already happened.
+    """
+
+    __slots__ = ("passed", "blocked_at", "blocked_reason")
+
+    def __init__(self):
+        self.passed = []
+        self.blocked_at = None
+        self.blocked_reason = None
+
+    def passed_stage(self, stage):
+        if stage not in self.passed:
+            self.passed.append(stage)
+
+    def blocked(self, stage, reason_code):
+        self.blocked_at = stage
+        self.blocked_reason = reason_code
+
+    def not_evaluated(self):
+        done = set(self.passed) | ({self.blocked_at} if self.blocked_at else set())
+        return [stage for stage in PRE_GATE_STAGES if stage not in done]
+
+    def as_payload(self):
+        return {
+            "pre_gate_stages_passed": list(self.passed),
+            "blocked_at": self.blocked_at,
+            "blocked_reason": self.blocked_reason,
+            "pre_gate_stages_not_evaluated": self.not_evaluated(),
+            # The single most important field: no gate verdict is being
+            # claimed here, and no gate was bypassed to produce one.
+            "order_gate_evaluated": False,
+        }
 
 
 
@@ -169,6 +238,28 @@ def _price_detail(exc, exchange_record=None):
     return str(exc)
 
 
+def _record_excluded(item, *, now):
+    """Writes down a candidate the KIS pipeline was not handed.
+
+    No analysis, no KIS read, no gate: the venue alone decides this, and
+    it is decided before anything else runs. The record exists so the day
+    reads as "analysed, held back, here is why" rather than as a symbol
+    that quietly never appeared.
+    """
+    run_id = shadow_audit.new_run_id()
+    _audit(run_id, shadow_audit.KIS_PIPELINE_EXCLUDED, shadow_audit.RESULT_INFO,
+           symbol=item.symbol, reason_code=item.reason_code, detail=item.detail,
+           payload={"kis_pipeline": False,
+                    "supported_exchanges": list(supported_analysis_exchanges())},
+           now=now)
+    _audit(run_id, shadow_audit.SHADOW_COMPLETED, shadow_audit.RESULT_INFO,
+           symbol=item.symbol, reason_code=item.reason_code, now=now)
+    return {"symbol": item.symbol, "run_id": run_id,
+            "result": shadow_audit.RESULT_INFO,
+            "reason_code": item.reason_code,
+            "hypothetical": "NOT_APPLICABLE:KIS_PIPELINE_EXCLUDED"}
+
+
 def _evaluate_symbol(*, symbol, broker, rollout, conn, kis_validation, deployed_commit,
                      validated_commit, allowed_account_no, is_regular_session, now):
     """Returns a dict describing what the live path WOULD have done. No
@@ -177,6 +268,8 @@ def _evaluate_symbol(*, symbol, broker, rollout, conn, kis_validation, deployed_
     outcome = {"symbol": symbol, "run_id": run_id, "result": shadow_audit.RESULT_BLOCKED,
                "reason_code": None, "hypothetical": None}
     signal = None
+    progress = _PreGateProgress()
+    signalled = False
     try:
         analysis = pso.analyze_stock(symbol)
         if analysis is None or analysis["score"] < klt.SCORE_THRESHOLD:
@@ -186,10 +279,12 @@ def _evaluate_symbol(*, symbol, broker, rollout, conn, kis_validation, deployed_
 
         _audit(run_id, shadow_audit.SIGNAL_RECEIVED, shadow_audit.RESULT_INFO, symbol=symbol,
                reason_code="SCORE_THRESHOLD_MET", now=now)
+        signalled = True
 
         try:
             # HIGH-1: resolve the venue instead of assuming NASDAQ.
             instrument, exchange_record = build_kis_instrument(symbol)
+            progress.passed_stage(STAGE_EXCHANGE)
             signal = build_signal(
                 strategy_id="PAPER_STRATEGY_ORDER_SCORE_V1", strategy_version="v1",
                 config_version="live_rollout_v1", code_commit=deployed_commit, symbol=symbol,
@@ -200,23 +295,27 @@ def _evaluate_symbol(*, symbol, broker, rollout, conn, kis_validation, deployed_
         except ExchangeResolutionError as exc:
             # HIGH-1: fail closed. No default venue, no transport.
             outcome["reason_code"] = exc.reason_code
+            progress.blocked(STAGE_EXCHANGE, exc.reason_code)
             _audit(run_id, shadow_audit.INSTRUMENT_BLOCKED, shadow_audit.RESULT_BLOCKED,
                    symbol=symbol, reason_code=exc.reason_code, detail=str(exc), now=now)
             return outcome
         except (InstrumentError, SignalError) as exc:
             outcome["reason_code"] = "INSTRUMENT_INVALID"
+            progress.blocked(STAGE_EXCHANGE, "INSTRUMENT_INVALID")
             _audit(run_id, shadow_audit.INSTRUMENT_BLOCKED, shadow_audit.RESULT_BLOCKED,
                    symbol=symbol, reason_code="INSTRUMENT_INVALID", detail=str(exc), now=now)
             return outcome
 
         try:
             kis_quote = kis_validation.get_price_quote(symbol)
+            progress.passed_stage(STAGE_PRICE)
         except MarketDataProviderError as exc:
             # HIGH-1: keep the specific reason when the broker gave one --
             # an empty price on a successful call means the exchange code
             # is probably wrong, which a flat PRICE_UNAVAILABLE hides.
             reason = getattr(exc, "reason_code", None) or _price_reason_of(exc)
             outcome["reason_code"] = reason
+            progress.blocked(STAGE_PRICE, reason)
             _audit(run_id, shadow_audit.PRICE_DEVIATION_BLOCKED, shadow_audit.RESULT_BLOCKED,
                    symbol=symbol, signal_id=signal.signal_id, reason_code=reason,
                    detail=_price_detail(exc, exchange_record), now=now)
@@ -225,8 +324,10 @@ def _evaluate_symbol(*, symbol, broker, rollout, conn, kis_validation, deployed_
         try:
             account_snapshot = broker.get_account_snapshot()
             open_orders = broker.get_open_orders()
+            progress.passed_stage(STAGE_ACCOUNT_READ)
         except KISBrokerError as exc:
             outcome["reason_code"] = "ACCOUNT_READ_FAILED"
+            progress.blocked(STAGE_ACCOUNT_READ, "ACCOUNT_READ_FAILED")
             _audit(run_id, shadow_audit.CASH_BLOCKED, shadow_audit.RESULT_BLOCKED, symbol=symbol,
                    signal_id=signal.signal_id, reason_code="ACCOUNT_READ_FAILED",
                    detail=str(exc), now=now)
@@ -238,6 +339,7 @@ def _evaluate_symbol(*, symbol, broker, rollout, conn, kis_validation, deployed_
                        rollout.max_quantity_per_order)
         if quantity < 1:
             outcome["reason_code"] = "INSUFFICIENT_CASH"
+            progress.blocked(STAGE_CASH, "INSUFFICIENT_CASH")
             _audit(run_id, shadow_audit.CASH_BLOCKED, shadow_audit.RESULT_BLOCKED, symbol=symbol,
                    signal_id=signal.signal_id, reason_code="INSUFFICIENT_CASH", now=now)
             return outcome
@@ -249,8 +351,11 @@ def _evaluate_symbol(*, symbol, broker, rollout, conn, kis_validation, deployed_
                 exchange=instrument.exchange, side="buy", quantity=quantity, order_type="limit",
                 limit_price=price, stop_price=None, target_price=None, created_at=now,
             )
+            progress.passed_stage(STAGE_CASH)
+            progress.passed_stage(STAGE_ORDER_INTENT)
         except OrderIntentError as exc:
             outcome["reason_code"] = "ORDER_INTENT_INVALID"
+            progress.blocked(STAGE_ORDER_INTENT, "ORDER_INTENT_INVALID")
             _audit(run_id, shadow_audit.INSTRUMENT_BLOCKED, shadow_audit.RESULT_BLOCKED,
                    symbol=symbol, signal_id=signal.signal_id, reason_code="ORDER_INTENT_INVALID",
                    detail=str(exc), now=now)
@@ -261,8 +366,10 @@ def _evaluate_symbol(*, symbol, broker, rollout, conn, kis_validation, deployed_
                 broker=broker, conn=conn, account_id=account_snapshot.account_id, symbol=symbol,
                 now=now, source="shadow_service",
             )
+            progress.passed_stage(STAGE_RECONCILIATION)
         except reconciliation_snapshot.ReconciliationUnavailableError as exc:
             outcome["reason_code"] = "RECONCILIATION_UNAVAILABLE"
+            progress.blocked(STAGE_RECONCILIATION, "RECONCILIATION_UNAVAILABLE")
             _audit(run_id, shadow_audit.RECONCILIATION_BLOCKED, shadow_audit.RESULT_BLOCKED,
                    symbol=symbol, signal_id=signal.signal_id,
                    reason_code="RECONCILIATION_UNAVAILABLE", detail=str(exc), now=now)
@@ -341,6 +448,15 @@ def _evaluate_symbol(*, symbol, broker, rollout, conn, kis_validation, deployed_
         logger.exception("shadow evaluation failed for %s", symbol)
         return outcome
     finally:
+        if signalled and outcome["hypothetical"] is None:
+            # The evaluation stopped before the Order Gate. Record what
+            # the pre-gate checks actually established -- never a gate
+            # verdict, and without re-running anything.
+            outcome["hypothetical"] = f"NOT_EVALUATED:{progress.blocked_at or 'UNKNOWN'}"
+            _audit(run_id, shadow_audit.HYPOTHETICAL_INCOMPLETE, shadow_audit.RESULT_INFO,
+                   symbol=symbol, signal_id=signal.signal_id if signal is not None else None,
+                   reason_code=f"HYPOTHETICAL_NOT_EVALUATED:{progress.blocked_at or 'UNKNOWN'}",
+                   payload=progress.as_payload(), now=now)
         _audit(run_id, shadow_audit.SHADOW_COMPLETED, outcome["result"], symbol=symbol,
                signal_id=signal.signal_id if signal is not None else None,
                reason_code=outcome["reason_code"], now=now)
@@ -375,10 +491,19 @@ def run_once(*, broker=None, rollout=None, watchlist=None, now=None, conn=None):
     conn = conn or state_db.open_db()
     outcomes = []
     evaluable = shadow_allowed_symbols(rollout)
+    requested = [s for s in symbols if evaluable is None or s in evaluable]
+
+    # The analysis side and the KIS-executable side are not the same set.
+    # Candidates whose venue has no KIS order exchange code never enter
+    # the KIS pipeline: they cost a scored analysis pass and a KIS read
+    # only to end in UNSUPPORTED_EXCHANGE. They stay in the analysis
+    # output and are recorded here, so "analysed but not executable" is
+    # visible rather than silent.
+    executable, excluded = partition_kis_executable(requested)
     try:
-        for symbol in symbols:
-            if evaluable is not None and symbol not in evaluable:
-                continue
+        for item in excluded:
+            outcomes.append(_record_excluded(item, now=current))
+        for symbol, _record in executable:
             outcomes.append(_evaluate_symbol(
                 symbol=symbol, broker=broker, rollout=rollout, conn=conn,
                 kis_validation=kis_validation, deployed_commit=deployed_commit,

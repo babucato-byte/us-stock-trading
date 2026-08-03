@@ -117,8 +117,27 @@ run usermod -a -G "${SERVICE_GROUP}" "${SERVICE_USER}"
 
 run install -d -m 0750 -o root -g "${SERVICE_GROUP}" "${ENV_DIR}"
 run install -d -m 0770 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${LOG_DIR}"
-run install -d -m 0770 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${SHARED_DIR}/state"
 run install -d -m 0770 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${SHARED_DIR}/logs"
+
+# shared/state is the ONE directory that must not be group-writable.
+# Since the limiter began failing closed on any file in its own temp
+# namespace that it could not have written, a single planted file there
+# stops every service on the box. Under 0770 root:trading that was one
+# `trading` group member away; the services all run as ${SERVICE_USER},
+# so nothing needs group access to it in the first place.
+run install -d -m 0700 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${SHARED_DIR}/state"
+if [ "${DRY_RUN}" != "1" ]; then
+    # `install -d` also re-applies to an existing directory, but a
+    # previous install may have left 0770 root:trading behind, and a
+    # silent failure here is the whole exposure -- so verify.
+    state_mode="$(stat -c '%a' "${SHARED_DIR}/state")"
+    state_owner="$(stat -c '%U:%G' "${SHARED_DIR}/state")"
+    if [ "${state_mode}" != "700" ] || [ "${state_owner}" != "${SERVICE_USER}:${SERVICE_USER}" ]; then
+        echo "ERROR: ${SHARED_DIR}/state is ${state_mode} ${state_owner}, expected 700 ${SERVICE_USER}:${SERVICE_USER}." >&2
+        exit 1
+    fi
+    echo "shared state: ${SHARED_DIR}/state is ${state_mode} ${state_owner}"
+fi
 
 if [ ! -f "${ENV_FILE}" ]; then
     echo "ERROR: ${ENV_FILE} does not exist." >&2
@@ -191,8 +210,26 @@ for timer in "${ENABLE_TIMERS[@]}"; do
     run systemctl enable --now "${timer}"
 done
 
+# The live unit ships without an [Install] section, so it cannot be
+# enabled at all. These two still run: a PREVIOUS install may have left
+# an enablement symlink behind, and that link keeps working even after
+# the section is removed.
 run systemctl disable us-stock-trading-live.service || true
 run systemctl stop us-stock-trading-live.service || true
+
+# Refuse to finish while live order placement is armed for boot. The
+# unit is not enableable now, but this is the assertion an operator can
+# point at, rather than a claim in a comment.
+if [ "${DRY_RUN}" != "1" ]; then
+    live_state="$(systemctl is-enabled us-stock-trading-live.service 2>/dev/null || true)"
+    case "${live_state}" in
+        enabled|enabled-runtime|static|alias|indirect)
+            echo "ERROR: us-stock-trading-live.service reports '${live_state}' -- it must not be enableable." >&2
+            exit 1
+            ;;
+    esac
+    echo "live unit: '${live_state:-disabled}' (not enableable -- no [Install] section)"
+fi
 
 echo
 echo "Installed. Current state:"
@@ -201,4 +238,4 @@ for timer in "${ENABLE_TIMERS[@]}"; do
     systemctl is-enabled "${timer}" 2>/dev/null || echo "unknown"
 done
 echo -n "us-stock-trading-live.service: "
-systemctl is-enabled us-stock-trading-live.service 2>/dev/null || echo "disabled (expected)"
+systemctl is-enabled us-stock-trading-live.service 2>/dev/null || echo "not enableable (expected)"
