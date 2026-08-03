@@ -93,9 +93,14 @@ class TestSecretRedaction:
 
 
 class TestRotation:
+    """Rotation applies to SHADOW_MODE_LOG_DIR. There is deliberately no
+    unconfigured default: the module used to fall back to its own
+    directory, i.e. the release root, and Oracle verification caught it
+    writing there."""
+
     def test_default_path_rotates_by_calendar_day(self, tmp_path, monkeypatch):
         monkeypatch.delenv("SHADOW_MODE_LOG_FILE", raising=False)
-        monkeypatch.setattr(shadow_mode, "BASE_DIR", tmp_path)
+        monkeypatch.setenv("SHADOW_MODE_LOG_DIR", str(tmp_path))
         day_1 = datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc)
         day_2 = datetime(2026, 7, 30, 15, 0, tzinfo=timezone.utc)
         shadow_mode.persist(_record(signal_id="sig-day1", now=day_1))
@@ -105,7 +110,7 @@ class TestRotation:
 
     def test_read_all_without_override_reads_across_all_rotated_files(self, tmp_path, monkeypatch):
         monkeypatch.delenv("SHADOW_MODE_LOG_FILE", raising=False)
-        monkeypatch.setattr(shadow_mode, "BASE_DIR", tmp_path)
+        monkeypatch.setenv("SHADOW_MODE_LOG_DIR", str(tmp_path))
         day_1 = datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc)
         day_2 = datetime(2026, 7, 30, 15, 0, tzinfo=timezone.utc)
         shadow_mode.persist(_record(signal_id="sig-day1", now=day_1))
@@ -115,7 +120,7 @@ class TestRotation:
 
     def test_read_all_with_date_reads_only_that_day(self, tmp_path, monkeypatch):
         monkeypatch.delenv("SHADOW_MODE_LOG_FILE", raising=False)
-        monkeypatch.setattr(shadow_mode, "BASE_DIR", tmp_path)
+        monkeypatch.setenv("SHADOW_MODE_LOG_DIR", str(tmp_path))
         day_1 = datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc)
         day_2 = datetime(2026, 7, 30, 15, 0, tzinfo=timezone.utc)
         shadow_mode.persist(_record(signal_id="sig-day1", now=day_1))

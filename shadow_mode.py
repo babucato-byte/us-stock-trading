@@ -18,11 +18,27 @@ flock (mirroring execution/idempotency.py's single_run_lock() pattern)
 around the append so two concurrent writers (this pipeline's buy cycle
 and kis_position_manager.py's sell/exit tick both call shadow_mode.
 persist()) can never interleave partial writes into the same line.
-Without an explicit SHADOW_MODE_LOG_FILE override (the escape hatch
-every test in this suite uses to isolate its own file), the default
-path rotates to one file PER CALENDAR DAY (`shadow-YYYY-MM-DD.jsonl`)
-so the log never grows into a single unbounded file across the life of
-a deployment.
+Where the file goes is CONFIGURED, never guessed. There used to be a
+fallback to this module's own directory -- i.e. the release root -- when
+nothing was set, and Oracle verification caught it writing
+`shadow-2026-08-04.jsonl` next to the source tree. A deployment that
+forgot to configure a path got audit records scattered into the release
+directory, where the next release cannot see them and the "zero stray
+artifacts" check trips over them.
+
+The policy now:
+
+    SHADOW_MODE_LOG_FILE=<file>  exactly that file, no rotation
+    SHADOW_MODE_LOG_DIR=<dir>    one file PER CALENDAR DAY in that
+                                 directory (`shadow-YYYY-MM-DD.jsonl`),
+                                 so the log never grows unbounded
+    neither                      JSONL is OFF. Nothing is written
+                                 anywhere. shadow_audit.py's database
+                                 table remains the durable record, and
+                                 that fact is logged once per process.
+
+There is no implicit path. Not the release root, not the working
+directory, not the repository.
 """
 
 import fcntl
@@ -40,7 +56,11 @@ from execution.secret_redaction import redact_text, redact_value
 logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_LOG_FILE = BASE_DIR / "SHADOW_MODE_LOG.jsonl"
+
+# Emitted once per process when JSONL logging is off, so an operator
+# reading service logs is told where the record actually is instead of
+# looking for a file that was never meant to exist.
+_DB_ONLY_ANNOUNCED = False
 
 # CODEX-048: size-based rotation on top of the per-day file, plus a
 # retention window, so a single high-volume day cannot grow one file
@@ -71,17 +91,48 @@ def retention_days():
     return value if value > 0 else DEFAULT_RETENTION_DAYS
 
 
+def log_directory():
+    """The configured directory for per-day files, or None."""
+    raw = os.environ.get("SHADOW_MODE_LOG_DIR", "").strip()
+    return Path(raw) if raw else None
+
+
+def jsonl_enabled():
+    """False when neither knob is set: the database is then the only
+    store, which is a supported configuration, not a failure."""
+    return bool(os.environ.get("SHADOW_MODE_LOG_FILE", "").strip()) \
+        or log_directory() is not None
+
+
+def _announce_db_only():
+    global _DB_ONLY_ANNOUNCED
+    if _DB_ONLY_ANNOUNCED:
+        return
+    _DB_ONLY_ANNOUNCED = True
+    logger.info(
+        "shadow_audit_backend=database jsonl_enabled=false "
+        "(set SHADOW_MODE_LOG_DIR or SHADOW_MODE_LOG_FILE to also write JSONL)"
+    )
+
+
 def _resolve_log_path(*, for_date=None):
-    """Explicit SHADOW_MODE_LOG_FILE always wins (test isolation and any
-    operator override use this) -- no rotation applied to it, matching
-    the "an explicit path override means exactly that path" convention
-    already used throughout this codebase's env-driven state files.
-    Without an override, rotates to a per-calendar-day file."""
-    override = os.environ.get("SHADOW_MODE_LOG_FILE")
+    """Where a record goes, or None when JSONL logging is off.
+
+    An explicit SHADOW_MODE_LOG_FILE means exactly that path, with no
+    rotation -- the convention every env-driven state file in this
+    codebase follows. SHADOW_MODE_LOG_DIR rotates per calendar day
+    inside the configured directory. Neither set means OFF; this
+    deliberately does NOT fall back to BASE_DIR, which is the release
+    root on a deployed host.
+    """
+    override = os.environ.get("SHADOW_MODE_LOG_FILE", "").strip()
     if override:
         return Path(override)
+    directory = log_directory()
+    if directory is None:
+        return None
     day = for_date or datetime.now(timezone.utc).date()
-    return BASE_DIR / f"shadow-{day.isoformat()}.jsonl"
+    return directory / f"shadow-{day.isoformat()}.jsonl"
 
 
 def _lock_path_for(target):
@@ -162,6 +213,12 @@ def persist(record: ShadowModeRecord, *, path=None):
             except ValueError:
                 for_date = None
         target = _resolve_log_path(for_date=for_date)
+        if target is None:
+            # JSONL is off. shadow_audit.py's table already holds this
+            # record; writing a file somewhere unconfigured would be
+            # worse than writing none.
+            _announce_db_only()
+            return None
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = redact_value(asdict(record))
     if payload.get("rejection_reason") is not None:
@@ -217,7 +274,10 @@ def purge_old_files(*, days=None, now=None, base_dir=None):
     limit_days = days if days is not None else retention_days()
     current = now or datetime.now(timezone.utc)
     cutoff = (current - timedelta(days=limit_days)).date()
-    directory = Path(base_dir) if base_dir else BASE_DIR
+    directory = Path(base_dir) if base_dir else log_directory()
+    if directory is None:
+        # Nothing rotates when JSONL is off, so there is nothing to purge.
+        return []
     deleted = []
     for path in sorted(directory.glob("shadow-*.jsonl")):
         stem = path.name[len("shadow-"):].split(".")[0]
@@ -263,9 +323,11 @@ def read_all(*, path=None, date=None):
     -- the durable prefix of good lines is never discarded.
 
     Without `path` and without SHADOW_MODE_LOG_FILE set, reads across
-    EVERY rotated `shadow-*.jsonl` file (chronological by filename) so
-    a full audit still sees every day's records; pass `date` to read
-    just one day's file."""
+    EVERY rotated `shadow-*.jsonl` file in SHADOW_MODE_LOG_DIR
+    (chronological by filename) so a full audit still sees every day's
+    records; pass `date` to read just one day's file. With neither knob
+    set, JSONL is off and this returns nothing -- the records are in
+    shadow_audit_events."""
     records, corruption = read_all_with_integrity(path=path, date=date)
     if corruption:
         logger.error(
@@ -319,12 +381,17 @@ def read_all_with_integrity(*, path=None, date=None):
     corruption = []
     if path is not None:
         return _read_file(path, corruption), corruption
-    override = os.environ.get("SHADOW_MODE_LOG_FILE")
+    override = os.environ.get("SHADOW_MODE_LOG_FILE", "").strip()
     if override:
         return _read_file(Path(override), corruption), corruption
+    directory = log_directory()
+    if directory is None:
+        # JSONL off: an empty result is the honest answer. The records
+        # are in shadow_audit_events, and this reader does not read that.
+        return [], corruption
     if date is not None:
         return _read_file(_resolve_log_path(for_date=date), corruption), corruption
     records = []
-    for rotated_file in sorted(BASE_DIR.glob("shadow-*.jsonl")):
+    for rotated_file in sorted(directory.glob("shadow-*.jsonl")):
         records.extend(_read_file(rotated_file, corruption))
     return records, corruption

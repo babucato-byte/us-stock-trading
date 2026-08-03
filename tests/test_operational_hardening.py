@@ -47,6 +47,19 @@ LIVE_UNIT = UNIT_DIR / "us-stock-trading-live.service"
 RUNBOOK = REPO_ROOT / "docs" / "deployment" / "ORACLE_KIS_MIGRATION_RUNBOOK.md"
 
 INSTALLER_SOURCE = INSTALLER.read_text(encoding="utf-8")
+FAKE_SYSTEMCTL = Path(__file__).resolve().parent / "fake_systemctl.py"
+
+
+def _stub(tmp_path, name, body="#!/bin/sh\nexit 0\n"):
+    path = tmp_path / name
+    path.write_text(body, encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def _fake_systemctl(tmp_path):
+    return _stub(tmp_path, "systemctl",
+                 f"#!/bin/sh\nexec {sys.executable} {FAKE_SYSTEMCTL} \"$@\"\n")
 SHADOW_SOURCE = (SCRIPTS_DIR / "run_shadow_mode.py").read_text(encoding="utf-8")
 
 NOW = datetime(2026, 8, 4, 15, 0, tzinfo=timezone.utc)
@@ -102,7 +115,9 @@ class TestSharedStatePermissions:
             env={**os.environ, "DRY_RUN": "1", "TRADING_RELEASE_ROOT": str(REPO_ROOT),
                  "TRADING_SHARED_ROOT": str(tmp_path / "shared"), "ENV_DIR": str(env_dir),
                  "ENV_FILE": str(env_file), "LOG_DIR": str(tmp_path / "logs"),
-                 "UNIT_DIR": str(tmp_path / "units"), "PYTHON_BIN": sys.executable},
+                 "UNIT_DIR": str(tmp_path / "units"), "PYTHON_BIN": sys.executable,
+                 "SYSTEMD_ANALYZE_BIN": str(_stub(tmp_path, "systemd-analyze")),
+                 "SYSTEMCTL_BIN": str(_fake_systemctl(tmp_path))},
             capture_output=True, text=True, timeout=120,
         )
         assert result.returncode == 0, result.stderr
@@ -123,7 +138,9 @@ class TestSharedStatePermissions:
             env={**os.environ, "DRY_RUN": "1", "TRADING_RELEASE_ROOT": str(REPO_ROOT),
                  "TRADING_SHARED_ROOT": str(tmp_path / "shared"), "ENV_DIR": str(env_dir),
                  "ENV_FILE": str(env_file), "LOG_DIR": str(tmp_path / "logs"),
-                 "UNIT_DIR": str(tmp_path / "units"), "PYTHON_BIN": sys.executable},
+                 "UNIT_DIR": str(tmp_path / "units"), "PYTHON_BIN": sys.executable,
+                 "SYSTEMD_ANALYZE_BIN": str(_stub(tmp_path, "systemd-analyze")),
+                 "SYSTEMCTL_BIN": str(_fake_systemctl(tmp_path))},
             capture_output=True, text=True, timeout=120,
         )
         for line in result.stdout.splitlines():
@@ -168,12 +185,25 @@ class TestLiveUnitIsNotEnableable:
     def test_the_installer_still_disables_a_legacy_enablement(self):
         """A previous install's symlink keeps working even after the
         [Install] section is gone, so the disable must stay."""
-        assert "systemctl disable us-stock-trading-live.service" in INSTALLER_SOURCE
-        assert "systemctl stop us-stock-trading-live.service" in INSTALLER_SOURCE
+        assert 'disable "${LIVE_UNIT}"' in INSTALLER_SOURCE
+        assert 'stop "${LIVE_UNIT}"' in INSTALLER_SOURCE
 
-    def test_the_installer_fails_if_the_live_unit_is_enableable(self):
-        assert "it must not be enableable" in INSTALLER_SOURCE
-        assert "enabled|enabled-runtime|static|alias|indirect" in INSTALLER_SOURCE
+    def test_static_is_the_expected_state_not_a_failure(self):
+        """Codex HIGH-1: the installer rejected `static`, which is
+        exactly what a unit with no [Install] section reports, so every
+        real install exited 1. `static` is the goal, and `disabled`
+        would mean the [Install] section came back."""
+        assert 'if [ "${sandbox_state}" != "static" ]' in INSTALLER_SOURCE
+        assert "enabled|enabled-runtime|static|alias|indirect" not in INSTALLER_SOURCE
+        assert 'report_state "${LIVE_UNIT}" "static"' in INSTALLER_SOURCE
+
+    def test_the_installer_proves_enableability_rather_than_asserting_it(self):
+        """A string check is what let HIGH-1 through; the installer now
+        enables the unit in a throwaway --root sandbox and counts the
+        symlinks it did not create."""
+        assert '--root="${SANDBOX}" enable' in INSTALLER_SOURCE
+        assert 'sandbox_links' in INSTALLER_SOURCE
+        assert 'if [ "${sandbox_links}" != "0" ]' in INSTALLER_SOURCE
 
     def test_every_read_only_unit_is_still_enableable(self):
         for name in ("us-stock-trading-shadow.timer", "us-stock-trading-reconcile.timer",
@@ -518,6 +548,22 @@ class TestRunbookRecordsWhereTheAuditLives:
         lowered = text.lower()
         assert "order gate" in lowered
 
+    def test_it_documents_the_configured_jsonl_path(self):
+        text = RUNBOOK.read_text(encoding="utf-8")
+        assert "SHADOW_MODE_LOG_DIR" in text
+        assert "release root fallback" in text or "release 루트" in text
+
+    def test_it_says_live_is_static_not_disabled(self):
+        text = RUNBOOK.read_text(encoding="utf-8")
+        assert "static 이어야 한다" in text
+        assert "# disabled 이어야 한다" not in text
+
+    def test_it_separates_installation_from_timer_activation(self):
+        text = RUNBOOK.read_text(encoding="utf-8")
+        assert "enable_oracle_shadow_timer.sh" in text
+        assert "ALLOW_SHADOW_TIMER_ENABLE" in text
+        assert "단계 A" in text and "단계 B" in text
+
 
 class TestTheFullPathIsUnchanged:
     """The pre-gate record must not displace the real thing: when a
@@ -575,3 +621,126 @@ class TestTheFullPathIsUnchanged:
             conn.close()
         assert outcome["result"] == "BLOCKED"
         assert outcome["reason_code"].startswith("GATE:")
+
+
+# =====================================================================
+# 6. The Shadow JSONL never lands in the release directory.
+# =====================================================================
+
+class TestJsonlPathIsConfiguredNotGuessed:
+    """The reviewer's own probe wrote `shadow-2026-08-04.jsonl` into the
+    repository root, because an unset SHADOW_MODE_LOG_FILE fell back to
+    this module's directory -- which on a deployed host is the release
+    root. Records landed where the next release cannot see them and
+    where the stray-artifact check trips over them."""
+
+    def _record(self, **overrides):
+        import shadow_mode
+
+        kwargs = dict(
+            signal_id="sig-1", strategy_id="s", strategy_version="v1",
+            code_commit="abc", symbol="AAPL", side="buy", alpaca_signal_price=100.0,
+            kis_validation_price=100.0, price_difference_percent=0.0,
+            planned_quantity=1, planned_limit_price=100.0, stop_price=92.0,
+            target_price=108.0, risk_gate_result="BLOCKED", rejection_reason=None,
+            account_available_usd=0.0, existing_position_quantity=0,
+            existing_open_order=False, now=NOW,
+        )
+        kwargs.update(overrides)
+        return shadow_mode.build_record(**kwargs)
+
+    def test_unset_writes_nothing_anywhere(self, monkeypatch, tmp_path):
+        import shadow_mode
+
+        monkeypatch.delenv("SHADOW_MODE_LOG_FILE", raising=False)
+        monkeypatch.delenv("SHADOW_MODE_LOG_DIR", raising=False)
+        before = sorted(p.name for p in REPO_ROOT.glob("shadow-*.jsonl"))
+        assert shadow_mode.persist(self._record()) is None
+        after = sorted(p.name for p in REPO_ROOT.glob("shadow-*.jsonl"))
+        assert after == before, "a JSONL file appeared in the release root"
+        assert sorted(tmp_path.glob("*.jsonl")) == []
+
+    def test_unset_means_jsonl_disabled(self, monkeypatch):
+        import shadow_mode
+
+        monkeypatch.delenv("SHADOW_MODE_LOG_FILE", raising=False)
+        monkeypatch.delenv("SHADOW_MODE_LOG_DIR", raising=False)
+        assert shadow_mode.jsonl_enabled() is False
+        assert shadow_mode._resolve_log_path() is None
+
+    def test_unset_announces_the_database_backend(self, monkeypatch, caplog):
+        import shadow_mode
+
+        monkeypatch.delenv("SHADOW_MODE_LOG_FILE", raising=False)
+        monkeypatch.delenv("SHADOW_MODE_LOG_DIR", raising=False)
+        monkeypatch.setattr(shadow_mode, "_DB_ONLY_ANNOUNCED", False)
+        with caplog.at_level("INFO"):
+            shadow_mode.persist(self._record())
+        assert "shadow_audit_backend=database" in caplog.text
+        assert "jsonl_enabled=false" in caplog.text
+
+    def test_unset_reads_back_empty_rather_than_globbing_the_release(self, monkeypatch):
+        import shadow_mode
+
+        monkeypatch.delenv("SHADOW_MODE_LOG_FILE", raising=False)
+        monkeypatch.delenv("SHADOW_MODE_LOG_DIR", raising=False)
+        records, corruption = shadow_mode.read_all_with_integrity()
+        assert records == [] and corruption == []
+
+    def test_a_configured_directory_receives_the_file(self, monkeypatch, tmp_path):
+        import shadow_mode
+
+        monkeypatch.delenv("SHADOW_MODE_LOG_FILE", raising=False)
+        monkeypatch.setenv("SHADOW_MODE_LOG_DIR", str(tmp_path))
+        shadow_mode.persist(self._record())
+        written = sorted(p.name for p in tmp_path.glob("shadow-*.jsonl"))
+        assert written == [f"shadow-{NOW.date().isoformat()}.jsonl"], written
+        assert sorted(REPO_ROOT.glob("shadow-*.jsonl")) == []
+
+    def test_a_configured_file_receives_exactly_that_path(self, monkeypatch, tmp_path):
+        import shadow_mode
+
+        target = tmp_path / "shadow-mode.jsonl"
+        monkeypatch.setenv("SHADOW_MODE_LOG_FILE", str(target))
+        monkeypatch.delenv("SHADOW_MODE_LOG_DIR", raising=False)
+        shadow_mode.persist(self._record())
+        assert target.exists()
+        assert sorted(REPO_ROOT.glob("shadow-*.jsonl")) == []
+
+    def test_an_unwritable_configured_path_raises_rather_than_falling_back(
+            self, monkeypatch, tmp_path):
+        import shadow_mode
+
+        monkeypatch.setenv("SHADOW_MODE_LOG_FILE", str(tmp_path / "nope" / "x" / "f.jsonl"))
+        monkeypatch.setattr(shadow_mode.Path, "mkdir",
+                            lambda *a, **k: (_ for _ in ()).throw(PermissionError("no")))
+        with pytest.raises(Exception):
+            shadow_mode.persist(self._record())
+        assert sorted(REPO_ROOT.glob("shadow-*.jsonl")) == []
+
+    def test_purging_is_a_no_op_when_jsonl_is_off(self, monkeypatch):
+        import shadow_mode
+
+        monkeypatch.delenv("SHADOW_MODE_LOG_FILE", raising=False)
+        monkeypatch.delenv("SHADOW_MODE_LOG_DIR", raising=False)
+        assert shadow_mode.purge_old_files() == []
+
+    def test_the_db_audit_still_records_with_jsonl_off(self, shadow_env, monkeypatch):
+        """The point of the policy: turning the file off must not turn
+        the durable record off."""
+        monkeypatch.delenv("SHADOW_MODE_LOG_FILE", raising=False)
+        monkeypatch.delenv("SHADOW_MODE_LOG_DIR", raising=False)
+        module = _shadow_module()
+        monkeypatch.setattr(module.pso, "analyze_stock", lambda s: None)
+        module.run_once(broker=_Broker(), rollout=_Rollout(), watchlist=["IXN"], now=NOW)
+        assert [e for e in _events("IXN")
+                if e["event_type"] == "KIS_PIPELINE_EXCLUDED"]
+        assert sorted(REPO_ROOT.glob("shadow-*.jsonl")) == []
+
+    def test_the_module_has_no_implicit_default_path(self):
+        import shadow_mode
+
+        source = Path(shadow_mode.__file__).read_text(encoding="utf-8")
+        assert "DEFAULT_LOG_FILE" not in source
+        assert 'BASE_DIR / f"shadow-' not in source
+        assert 'BASE_DIR.glob' not in source
