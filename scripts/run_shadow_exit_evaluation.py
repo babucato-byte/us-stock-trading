@@ -58,6 +58,10 @@ EXIT_ERROR = 1
 EXIT_KIS_UNAVAILABLE = 2
 
 EXIT_FATAL_DB = 4
+# The HALT state could not be read. Not "assume clear": HALT is the
+# switch that stops automated execution, so an unreadable one is the
+# strongest possible reason to do nothing.
+EXIT_HALT_UNAVAILABLE = 6
 
 
 def _fail_stop(stage, exc):
@@ -97,8 +101,33 @@ def _audit(run_id, event_type, result, *, symbol, reason_code=None, detail=None,
         )
 
 
+class HaltStatusUnavailable(Exception):
+    """kill_switch could not be read. Fail-closed: no broker call, no
+    evaluation, non-zero exit."""
+
+    reason_code = "HALT_STATUS_UNAVAILABLE"
+
+
+def read_halt_state():
+    """The HALT state AT RUN TIME, read directly.
+
+    Deliberately not taken from the reconciliation snapshot: that value
+    describes the moment the reconciler ran, which may be minutes old,
+    and an exit pass that acts on a stale HALT is acting on a fact nobody
+    has checked. `kill_switch.is_halted()` already fails closed to halted
+    on a corrupt state file; an exception here means we could not even
+    get that far.
+    """
+    try:
+        from operations import kill_switch
+
+        return bool(kill_switch.is_halted())
+    except Exception as exc:  # noqa: BLE001 -- unreadable is not "clear"
+        raise HaltStatusUnavailable(str(exc)) from exc
+
+
 def evaluate_position(*, position_id, record, broker, conn, exit_flags, now, eastern_now,
-                      account_id):
+                      account_id, halted):
     """Evaluates ONE position's exit conditions. Returns a summary dict.
     Places no order on any path through this function."""
     run_id = shadow_audit.new_run_id()
@@ -106,11 +135,17 @@ def evaluate_position(*, position_id, record, broker, conn, exit_flags, now, eas
     outcome = {
         "position_id": position_id, "symbol": symbol, "run_id": run_id,
         "result": shadow_audit.RESULT_BLOCKED, "reason_code": None, "decision": None,
+        "halt": halted, "exit_classification": None,
     }
     terminal_recorded = False
     try:
         _audit(run_id, shadow_audit.SIGNAL_RECEIVED, shadow_audit.RESULT_INFO, symbol=symbol,
                reason_code="EXIT_EVALUATION", detail=f"state={record['state']}", now=now)
+        # Recorded on every run, halted or not, so "was HALT set when
+        # this was evaluated?" is answerable from the trail alone.
+        _audit(run_id, shadow_audit.HALT_CHECKED, shadow_audit.RESULT_INFO, symbol=symbol,
+               reason_code="HALT_TRUE" if halted else "HALT_FALSE",
+               detail=f"halt={halted} source=kill_switch.is_halted", now=now)
 
         if record["stop_price"] is None:
             outcome["reason_code"] = "STOP_NOT_FINALIZED"
@@ -199,10 +234,26 @@ def evaluate_position(*, position_id, record, broker, conn, exit_flags, now, eas
                    reason_code="NO_EXIT_CONDITION", detail=detail, now=now)
             return outcome
 
+        classification = lifecycle.classify_exit(decision.reason)
+        outcome["exit_classification"] = classification
+        if halted and classification != lifecycle.EXIT_CLASS_RISK_REDUCTION:
+            # HALT stops automated execution. A protective exit is what
+            # HALT conditions usually call for, so STOP_LOSS and the
+            # forced end-of-day close are still evaluated; profit taking,
+            # time stops and trailing adjustments are not.
+            outcome["reason_code"] = "HALT_ACTIVE"
+            _audit(run_id, shadow_audit.EXIT_BLOCKED_HALT, shadow_audit.RESULT_BLOCKED,
+                   symbol=symbol, reason_code="HALT_ACTIVE",
+                   detail=f"{detail} exit_classification={classification} halt=true",
+                   now=now)
+            return outcome
+
         outcome["result"] = shadow_audit.RESULT_APPROVED
         outcome["reason_code"] = decision.reason
         _audit(run_id, shadow_audit.GATE_APPROVED, shadow_audit.RESULT_APPROVED, symbol=symbol,
-               reason_code=decision.reason, detail=detail, now=now)
+               reason_code=decision.reason,
+               detail=f"{detail} exit_classification={classification} halt={halted} "
+                      "transport_suppressed=true", now=now)
         _audit(run_id, shadow_audit.EXECUTION_PLANNED, shadow_audit.RESULT_APPROVED,
                symbol=symbol, reason_code="NO_ORDER_PLACED_SHADOW_MODE", detail=detail, now=now)
         return outcome
@@ -239,6 +290,11 @@ def run_once(*, broker=None, now=None, eastern_now=None, conn=None, clock=None):
     broker = broker or KISBroker()
     exit_flags = LiveExitFlags.from_env()
 
+    # BEFORE the first broker call. An account read that happens while
+    # HALT is unreadable is a read this pass had no business making.
+    halted = read_halt_state()
+    logger.info("halt state at run time: halt=%s source=kill_switch.is_halted", halted)
+
     try:
         account_id = broker.get_account_snapshot().account_id
     except Exception as exc:  # noqa: BLE001 -- no account, no evaluation
@@ -252,12 +308,13 @@ def run_once(*, broker=None, now=None, eastern_now=None, conn=None, clock=None):
         for position_id, record in store.load_non_terminal().items():
             outcomes.append(evaluate_position(
                 position_id=position_id, record=record, broker=broker, conn=conn,
-                exit_flags=exit_flags, now=current, eastern_now=eastern, account_id=account_id,
+                exit_flags=exit_flags, now=current, eastern_now=eastern,
+                account_id=account_id, halted=halted,
             ))
     finally:
         if owns_conn:
             conn.close()
-    return {"status": "ok", "evaluated": outcomes}
+    return {"status": "ok", "evaluated": outcomes, "halt": halted}
 
 
 def main(argv=None):
@@ -271,6 +328,13 @@ def main(argv=None):
     install_logging_redaction()
     try:
         result = run_once()
+    except HaltStatusUnavailable as exc:
+        logger.error(
+            "HALT state could not be read: reason=%s detail=%s "
+            "shadow_exit_suppressed=true transport_suppressed=true",
+            exc.reason_code, type(exc.__cause__).__name__ if exc.__cause__ else "unknown",
+        )
+        return EXIT_HALT_UNAVAILABLE
     except FatalRepositoryConnectionError as exc:
         # CODEX-058: the order-state connection could neither be rolled
         # back nor closed, so this process may still hold a SQLite write
@@ -287,8 +351,9 @@ def main(argv=None):
         return EXIT_KIS_UNAVAILABLE
     for outcome in result["evaluated"]:
         logger.info(
-            "shadow exit %s: decision=%s result=%s reason=%s",
+            "shadow exit %s: decision=%s result=%s reason=%s halt=%s classification=%s",
             outcome["symbol"], outcome["decision"], outcome["result"], outcome["reason_code"],
+            outcome["halt"], outcome["exit_classification"],
         )
     return EXIT_OK
 

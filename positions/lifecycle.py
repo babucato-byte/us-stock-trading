@@ -589,6 +589,29 @@ def _exit_states_reachable_from(current_state):
     )
 
 
+# How an exit reason is treated when HALT is set. HALT stops AUTOMATED
+# order execution; it is not an instruction to sit on a losing position
+# while a protective stop fires, so the two kinds are distinguished
+# rather than lumped together.
+EXIT_CLASS_RISK_REDUCTION = "RISK_REDUCTION"
+EXIT_CLASS_STRATEGY = "STRATEGY"
+
+# Protective/forced exits: these reduce exposure and exist precisely for
+# the conditions HALT is usually set during.
+RISK_REDUCTION_REASONS = frozenset({"STOP_LOSS", "EOD_FORCED_CLOSE"})
+
+
+def classify_exit(reason):
+    """RISK_REDUCTION for a protective or forced close, STRATEGY for
+    everything else (profit taking, time stops, trailing adjustments).
+
+    Deliberately a whitelist: an exit reason added later is STRATEGY, so
+    a new rule cannot quietly acquire permission to act while halted.
+    """
+    return (EXIT_CLASS_RISK_REDUCTION if reason in RISK_REDUCTION_REASONS
+            else EXIT_CLASS_STRATEGY)
+
+
 ACTION_NONE = "none"
 ACTION_FULL_EXIT = "full_exit"
 ACTION_PARTIAL_EXIT = "partial_exit"
