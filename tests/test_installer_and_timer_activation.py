@@ -20,6 +20,7 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -115,7 +116,11 @@ def sandbox(tmp_path):
         encoding="utf-8")
     python_stub.chmod(0o755)
 
+    preflight_stub = host / "preflight-stub.py"
+    preflight_stub.write_text("import sys\nsys.exit(0)\n", encoding="utf-8")
+
     return {
+        "preflight_stub": preflight_stub,
         "root": host,
         "python": python_stub,
         "units": host / "units",
@@ -155,9 +160,37 @@ def run_installer(sandbox, **extra):
                           capture_output=True, text=True, timeout=300)
 
 
-def run_activator(sandbox, **extra):
-    return subprocess.run(["bash", str(ACTIVATOR)], env=_env(sandbox, **extra),
+def run_activator(sandbox, *, fresh_snapshot=True, **extra):
+    """Runs the activation script with the REAL interpreter.
+
+    A stubbed PYTHON_BIN is how the stale-snapshot defect survived: the
+    script's operational checks never executed under test. Only the
+    preflight is stubbed (it has its own suite); the reconciliation
+    freshness check runs for real against a snapshot this fixture
+    controls.
+    """
+    snapshot = sandbox["shared"] / "state" / "RECONCILIATION.json"
+    if fresh_snapshot:
+        _write_snapshot(snapshot, datetime.now(timezone.utc))
+    env = _env(sandbox, **extra)
+    env["RECONCILIATION_STATE_FILE"] = str(snapshot)
+    env["STATE_STORE_DB_FILE"] = str(sandbox["root"] / "state.db")
+    env["OPERATIONS_HALT_STATE_FILE"] = str(sandbox["root"] / "halt.json")
+    env["PYTHONPATH"] = str(REPO_ROOT)
+    env["PYTHON_BIN"] = sys.executable
+    env["PREFLIGHT_SCRIPT"] = str(sandbox["preflight_stub"])
+    return subprocess.run(["bash", str(ACTIVATOR)], env=env,
                           capture_output=True, text=True, timeout=300)
+
+
+def _write_snapshot(path, checked_at, *, clean=True, mismatch_count=0):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"clean": clean, "mismatch_count": mismatch_count}
+    if checked_at is not None:
+        payload["checked_at"] = (checked_at.isoformat()
+                                 if isinstance(checked_at, datetime) else checked_at)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
 
 
 def systemctl_state(sandbox):
@@ -551,3 +584,151 @@ class TestSharedStateStillHardened:
         source = INSTALLER.read_text(encoding="utf-8")
         assert 'install -d -m 0770 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${LOG_DIR}"' \
             in source
+
+
+# =====================================================================
+# Freshness: the snapshot must be recent, not merely present.
+# =====================================================================
+
+class TestStaleReconciliationBlocksActivation:
+    """Codex armed the timer with a 30-day-old clean snapshot. These run
+    the activation script with the REAL interpreter, so the check that
+    was previously invisible to the suite actually executes."""
+
+    def _install(self, sandbox):
+        assert run_installer(sandbox).returncode == 0
+
+    def _snapshot(self, sandbox):
+        return sandbox["shared"] / "state" / "RECONCILIATION.json"
+
+    def test_control_a_fresh_snapshot_arms_the_timer(self, sandbox):
+        self._install(sandbox)
+        result = run_activator(sandbox, ALLOW_SHADOW_TIMER_ENABLE="true")
+        assert result.returncode == 0, result.stdout + result.stderr
+        state = systemctl_state(sandbox)
+        assert state["enabled"].get("us-stock-trading-shadow.timer") is True
+        assert state["active"].get("us-stock-trading-shadow.timer") == "active"
+
+    def test_a_thirty_day_old_snapshot_is_refused(self, sandbox):
+        self._install(sandbox)
+        _write_snapshot(self._snapshot(sandbox),
+                        datetime.now(timezone.utc) - timedelta(days=30))
+        result = run_activator(sandbox, ALLOW_SHADOW_TIMER_ENABLE="true",
+                               fresh_snapshot=False)
+        assert result.returncode == 1
+        assert "RECONCILIATION_SNAPSHOT_STALE" in result.stdout + result.stderr
+        state = systemctl_state(sandbox)
+        assert not state["enabled"].get("us-stock-trading-shadow.timer")
+        assert state["active"].get("us-stock-trading-shadow.timer", "inactive") != "active"
+
+    def test_a_stale_snapshot_issues_no_enable_or_start(self, sandbox):
+        self._install(sandbox)
+        before = len(systemctl_state(sandbox)["calls"])
+        _write_snapshot(self._snapshot(sandbox),
+                        datetime.now(timezone.utc) - timedelta(days=30))
+        run_activator(sandbox, ALLOW_SHADOW_TIMER_ENABLE="true", fresh_snapshot=False)
+        calls = systemctl_state(sandbox)["calls"][before:]
+        assert not [c for c in calls if c.startswith("enable ")], calls
+        assert not [c for c in calls if c.startswith("start ")], calls
+
+    @pytest.mark.parametrize("checked_at,expected", [
+        (None, "RECONCILIATION_TIMESTAMP_INVALID"),
+        ("2026-08-04T15:00:00", "RECONCILIATION_TIMESTAMP_TIMEZONE_MISSING"),
+        ("not-a-timestamp", "RECONCILIATION_TIMESTAMP_INVALID"),
+    ])
+    def test_bad_timestamps_are_refused(self, sandbox, checked_at, expected):
+        self._install(sandbox)
+        _write_snapshot(self._snapshot(sandbox), checked_at)
+        result = run_activator(sandbox, ALLOW_SHADOW_TIMER_ENABLE="true",
+                               fresh_snapshot=False)
+        assert result.returncode == 1
+        assert expected in result.stdout + result.stderr
+        assert not systemctl_state(sandbox)["enabled"].get("us-stock-trading-shadow.timer")
+
+    def test_a_future_snapshot_is_refused(self, sandbox):
+        self._install(sandbox)
+        _write_snapshot(self._snapshot(sandbox),
+                        datetime.now(timezone.utc) + timedelta(hours=1))
+        result = run_activator(sandbox, ALLOW_SHADOW_TIMER_ENABLE="true",
+                               fresh_snapshot=False)
+        assert result.returncode == 1
+        assert "RECONCILIATION_SNAPSHOT_FROM_FUTURE" in result.stdout + result.stderr
+
+    def test_a_dirty_snapshot_is_refused(self, sandbox):
+        self._install(sandbox)
+        _write_snapshot(self._snapshot(sandbox), datetime.now(timezone.utc),
+                        clean=False, mismatch_count=2)
+        result = run_activator(sandbox, ALLOW_SHADOW_TIMER_ENABLE="true",
+                               fresh_snapshot=False)
+        assert result.returncode == 1
+        assert "RECONCILIATION_NOT_CLEAN" in result.stdout + result.stderr
+
+    def test_a_missing_snapshot_is_refused(self, sandbox):
+        self._install(sandbox)
+        snapshot = self._snapshot(sandbox)
+        if snapshot.exists():
+            snapshot.unlink()
+        result = run_activator(sandbox, ALLOW_SHADOW_TIMER_ENABLE="true",
+                               fresh_snapshot=False)
+        assert result.returncode == 1
+        assert "RECONCILIATION_SNAPSHOT_MISSING" in result.stdout + result.stderr
+
+    def test_a_partial_json_snapshot_is_refused(self, sandbox):
+        self._install(sandbox)
+        self._snapshot(sandbox).write_text('{"clean": true, "mismatch_c',
+                                           encoding="utf-8")
+        result = run_activator(sandbox, ALLOW_SHADOW_TIMER_ENABLE="true",
+                               fresh_snapshot=False)
+        assert result.returncode == 1
+        assert "RECONCILIATION_SNAPSHOT_INVALID" in result.stdout + result.stderr
+
+    def test_the_check_runs_with_the_real_interpreter(self, sandbox):
+        """Guards the test gap itself: a stubbed PYTHON_BIN is what hid
+        this defect, so the fixture must not reintroduce one."""
+        self._install(sandbox)
+        _write_snapshot(self._snapshot(sandbox),
+                        datetime.now(timezone.utc) - timedelta(days=30))
+        result = run_activator(sandbox, ALLOW_SHADOW_TIMER_ENABLE="true",
+                               fresh_snapshot=False)
+        assert "RECONCILIATION CHECK FAILED" in result.stderr
+
+
+class TestRuntimeFreshness:
+    """Arming once says nothing about an hour later."""
+
+    def test_the_shadow_unit_rechecks_before_every_run(self):
+        unit = (REPO_ROOT / "deploy" / "systemd"
+                / "us-stock-trading-shadow.service").read_text(encoding="utf-8")
+        pre = [l for l in unit.splitlines() if l.startswith("ExecStartPre=")]
+        assert any("check_reconciliation_freshness.py" in l for l in pre), pre
+        assert any("preflight_kis_live.py" in l for l in pre), pre
+
+    def test_a_stale_snapshot_stops_a_manual_shadow_run(self, sandbox, tmp_path):
+        """systemd is not in the picture for a hand-run pass, so the
+        entrypoint checks too."""
+        snapshot = tmp_path / "RECONCILIATION.json"
+        _write_snapshot(snapshot, datetime.now(timezone.utc) - timedelta(days=30))
+        result = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "run_shadow_mode.py")],
+            env={**os.environ, "PYTHONPATH": str(REPO_ROOT),
+                 "RECONCILIATION_STATE_FILE": str(snapshot),
+                 "STATE_STORE_DB_FILE": str(tmp_path / "s.db"),
+                 "KIS_LIVE_ORDER_ENABLED": "false", "ENTRY_DISABLED": "true"},
+            capture_output=True, text=True, timeout=300)
+        assert result.returncode == 5, result.stdout + result.stderr
+        assert "RECONCILIATION_SNAPSHOT_STALE" in result.stderr
+        assert "shadow_run_suppressed=true" in result.stderr
+
+    def test_the_stale_manual_run_reaches_no_broker(self, sandbox, tmp_path):
+        snapshot = tmp_path / "RECONCILIATION.json"
+        _write_snapshot(snapshot, datetime.now(timezone.utc) - timedelta(days=30))
+        result = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "run_shadow_mode.py")],
+            env={**os.environ, "PYTHONPATH": str(REPO_ROOT),
+                 "RECONCILIATION_STATE_FILE": str(snapshot),
+                 "STATE_STORE_DB_FILE": str(tmp_path / "s.db"),
+                 "KIS_LIVE_ORDER_ENABLED": "false", "ENTRY_DISABLED": "true"},
+            capture_output=True, text=True, timeout=300)
+        # No candidate was ever evaluated, so no shadow outcome was logged.
+        assert "shadow " not in result.stderr.replace("shadow_run_suppressed", "")
+        assert result.returncode == 5

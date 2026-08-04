@@ -600,9 +600,69 @@ KIS_LIVE_ORDER_ENABLED=false / LIVE_ROLLOUT_ENABLED=false / ENTRY_DISABLED=true
 live unit: static + inactive
 shared/state: 0700 ubuntu:ubuntu
 preflight PASS
-reconciliation snapshot clean
+reconciliation snapshot이 FRESH (아래 참조)
 UNKNOWN 주문 0건
 HALT false
+```
+
+#### reconciliation snapshot freshness (필수)
+
+snapshot이 **존재하고 clean한 것만으로는 부족하다.** 30일 된 clean snapshot으로 timer가
+활성화된 사례가 검증에서 재현됐다. 이제 다음을 모두 만족해야 한다.
+
+```text
+regular file (symlink·디렉터리·world-writable 거부)
+JSON object로 완전히 파싱됨 (부분 write는 거부)
+checked_at 존재 + ISO-8601 파싱 가능
+checked_at에 timezone 명시 (Z 또는 offset) — timezone 없으면 거부
+checked_at <= now + clock skew
+now - checked_at <= TTL
+clean = true, mismatch_count = 0
+```
+
+```env
+SHADOW_RECONCILIATION_MAX_AGE_SECONDS=900         # 기본 900초(15분), 상한 3600
+SHADOW_RECONCILIATION_MAX_FUTURE_SKEW_SECONDS=30  # 기본 30초, 상한 300
+```
+
+경계는 `age <= TTL` 허용, `age > TTL` 거부다. 미래 timestamp는 skew 이내만 허용하며
+그 밖은 `RECONCILIATION_SNAPSHOT_FROM_FUTURE`로 차단한다 — 서버 시계가 뒤로 이동해
+과거 snapshot이 미래로 보이는 상황을 fresh로 오인하지 않기 위한 것이다. TTL/skew에
+잘못된 값(0, 음수, 소수, 문자열, 상한 초과)을 넣으면 설정 오류로 exit 1이며, 미설정 시에만
+기본값을 쓰고 실제 적용값을 로그에 남긴다.
+
+**cadence와 TTL 정합성**: reconcile timer는 `OnUnitActiveSec=2min`, Shadow timer는 5분
+주기다. TTL 15분은 reconciliation을 여러 번 연속으로 놓쳐도 정상 운영을 막지 않으면서,
+reconciler가 멈추면 Shadow도 함께 멈추게 한다. TTL을 reconcile 주기보다 짧게 설정하면
+정상 운영 중에도 반복 차단되므로 금지한다.
+
+**timer를 켠 뒤에도 매 실행 직전 다시 검증한다.** `us-stock-trading-shadow.service`의
+`ExecStartPre`가 같은 프로그램(`scripts/check_reconciliation_freshness.py`)을 실행하므로,
+timer 활성화 이후 reconciliation이 멈추면 Shadow 본체는 실행되지 않는다. 손으로
+`run_shadow_mode.py`를 실행할 때도 entrypoint가 같은 검사를 수행하고 exit 5로 종료한다.
+
+운영 중 상태 확인:
+
+```bash
+jq '.checked_at, .clean, .mismatch_count' "$RECONCILIATION_STATE_FILE"
+date -u
+venv/bin/python scripts/check_reconciliation_freshness.py --purpose manual-check
+echo "exit=$?"    # 0이 아니면 Shadow timer를 켜지 않는다
+```
+
+차단 사유는 다음 reason code로 구분된다.
+
+```text
+RECONCILIATION_SNAPSHOT_MISSING            snapshot 파일 없음
+RECONCILIATION_SNAPSHOT_INVALID            symlink/비정규 파일/world-writable/JSON 파손
+RECONCILIATION_TIMESTAMP_INVALID           checked_at 없음 또는 파싱 불가
+RECONCILIATION_TIMESTAMP_TIMEZONE_MISSING  timezone 미표기
+RECONCILIATION_SNAPSHOT_STALE              TTL 초과
+RECONCILIATION_SNAPSHOT_FROM_FUTURE        허용 skew를 넘는 미래 timestamp
+RECONCILIATION_NOT_CLEAN                   clean=false 또는 mismatch_count>0
+RECONCILIATION_UNKNOWN_PRESENT             UNKNOWN 주문 존재
+RECONCILIATION_HALT_ACTIVE                 HALT 설정됨
+RECONCILIATION_FRESHNESS_CONFIG_INVALID    TTL/skew 환경변수 값 오류
 ```
 
 중간에 실패하면 `stop` + `disable`로 되돌린다. 종료 시 상태는 둘 중 하나뿐이다.

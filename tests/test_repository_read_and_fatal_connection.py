@@ -561,6 +561,18 @@ class TestEntrypointsFailStop:
             monkeypatch.setenv("KIS_LIVE_ORDER_ENABLED", "true")
             monkeypatch.setenv("LIVE_ROLLOUT_ENABLED", "true")
             monkeypatch.setenv("ENTRY_DISABLED", "false")
+        if entrypoint == "run_shadow_mode.py":
+            # Shadow refuses to evaluate against a stale/absent
+            # reconciliation snapshot, which would also short-circuit the
+            # fatal path this test is about. Give it a usable one.
+            import json
+            from datetime import datetime, timezone
+
+            snapshot = tmp_path / "RECONCILIATION.json"
+            snapshot.write_text(json.dumps({
+                "clean": True, "mismatch_count": 0,
+                "checked_at": datetime.now(timezone.utc).isoformat()}), encoding="utf-8")
+            monkeypatch.setenv("RECONCILIATION_STATE_FILE", str(snapshot))
         sys.path.insert(0, str(REPO_ROOT / "scripts"))
         try:
             import importlib

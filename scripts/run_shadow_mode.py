@@ -73,6 +73,7 @@ from market_data.kis_validation_provider import (  # noqa: E402
     KISValidationProvider,
     compute_price_deviation_percent,
 )
+from reconciliation import freshness  # noqa: E402
 from reconciliation import snapshot as reconciliation_snapshot  # noqa: E402
 from state_store import db as state_db  # noqa: E402
 
@@ -82,6 +83,11 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 
 EXIT_FATAL_DB = 4
+# The reconciliation snapshot this pass would have relied on is missing,
+# stale, from the future or unreadable. The service unit checks the same
+# thing in ExecStartPre; this covers a manual run, which does not go
+# through systemd at all.
+EXIT_STALE_RECONCILIATION = 5
 
 
 def _fail_stop(stage, exc):
@@ -523,6 +529,23 @@ def main(argv=None):
 
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     install_logging_redaction()
+
+    # Same module the service unit and the timer-approval script use, so
+    # a manual `python scripts/run_shadow_mode.py` cannot evaluate
+    # against an account reconciliation nobody has refreshed.
+    try:
+        snapshot = freshness.evaluate()
+    except freshness.SnapshotUnusable as exc:
+        logger.error(
+            "reconciliation snapshot refused: reason=%s detail=%s "
+            "shadow_run_suppressed=true", exc.reason_code, exc.detail,
+        )
+        return EXIT_STALE_RECONCILIATION
+    logger.info(
+        "reconciliation snapshot accepted: %s",
+        " ".join(f"{k}={v}" for k, v in snapshot.as_log_fields().items()),
+    )
+
     try:
         outcomes = run_once()
     except FatalRepositoryConnectionError as exc:

@@ -34,6 +34,11 @@ ProtectSystem=full
 ProtectHome=false
 ReadWritePaths=@TRADING_RELEASE_ROOT@ @TRADING_SHARED_ROOT@ @TRADING_LOG_DIR@
 ExecStartPre=@TRADING_RELEASE_ROOT@/venv/bin/python @TRADING_RELEASE_ROOT@/scripts/preflight_kis_live.py
+# Arming the timer once against a fresh reconciliation says nothing
+# about the state an hour later. Checked again before EVERY run, with
+# the same program and therefore the same TTL the approval used, so a
+# reconciler that stops after the timer is armed stops Shadow too.
+ExecStartPre=@TRADING_RELEASE_ROOT@/venv/bin/python @TRADING_RELEASE_ROOT@/scripts/check_reconciliation_freshness.py --purpose shadow-run
 ExecStart=@TRADING_RELEASE_ROOT@/venv/bin/python @TRADING_RELEASE_ROOT@/scripts/run_shadow_mode.py
 
 [Install]

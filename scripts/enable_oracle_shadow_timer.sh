@@ -31,6 +31,9 @@ ENV_DIR="${ENV_DIR:-/etc/us-stock-trading}"
 ENV_FILE="${ENV_FILE:-${ENV_DIR}/live-readonly.env}"
 SERVICE_USER="${SERVICE_USER:-ubuntu}"
 PYTHON_BIN="${PYTHON_BIN:-${RELEASE_DIR}/venv/bin/python}"
+# Which preflight program to run. Named, not skippable: there is no
+# value that turns the check off, and the default is the release's own.
+PREFLIGHT_SCRIPT="${PREFLIGHT_SCRIPT:-${RELEASE_DIR}/scripts/preflight_kis_live.py}"
 DRY_RUN="${DRY_RUN:-0}"
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
 
@@ -122,57 +125,21 @@ echo "shared state : ${state_mode} ${state_owner}"
 #    itself depend on: a fresh reconciliation snapshot, no UNKNOWN
 #    orders, no HALT.
 # ---------------------------------------------------------------------
-run "${PYTHON_BIN}" "${RELEASE_DIR}/scripts/preflight_kis_live.py"
+run "${PYTHON_BIN}" "${PREFLIGHT_SCRIPT}"
 
-if [ "${DRY_RUN}" != "1" ]; then
-    "${PYTHON_BIN}" - "${RELEASE_DIR}" <<'PYCHECK' || fail "operational preconditions not met."
-import json, os, sys
-sys.path.insert(0, sys.argv[1])
-problems = []
-
-snapshot_path = os.environ.get("RECONCILIATION_STATE_FILE", "")
-if not snapshot_path or not os.path.exists(snapshot_path):
-    problems.append("no reconciliation snapshot on disk")
-else:
-    try:
-        snapshot = json.load(open(snapshot_path))
-    except ValueError:
-        problems.append("reconciliation snapshot is not readable JSON")
-    else:
-        if not snapshot.get("clean", False):
-            problems.append(f"reconciliation is not clean: {snapshot.get('mismatch_count')}")
-        if not snapshot.get("checked_at"):
-            problems.append("reconciliation snapshot has no checked_at")
-
-try:
-    from state_store import db as state_db
-    conn = state_db.open_db()
-    try:
-        unknown = conn.execute(
-            "select count(*) from orders where status = 'UNKNOWN'").fetchone()[0]
-        if unknown:
-            problems.append(f"{unknown} UNKNOWN order(s) outstanding")
-    finally:
-        conn.close()
-except Exception as exc:                                    # noqa: BLE001
-    problems.append(f"could not read order state: {type(exc).__name__}")
-
-try:
-    from operations import kill_switch
-    if kill_switch.is_halted():
-        problems.append("HALT is set")
-except Exception as exc:                                    # noqa: BLE001
-    # kill_switch fails closed to "halted" on a corrupt state file, and
-    # that must not read as "fine" here either.
-    problems.append(f"could not read HALT state: {type(exc).__name__}")
-
-for problem in problems:
-    print(f"  - {problem}", file=sys.stderr)
-sys.exit(1 if problems else 0)
-PYCHECK
-    echo "preconditions: reconciliation clean, 0 UNKNOWN orders, HALT false"
-else
-    echo "DRY_RUN: would verify reconciliation snapshot, UNKNOWN orders and HALT"
+# The snapshot must be FRESH, not merely present. Codex armed the timer
+# with a 30-day-old clean snapshot because this step only checked that
+# `checked_at` existed. It is now the same program the Shadow service
+# runs before every single evaluation, so the TTL, the clock-skew
+# tolerance and the reason codes cannot drift between the two.
+#
+# Deliberately not an inline heredoc any more: a shell-embedded check is
+# invisible to the test suite (a stubbed PYTHON_BIN skips it entirely,
+# which is exactly how this defect survived), while a script is run and
+# tested like any other program.
+if ! "${PYTHON_BIN}" "${RELEASE_DIR}/scripts/check_reconciliation_freshness.py" \
+        --purpose shadow-timer-enable --require-unknown-zero --require-halt-clear; then
+    fail "reconciliation snapshot is not usable -- refusing to arm ${TARGET_TIMER}."
 fi
 
 # ---------------------------------------------------------------------
