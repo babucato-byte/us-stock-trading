@@ -300,6 +300,20 @@ def has_unknown_order(conn):
     return row is not None
 
 
+def count_unknown_orders(conn):
+    """How many orders are UNKNOWN, not merely whether any is.
+
+    The reconciliation snapshot records a COUNT, and a count derived from
+    a boolean would say "1" for any number of them -- which understates
+    exactly when it matters most.
+    """
+    row = _read(
+        conn, "SELECT COUNT(*) FROM kis_order_idempotency WHERE status = 'UNKNOWN'",
+        fetch="one",
+    )
+    return int(row[0]) if row else 0
+
+
 def list_orders_by_status(conn, statuses):
     """Every order attempt currently in one of `statuses` -- the internal
     side of reconciliation/snapshot.py's open-order comparison."""

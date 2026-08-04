@@ -608,17 +608,53 @@ HALT false
 #### reconciliation snapshot freshness (필수)
 
 snapshot이 **존재하고 clean한 것만으로는 부족하다.** 30일 된 clean snapshot으로 timer가
-활성화된 사례가 검증에서 재현됐다. 이제 다음을 모두 만족해야 한다.
+활성화된 사례, 그리고 `"clean": "false"`(문자열)가 truthy로 승인된 사례가 검증에서
+재현됐다. 이제 다음을 모두 만족해야 한다.
 
 ```text
 regular file (symlink·디렉터리·world-writable 거부)
 JSON object로 완전히 파싱됨 (부분 write는 거부)
-checked_at 존재 + ISO-8601 파싱 가능
+strict schema (아래) — 타입 강제 변환·암묵적 기본값 없음
 checked_at에 timezone 명시 (Z 또는 offset) — timezone 없으면 거부
 checked_at <= now + clock skew
 now - checked_at <= TTL
-clean = true, mismatch_count = 0
+clean = true, mismatch_count = 0, unknown_count = 0, halt = false
 ```
+
+#### snapshot strict schema (schema_version 1)
+
+```json
+{
+  "schema_version": 1,
+  "checked_at": "2026-08-05T00:00:00+00:00",
+  "clean": true,
+  "mismatch_count": 0,
+  "unknown_count": 0,
+  "halt": false
+}
+```
+
+여섯 필드 모두 **필수**이며 타입이 정확히 일치해야 한다.
+
+```text
+schema_version  integer, 정확히 1
+checked_at      string, timezone 포함 ISO-8601
+clean           boolean
+mismatch_count  integer >= 0
+unknown_count   integer >= 0
+halt            boolean
+```
+
+**강제 변환하지 않는다.** `"clean": "false"`는 문자열이므로 거부한다 — Python에서
+`bool("false")`는 `True`라 예전 reader가 이를 승인했다. `"mismatch_count": "0"`도
+거부하며, 필드가 없으면 0/false로 추정하지 않고 `RECONCILIATION_REQUIRED_FIELD_MISSING`으로
+차단한다. `mismatch_count: true`처럼 boolean을 정수 자리에 넣는 것도 거부한다
+(`isinstance(True, int)`가 참이므로 `type(x) is int`로 검사한다).
+
+**배포 후 reconciliation을 한 번 수동 실행해 새 schema snapshot을 생성해야 한다.**
+이전 schema의 snapshot은 `RECONCILIATION_REQUIRED_FIELD_MISSING`으로 거부된다 — 구버전을
+추정해서 읽지 않는다. `reconciliation_state.is_current_and_clean()`(주문 gate가 사용)도
+동일 schema를 적용하므로, 스키마 갱신 전에는 주문 gate도 fail-closed로 막힌다.
 
 ```env
 SHADOW_RECONCILIATION_MAX_AGE_SECONDS=900         # 기본 900초(15분), 상한 3600
@@ -663,7 +699,16 @@ RECONCILIATION_NOT_CLEAN                   clean=false 또는 mismatch_count>0
 RECONCILIATION_UNKNOWN_PRESENT             UNKNOWN 주문 존재
 RECONCILIATION_HALT_ACTIVE                 HALT 설정됨
 RECONCILIATION_FRESHNESS_CONFIG_INVALID    TTL/skew 환경변수 값 오류
+RECONCILIATION_SNAPSHOT_SCHEMA_INVALID     JSON object가 아님
+RECONCILIATION_REQUIRED_FIELD_MISSING      필수 필드 누락 (detail=field=<이름>)
+RECONCILIATION_FIELD_TYPE_INVALID          타입 불일치 (detail=field/expected/actual)
+RECONCILIATION_FIELD_VALUE_INVALID         값 범위 위반 (음수 count)
+RECONCILIATION_SCHEMA_VERSION_UNSUPPORTED  지원하지 않는 schema_version
 ```
+
+타입 오류(`*_FIELD_TYPE_INVALID`)와 안전 상태 차단(`RECONCILIATION_NOT_CLEAN` /
+`_UNKNOWN_PRESENT` / `_HALT_ACTIVE`)은 서로 다른 reason으로 구분된다 — 전자는 snapshot이
+잘못 쓰인 것이고 후자는 계좌 상태가 안전하지 않은 것이다.
 
 중간에 실패하면 `stop` + `disable`로 되돌린다. 종료 시 상태는 둘 중 하나뿐이다.
 

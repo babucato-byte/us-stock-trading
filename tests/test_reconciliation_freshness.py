@@ -34,16 +34,28 @@ def _clean_env(monkeypatch):
     yield
 
 
+_ABSENT = object()
+
+
 def write_snapshot(tmp_path, *, checked_at=NOW, clean=True, mismatch_count=0,
+                   unknown_count=0, halt=False, schema_version=1,
                    raw=None, name="RECONCILIATION.json"):
+    """Writes the strict schema. Pass `_ABSENT` for any field to leave it
+    out entirely -- there are no defaults on the reading side."""
     path = tmp_path / name
     if raw is not None:
         path.write_text(raw, encoding="utf-8")
         return path
-    payload = {"clean": clean, "mismatch_count": mismatch_count}
-    if checked_at is not None:
-        payload["checked_at"] = (checked_at.isoformat()
-                                 if isinstance(checked_at, datetime) else checked_at)
+    payload = {}
+    for field, value in (("schema_version", schema_version),
+                         ("checked_at", checked_at), ("clean", clean),
+                         ("mismatch_count", mismatch_count),
+                         ("unknown_count", unknown_count), ("halt", halt)):
+        if value is _ABSENT:
+            continue
+        if field == "checked_at" and isinstance(value, datetime):
+            value = value.isoformat()
+        payload[field] = value
     path.write_text(json.dumps(payload), encoding="utf-8")
     return path
 
@@ -72,7 +84,8 @@ class TestAFreshSnapshotIsAccepted:
     def test_the_log_fields_carry_the_numbers_and_nothing_else(self, tmp_path):
         fields = evaluate(write_snapshot(tmp_path)).as_log_fields()
         assert set(fields) == {"snapshot_age_seconds", "max_age_seconds",
-                               "future_skew_seconds", "clean", "mismatch_count"}
+                               "future_skew_seconds", "clean", "mismatch_count",
+                               "unknown_count", "halt"}
 
 
 # =====================================================================
@@ -182,19 +195,18 @@ class TestTimestampParsing:
 
     @pytest.mark.parametrize("value", [None, 12345, 1.5, True, [], {}])
     def test_non_string_values_are_refused(self, tmp_path, value):
-        path = tmp_path / "R.json"
-        path.write_text(json.dumps({"clean": True, "mismatch_count": 0,
-                                    "checked_at": value}), encoding="utf-8")
+        path = write_snapshot(tmp_path, checked_at=value)
         with pytest.raises(freshness.SnapshotUnusable) as excinfo:
             evaluate(path)
-        assert excinfo.value.reason_code == "RECONCILIATION_TIMESTAMP_INVALID"
+        assert excinfo.value.reason_code == "RECONCILIATION_FIELD_TYPE_INVALID"
+        assert "field=checked_at" in excinfo.value.detail
 
     def test_a_missing_checked_at_is_refused(self, tmp_path):
-        path = write_snapshot(tmp_path, checked_at=None)
+        path = write_snapshot(tmp_path, checked_at=_ABSENT)
         with pytest.raises(freshness.SnapshotUnusable) as excinfo:
             evaluate(path)
-        assert excinfo.value.reason_code == "RECONCILIATION_TIMESTAMP_INVALID"
-        assert excinfo.value.detail == "missing"
+        assert excinfo.value.reason_code == "RECONCILIATION_REQUIRED_FIELD_MISSING"
+        assert excinfo.value.detail == "field=checked_at"
 
 
 # =====================================================================
@@ -215,6 +227,16 @@ class TestCleanAloneIsNotEnough:
     def test_clean_but_unparseable_timestamp(self, tmp_path):
         with pytest.raises(freshness.SnapshotUnusable):
             evaluate(write_snapshot(tmp_path, checked_at="whenever"))
+
+    def test_clean_but_an_unknown_order_was_outstanding(self, tmp_path):
+        with pytest.raises(freshness.SnapshotUnusable) as e:
+            evaluate(write_snapshot(tmp_path, unknown_count=1))
+        assert e.value.reason_code == "RECONCILIATION_UNKNOWN_PRESENT"
+
+    def test_clean_but_halted(self, tmp_path):
+        with pytest.raises(freshness.SnapshotUnusable) as e:
+            evaluate(write_snapshot(tmp_path, halt=True))
+        assert e.value.reason_code == "RECONCILIATION_HALT_ACTIVE"
 
     def test_not_clean(self, tmp_path):
         with pytest.raises(freshness.SnapshotUnusable) as e:
@@ -276,7 +298,7 @@ class TestTheWriterIsAtomic:
         a good snapshot and left an unusable one."""
         target = tmp_path / "R.json"
         reconciliation_state.record_result(clean=True, mismatch_count=0, now=NOW,
-                                           path=target)
+                                           path=target, unknown_count=0, halt=False)
         original = target.read_text(encoding="utf-8")
 
         def _boom(*args, **kwargs):
@@ -285,25 +307,53 @@ class TestTheWriterIsAtomic:
         monkeypatch.setattr(reconciliation_state.os, "replace", _boom)
         with pytest.raises(reconciliation_state.ReconciliationStateError):
             reconciliation_state.record_result(clean=False, mismatch_count=9, now=NOW,
-                                               path=target)
+                                               path=target, unknown_count=0, halt=False)
         assert target.read_text(encoding="utf-8") == original
 
     def test_no_temp_file_survives_a_failed_write(self, tmp_path, monkeypatch):
         target = tmp_path / "R.json"
         reconciliation_state.record_result(clean=True, mismatch_count=0, now=NOW,
-                                           path=target)
+                                           path=target, unknown_count=0, halt=False)
         monkeypatch.setattr(reconciliation_state.os, "replace",
                             lambda *a, **k: (_ for _ in ()).throw(OSError("x")))
         with pytest.raises(reconciliation_state.ReconciliationStateError):
             reconciliation_state.record_result(clean=True, mismatch_count=0, now=NOW,
-                                               path=target)
+                                               path=target, unknown_count=0, halt=False)
         assert sorted(p.name for p in tmp_path.iterdir()) == ["R.json"]
 
     def test_the_written_snapshot_is_accepted_by_the_freshness_check(self, tmp_path):
         target = tmp_path / "R.json"
         reconciliation_state.record_result(clean=True, mismatch_count=0, now=NOW,
-                                           path=target)
+                                           path=target, unknown_count=0, halt=False)
         assert evaluate(target).clean is True
+
+    def test_the_writer_emits_every_required_field_with_the_right_type(self, tmp_path):
+        """Hardening the reader without the writer would block normal
+        operation entirely."""
+        target = tmp_path / "R.json"
+        reconciliation_state.record_result(clean=True, mismatch_count=0,
+                                           unknown_count=0, halt=False, now=NOW,
+                                           path=target)
+        payload = json.loads(target.read_text(encoding="utf-8"))
+        assert payload["schema_version"] == freshness.SCHEMA_VERSION
+        assert type(payload["schema_version"]) is int
+        assert type(payload["checked_at"]) is str and payload["checked_at"].endswith("+00:00")
+        assert type(payload["clean"]) is bool
+        assert type(payload["mismatch_count"]) is int
+        assert type(payload["unknown_count"]) is int
+        assert type(payload["halt"]) is bool
+        assert freshness.validate_schema(payload) is payload
+
+    @pytest.mark.parametrize("kwargs", [
+        {"clean": "true"}, {"clean": 1}, {"halt": "false"}, {"halt": 0},
+        {"mismatch_count": "0"}, {"mismatch_count": True}, {"unknown_count": "0"},
+        {"mismatch_count": -1}, {"unknown_count": -1},
+    ])
+    def test_the_writer_refuses_a_wrongly_typed_value(self, tmp_path, kwargs):
+        base = dict(clean=True, mismatch_count=0, unknown_count=0, halt=False)
+        base.update(kwargs)
+        with pytest.raises(reconciliation_state.ReconciliationStateError):
+            reconciliation_state.record_result(now=NOW, path=tmp_path / "R.json", **base)
 
     def test_a_naive_timestamp_no_longer_crashes_the_legacy_reader(self, tmp_path):
         """is_current_and_clean() used to raise TypeError out of a
@@ -435,3 +485,129 @@ class TestBothCallersUseTheSameCheck:
         assert "PYCHECK" not in source
         code = [l for l in source.splitlines() if not l.strip().startswith("#")]
         assert not [l for l in code if "checked_at" in l], code
+
+
+# =====================================================================
+# Strict schema -- the reported HIGH.
+# =====================================================================
+
+class TestStrictSchema:
+    """`bool("false")` is True and `int("0")` is 0, so a coercing reader
+    approved `{"clean": "false"}` and `{"mismatch_count": "0"}`. Nothing
+    is coerced now, and nothing is defaulted."""
+
+    def test_the_reported_string_false_is_refused(self, tmp_path):
+        with pytest.raises(freshness.SnapshotUnusable) as e:
+            evaluate(write_snapshot(tmp_path, clean="false"))
+        assert e.value.reason_code == "RECONCILIATION_FIELD_TYPE_INVALID"
+        assert "field=clean expected=boolean actual=string" in e.value.detail
+
+    def test_the_reported_string_zero_count_is_refused(self, tmp_path):
+        with pytest.raises(freshness.SnapshotUnusable) as e:
+            evaluate(write_snapshot(tmp_path, mismatch_count="0"))
+        assert e.value.reason_code == "RECONCILIATION_FIELD_TYPE_INVALID"
+        assert "field=mismatch_count expected=integer actual=string" in e.value.detail
+
+    def test_the_reported_missing_count_is_refused(self, tmp_path):
+        with pytest.raises(freshness.SnapshotUnusable) as e:
+            evaluate(write_snapshot(tmp_path, mismatch_count=_ABSENT))
+        assert e.value.reason_code == "RECONCILIATION_REQUIRED_FIELD_MISSING"
+        assert e.value.detail == "field=mismatch_count"
+
+    @pytest.mark.parametrize("value", ["true", "false", 1, 0, None, [], {}, 1.0])
+    def test_clean_accepts_only_a_json_boolean(self, tmp_path, value):
+        with pytest.raises(freshness.SnapshotUnusable) as e:
+            evaluate(write_snapshot(tmp_path, clean=value))
+        assert e.value.reason_code == "RECONCILIATION_FIELD_TYPE_INVALID"
+
+    @pytest.mark.parametrize("value", ["false", "true", 1, 0, None, [], {}])
+    def test_halt_accepts_only_a_json_boolean(self, tmp_path, value):
+        with pytest.raises(freshness.SnapshotUnusable) as e:
+            evaluate(write_snapshot(tmp_path, halt=value))
+        assert e.value.reason_code == "RECONCILIATION_FIELD_TYPE_INVALID"
+
+    @pytest.mark.parametrize("field", ["mismatch_count", "unknown_count"])
+    @pytest.mark.parametrize("value", ["0", "1", 0.0, 1.5, True, False, None, [], {}])
+    def test_counts_accept_only_a_json_integer(self, tmp_path, field, value):
+        with pytest.raises(freshness.SnapshotUnusable) as e:
+            evaluate(write_snapshot(tmp_path, **{field: value}))
+        assert e.value.reason_code == "RECONCILIATION_FIELD_TYPE_INVALID"
+        assert f"field={field}" in e.value.detail
+
+    @pytest.mark.parametrize("field", ["mismatch_count", "unknown_count"])
+    def test_a_negative_count_is_a_value_error_not_a_type_error(self, tmp_path, field):
+        with pytest.raises(freshness.SnapshotUnusable) as e:
+            evaluate(write_snapshot(tmp_path, **{field: -1}))
+        assert e.value.reason_code == "RECONCILIATION_FIELD_VALUE_INVALID"
+
+    def test_true_is_not_accepted_as_a_count(self, tmp_path):
+        """isinstance(True, int) is True in Python; type(x) is int is not."""
+        with pytest.raises(freshness.SnapshotUnusable) as e:
+            evaluate(write_snapshot(tmp_path, mismatch_count=True))
+        assert "actual=boolean" in e.value.detail
+
+    @pytest.mark.parametrize("field", ["schema_version", "checked_at", "clean",
+                                       "mismatch_count", "unknown_count", "halt"])
+    def test_every_required_field_must_be_present(self, tmp_path, field):
+        with pytest.raises(freshness.SnapshotUnusable) as e:
+            evaluate(write_snapshot(tmp_path, **{field: _ABSENT}))
+        assert e.value.reason_code == "RECONCILIATION_REQUIRED_FIELD_MISSING"
+        assert e.value.detail == f"field={field}"
+
+    @pytest.mark.parametrize("value", ["1", 1.0, True, None, 0, 2, 99])
+    def test_schema_version_must_be_exactly_the_supported_integer(self, tmp_path, value):
+        with pytest.raises(freshness.SnapshotUnusable) as e:
+            evaluate(write_snapshot(tmp_path, schema_version=value))
+        assert e.value.reason_code in ("RECONCILIATION_FIELD_TYPE_INVALID",
+                                       "RECONCILIATION_SCHEMA_VERSION_UNSUPPORTED")
+
+    def test_a_future_schema_version_is_refused(self, tmp_path):
+        with pytest.raises(freshness.SnapshotUnusable) as e:
+            evaluate(write_snapshot(tmp_path, schema_version=2))
+        assert e.value.reason_code == "RECONCILIATION_SCHEMA_VERSION_UNSUPPORTED"
+
+    def test_the_version_is_checked_before_the_other_fields(self, tmp_path):
+        """A different schema means these field rules are the wrong ones
+        to apply, so the version failure is the useful report."""
+        with pytest.raises(freshness.SnapshotUnusable) as e:
+            evaluate(write_snapshot(tmp_path, schema_version=2, clean="nonsense"))
+        assert e.value.reason_code == "RECONCILIATION_SCHEMA_VERSION_UNSUPPORTED"
+
+    def test_a_schema_fault_is_reported_before_staleness(self, tmp_path):
+        with pytest.raises(freshness.SnapshotUnusable) as e:
+            evaluate(write_snapshot(tmp_path, checked_at=NOW - timedelta(days=30),
+                                    clean="false"))
+        assert e.value.reason_code == "RECONCILIATION_FIELD_TYPE_INVALID"
+
+    def test_the_detail_never_carries_the_snapshot_body(self, tmp_path):
+        with pytest.raises(freshness.SnapshotUnusable) as e:
+            evaluate(write_snapshot(tmp_path, clean="false"))
+        assert "{" not in e.value.detail and "}" not in e.value.detail
+
+    def test_an_extra_unknown_field_is_tolerated(self, tmp_path):
+        """Strictness is about the fields that MATTER; refusing an added
+        field would make any future writer change a flag day."""
+        path = tmp_path / "R.json"
+        payload = json.loads(write_snapshot(tmp_path).read_text(encoding="utf-8"))
+        payload["account"] = "44xxxxxx"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        assert evaluate(path).clean is True
+
+    def test_the_legacy_reader_refuses_the_same_snapshots(self, tmp_path):
+        """is_current_and_clean() feeds the order gates; it must not
+        accept what the freshness gate rejects."""
+        for kwargs in ({"clean": "false"}, {"mismatch_count": "0"},
+                       {"mismatch_count": _ABSENT}, {"schema_version": _ABSENT},
+                       {"unknown_count": 1}, {"halt": True}):
+            path = write_snapshot(tmp_path, name=f"L{abs(hash(str(kwargs)))}.json",
+                                  **kwargs)
+            assert reconciliation_state.is_current_and_clean(
+                max_age_seconds=300, now=NOW, path=path) is False, kwargs
+
+    def test_the_legacy_reader_still_accepts_a_good_snapshot(self, tmp_path):
+        path = tmp_path / "ok.json"
+        reconciliation_state.record_result(clean=True, mismatch_count=0,
+                                           unknown_count=0, halt=False, now=NOW,
+                                           path=path)
+        assert reconciliation_state.is_current_and_clean(
+            max_age_seconds=300, now=NOW, path=path) is True

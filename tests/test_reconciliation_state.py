@@ -17,23 +17,23 @@ class TestIsCurrentAndClean:
         assert reconciliation_state.is_current_and_clean(max_age_seconds=300, now=NOW, path=state_path) is False
 
     def test_clean_and_fresh_result_passes(self, state_path):
-        reconciliation_state.record_result(clean=True, mismatch_count=0, now=NOW, path=state_path)
+        reconciliation_state.record_result(clean=True, mismatch_count=0, now=NOW, path=state_path, unknown_count=0, halt=False)
         assert reconciliation_state.is_current_and_clean(
             max_age_seconds=300, now=NOW + timedelta(seconds=10), path=state_path,
         ) is True
 
     def test_dirty_result_fails_closed(self, state_path):
-        reconciliation_state.record_result(clean=False, mismatch_count=1, now=NOW, path=state_path)
+        reconciliation_state.record_result(clean=False, mismatch_count=1, now=NOW, path=state_path, unknown_count=0, halt=False)
         assert reconciliation_state.is_current_and_clean(max_age_seconds=300, now=NOW, path=state_path) is False
 
     def test_stale_result_fails_closed(self, state_path):
-        reconciliation_state.record_result(clean=True, mismatch_count=0, now=NOW, path=state_path)
+        reconciliation_state.record_result(clean=True, mismatch_count=0, now=NOW, path=state_path, unknown_count=0, halt=False)
         assert reconciliation_state.is_current_and_clean(
             max_age_seconds=300, now=NOW + timedelta(seconds=301), path=state_path,
         ) is False
 
     def test_clock_moved_backwards_fails_closed(self, state_path):
-        reconciliation_state.record_result(clean=True, mismatch_count=0, now=NOW, path=state_path)
+        reconciliation_state.record_result(clean=True, mismatch_count=0, now=NOW, path=state_path, unknown_count=0, halt=False)
         assert reconciliation_state.is_current_and_clean(
             max_age_seconds=300, now=NOW - timedelta(seconds=10), path=state_path,
         ) is False
@@ -44,9 +44,10 @@ class TestIsCurrentAndClean:
         assert reconciliation_state.is_current_and_clean(max_age_seconds=300, now=NOW, path=state_path) is False
 
     def test_new_clean_result_overwrites_previous_dirty_result(self, state_path):
-        reconciliation_state.record_result(clean=False, mismatch_count=2, now=NOW, path=state_path)
+        reconciliation_state.record_result(clean=False, mismatch_count=2, now=NOW, path=state_path, unknown_count=0, halt=False)
         reconciliation_state.record_result(
-            clean=True, mismatch_count=0, now=NOW + timedelta(seconds=5), path=state_path,
+            clean=True, mismatch_count=0, unknown_count=0, halt=False,
+            now=NOW + timedelta(seconds=5), path=state_path,
         )
         assert reconciliation_state.is_current_and_clean(
             max_age_seconds=300, now=NOW + timedelta(seconds=10), path=state_path,
@@ -58,7 +59,7 @@ class TestGetLastResult:
         assert reconciliation_state.get_last_result(path=state_path) is None
 
     def test_returns_recorded_values(self, state_path):
-        reconciliation_state.record_result(clean=False, mismatch_count=3, now=NOW, path=state_path)
+        reconciliation_state.record_result(clean=False, mismatch_count=3, now=NOW, path=state_path, unknown_count=0, halt=False)
         record = reconciliation_state.get_last_result(path=state_path)
         assert record.clean is False
         assert record.mismatch_count == 3

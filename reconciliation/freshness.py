@@ -55,6 +55,30 @@ REASON_NOT_CLEAN = "RECONCILIATION_NOT_CLEAN"
 REASON_UNKNOWN_PRESENT = "RECONCILIATION_UNKNOWN_PRESENT"
 REASON_HALT_ACTIVE = "RECONCILIATION_HALT_ACTIVE"
 REASON_CONFIG_INVALID = "RECONCILIATION_FRESHNESS_CONFIG_INVALID"
+REASON_SCHEMA_INVALID = "RECONCILIATION_SNAPSHOT_SCHEMA_INVALID"
+REASON_REQUIRED_FIELD_MISSING = "RECONCILIATION_REQUIRED_FIELD_MISSING"
+REASON_FIELD_TYPE_INVALID = "RECONCILIATION_FIELD_TYPE_INVALID"
+REASON_FIELD_VALUE_INVALID = "RECONCILIATION_FIELD_VALUE_INVALID"
+REASON_SCHEMA_VERSION_UNSUPPORTED = "RECONCILIATION_SCHEMA_VERSION_UNSUPPORTED"
+
+# The only snapshot shape this code accepts. Bumping it is a deliberate
+# change on both sides: the writer stamps it and the reader refuses
+# anything else, so a snapshot written by an older release is rejected
+# rather than half-understood.
+SCHEMA_VERSION = 1
+
+# field -> exact type. EXACT: `isinstance(True, int)` is True in Python,
+# so an isinstance check would accept `{"mismatch_count": true}` as a
+# count. Every check below is `type(value) is expected`.
+REQUIRED_FIELDS = (
+    ("schema_version", int),
+    ("checked_at", str),
+    ("clean", bool),
+    ("mismatch_count", int),
+    ("unknown_count", int),
+    ("halt", bool),
+)
+NON_NEGATIVE_FIELDS = ("mismatch_count", "unknown_count")
 
 
 class SnapshotUnusable(Exception):
@@ -75,6 +99,8 @@ class Freshness:
     max_future_skew_seconds: int
     clean: bool
     mismatch_count: int
+    unknown_count: int
+    halt: bool
 
     def as_log_fields(self):
         """Exactly what an operator needs, and nothing that identifies an
@@ -85,7 +111,87 @@ class Freshness:
             "future_skew_seconds": self.max_future_skew_seconds,
             "clean": self.clean,
             "mismatch_count": self.mismatch_count,
+            "unknown_count": self.unknown_count,
+            "halt": self.halt,
         }
+
+
+def _json_type_name(value):
+    """What the field actually was, in JSON terms, for the log line."""
+    if value is None:
+        return "null"
+    if type(value) is bool:
+        return "boolean"
+    if type(value) is int:
+        return "integer"
+    if type(value) is float:
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return type(value).__name__
+
+
+_EXPECTED_NAME = {bool: "boolean", int: "integer", str: "string"}
+
+
+def validate_schema(data):
+    """Strict. No coercion, no defaults, no truthiness.
+
+    Codex got a snapshot with `"clean": "false"` and `"mismatch_count":
+    "0"` approved, because the reader did `bool(...)` and `int(...)` on
+    whatever was there -- and `bool("false")` is True. A missing
+    `mismatch_count` defaulted to 0, which reads as "no mismatches" when
+    it actually means "nobody said".
+
+    Returns the validated dict; raises SnapshotUnusable otherwise.
+    """
+    if not isinstance(data, dict):
+        raise SnapshotUnusable(
+            "the reconciliation snapshot is not a JSON object",
+            reason_code=REASON_SCHEMA_INVALID, detail=f"actual={_json_type_name(data)}")
+
+    # Version first: a different schema means the field checks below are
+    # not the right ones to apply.
+    if "schema_version" not in data:
+        raise SnapshotUnusable(
+            "the reconciliation snapshot has no schema_version",
+            reason_code=REASON_REQUIRED_FIELD_MISSING, detail="field=schema_version")
+    version = data["schema_version"]
+    if type(version) is not int:
+        raise SnapshotUnusable(
+            "schema_version is not an integer",
+            reason_code=REASON_FIELD_TYPE_INVALID,
+            detail=f"field=schema_version expected=integer actual={_json_type_name(version)}")
+    if version != SCHEMA_VERSION:
+        raise SnapshotUnusable(
+            f"unsupported reconciliation snapshot schema_version {version}",
+            reason_code=REASON_SCHEMA_VERSION_UNSUPPORTED,
+            detail=f"field=schema_version expected={SCHEMA_VERSION} actual={version}")
+
+    for field, expected in REQUIRED_FIELDS:
+        if field not in data:
+            raise SnapshotUnusable(
+                f"the reconciliation snapshot has no {field}",
+                reason_code=REASON_REQUIRED_FIELD_MISSING, detail=f"field={field}")
+        value = data[field]
+        if type(value) is not expected:
+            raise SnapshotUnusable(
+                f"{field} is not a JSON {_EXPECTED_NAME[expected]}",
+                reason_code=REASON_FIELD_TYPE_INVALID,
+                detail=(f"field={field} expected={_EXPECTED_NAME[expected]} "
+                        f"actual={_json_type_name(value)}"))
+
+    for field in NON_NEGATIVE_FIELDS:
+        if data[field] < 0:
+            raise SnapshotUnusable(
+                f"{field} is negative",
+                reason_code=REASON_FIELD_VALUE_INVALID,
+                detail=f"field={field} value_invalid=negative")
+    return data
 
 
 def _bounded_int_env(name, default, *, maximum):
@@ -230,8 +336,8 @@ def evaluate(*, path=None, now=None, require_unknown_zero=False,
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
 
-    data = _read_snapshot(target)
-    checked_at = _parse_checked_at(data.get("checked_at"))
+    data = validate_schema(_read_snapshot(target))
+    checked_at = _parse_checked_at(data["checked_at"])
     age = (current - checked_at).total_seconds()
 
     if age < -skew:
@@ -245,18 +351,27 @@ def evaluate(*, path=None, now=None, require_unknown_zero=False,
             reason_code=REASON_SNAPSHOT_STALE,
             detail=f"age={age:.0f}s max_age={limit}s")
 
-    clean = bool(data.get("clean", False))
-    try:
-        mismatch_count = int(data.get("mismatch_count", 0))
-    except (TypeError, ValueError):
-        raise SnapshotUnusable(
-            "mismatch_count is not a number",
-            reason_code=REASON_SNAPSHOT_INVALID, detail="mismatch_count")
-    if not clean or mismatch_count > 0:
+    # Types are already guaranteed exact, so these are state decisions,
+    # reported separately from a schema fault.
+    clean = data["clean"]
+    mismatch_count = data["mismatch_count"]
+    if clean is not True or mismatch_count > 0:
         raise SnapshotUnusable(
             f"the last reconciliation was not clean ({mismatch_count} mismatch(es))",
-            reason_code=REASON_NOT_CLEAN, detail=f"mismatch_count={mismatch_count}")
+            reason_code=REASON_NOT_CLEAN,
+            detail=f"clean={clean} mismatch_count={mismatch_count}")
+    if data["unknown_count"] > 0:
+        raise SnapshotUnusable(
+            f"{data['unknown_count']} order(s) were UNKNOWN at reconciliation",
+            reason_code=REASON_UNKNOWN_PRESENT,
+            detail=f"unknown_count={data['unknown_count']}")
+    if data["halt"] is not False:
+        raise SnapshotUnusable(
+            "HALT was set at reconciliation",
+            reason_code=REASON_HALT_ACTIVE, detail="snapshot_halt=true")
 
+    # The snapshot records the state at reconciliation time; these two
+    # re-read it NOW, which is stricter, not a substitute.
     if require_unknown_zero:
         _require_no_unknown_orders()
     if require_halt_clear:
@@ -266,7 +381,8 @@ def evaluate(*, path=None, now=None, require_unknown_zero=False,
     # than possible".
     return Freshness(checked_at=checked_at, age_seconds=max(age, 0.0),
                      max_age_seconds=limit, max_future_skew_seconds=skew,
-                     clean=clean, mismatch_count=mismatch_count)
+                     clean=clean, mismatch_count=mismatch_count,
+                     unknown_count=data["unknown_count"], halt=data["halt"])
 
 
 def _require_no_unknown_orders():

@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from reconciliation import freshness
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_STATE_FILE = BASE_DIR / "RECONCILIATION_STATE.json"
 # How stale a recorded reconciliation is allowed to be before the buy/sell
@@ -44,10 +46,18 @@ class ReconciliationRecord:
     clean: bool
     mismatch_count: int
     checked_at: datetime
+    unknown_count: int = 0
+    halt: bool = False
 
 
-def record_result(*, clean: bool, mismatch_count: int, now=None, path=None):
-    """Writes the snapshot ATOMICALLY.
+def record_result(*, clean: bool, mismatch_count: int, unknown_count: int,
+                  halt: bool, now=None, path=None):
+    """Writes the snapshot ATOMICALLY, in the strict schema.
+
+    `unknown_count` and `halt` are REQUIRED, not defaulted: a reader that
+    assumes "no unknowns, not halted" when nobody said so is assuming the
+    safe answer, which is the opposite of what a safety record is for.
+    The two production callers already know both.
 
     It used to truncate the file and write in place, so a crash or a
     concurrent read could observe a half-written document. A reader
@@ -60,8 +70,20 @@ def record_result(*, clean: bool, mismatch_count: int, now=None, path=None):
     current = now or datetime.now(timezone.utc)
     target = path or _resolve_state_path()
     target.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"clean": bool(clean), "mismatch_count": int(mismatch_count),
-               "checked_at": current.isoformat()}
+    if type(clean) is not bool or type(halt) is not bool:
+        raise ReconciliationStateError("clean and halt must be booleans")
+    if type(mismatch_count) is not int or type(unknown_count) is not int:
+        raise ReconciliationStateError("counts must be integers")
+    if mismatch_count < 0 or unknown_count < 0:
+        raise ReconciliationStateError("counts must not be negative")
+    payload = {
+        "schema_version": freshness.SCHEMA_VERSION,
+        "checked_at": current.isoformat(),
+        "clean": clean,
+        "mismatch_count": mismatch_count,
+        "unknown_count": unknown_count,
+        "halt": halt,
+    }
     temp_path = target.with_name(f".{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
         with open(temp_path, "w", encoding="utf-8") as fh:
@@ -93,7 +115,16 @@ def _load(path=None) -> Optional[ReconciliationRecord]:
     try:
         with open(target, encoding="utf-8") as fh:
             data = json.load(fh)
-        checked_at = datetime.fromisoformat(data["checked_at"])
+    except (OSError, ValueError):
+        return None
+    try:
+        # The SAME strict schema the freshness gate applies. A snapshot
+        # that gate would refuse must not read as usable here either --
+        # `bool("false")` is True, and that is exactly the coercion this
+        # avoids.
+        data = freshness.validate_schema(data)
+        checked_at = datetime.fromisoformat(
+            data["checked_at"].replace("Z", "+00:00").replace("z", "+00:00"))
         if checked_at.tzinfo is None or checked_at.tzinfo.utcoffset(checked_at) is None:
             # A naive timestamp used to reach is_current_and_clean() and
             # raise TypeError there, out of a fail-closed check and into
@@ -101,10 +132,11 @@ def _load(path=None) -> Optional[ReconciliationRecord]:
             # not definitively usable reads as "no current result".
             return None
         return ReconciliationRecord(
-            clean=bool(data["clean"]), mismatch_count=int(data["mismatch_count"]),
+            clean=data["clean"], mismatch_count=data["mismatch_count"],
+            unknown_count=data["unknown_count"], halt=data["halt"],
             checked_at=checked_at,
         )
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+    except (freshness.SnapshotUnusable, ValueError, KeyError, TypeError, AttributeError):
         return None
 
 
@@ -114,7 +146,9 @@ def is_current_and_clean(*, max_age_seconds, now=None, path=None) -> bool:
     record = _load(path=path)
     if record is None:
         return False
-    if not record.clean or record.mismatch_count > 0:
+    if record.clean is not True or record.mismatch_count > 0:
+        return False
+    if record.unknown_count > 0 or record.halt is not False:
         return False
     current = now or datetime.now(timezone.utc)
     age_seconds = (current - record.checked_at).total_seconds()

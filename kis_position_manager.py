@@ -216,9 +216,19 @@ def _reconcile_account_and_orders(*, kis_broker, conn, open_positions, kis_posit
     ]
     mismatches = reconcile_positions(internal_positions, kis_positions)
     still_unknown = idempotency.has_unknown_order(conn)
+    unknown_count = idempotency.count_unknown_orders(conn)
+    try:
+        from operations import kill_switch
+
+        halted = kill_switch.is_halted()
+    except Exception:                                 # noqa: BLE001
+        # kill_switch fails closed to "halted"; an unreadable state must
+        # be recorded as halted, never as clear.
+        halted = True
     reconciliation_state.record_result(
         clean=not mismatches and not still_unknown,
-        mismatch_count=len(mismatches) + (1 if still_unknown else 0), now=now,
+        mismatch_count=len(mismatches) + (1 if still_unknown else 0),
+        unknown_count=unknown_count, halt=halted, now=now,
     )
 
 

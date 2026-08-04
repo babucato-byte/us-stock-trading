@@ -32,7 +32,7 @@ def _isolate(tmp_path, monkeypatch):
     # kis_position_manager.sync_kis_fills_and_manage_exits()'s tick) --
     # seed a clean one so these tests exercise the buy path itself, not
     # the (separately, explicitly tested) reconciliation gate.
-    reconciliation_state.record_result(clean=True, mismatch_count=0, now=NOW)
+    reconciliation_state.record_result(clean=True, mismatch_count=0, now=NOW, unknown_count=0, halt=False)
     yield
 
 

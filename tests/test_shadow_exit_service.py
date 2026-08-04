@@ -342,7 +342,7 @@ class TestHealthAndMigrationEntrypoints:
         module = _load("run_health_report")
         from reconciliation import reconciliation_state
 
-        reconciliation_state.record_result(clean=True, mismatch_count=0, now=NOW)
+        reconciliation_state.record_result(clean=True, mismatch_count=0, now=NOW, unknown_count=0, halt=False)
         report = module.collect(now=NOW, check_live_unit=False)
         assert report["healthy"] is True, report["problems"]
         assert report["schema_version"] >= 9
@@ -353,7 +353,7 @@ class TestHealthAndMigrationEntrypoints:
         module = _load("run_health_report")
         from reconciliation import reconciliation_state
 
-        reconciliation_state.record_result(clean=True, mismatch_count=0, now=NOW)
+        reconciliation_state.record_result(clean=True, mismatch_count=0, now=NOW, unknown_count=0, halt=False)
         conn = state_db.open_db()
         register_and_drive(
             conn, internal_order_id="u-1", signal_id="u-1", symbol="AAPL", side="buy",
@@ -368,7 +368,7 @@ class TestHealthAndMigrationEntrypoints:
         module = _load("run_health_report")
         from reconciliation import reconciliation_state
 
-        reconciliation_state.record_result(clean=True, mismatch_count=0, now=NOW)
+        reconciliation_state.record_result(clean=True, mismatch_count=0, now=NOW, unknown_count=0, halt=False)
         shadow_audit.record_event(
             shadow_run_id="dangling", event_type=shadow_audit.SIGNAL_RECEIVED,
             result=shadow_audit.RESULT_INFO, now=NOW,

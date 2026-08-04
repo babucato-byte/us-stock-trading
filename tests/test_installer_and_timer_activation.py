@@ -183,12 +183,25 @@ def run_activator(sandbox, *, fresh_snapshot=True, **extra):
                           capture_output=True, text=True, timeout=300)
 
 
-def _write_snapshot(path, checked_at, *, clean=True, mismatch_count=0):
+_ABSENT = object()
+
+
+def _write_snapshot(path, checked_at, *, clean=True, mismatch_count=0,
+                    unknown_count=0, halt=False, schema_version=1):
+    """The strict schema. `_ABSENT` leaves a field out entirely."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"clean": clean, "mismatch_count": mismatch_count}
-    if checked_at is not None:
-        payload["checked_at"] = (checked_at.isoformat()
-                                 if isinstance(checked_at, datetime) else checked_at)
+    payload = {}
+    for field, value in (("schema_version", schema_version),
+                         ("checked_at", checked_at), ("clean", clean),
+                         ("mismatch_count", mismatch_count),
+                         ("unknown_count", unknown_count), ("halt", halt)):
+        if value is _ABSENT:
+            continue
+        if field == "checked_at" and isinstance(value, datetime):
+            value = value.isoformat()
+        if field == "checked_at" and value is None:
+            continue
+        payload[field] = value
     path.write_text(json.dumps(payload), encoding="utf-8")
     return path
 
@@ -632,7 +645,7 @@ class TestStaleReconciliationBlocksActivation:
         assert not [c for c in calls if c.startswith("start ")], calls
 
     @pytest.mark.parametrize("checked_at,expected", [
-        (None, "RECONCILIATION_TIMESTAMP_INVALID"),
+        (None, "RECONCILIATION_REQUIRED_FIELD_MISSING"),
         ("2026-08-04T15:00:00", "RECONCILIATION_TIMESTAMP_TIMEZONE_MISSING"),
         ("not-a-timestamp", "RECONCILIATION_TIMESTAMP_INVALID"),
     ])
@@ -732,3 +745,87 @@ class TestRuntimeFreshness:
         # No candidate was ever evaluated, so no shadow outcome was logged.
         assert "shadow " not in result.stderr.replace("shadow_run_suppressed", "")
         assert result.returncode == 5
+
+
+class TestStrictSchemaBlocksActivation:
+    """Every case reaches the schema check: approval, commit, flags, live
+    state, permissions and preflight all pass first, so nothing here is
+    blocked earlier by accident."""
+
+    def _install(self, sandbox):
+        assert run_installer(sandbox).returncode == 0
+
+    def _snapshot(self, sandbox):
+        return sandbox["shared"] / "state" / "RECONCILIATION.json"
+
+    def _attempt(self, sandbox, **snapshot_kwargs):
+        _write_snapshot(self._snapshot(sandbox), datetime.now(timezone.utc),
+                        **snapshot_kwargs)
+        before = len(systemctl_state(sandbox)["calls"])
+        result = run_activator(sandbox, ALLOW_SHADOW_TIMER_ENABLE="true",
+                               fresh_snapshot=False)
+        calls = systemctl_state(sandbox)["calls"][before:]
+        return result, calls
+
+    def test_control_the_strict_schema_is_reached_and_passes(self, sandbox):
+        self._install(sandbox)
+        result, _ = self._attempt(sandbox)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert systemctl_state(sandbox)["enabled"].get("us-stock-trading-shadow.timer")
+
+    @pytest.mark.parametrize("kwargs,reason", [
+        ({"clean": "false"}, "RECONCILIATION_FIELD_TYPE_INVALID"),
+        ({"clean": "true"}, "RECONCILIATION_FIELD_TYPE_INVALID"),
+        ({"mismatch_count": "0"}, "RECONCILIATION_FIELD_TYPE_INVALID"),
+        ({"mismatch_count": True}, "RECONCILIATION_FIELD_TYPE_INVALID"),
+        ({"mismatch_count": _ABSENT}, "RECONCILIATION_REQUIRED_FIELD_MISSING"),
+        ({"unknown_count": _ABSENT}, "RECONCILIATION_REQUIRED_FIELD_MISSING"),
+        ({"halt": _ABSENT}, "RECONCILIATION_REQUIRED_FIELD_MISSING"),
+        ({"schema_version": _ABSENT}, "RECONCILIATION_REQUIRED_FIELD_MISSING"),
+        ({"schema_version": "1"}, "RECONCILIATION_FIELD_TYPE_INVALID"),
+        ({"schema_version": 2}, "RECONCILIATION_SCHEMA_VERSION_UNSUPPORTED"),
+        ({"mismatch_count": -1}, "RECONCILIATION_FIELD_VALUE_INVALID"),
+    ])
+    def test_an_invalid_schema_never_arms_the_timer(self, sandbox, kwargs, reason):
+        self._install(sandbox)
+        result, calls = self._attempt(sandbox, **kwargs)
+        assert result.returncode == 1, result.stdout
+        assert reason in result.stdout + result.stderr
+        assert not [c for c in calls if c.startswith("enable ")], calls
+        assert not [c for c in calls if c.startswith("start ")], calls
+        state = systemctl_state(sandbox)
+        assert not state["enabled"].get("us-stock-trading-shadow.timer")
+        assert state["active"].get("us-stock-trading-shadow.timer", "inactive") != "active"
+
+    @pytest.mark.parametrize("kwargs,reason", [
+        ({"clean": False}, "RECONCILIATION_NOT_CLEAN"),
+        ({"mismatch_count": 1}, "RECONCILIATION_NOT_CLEAN"),
+        ({"unknown_count": 1}, "RECONCILIATION_UNKNOWN_PRESENT"),
+        ({"halt": True}, "RECONCILIATION_HALT_ACTIVE"),
+    ])
+    def test_a_valid_schema_with_an_unsafe_state_is_reported_separately(
+            self, sandbox, kwargs, reason):
+        """A type fault and an unsafe state are different problems and
+        must not be reported as the same thing."""
+        self._install(sandbox)
+        result, calls = self._attempt(sandbox, **kwargs)
+        assert result.returncode == 1
+        assert reason in result.stdout + result.stderr
+        assert "FIELD_TYPE_INVALID" not in result.stdout + result.stderr
+        assert not [c for c in calls if c.startswith("enable ")], calls
+
+    def test_the_runtime_path_refuses_the_same_snapshot(self, sandbox, tmp_path):
+        """Approval and ExecStartPre share one checker, so they cannot
+        disagree about what a valid snapshot is."""
+        snapshot = tmp_path / "R.json"
+        _write_snapshot(snapshot, datetime.now(timezone.utc), clean="false")
+        result = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "run_shadow_mode.py")],
+            env={**os.environ, "PYTHONPATH": str(REPO_ROOT),
+                 "RECONCILIATION_STATE_FILE": str(snapshot),
+                 "STATE_STORE_DB_FILE": str(tmp_path / "s.db"),
+                 "KIS_LIVE_ORDER_ENABLED": "false", "ENTRY_DISABLED": "true"},
+            capture_output=True, text=True, timeout=300)
+        assert result.returncode == 5
+        assert "RECONCILIATION_FIELD_TYPE_INVALID" in result.stderr
+        assert "shadow_run_suppressed=true" in result.stderr

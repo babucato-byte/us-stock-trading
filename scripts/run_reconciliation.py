@@ -139,8 +139,16 @@ def run_once(*, broker=None, now=None, conn=None, account_id=None):
             logger.error("reconciliation could not be performed: %s", exc)
             return {"status": "kis_unavailable", "resolved": resolved, "snapshot": None}
 
+        try:
+            from operations import kill_switch
+
+            halted = kill_switch.is_halted()
+        except Exception:                             # noqa: BLE001
+            halted = True                             # unreadable -> halted
         reconciliation_state.record_result(
-            clean=snapshot.is_clean(), mismatch_count=snapshot.mismatch_count(), now=current,
+            clean=snapshot.is_clean(), mismatch_count=snapshot.mismatch_count(),
+            unknown_count=idempotency.count_unknown_orders(conn), halt=halted,
+            now=current,
         )
         if not snapshot.is_clean():
             for line in snapshot.detail:

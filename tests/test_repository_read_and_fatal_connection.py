@@ -570,7 +570,8 @@ class TestEntrypointsFailStop:
 
             snapshot = tmp_path / "RECONCILIATION.json"
             snapshot.write_text(json.dumps({
-                "clean": True, "mismatch_count": 0,
+                "schema_version": 1, "clean": True, "mismatch_count": 0,
+                "unknown_count": 0, "halt": False,
                 "checked_at": datetime.now(timezone.utc).isoformat()}), encoding="utf-8")
             monkeypatch.setenv("RECONCILIATION_STATE_FILE", str(snapshot))
         sys.path.insert(0, str(REPO_ROOT / "scripts"))
