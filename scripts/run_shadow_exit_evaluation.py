@@ -108,22 +108,45 @@ class HaltStatusUnavailable(Exception):
     reason_code = "HALT_STATUS_UNAVAILABLE"
 
 
+class HaltStatusInvalid(HaltStatusUnavailable):
+    """kill_switch answered, but not with a boolean.
+
+    Separate from "could not read" because the operator action differs:
+    an exception points at the state file or the filesystem, while a
+    wrong type points at the code or a monkeypatched double.
+    """
+
+    reason_code = "HALT_STATUS_INVALID"
+
+
 def read_halt_state():
-    """The HALT state AT RUN TIME, read directly.
+    """The HALT state AT RUN TIME, read directly, and required to be an
+    actual boolean.
 
     Deliberately not taken from the reconciliation snapshot: that value
     describes the moment the reconciler ran, which may be minutes old,
     and an exit pass that acts on a stale HALT is acting on a fact nobody
-    has checked. `kill_switch.is_halted()` already fails closed to halted
-    on a corrupt state file; an exception here means we could not even
-    get that far.
+    has checked.
+
+    The result is NOT coerced. `bool(None)`, `bool(0)`, `bool([])` and
+    `bool({})` are all False, so a wrapper that returned "I do not know"
+    in any of those shapes would have read as "not halted" -- the single
+    most dangerous misreading available here. `kill_switch.is_halted()`
+    already fails closed to halted on a corrupt state file; an exception
+    means we could not get even that far.
     """
     try:
         from operations import kill_switch
 
-        return bool(kill_switch.is_halted())
+        value = kill_switch.is_halted()
     except Exception as exc:  # noqa: BLE001 -- unreadable is not "clear"
         raise HaltStatusUnavailable(str(exc)) from exc
+    # `type(...) is bool`, not isinstance: bool subclasses int, so an
+    # isinstance check would accept 0 and 1 as answers.
+    if type(value) is not bool:
+        raise HaltStatusInvalid(
+            f"kill_switch.is_halted() returned {type(value).__name__}, not a boolean")
+    return value
 
 
 def evaluate_position(*, position_id, record, broker, conn, exit_flags, now, eastern_now,
@@ -329,10 +352,13 @@ def main(argv=None):
     try:
         result = run_once()
     except HaltStatusUnavailable as exc:
+        # Only the classification and the type name -- never the value
+        # itself, which could be any object a caller handed back.
         logger.error(
-            "HALT state could not be read: reason=%s detail=%s "
+            "HALT state unusable: reason=%s actual_type=%s "
             "shadow_exit_suppressed=true transport_suppressed=true",
-            exc.reason_code, type(exc.__cause__).__name__ if exc.__cause__ else "unknown",
+            exc.reason_code,
+            type(exc.__cause__).__name__ if exc.__cause__ else "n/a",
         )
         return EXIT_HALT_UNAVAILABLE
     except FatalRepositoryConnectionError as exc:
