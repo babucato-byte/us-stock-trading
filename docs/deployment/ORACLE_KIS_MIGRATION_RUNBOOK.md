@@ -710,6 +710,74 @@ RECONCILIATION_SCHEMA_VERSION_UNSUPPORTED  지원하지 않는 schema_version
 `_UNKNOWN_PRESENT` / `_HALT_ACTIVE`)은 서로 다른 reason으로 구분된다 — 전자는 snapshot이
 잘못 쓰인 것이고 후자는 계좌 상태가 안전하지 않은 것이다.
 
+#### snapshot writer lifecycle과 commit-uncertain
+
+writer는 하나의 flock 안에서 다음 순서를 수행한다.
+
+```text
+lock -> stale temp scan/검증/정리 -> temp write -> file fsync -> chmod 0600
+     -> os.replace -> directory fsync -> unlock
+```
+
+`now`는 **timezone-aware만 허용**한다. naive datetime은
+`RECONCILIATION_TIMESTAMP_TIMEZONE_MISSING`으로 거부되며 기존 snapshot은 그대로 남는다
+(naive를 쓰면 reader가 반드시 거부할 snapshot이 만들어지므로 쓰기 자체를 막는다).
+`checked_at`은 UTC(`+00:00`)로 정규화해 기록한다.
+
+**replace 전 실패와 후 실패는 다르게 보고된다.**
+
+```text
+replace 전 (temp write / file fsync / replace 실패)
+  -> 기존 snapshot byte 동일, temp 제거, 일반 write 실패
+
+replace 후 (directory fsync 실패)
+  -> RECONCILIATION_SNAPSHOT_COMMIT_UNCERTAIN
+  -> 새 snapshot이 이미 보일 수 있으므로 "write 실패"라고 하지 않는다
+  -> 롤백하지 않는다 (커밋됐을 수도 있는 snapshot을 지우면 불확실이 손실로 바뀐다)
+  -> commit-uncertain marker 기록 + 운영 alert
+  -> freshness gate가 RECONCILIATION_SNAPSHOT_COMMIT_UNCERTAIN으로 차단
+  -> 다음 reconciliation이 전체 lifecycle을 완주하면 자동 해제
+```
+
+즉 **directory fsync가 실패한 뒤에는 reconciliation을 한 번 더 정상 완주시키기 전까지
+Shadow timer를 켤 수 없다.**
+
+stale temp는 `.{snapshot}.{pid}.{uuid}.tmp` 형식이며, 다음 정상 write가 lock을 쥔 채
+정리한다. dead PID의 정상 temp는 삭제하고, live PID temp·malformed 이름·symlink·디렉터리·
+FIFO는 **삭제하지 않고 write를 차단**한다(`RECONCILIATION_TEMP_ARTIFACT_INVALID`).
+정리 실패 시에도 write를 진행하지 않는다(`RECONCILIATION_STALE_TEMP_CLEANUP_FAILED`).
+
+### Shadow exit와 HALT
+
+`us-stock-trading-shadow-exit.service`는 **stale reconciliation snapshot으로는 차단하지
+않는다**(매도·청산 경로를 막으면 포지션이 갇힐 수 있다). 대신 실행 시점의 HALT를
+`kill_switch.is_halted()`로 **직접 조회**한다 — snapshot의 `halt` 필드는 reconciliation
+시점의 값이라 사용하지 않는다.
+
+```text
+kill_switch.is_halted()  <- 첫 broker 호출보다 먼저
+-> 포지션 조회 -> 가격/계좌 조회 -> 미체결·UNKNOWN 조회 -> exit 판단
+```
+
+HALT 조회가 실패하면 `HALT_STATUS_UNAVAILABLE`로 exit code 6, broker 호출 0, 주문·취소
+transport 0이다.
+
+HALT=true일 때의 정책은 exit 종류로 나뉜다.
+
+```text
+RISK_REDUCTION (STOP_LOSS, EOD_FORCED_CLOSE)
+  -> 계속 평가한다. HALT는 자동 실행을 멈추라는 것이지
+     보호 손절이 걸린 포지션을 방치하라는 뜻이 아니다.
+
+STRATEGY (TARGET_1, TARGET_2, TIME_STOP, TRAILING_BREAKEVEN, 그 밖의 모든 신규 사유)
+  -> BLOCKED / HALT_ACTIVE
+```
+
+분류는 whitelist다 — 나중에 추가되는 exit 사유는 자동으로 STRATEGY가 되므로, 새 규칙이
+조용히 halt 중 동작 권한을 얻지 못한다. 모든 실행은 `HALT_CHECKED` 이벤트를 남기고,
+차단 시 `EXIT_BLOCKED_HALT`를 남기며, 두 이벤트 모두 terminal이 아니므로 run당 terminal은
+정확히 1건을 유지한다. Shadow이므로 어느 경로에서도 실제 주문·취소 transport는 0이다.
+
 중간에 실패하면 `stop` + `disable`로 되돌린다. 종료 시 상태는 둘 중 하나뿐이다.
 
 ```text

@@ -60,6 +60,7 @@ REASON_REQUIRED_FIELD_MISSING = "RECONCILIATION_REQUIRED_FIELD_MISSING"
 REASON_FIELD_TYPE_INVALID = "RECONCILIATION_FIELD_TYPE_INVALID"
 REASON_FIELD_VALUE_INVALID = "RECONCILIATION_FIELD_VALUE_INVALID"
 REASON_SCHEMA_VERSION_UNSUPPORTED = "RECONCILIATION_SCHEMA_VERSION_UNSUPPORTED"
+REASON_COMMIT_UNCERTAIN = "RECONCILIATION_SNAPSHOT_COMMIT_UNCERTAIN"
 
 # The only snapshot shape this code accepts. Bumping it is a deliberate
 # change on both sides: the writer stamps it and the reader refuses
@@ -335,6 +336,18 @@ def evaluate(*, path=None, now=None, require_unknown_zero=False,
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
+
+    # A snapshot whose commit is not known to be durable cannot arm
+    # anything: os.replace() landed but the directory fsync did not, so
+    # what a reader sees now and what survives a power loss may differ.
+    # Cleared by the next reconciliation that completes the whole
+    # lifecycle.
+    from reconciliation import reconciliation_state
+
+    if reconciliation_state.commit_is_uncertain(target):
+        raise SnapshotUnusable(
+            "the last reconciliation snapshot commit is not known to be durable",
+            reason_code=REASON_COMMIT_UNCERTAIN, detail="commit_uncertain_marker")
 
     data = validate_schema(_read_snapshot(target))
     checked_at = _parse_checked_at(data["checked_at"])

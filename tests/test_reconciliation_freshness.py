@@ -319,7 +319,11 @@ class TestTheWriterIsAtomic:
         with pytest.raises(reconciliation_state.ReconciliationStateError):
             reconciliation_state.record_result(clean=True, mismatch_count=0, now=NOW,
                                                path=target, unknown_count=0, halt=False)
-        assert sorted(p.name for p in tmp_path.iterdir()) == ["R.json"]
+        # The writer's flock file is permanent infrastructure, like the
+        # limiter's; a leftover TEMP is what must not survive.
+        leftovers = sorted(p.name for p in tmp_path.iterdir()
+                           if not p.name.endswith(".writer.lock"))
+        assert leftovers == ["R.json"], leftovers
 
     def test_the_written_snapshot_is_accepted_by_the_freshness_check(self, tmp_path):
         target = tmp_path / "R.json"
