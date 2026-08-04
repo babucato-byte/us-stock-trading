@@ -51,22 +51,86 @@ REASON_LOCK_FAILED = "RECONCILIATION_WRITER_LOCK_FAILED"
 # told apart from a live one's.
 _TEMP_PATTERN = re.compile(r"\.(?P<state>.+)\.(?P<pid>\d+)\.(?P<uuid>[0-9a-f]{32})\.tmp")
 
-# Set when os.replace() succeeded but the directory fsync did not. The
-# new snapshot may be visible, and it may not survive a power loss --
-# both, until a later write completes the whole lifecycle.
-_COMMIT_UNCERTAIN = False
+MARKER_ABSENT = "ABSENT"
+MARKER_VALID = "VALID_MARKER"
+MARKER_INVALID = "INVALID_MARKER_ARTIFACT"
+REASON_MARKER_ARTIFACT_INVALID = "RECONCILIATION_MARKER_ARTIFACT_INVALID"
+REASON_LOCK_ARTIFACT_INVALID = "RECONCILIATION_LOCK_ARTIFACT_INVALID"
 
 
-def commit_is_uncertain(path=None):
-    """True while a snapshot's durability is unknown. Checked by the
-    freshness gate, so an uncertain commit cannot arm anything."""
-    if _COMMIT_UNCERTAIN:
-        return True
-    return _marker_path(path or _resolve_state_path()).exists()
+def _marker_name(target):
+    return f".{Path(target).name}.commit-uncertain"
 
 
 def _marker_path(target):
-    return Path(target).with_name(f".{Path(target).name}.commit-uncertain")
+    return Path(target).with_name(_marker_name(target))
+
+
+def _lock_name(target):
+    return f".{Path(target).name}.writer.lock"
+
+
+def _open_dir(directory):
+    return os.open(str(directory), os.O_RDONLY)
+
+
+def _classify_file_artifact(directory_fd, name):
+    """(state, detail) for a file this module owns, judged by lstat().
+
+    Never follows: a symlink here could point anywhere, and following one
+    would let an outside file be truncated, locked, or unlinked.
+    """
+    try:
+        info = os.lstat(name, dir_fd=directory_fd)
+    except FileNotFoundError:
+        return MARKER_ABSENT, None
+    except OSError as exc:
+        return MARKER_INVALID, type(exc).__name__
+    if stat.S_ISLNK(info.st_mode):
+        return MARKER_INVALID, "symlink"
+    if stat.S_ISDIR(info.st_mode):
+        return MARKER_INVALID, "directory"
+    if not stat.S_ISREG(info.st_mode):
+        return MARKER_INVALID, "non_regular_file"
+    if info.st_mode & stat.S_IWOTH:
+        return MARKER_INVALID, "world_writable"
+    if info.st_uid != os.getuid() and os.getuid() != 0:
+        return MARKER_INVALID, "unexpected_owner"
+    if info.st_nlink != 1:
+        # A hardlink to an inode outside this directory would make the
+        # file we act on not the file we validated.
+        return MARKER_INVALID, "unexpected_link_count"
+    return MARKER_VALID, None
+
+
+def marker_state(path=None):
+    """(state, detail) so a caller can tell "a crash happened" from
+    "someone put something odd in the state directory"."""
+    target = Path(path) if path else _resolve_state_path()
+    try:
+        directory_fd = _open_dir(target.parent)
+    except OSError as exc:
+        return MARKER_INVALID, type(exc).__name__
+    try:
+        return _classify_file_artifact(directory_fd, _marker_name(target))
+    finally:
+        os.close(directory_fd)
+
+
+def commit_is_uncertain(path=None):
+    """True while a snapshot's durability is unknown.
+
+    The marker is created and fsynced BEFORE the snapshot is replaced and
+    removed only after the replace has been made durable, so its presence
+    covers the whole window -- including a SIGKILL between os.replace()
+    and the directory fsync, which previously left no trace at all and
+    let the new snapshot be approved as fresh.
+
+    An unusable marker (symlink, directory, wrong owner, ...) counts as
+    uncertain too: it is never followed and never deleted.
+    """
+    state, _detail = marker_state(path)
+    return state != MARKER_ABSENT
 
 
 class ReconciliationStateError(Exception):
@@ -200,27 +264,119 @@ def _cleanup_stale_temps(target):
     return len(stale)
 
 
-def _clear_commit_uncertain(target):
-    global _COMMIT_UNCERTAIN
-    marker = _marker_path(target)
-    try:
-        marker.unlink()
-    except FileNotFoundError:
-        pass
-    except OSError:
+def _ensure_marker(directory_fd, target):
+    """Creates the intent marker and makes it durable BEFORE the replace.
+
+    Writing it after the replace could not close the crash window: a
+    SIGKILL in between left the new snapshot visible with nothing saying
+    its commit had never been synced.
+
+    An existing VALID marker is residue from an earlier attempt. It is
+    kept -- this call is the new reconciliation that clears it once the
+    whole lifecycle succeeds -- and never merely deleted, which would
+    approve a snapshot nobody re-derived. An INVALID one is fail-closed.
+    """
+    name = _marker_name(target)
+    state, detail = _classify_file_artifact(directory_fd, name)
+    if state == MARKER_INVALID:
+        raise ReconciliationStateError(
+            "the commit-uncertain marker is not a file this writer may use",
+            reason_code=REASON_MARKER_ARTIFACT_INVALID, detail=detail)
+    if state == MARKER_VALID:
+        logger.warning(
+            "a commit-uncertain marker from an earlier attempt is present; "
+            "this reconciliation must complete before anything is armed")
         return
-    _COMMIT_UNCERTAIN = False
 
-
-def _set_commit_uncertain(target):
-    global _COMMIT_UNCERTAIN
-    _COMMIT_UNCERTAIN = True
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        _marker_path(target).write_text("commit-uncertain\n", encoding="utf-8")
-    except OSError:
-        # The in-process flag still holds for this process; the marker is
-        # the cross-process half and its absence is reported, not hidden.
-        logger.error("could not persist the commit-uncertain marker")
+        fd = os.open(name, flags, 0o600, dir_fd=directory_fd)
+    except OSError as exc:
+        raise ReconciliationStateError(
+            "the commit-uncertain marker could not be created",
+            reason_code=REASON_MARKER_ARTIFACT_INVALID, detail=type(exc).__name__)
+    try:
+        os.write(fd, b"reconciliation write in progress\n")
+        os.fsync(fd)
+    except OSError as exc:
+        raise ReconciliationStateError(
+            "the commit-uncertain marker could not be synced",
+            reason_code=REASON_MARKER_ARTIFACT_INVALID, detail=type(exc).__name__)
+    finally:
+        os.close(fd)
+    # Durable before the replace, or the crash window reopens.
+    os.fsync(directory_fd)
+
+
+def _remove_marker(directory_fd, target):
+    """The LAST step, after the replace has been made durable.
+
+    Re-checks identity through the same directory descriptor: the entry
+    unlinked must be the regular file that was validated, not something
+    swapped in since.
+    """
+    name = _marker_name(target)
+    state, detail = _classify_file_artifact(directory_fd, name)
+    if state == MARKER_ABSENT:
+        return
+    if state == MARKER_INVALID:
+        raise ReconciliationStateError(
+            "the commit-uncertain marker changed into something unusable",
+            reason_code=REASON_MARKER_ARTIFACT_INVALID, detail=detail)
+    try:
+        os.unlink(name, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    except OSError as exc:
+        # Returning success here would tell an operator the write
+        # completed while the marker still blocks every gate.
+        raise ReconciliationStateError(
+            "the commit-uncertain marker could not be removed durably",
+            reason_code=REASON_MARKER_ARTIFACT_INVALID, detail=type(exc).__name__)
+
+
+def _open_writer_lock(directory_fd, target):
+    """Opens the flock file without ever following a symlink.
+
+    A symlinked lock path would have this writer locking some other
+    inode -- two writers could then hold "the lock" on different files
+    and write concurrently, which is the one thing the lock exists to
+    prevent. O_NOFOLLOW also turns "it became a symlink between the
+    lstat and the open" into an error rather than a follow.
+    """
+    name = _lock_name(target)
+    state, detail = _classify_file_artifact(directory_fd, name)
+    if state == MARKER_INVALID:
+        raise ReconciliationStateError(
+            "the writer lock is not a file this writer may use",
+            reason_code=REASON_LOCK_ARTIFACT_INVALID, detail=detail)
+
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    if state == MARKER_ABSENT:
+        flags |= os.O_CREAT | os.O_EXCL
+    try:
+        fd = os.open(name, flags, 0o600, dir_fd=directory_fd)
+    except OSError as exc:
+        raise ReconciliationStateError(
+            "the writer lock could not be opened safely",
+            reason_code=REASON_LOCK_ARTIFACT_INVALID, detail=type(exc).__name__)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ReconciliationStateError(
+                "the writer lock is not a regular file",
+                reason_code=REASON_LOCK_ARTIFACT_INVALID, detail="non_regular_file")
+        if info.st_nlink != 1:
+            raise ReconciliationStateError(
+                "the writer lock has more than one link",
+                reason_code=REASON_LOCK_ARTIFACT_INVALID, detail="unexpected_link_count")
+        if info.st_mode & stat.S_IWOTH:
+            raise ReconciliationStateError(
+                "the writer lock is world-writable",
+                reason_code=REASON_LOCK_ARTIFACT_INVALID, detail="world_writable")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 def record_result(*, clean: bool, mismatch_count: int, unknown_count: int,
@@ -274,81 +430,91 @@ def record_result(*, clean: bool, mismatch_count: int, unknown_count: int,
         "halt": halt,
     }
 
-    lock_path = target.with_name(f".{target.name}.writer.lock")
+    # One directory descriptor for the whole lifecycle: every lock,
+    # marker and unlink below is resolved relative to it, so no path
+    # component can be swapped underneath this writer.
     try:
-        lock_handle = open(lock_path, "a+")
+        directory_fd = _open_dir(target.parent)
     except OSError as exc:
         raise ReconciliationStateError(
-            "the snapshot writer lock could not be opened",
+            "the snapshot directory could not be opened",
             reason_code=REASON_LOCK_FAILED, detail=type(exc).__name__) from exc
 
     try:
+        lock_fd = _open_writer_lock(directory_fd, target)
         try:
-            fcntl.flock(lock_handle, fcntl.LOCK_EX)
-        except OSError as exc:
-            raise ReconciliationStateError(
-                "the snapshot writer lock could not be acquired",
-                reason_code=REASON_LOCK_FAILED, detail=type(exc).__name__) from exc
-
-        # Cleanup failure blocks the write: a directory this module
-        # cannot tidy is one it should not add to.
-        _cleanup_stale_temps(target)
-
-        temp_path = target.with_name(
-            f".{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-        try:
-            with open(temp_path, "w", encoding="utf-8") as fh:
-                json.dump(payload, fh)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.chmod(temp_path, 0o600)
-        except OSError as exc:
             try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
-            raise ReconciliationStateError(
-                f"failed to persist reconciliation result: {exc}") from exc
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            except OSError as exc:
+                raise ReconciliationStateError(
+                    "the snapshot writer lock could not be acquired",
+                    reason_code=REASON_LOCK_FAILED, detail=type(exc).__name__) from exc
 
-        try:
-            os.replace(temp_path, target)
-        except OSError as exc:
             try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
-            raise ReconciliationStateError(
-                f"failed to persist reconciliation result: {exc}") from exc
+                # Cleanup failure blocks the write: a directory this
+                # module cannot tidy is one it should not add to.
+                _cleanup_stale_temps(target)
 
-        # Past this point the new snapshot may already be what a reader
-        # sees. Only durability is still in question.
-        dir_fd = None
-        try:
-            dir_fd = os.open(str(target.parent), os.O_RDONLY)
-            os.fsync(dir_fd)
-        except OSError as exc:
-            _set_commit_uncertain(target)
-            _alert_commit_uncertain()
-            raise ReconciliationCommitUncertain(
-                "the reconciliation snapshot was replaced but its directory "
-                "entry could not be synced; the commit is not known to be durable",
-                reason_code=REASON_COMMIT_UNCERTAIN, detail=type(exc).__name__) from exc
-        finally:
-            if dir_fd is not None:
+                # BEFORE the replace, and durable. This is what makes a
+                # crash between os.replace() and the directory fsync
+                # visible afterwards.
+                _ensure_marker(directory_fd, target)
+
+                temp_name = f".{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+                temp_path = target.with_name(temp_name)
                 try:
-                    os.close(dir_fd)
+                    with open(temp_path, "w", encoding="utf-8") as fh:
+                        json.dump(payload, fh)
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    os.chmod(temp_path, 0o600)
+                except OSError as exc:
+                    try:
+                        os.unlink(temp_name, dir_fd=directory_fd)
+                    except OSError:
+                        pass
+                    raise ReconciliationStateError(
+                        f"failed to persist reconciliation result: {exc}") from exc
+
+                try:
+                    os.replace(temp_path, target)
+                except OSError as exc:
+                    try:
+                        os.unlink(temp_name, dir_fd=directory_fd)
+                    except OSError:
+                        pass
+                    raise ReconciliationStateError(
+                        f"failed to persist reconciliation result: {exc}") from exc
+
+                # Past this point the new snapshot may already be what a
+                # reader sees; only durability is still in question, and
+                # the marker already records that.
+                try:
+                    os.fsync(directory_fd)
+                except OSError as exc:
+                    _alert_commit_uncertain()
+                    raise ReconciliationCommitUncertain(
+                        "the reconciliation snapshot was replaced but its directory "
+                        "entry could not be synced; the commit is not known to be durable",
+                        reason_code=REASON_COMMIT_UNCERTAIN,
+                        detail=type(exc).__name__) from exc
+
+                # Only now: the snapshot is durable, so the intent it
+                # recorded is complete.
+                _remove_marker(directory_fd, target)
+            finally:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
                 except OSError:
                     pass
-
-        # A complete lifecycle is what clears an earlier uncertainty.
-        _clear_commit_uncertain(target)
+        finally:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
     finally:
         try:
-            fcntl.flock(lock_handle, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        try:
-            lock_handle.close()
+            os.close(directory_fd)
         except OSError:
             pass
 

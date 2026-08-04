@@ -422,14 +422,27 @@ class TestFailuresBeforeReplacePreserveTheSnapshot:
 
 class TestDirectoryFsyncFailureIsCommitUncertain:
     def _break_dir_fsync(self, monkeypatch):
-        real_open = os.open
+        """Fails the SNAPSHOT directory fsync only.
 
-        def _open(path, *args, **kwargs):
-            if Path(str(path)).is_dir():
-                raise OSError(errno.EIO, "no directory descriptor")
-            return real_open(path, *args, **kwargs)
+        The marker is created and fsynced before the replace now, so
+        breaking every directory fsync would fail the write before it
+        ever reached the interesting point.
+        """
+        real_fsync = os.fsync
+        seen = {"dir": 0}
 
-        monkeypatch.setattr(reconciliation_state.os, "open", _open)
+        def _fsync(fd):
+            try:
+                is_dir = stat.S_ISDIR(os.fstat(fd).st_mode)
+            except OSError:
+                is_dir = False
+            if is_dir:
+                seen["dir"] += 1
+                if seen["dir"] >= 2:        # 1 = marker, 2 = snapshot
+                    raise OSError(errno.EIO, "no directory sync")
+            return real_fsync(fd)
+
+        monkeypatch.setattr(reconciliation_state.os, "fsync", _fsync)
 
     def test_it_is_not_reported_as_a_failed_write(self, tmp_path, monkeypatch):
         """os.replace() already landed, so claiming the old snapshot is
@@ -454,6 +467,49 @@ class TestDirectoryFsyncFailureIsCommitUncertain:
                                                unknown_count=0, halt=False, now=NOW,
                                                path=target)
         assert target.exists(), "a possibly-committed snapshot was deleted"
+
+    def test_the_marker_exists_before_the_replace(self, tmp_path, monkeypatch):
+        """The crash window Codex found: a SIGKILL between os.replace()
+        and the directory fsync used to leave no trace at all."""
+        target = tmp_path / "R.json"
+        seen = {}
+        real_replace = os.replace
+
+        def _capture(src, dst):
+            seen["marker_at_replace"] = (
+                tmp_path / ".R.json.commit-uncertain").exists()
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(reconciliation_state.os, "replace", _capture)
+        reconciliation_state.record_result(clean=True, mismatch_count=0, unknown_count=0,
+                                           halt=False, now=NOW, path=target)
+        assert seen["marker_at_replace"] is True
+
+    def test_the_marker_is_removed_only_after_the_snapshot_is_durable(self, tmp_path,
+                                                                       monkeypatch):
+        order = []
+        real_fsync = os.fsync
+        real_unlink = os.unlink
+
+        def _fsync(fd):
+            try:
+                if stat.S_ISDIR(os.fstat(fd).st_mode):
+                    order.append("dir_fsync")
+            except OSError:
+                pass
+            return real_fsync(fd)
+
+        def _unlink(name, *args, **kwargs):
+            if str(name).endswith("commit-uncertain"):
+                order.append("marker_unlink")
+            return real_unlink(name, *args, **kwargs)
+
+        monkeypatch.setattr(reconciliation_state.os, "fsync", _fsync)
+        monkeypatch.setattr(reconciliation_state.os, "unlink", _unlink)
+        reconciliation_state.record_result(clean=True, mismatch_count=0, unknown_count=0,
+                                           halt=False, now=NOW, path=tmp_path / "R.json")
+        assert order.index("marker_unlink") > order.index("dir_fsync")
+        assert order[-1] == "dir_fsync", order
 
     def test_the_writer_is_marked_uncertain(self, tmp_path, monkeypatch):
         target = tmp_path / "R.json"
@@ -489,7 +545,9 @@ class TestDirectoryFsyncFailureIsCommitUncertain:
         assert reconciliation_state.commit_is_uncertain(target) is False
         assert freshness.evaluate(path=target, now=NOW).clean is True
 
-    def test_the_marker_survives_across_processes(self, tmp_path, monkeypatch):
+    def test_the_marker_is_on_disk_not_in_memory(self, tmp_path, monkeypatch):
+        """An in-process flag could never survive the SIGKILL this is
+        meant to cover."""
         target = tmp_path / "R.json"
         self._break_dir_fsync(monkeypatch)
         with pytest.raises(reconciliation_state.ReconciliationCommitUncertain):
@@ -497,7 +555,7 @@ class TestDirectoryFsyncFailureIsCommitUncertain:
                                                unknown_count=0, halt=False, now=NOW,
                                                path=target)
         monkeypatch.undo()
-        monkeypatch.setattr(reconciliation_state, "_COMMIT_UNCERTAIN", False)
+        assert (tmp_path / ".R.json.commit-uncertain").is_file()
         assert reconciliation_state.commit_is_uncertain(target) is True
 
 
@@ -649,11 +707,13 @@ class TestStaleTempRecovery:
     def test_the_cleanup_runs_inside_the_writer_lock(self):
         source = (REPO_ROOT / "reconciliation" / "reconciliation_state.py").read_text(
             encoding="utf-8")
-        lock_at = source.index("fcntl.flock(lock_handle, fcntl.LOCK_EX)")
+        lock_at = source.index("fcntl.flock(lock_fd, fcntl.LOCK_EX)")
         cleanup_at = source.index("_cleanup_stale_temps(target)", lock_at)
+        marker_at = source.index("_ensure_marker(directory_fd, target)", lock_at)
         replace_at = source.index("os.replace(temp_path, target)")
-        unlock_at = source.index("fcntl.flock(lock_handle, fcntl.LOCK_UN)")
-        assert lock_at < cleanup_at < replace_at < unlock_at
+        remove_at = source.index("_remove_marker(directory_fd, target)", replace_at)
+        unlock_at = source.index("fcntl.flock(lock_fd, fcntl.LOCK_UN)")
+        assert lock_at < cleanup_at < marker_at < replace_at < remove_at < unlock_at
 
 
 _CRASH_BEFORE_REPLACE = textwrap.dedent(
@@ -669,18 +729,27 @@ _CRASH_BEFORE_REPLACE = textwrap.dedent(
     """
 )
 
+# Dies on the SNAPSHOT directory fsync -- the second one, since the
+# marker's own fsync now comes first. That is the exact window Codex
+# reported: os.replace() has landed, durability is unconfirmed.
 _CRASH_AFTER_REPLACE = textwrap.dedent(
     """
-    import os, signal, sys
+    import os, signal, stat, sys
     sys.path.insert(0, sys.argv[1])
     from reconciliation import reconciliation_state
-    real_open = os.open
-    def _open(path, *a, **k):
-        import pathlib
-        if pathlib.Path(str(path)).is_dir():
-            os.kill(os.getpid(), signal.SIGKILL)
-        return real_open(path, *a, **k)
-    reconciliation_state.os.open = _open
+    real_fsync = os.fsync
+    seen = {"dir": 0}
+    def _fsync(fd):
+        try:
+            is_dir = stat.S_ISDIR(os.fstat(fd).st_mode)
+        except OSError:
+            is_dir = False
+        if is_dir:
+            seen["dir"] += 1
+            if seen["dir"] >= 2:
+                os.kill(os.getpid(), signal.SIGKILL)
+        return real_fsync(fd)
+    reconciliation_state.os.fsync = _fsync
     from datetime import datetime, timezone
     reconciliation_state.record_result(
         clean=False, mismatch_count=3, unknown_count=0, halt=False,
@@ -731,6 +800,12 @@ class TestRealSigkillRecovery:
         assert target.read_bytes() != old, "the replace did not land"
         assert json.loads(target.read_text(encoding="utf-8"))["mismatch_count"] == 3
         assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
+        # The reported HIGH: this window used to leave no trace, so the
+        # new snapshot was approved as fresh.
+        assert (tmp_path / ".R.json.commit-uncertain").exists()
+        with pytest.raises(freshness.SnapshotUnusable) as excinfo:
+            freshness.evaluate(path=target, now=NOW)
+        assert excinfo.value.reason_code == "RECONCILIATION_SNAPSHOT_COMMIT_UNCERTAIN"
 
     def test_a_later_write_restores_a_usable_snapshot(self, tmp_path):
         target = tmp_path / "R.json"
@@ -762,3 +837,344 @@ class TestWriterSchemaRegression:
         reconciliation_state.record_result(clean=True, mismatch_count=0, unknown_count=0,
                                            halt=False, now=NOW, path=target)
         assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+# =====================================================================
+# HALT must be an actual boolean.
+# =====================================================================
+
+class TestHaltResultIsStrictlyBoolean:
+    """`bool(None)`, `bool(0)`, `bool([])` and `bool({})` are all False,
+    so coercing the answer turned "I do not know" into "not halted" --
+    the single most dangerous misreading available here."""
+
+    def _with_result(self, monkeypatch, value):
+        from operations import kill_switch
+
+        monkeypatch.setattr(kill_switch, "is_halted", lambda: value)
+        return _exit_module()
+
+    @pytest.mark.parametrize("value", [False, True])
+    def test_a_real_boolean_is_returned_unchanged(self, exit_env, monkeypatch, value):
+        module = self._with_result(monkeypatch, value)
+        result = module.read_halt_state()
+        assert result is value
+        assert type(result) is bool
+
+    @pytest.mark.parametrize("value", [None, 0, 1, "", "false", "true",
+                                       [], {}, (), set(), 0.0, object()])
+    def test_a_non_boolean_is_refused(self, exit_env, monkeypatch, value):
+        module = self._with_result(monkeypatch, value)
+        with pytest.raises(module.HaltStatusInvalid) as excinfo:
+            module.read_halt_state()
+        assert excinfo.value.reason_code == "HALT_STATUS_INVALID"
+
+    @pytest.mark.parametrize("value", [0, 1])
+    def test_an_int_is_refused_despite_bool_subclassing_int(self, exit_env,
+                                                             monkeypatch, value):
+        module = self._with_result(monkeypatch, value)
+        with pytest.raises(module.HaltStatusInvalid):
+            module.read_halt_state()
+
+    def test_the_source_does_not_coerce(self):
+        source = (SCRIPTS_DIR / "run_shadow_exit_evaluation.py").read_text(encoding="utf-8")
+        assert "bool(kill_switch.is_halted())" not in source
+        assert "type(value) is not bool" in source
+
+    def test_an_exception_is_reported_separately_from_a_wrong_type(self, exit_env,
+                                                                    monkeypatch):
+        from operations import kill_switch
+
+        monkeypatch.setattr(kill_switch, "is_halted",
+                            lambda: (_ for _ in ()).throw(OSError("boom")))
+        module = _exit_module()
+        with pytest.raises(module.HaltStatusUnavailable) as excinfo:
+            module.read_halt_state()
+        assert excinfo.value.reason_code == "HALT_STATUS_UNAVAILABLE"
+        assert not isinstance(excinfo.value, module.HaltStatusInvalid)
+
+    @pytest.mark.parametrize("value", [None, 0, [], {}])
+    def test_no_broker_call_follows_an_invalid_result(self, exit_env, monkeypatch, value):
+        module = self._with_result(monkeypatch, value)
+        broker = _Broker()
+        with pytest.raises(module.HaltStatusInvalid):
+            module.run_once(broker=broker, now=NOW)
+        assert broker.calls == [], broker.calls
+
+    @pytest.mark.parametrize("value", [None, 0, [], {}])
+    def test_the_entrypoint_exits_non_zero(self, exit_env, monkeypatch, value):
+        module = self._with_result(monkeypatch, value)
+        assert module.main([]) == module.EXIT_HALT_UNAVAILABLE
+
+    def test_the_log_names_the_type_not_the_value(self, exit_env, monkeypatch, caplog):
+        module = self._with_result(monkeypatch, ["secret-ish"])
+        with caplog.at_level("ERROR"):
+            module.main([])
+        assert "HALT_STATUS_INVALID" in caplog.text
+        assert "secret-ish" not in caplog.text
+        assert "transport_suppressed=true" in caplog.text
+
+
+# =====================================================================
+# Marker and lock are symlink-safe.
+# =====================================================================
+
+def _marker(tmp_path, name="R.json"):
+    return tmp_path / f".{name}.commit-uncertain"
+
+
+def _lock(tmp_path, name="R.json"):
+    return tmp_path / f".{name}.writer.lock"
+
+
+def _write(tmp_path, target=None, **kwargs):
+    body = dict(clean=True, mismatch_count=0, unknown_count=0, halt=False, now=NOW)
+    body.update(kwargs)
+    return reconciliation_state.record_result(path=target or (tmp_path / "R.json"), **body)
+
+
+class TestMarkerIsSymlinkSafe:
+    def test_control_a_normal_write_creates_and_clears_the_marker(self, tmp_path):
+        _write(tmp_path)
+        assert not _marker(tmp_path).exists()
+        assert reconciliation_state.commit_is_uncertain(tmp_path / "R.json") is False
+
+    def test_a_symlinked_marker_is_never_followed(self, tmp_path):
+        outside = tmp_path.parent / "marker-precious.txt"
+        outside.write_text("do not touch", encoding="utf-8")
+        os.symlink(outside, _marker(tmp_path))
+        with pytest.raises(reconciliation_state.ReconciliationStateError) as excinfo:
+            _write(tmp_path)
+        assert excinfo.value.reason_code == "RECONCILIATION_MARKER_ARTIFACT_INVALID"
+        assert excinfo.value.detail == "symlink"
+        assert outside.read_text(encoding="utf-8") == "do not touch"
+        assert os.path.islink(_marker(tmp_path))
+        _marker(tmp_path).unlink()
+        outside.unlink()
+
+    def test_a_broken_symlinked_marker_is_refused(self, tmp_path):
+        os.symlink(tmp_path / "nothing-here", _marker(tmp_path))
+        with pytest.raises(reconciliation_state.ReconciliationStateError) as excinfo:
+            _write(tmp_path)
+        assert excinfo.value.detail == "symlink"
+        assert os.path.islink(_marker(tmp_path))
+        _marker(tmp_path).unlink()
+
+    def test_a_directory_marker_is_refused(self, tmp_path):
+        _marker(tmp_path).mkdir()
+        with pytest.raises(reconciliation_state.ReconciliationStateError) as excinfo:
+            _write(tmp_path)
+        assert excinfo.value.detail == "directory"
+        _marker(tmp_path).rmdir()
+
+    def test_a_fifo_marker_is_refused(self, tmp_path):
+        os.mkfifo(_marker(tmp_path))
+        with pytest.raises(reconciliation_state.ReconciliationStateError) as excinfo:
+            _write(tmp_path)
+        assert excinfo.value.detail == "non_regular_file"
+        _marker(tmp_path).unlink()
+
+    def test_a_world_writable_marker_is_refused(self, tmp_path):
+        _marker(tmp_path).write_text("x", encoding="utf-8")
+        _marker(tmp_path).chmod(0o666)
+        with pytest.raises(reconciliation_state.ReconciliationStateError) as excinfo:
+            _write(tmp_path)
+        assert excinfo.value.detail == "world_writable"
+
+    def test_a_hardlinked_marker_is_refused(self, tmp_path):
+        real = tmp_path / "elsewhere.txt"
+        real.write_text("x", encoding="utf-8")
+        os.link(real, _marker(tmp_path))
+        with pytest.raises(reconciliation_state.ReconciliationStateError) as excinfo:
+            _write(tmp_path)
+        assert excinfo.value.detail == "unexpected_link_count"
+
+    def test_an_invalid_marker_blocks_the_freshness_gate_too(self, tmp_path):
+        target = tmp_path / "R.json"
+        _write(tmp_path)
+        os.symlink(tmp_path / "nothing", _marker(tmp_path))
+        with pytest.raises(freshness.SnapshotUnusable) as excinfo:
+            freshness.evaluate(path=target, now=NOW)
+        assert excinfo.value.reason_code == "RECONCILIATION_SNAPSHOT_COMMIT_UNCERTAIN"
+        _marker(tmp_path).unlink()
+
+    def test_the_marker_is_created_exclusively(self):
+        source = (REPO_ROOT / "reconciliation" / "reconciliation_state.py").read_text(
+            encoding="utf-8")
+        assert "os.O_CREAT | os.O_EXCL | os.O_WRONLY" in source
+        assert 'getattr(os, "O_NOFOLLOW", 0)' in source
+        assert 'open(marker_path, "w")' not in source
+
+    def test_an_existing_valid_marker_is_not_overwritten(self, tmp_path):
+        """A residue marker means an earlier attempt died; this write is
+        the new reconciliation that clears it, not a truncation of it."""
+        marker = _marker(tmp_path)
+        marker.write_text("earlier attempt\n", encoding="utf-8")
+        before = marker.read_bytes()
+        seen = {}
+        real_replace = os.replace
+
+        def _capture(src, dst):
+            seen["marker"] = marker.read_bytes() if marker.exists() else None
+            return real_replace(src, dst)
+
+        original = reconciliation_state.os.replace
+        reconciliation_state.os.replace = _capture
+        try:
+            _write(tmp_path)
+        finally:
+            reconciliation_state.os.replace = original
+        assert seen["marker"] == before, "the existing marker was rewritten"
+        assert not marker.exists(), "a completed write must clear it"
+
+    def test_another_snapshots_marker_is_untouched(self, tmp_path):
+        theirs = tmp_path / ".OTHER.json.commit-uncertain"
+        theirs.write_text("theirs", encoding="utf-8")
+        _write(tmp_path)
+        assert theirs.read_text(encoding="utf-8") == "theirs"
+
+
+class TestWriterLockIsSymlinkSafe:
+    def test_control_the_lock_is_a_plain_file(self, tmp_path):
+        _write(tmp_path)
+        info = os.lstat(_lock(tmp_path))
+        assert stat.S_ISREG(info.st_mode)
+        assert stat.S_IMODE(info.st_mode) == 0o600
+        assert info.st_nlink == 1
+
+    def test_a_symlinked_lock_is_never_followed(self, tmp_path):
+        outside = tmp_path.parent / "lock-precious.txt"
+        outside.write_text("do not lock me", encoding="utf-8")
+        os.symlink(outside, _lock(tmp_path))
+        with pytest.raises(reconciliation_state.ReconciliationStateError) as excinfo:
+            _write(tmp_path)
+        assert excinfo.value.reason_code == "RECONCILIATION_LOCK_ARTIFACT_INVALID"
+        assert excinfo.value.detail == "symlink"
+        assert outside.read_text(encoding="utf-8") == "do not lock me"
+        assert not (tmp_path / "R.json").exists(), "a snapshot was written anyway"
+        _lock(tmp_path).unlink()
+        outside.unlink()
+
+    def test_a_broken_symlinked_lock_is_refused(self, tmp_path):
+        os.symlink(tmp_path / "nothing-here", _lock(tmp_path))
+        with pytest.raises(reconciliation_state.ReconciliationStateError) as excinfo:
+            _write(tmp_path)
+        assert excinfo.value.detail == "symlink"
+        _lock(tmp_path).unlink()
+
+    def test_a_directory_lock_is_refused(self, tmp_path):
+        _lock(tmp_path).mkdir()
+        with pytest.raises(reconciliation_state.ReconciliationStateError) as excinfo:
+            _write(tmp_path)
+        assert excinfo.value.detail == "directory"
+        _lock(tmp_path).rmdir()
+
+    def test_a_world_writable_lock_is_refused(self, tmp_path):
+        _lock(tmp_path).write_text("", encoding="utf-8")
+        _lock(tmp_path).chmod(0o666)
+        with pytest.raises(reconciliation_state.ReconciliationStateError) as excinfo:
+            _write(tmp_path)
+        assert excinfo.value.detail == "world_writable"
+
+    def test_a_hardlinked_lock_is_refused(self, tmp_path):
+        """An outside inode hardlinked in would mean two writers locking
+        different files while both believe they hold the lock."""
+        real = tmp_path / "elsewhere.lock"
+        real.write_text("", encoding="utf-8")
+        os.link(real, _lock(tmp_path))
+        with pytest.raises(reconciliation_state.ReconciliationStateError) as excinfo:
+            _write(tmp_path)
+        assert excinfo.value.detail == "unexpected_link_count"
+
+    def test_a_lock_swapped_for_a_symlink_after_the_check_is_refused(self, tmp_path,
+                                                                      monkeypatch):
+        """TOCTOU: O_NOFOLLOW turns the swap into an error rather than a
+        follow."""
+        outside = tmp_path.parent / "lock-toctou.txt"
+        outside.write_text("intact", encoding="utf-8")
+        lock = _lock(tmp_path)
+        lock.write_text("", encoding="utf-8")
+
+        real_lstat = os.lstat
+        swapped = []
+
+        def _lstat(name, *args, **kwargs):
+            info = real_lstat(name, *args, **kwargs)
+            if str(name).endswith(".writer.lock") and not swapped:
+                swapped.append(True)
+                lock.unlink()
+                os.symlink(outside, lock)
+            return info
+
+        monkeypatch.setattr(reconciliation_state.os, "lstat", _lstat)
+        with pytest.raises(reconciliation_state.ReconciliationStateError) as excinfo:
+            _write(tmp_path)
+        assert excinfo.value.reason_code == "RECONCILIATION_LOCK_ARTIFACT_INVALID"
+        assert outside.read_text(encoding="utf-8") == "intact"
+        assert os.path.islink(lock)
+        lock.unlink()
+        outside.unlink()
+
+    def test_the_lock_open_uses_a_directory_descriptor(self):
+        source = (REPO_ROOT / "reconciliation" / "reconciliation_state.py").read_text(
+            encoding="utf-8")
+        assert "os.open(name, flags, 0o600, dir_fd=directory_fd)" in source
+        assert 'open(lock_path, "a+")' not in source
+
+    def test_another_snapshots_lock_is_untouched(self, tmp_path):
+        theirs = tmp_path / ".OTHER.json.writer.lock"
+        theirs.write_text("theirs", encoding="utf-8")
+        _write(tmp_path)
+        assert theirs.read_text(encoding="utf-8") == "theirs"
+
+
+class TestMarkerRemovalFailures:
+    def test_an_unremovable_marker_is_not_reported_as_success(self, tmp_path,
+                                                               monkeypatch):
+        real_unlink = os.unlink
+
+        def _unlink(name, *args, **kwargs):
+            if str(name).endswith("commit-uncertain"):
+                raise OSError(errno.EACCES, "denied")
+            return real_unlink(name, *args, **kwargs)
+
+        monkeypatch.setattr(reconciliation_state.os, "unlink", _unlink)
+        with pytest.raises(reconciliation_state.ReconciliationStateError) as excinfo:
+            _write(tmp_path)
+        assert excinfo.value.reason_code == "RECONCILIATION_MARKER_ARTIFACT_INVALID"
+        assert _marker(tmp_path).exists()
+        monkeypatch.undo()
+        with pytest.raises(freshness.SnapshotUnusable):
+            freshness.evaluate(path=tmp_path / "R.json", now=NOW)
+
+    def test_a_failed_marker_fsync_after_removal_blocks_too(self, tmp_path, monkeypatch):
+        real_fsync = os.fsync
+        seen = {"dir": 0}
+
+        def _fsync(fd):
+            try:
+                is_dir = stat.S_ISDIR(os.fstat(fd).st_mode)
+            except OSError:
+                is_dir = False
+            if is_dir:
+                seen["dir"] += 1
+                if seen["dir"] >= 3:       # marker, snapshot, then removal
+                    raise OSError(errno.EIO, "no sync")
+            return real_fsync(fd)
+
+        monkeypatch.setattr(reconciliation_state.os, "fsync", _fsync)
+        with pytest.raises(reconciliation_state.ReconciliationStateError) as excinfo:
+            _write(tmp_path)
+        assert excinfo.value.reason_code == "RECONCILIATION_MARKER_ARTIFACT_INVALID"
+
+    def test_recovery_requires_a_new_reconciliation_not_a_marker_delete(self, tmp_path):
+        """Deleting the marker alone would approve a snapshot nobody
+        re-derived."""
+        target = tmp_path / "R.json"
+        _write(tmp_path, clean=True, mismatch_count=0)
+        _marker(tmp_path).write_text("residue\n", encoding="utf-8")
+        with pytest.raises(freshness.SnapshotUnusable):
+            freshness.evaluate(path=target, now=NOW)
+        _write(tmp_path, clean=True, mismatch_count=0)
+        assert not _marker(tmp_path).exists()
+        assert freshness.evaluate(path=target, now=NOW).clean is True

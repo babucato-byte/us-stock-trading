@@ -322,7 +322,7 @@ class TestTheWriterIsAtomic:
         # The writer's flock file is permanent infrastructure, like the
         # limiter's; a leftover TEMP is what must not survive.
         leftovers = sorted(p.name for p in tmp_path.iterdir()
-                           if not p.name.endswith(".writer.lock"))
+                           if not p.name.endswith((".writer.lock", ".commit-uncertain")))
         assert leftovers == ["R.json"], leftovers
 
     def test_the_written_snapshot_is_accepted_by_the_freshness_check(self, tmp_path):

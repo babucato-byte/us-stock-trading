@@ -724,6 +724,27 @@ lock -> stale temp scan/검증/정리 -> temp write -> file fsync -> chmod 0600
 (naive를 쓰면 reader가 반드시 거부할 snapshot이 만들어지므로 쓰기 자체를 막는다).
 `checked_at`은 UTC(`+00:00`)로 정규화해 기록한다.
 
+**commit-uncertain marker는 replace보다 먼저 durable하게 만들어진다.**
+
+```text
+lock -> stale temp 정리
+     -> marker 생성 (O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW, 0600) + file fsync + dir fsync
+     -> temp write -> file fsync -> chmod
+     -> os.replace
+     -> snapshot dir fsync
+     -> marker unlink -> dir fsync
+```
+
+marker를 replace 이후에 만들면 `os.replace`와 directory fsync 사이의 SIGKILL 창을 막을 수
+없다 — 그 사이에 죽으면 새 snapshot은 보이는데 durability를 의심할 근거가 아무것도 남지
+않아 fresh로 승인된다. 실제 SIGKILL을 6개 지점(marker dir fsync 전/후, temp fsync 후
+replace 전, replace 직후, snapshot dir fsync 후 marker unlink 전, marker unlink 후 dir
+fsync 전)에서 넣어 확인했고, marker가 남는 5개 지점은 모두 gate가 차단하며 마지막
+지점은 snapshot이 durable한 상태다. 모든 지점이 다음 정상 reconciliation으로 복구된다.
+
+**marker가 있으면 snapshot 내용이 fresh하고 clean이어도 차단한다.** marker만 지우고
+승인하면 안 되며, 반드시 새 reconciliation을 완주시켜야 한다.
+
 **replace 전 실패와 후 실패는 다르게 보고된다.**
 
 ```text
@@ -742,6 +763,13 @@ replace 후 (directory fsync 실패)
 즉 **directory fsync가 실패한 뒤에는 reconciliation을 한 번 더 정상 완주시키기 전까지
 Shadow timer를 켤 수 없다.**
 
+marker(`.{snapshot}.commit-uncertain`)와 writer lock(`.{snapshot}.writer.lock`)은 모두
+**symlink를 따라가지 않는다.** 열기 전에 `lstat()`으로 검사하고 `dir_fd` + `O_NOFOLLOW`로
+연다. symlink·broken symlink·디렉터리·FIFO·world-writable·소유자 불일치·`st_nlink != 1`은
+전부 fail-closed이며 삭제하거나 target에 쓰지 않는다. lock이 symlink면 writer가 엉뚱한
+inode를 잠그게 되어 두 writer가 동시에 쓸 수 있으므로 특히 중요하다. 다른 snapshot의
+marker·lock(`.OTHER.json.*`)은 건드리지 않는다.
+
 stale temp는 `.{snapshot}.{pid}.{uuid}.tmp` 형식이며, 다음 정상 write가 lock을 쥔 채
 정리한다. dead PID의 정상 temp는 삭제하고, live PID temp·malformed 이름·symlink·디렉터리·
 FIFO는 **삭제하지 않고 write를 차단**한다(`RECONCILIATION_TEMP_ARTIFACT_INVALID`).
@@ -759,8 +787,13 @@ kill_switch.is_halted()  <- 첫 broker 호출보다 먼저
 -> 포지션 조회 -> 가격/계좌 조회 -> 미체결·UNKNOWN 조회 -> exit 판단
 ```
 
-HALT 조회가 실패하면 `HALT_STATUS_UNAVAILABLE`로 exit code 6, broker 호출 0, 주문·취소
-transport 0이다.
+HALT 조회가 실패하면 `HALT_STATUS_UNAVAILABLE`, 결과가 boolean이 아니면
+`HALT_STATUS_INVALID`로 각각 exit code 6, broker 호출 0, 주문·취소 transport 0이다.
+
+**결과를 `bool()`로 변환하지 않는다.** Python에서 `bool(None)`·`bool(0)`·`bool([])`·
+`bool({})`가 모두 False라, 변환하면 "모르겠다"가 "halt 아님"으로 읽힌다 — 여기서 가능한
+가장 위험한 오독이다. `type(value) is bool`로 검사하며(`isinstance`는 bool이 int의
+subclass라 0/1을 통과시킨다), 로그에는 값이 아니라 `actual_type`만 남긴다.
 
 HALT=true일 때의 정책은 exit 종류로 나뉜다.
 
