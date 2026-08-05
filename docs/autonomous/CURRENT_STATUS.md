@@ -1,6 +1,31 @@
 # CURRENT_STATUS
 
-마지막 갱신: 2026-07-31
+마지막 갱신: 2026-08-06
+
+## 자율 사이클 2026-08-06 — T1 독립 재검증 **PASS**
+
+`AUTOPILOT.md` 계약에 따른 첫 사이클. BACKLOG T1(Codex HIGH 3건 수정 커밋 독립 재검증)을
+Planner→Implementer→Verifier 순으로 처리했다. 상세: `AUTOPILOT_REVIEW_2026-08-06.md`.
+
+- 검증 대상: `8c30e6c`(HALT exact bool) · `e57b250`(marker before-replace + symlink 안전성) ·
+  `96e9236`(inode identity + exact mode). 브랜치 `feature/kis-live-broker`.
+- 기존 테스트 통과를 근거로 삼지 않고, 프로덕션 코드를 직접 호출하는 **독립 probe**를 저장소 밖
+  임시 디렉터리에서 새로 작성해 해제 조건 1~5를 전부 재현했다.
+  - HALT: 비-bool 13종 + 조회 예외 1종 → 전부 exit 6, broker 호출 0
+  - durable marker: 실제 SIGKILL(replace 직후·directory fsync 직전) → marker 잔존,
+    `freshness`·승인 게이트 차단, 다음 정상 reconciliation으로만 해제
+  - artifact: symlink/broken symlink/디렉터리/FIFO/hardlink/비-0600 mode 전건 fail-closed,
+    lock의 regular→regular swap은 `RECONCILIATION_WRITER_LOCK_CHANGED`로 차단
+- 회귀 보강(테스트만, 프로덕션 코드 변경 없음): marker mode matrix 확장, marker "자동 보정·삭제
+  없음" 계약, 그리고 marker unlink의 **닫을 수 없는 잔여 창구**를 고정하는 신규 테스트 클래스.
+- 잔여(신규 위험 아님, `96e9236` 커밋 메시지가 이미 공개): POSIX에 inode 지정 unlink가 없어
+  검증 `lstat`과 `unlink` 사이 간격은 제거 불가. `shared/state`가 0700 owner-only이고 unlink는
+  snapshot durable 이후에만 도달하므로 잘못된 clean 판정을 만들 수 없다. 운영자용 설명을
+  `ORACLE_KIS_MIGRATION_RUNBOOK.md`에 추가했다.
+- 전체 회귀: netguard(자식 프로세스 포함) 하에 3,069 tests 수집, 전건 통과, 외부 socket 0.
+
+**다음**: T2(origin push, ready로 승격). T3(Oracle 재검증 + Shadow 타이머 배포 준비)는 서버 접근이
+필요해 `blocked:needs-user` 유지 — **Shadow timer 활성화 불가, 실주문 활성화 금지**는 그대로다.
 
 ## 현재 Phase
 **Alpaca 데이터 전용 / KIS 실거래 브로커 전환 — 매수·매도 전체 경로 구현 완료

@@ -1,209 +1,182 @@
-# CODEX_REVIEW — KIS Limiter Artifact Validation 최종 독립 재검증
-
-## 검증 대상
-
-이전 판정과 테스트 결과를 재사용하지 않고 다음 정확한 HEAD를 검증했다.
+# HALT Strict Type · Durable Marker · Symlink-Safe Lock 최종 독립 재검증
 
 ```text
-$ git branch --show-current
+git branch --show-current
 feature/kis-live-broker
 
-$ git rev-parse HEAD
-904b9ed75f45f17bcfd8950f5fe40333eb8a5f8a
+git rev-parse HEAD
+e57b2508dd1e6ca3fa6be0ac479d2c68d4a9f668
 
-$ git status --short
+git status --short
  M docs/autonomous/CODEX_REVIEW.md
 
-$ git diff --check
-(no output — pass)
+git diff --check
+(output 없음, exit 0)
 
-$ git show --stat --oneline HEAD
-904b9ed Fail closed on invalid KIS limiter temp artifacts
- brokers/kis_rate_limiter.py               | 427 ++++++++++++++++----
- tests/test_limiter_artifact_validation.py | 634 ++++++++++++++++++++++++++++++
- tests/test_limiter_stale_temp_recovery.py |  71 +++-
- 3 files changed, 1042 insertions(+), 90 deletions(-)
+git show --stat --oneline e57b2508dd1e6ca3fa6be0ac479d2c68d4a9f668
+e57b250 Persist reconciliation intent before replacing snapshots, symlink-safely
+4 files changed, 725 insertions(+), 110 deletions(-)
 ```
-
-branch와 exact HEAD가 일치하고 코드·테스트 비커밋 변경은 없었다. 기존 보고서 변경만 허용했다.
-독립 수집 결과는 `2636 tests collected in 2.97s`였다.
 
 ## 최종 판정
 
-```text
-Overall verdict: PASS_WITH_CONDITIONS
-신규 CRITICAL/HIGH/MEDIUM: 0
-Oracle 배포: 아직 허용하지 않음
-Shadow timer: Oracle 재검증 전 비활성
-실주문/실계좌 취소: 활성화 금지
-```
+**BLOCKED**
 
-malformed own-prefix artifact와 symlink/non-regular artifact의 transport 허용 결함은 해결됐다. artifact
-validation, crash recovery, atomic limiter lifecycle, 부분체결 및 기존 Finding 회귀에서 차단사항을
-발견하지 않았다. 남은 조건은 Oracle 실응답, 실제 shared-state 권한과 Ubuntu systemd 검증이다.
+HALT exact type, durable intent marker, symlink/broken-symlink 차단, replace 직후 SIGKILL recovery는
+해결됐다. 그러나 지시된 regular-file TOCTOU를 production code가 방어하지 않아 신규 HIGH 2건이 독립
+probe에서 재현됐다. 기존 writer lock mode도 exact 0600이 아니어도 승인되는 MEDIUM 1건이 있다.
+Shadow timer와 실주문 활성화를 허용하지 않는다.
 
-## namespace 판정과 filename fullmatch
+## Findings
 
-state `KIS_API_RATE_LIMIT_STATE.json`의 own namespace는 suffix가 아니라 다음 prefix로 수집한다.
+### HIGH — writer lock regular→regular TOCTOU가 inode 재검증 없이 승인됨
 
-```text
-.KIS_API_RATE_LIMIT_STATE.json.
-```
+`reconciliation/reconciliation_state.py::_open_writer_lock()`은 open 전 lstat 분류와 open 후 fstat의
+regular/nlink/world-writable 검사를 수행하지만, 지시된 lstat/fstat `st_dev`·`st_ino` 일치 검사가 없다.
+`O_NOFOLLOW`는 symlink 교체만 막고 다른 regular inode로의 교체는 막지 못한다.
 
-후보를 수집한 뒤 정규식 `fullmatch()`로 다음 전체 형식만 허용한다.
+독립 race probe:
 
 ```text
-.{state_filename}.{numeric_pid}.{32-lowercase-hex-uuid}.tmp
+lstat(.R.json.writer.lock) -> 기존 0600 regular inode 반환
+open 직전 lock path를 다른 0600 regular inode로 교체
+O_NOFOLLOW open -> 성공
+writer flock 및 snapshot write -> 성공 반환
+교체된 lock content = "replacement"
 ```
 
-독립 production probe 결과:
+검증한 inode와 실제 flock inode가 다르다. 공격자가 교체 타이밍마다 다른 inode를 제공하면 writer들이
+서로 다른 파일을 잠가 mutual exclusion이 깨질 수 있다. 제공 테스트는 regular→symlink 교체만 다뤄
+이 race를 놓친다. lstat 결과와 fstat의 device/inode를 비교하고 불일치 시 artifact를 보존한 채
+`RECONCILIATION_LOCK_ARTIFACT_INVALID`로 차단해야 한다.
 
-| artifact | 결과 | transport |
-|---|---|---:|
-| `.temp` suffix | `KIS_RATE_LIMIT_TEMP_ARTIFACT_INVALID` | 0 |
-| nonnumeric PID | artifact-invalid | 0 |
-| invalid UUID | artifact-invalid | 0 |
-| uppercase UUID | artifact-invalid | 0 |
-| `.tmp.extra` | artifact-invalid | 0 |
-| `.tmp.` | artifact-invalid | 0 |
-| trailing newline/space | artifact-invalid | 0 |
+### HIGH — marker unlink regular→regular TOCTOU가 교체 inode를 삭제하고 성공 반환
 
-invalid artifact는 삭제하지 않고 operator alert를 발생시키며 limiter instance를 invalidated로 만든다.
-같은 instance의 다음 `wait()`는 state scan/sleep/transport 없이
-`KIS_RATE_LIMIT_LIMITER_INVALIDATED`로 즉시 실패했다.
+`_remove_marker()`는 `_classify_file_artifact()`로 marker를 lstat한 뒤 곧바로 dir-fd 상대 unlink한다.
+검증한 inode와 unlink 직전 inode/device/type의 동일성을 재확인하지 않는다.
 
-## symlink와 non-regular file
-
-artifact type은 PID 검사보다 먼저 `os.lstat()`로 판정하며 target을 follow하지 않는다.
-
-| type | detail/reason | 삭제 | target 변경 | transport |
-|---|---|---:|---:|---:|
-| valid-name symlink | `symlink` / artifact-invalid | 0 | 0 | 0 |
-| broken symlink | `symlink` / artifact-invalid | 0 | n/a | 0 |
-| live-PID symlink | `symlink` / artifact-invalid | 0 | 0 | 0 |
-| dead-PID symlink | `symlink` / artifact-invalid | 0 | 0 | 0 |
-| directory | `non_regular_file` | 0 | n/a | 0 |
-| FIFO | `non_regular_file` | 0 | n/a | 0 |
-| Unix socket | `non_regular_file` | 0 | n/a | 0 |
-
-독립 broker probe에서 모든 fault의 session call은 0이었다.
-
-## cross-category와 mixed artifacts
-
-각 limiter는 exact state filename namespace만 검사한다. READ validator는 TOKEN/ORDER/CANCEL state temp와
-일반 사용자 tmp를 삭제하거나 차단하지 않으며, TOKEN validator는 TOKEN own-prefix malformed artifact에서
-독립적으로 차단된다. dotted-prefix state 이름도 완전 match의 state group을 비교해 다른 state 소유로
-분리한다.
-
-valid stale temp, malformed artifact와 symlink를 동시에 둔 mixed probe는 전체 scan과 validation을 먼저
-끝낸 뒤 invalid에서 차단했다. stale temp의 부분 cleanup은 실행되지 않았고 세 artifact 및 외부 target이
-그대로 유지됐다. invalid를 제거한 다음 새 limiter run에서 valid stale만 정상 cleanup했다.
-
-## scan failure
-
-| fault | reason | broker session calls |
-|---|---|---:|
-| directory iteration PermissionError | `KIS_RATE_LIMIT_ARTIFACT_SCAN_FAILED` | 0 |
-| directory iteration OSError | scan failed | 0 |
-| lstat PermissionError | scan failed | 0 |
-| lstat OSError | scan failed | 0 |
-
-FileNotFoundError로 scan 중 사라진 entry는 실제로 남은 artifact가 없으므로 정상 진행한다. 그 외 scan
-실패를 “artifact 없음”으로 간주하는 경로는 발견하지 않았다.
-
-## TOCTOU 방어
-
-전체 namespace scan 후 stale cleanup은 해당 directory fd를 열고 각 entry를
-`os.lstat(name, dir_fd=...)`로 다시 확인한다. 최초 scan과 비교해 type, `st_dev`, `st_ino` 중 하나라도
-변하면 `detail=type_changed`, artifact-invalid, limiter invalidation과 transport 0으로 끝난다.
-
-regular stale temp를 cleanup 직전에 symlink 또는 다른 inode의 regular file로 교체한 fault에서 교체된
-entry는 unlink되지 않았고 외부 target과 replacement 내용이 보존됐다. 실제 unlink도 pathname 전체가
-아니라 `os.unlink(name, dir_fd=dir_fd)`를 사용한다.
-
-## broker 실제 경로
-
-깨끗한 state directory의 production broker read 대조군은 다음 세 session 호출까지 도달했다.
+독립 race probe:
 
 ```text
-OVRS_EXCG_CD = NASD, NYSE, AMEX
-session calls = 3
+marker lstat -> 원래 valid marker
+unlink 직전 marker를 다른 0600 regular "PRECIOUS" inode로 교체
+os.unlink(marker, dir_fd=...) -> 교체 inode 삭제
+directory fsync -> 성공
+writer -> 성공 반환
+PRECIOUS 존재=false, marker 존재=false
 ```
 
-동일 경로에 malformed, symlink, non-regular 또는 scan failure를 주입하면 limiter 예외가 첫 transport
-전에 전파되어 session calls는 0이었다. 단순 limiter 단위 결과가 아니라 실제 3거래소 broker 호출부를
-통해 확인했다.
+지시된 marker unlink TOCTOU 계약은 교체 감지, 삭제 0, fail-closed 유지다. 현재는 검증하지 않은 inode를
+삭제하고 uncertainty를 해제한다. unlink 직전 lstat와 초기 검증 inode를 비교하거나 rename-safe한
+identity protocol이 필요하다.
 
-## 정상 stale cleanup과 실제 SIGKILL
+### MEDIUM — 기존 writer lock mode를 exact 0600으로 강제하지 않음
 
-실제 subprocess가 temp JSON write, flush, file fsync 후 `os.replace` 직전에 SIGKILL되도록 했다.
+artifact 검사는 world-writable bit만 거부한다. 독립 mode matrix:
 
 ```text
-child return = -9
-committed state = byte-for-byte unchanged, valid JSON
-crash 직후 valid stale temp = 1
-다음 정상 limiter 실행 후 stale temp = 0
-state/reservation = valid
+0600 -> ACCEPT
+0640 -> ACCEPT
+0660 -> ACCEPT
+0644 -> ACCEPT
+0666 -> REJECT(world_writable)
 ```
 
-정상 stale artifact 강화가 valid dead-PID recovery를 차단하지 않는다. 기본 Policy B(age 0)는 즉시
-삭제하고 parent directory를 fsync한다. 양수 Policy A는 wall-clock `wall_now - st_mtime`으로 age 미달을
-보존하고 age 초과를 삭제한다. monotonic clock은 file age 계산에 사용하지 않는다.
+지시된 lock 계약은 mode 0600이다. group-writable/readable 및 world-readable lock을 승인하면 안 된다.
+open 전 lstat와 open 후 fstat 양쪽에서 `stat.S_IMODE(mode) == 0o600`을 확인해야 한다.
 
-valid regular temp의 실제 live PID는 stale로 오인해 삭제하지 않고
-`KIS_RATE_LIMIT_TEMP_ARTIFACT_LIVE`로 현재 cycle을 차단한다. transient live verdict는 limiter를 영구
-invalidated하지 않아 owner가 사라지거나 artifact가 제거된 뒤 같은 instance가 재시도할 수 있다.
+## HALT strict type
 
-## atomic lifecycle와 다중 process pacing
-
-다음 기존 limiter 보장을 재검증했다.
+`read_halt_state()`는 첫 broker/account/positions/open-orders 조회 전에
+`kill_switch.is_halted()`를 직접 호출하고 `type(value) is bool`을 적용한다. raw matrix 독립 probe:
 
 ```text
-unlock/close failure → transport 0, invalidation
-persistence failure → transport 0
-same-directory temp write → flush → file fsync → chmod 0600
-os.replace → parent directory fsync
-replace 전 failure → old state byte preserved
-replace 후 fsync failure → complete new JSON, transport 0
-atomic reader/writer → empty/truncated/partial/wrong-type observations 0
+False -> False
+True -> True
+None, 0, 1, 0.0, 1.0, "", "false", "true",
+[], {}, (), set(), object() -> HALT_STATUS_INVALID
+조회 예외 -> HALT_STATUS_UNAVAILABLE
 ```
 
-실제 subprocess 4개의 1초 shared pacing은 모두 성공하고 총 3초 이상 직렬화됐다. state JSON은 완전했고
-temp collision/leak, deadlock과 permanent lock은 0이었다.
+invalid/unavailable은 entrypoint exit 6, broker/order/cancel transport 0이다. HALT=false는 TARGET_2 등
+전략 exit 평가를 계속한다. HALT=true에서 TARGET_1/TARGET_2/TIME_STOP/TRAILING_BREAKEVEN은
+HALT_ACTIVE로 차단되고 STOP_LOSS/EOD_FORCED_CLOSE만 RISK_REDUCTION으로 계속 평가한다. 신규 reason
+기본값은 STRATEGY다. HALT_CHECKED/EXIT_BLOCKED_HALT는 non-terminal이며 run당 terminal은 정확히 1이다.
 
-## partial fill 및 기존 Finding 회귀
+## Marker 및 lock symlink 안전성
+
+정상 생성은 dir-fd, `O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW`, 0600, file fsync, directory fsync를
+사용한다. lock도 dir-fd와 `O_RDWR|O_NOFOLLOW`, 신규 시 `O_CREAT|O_EXCL`, 0600을 사용한다.
+
+독립 probe 결과:
 
 ```text
-same odno fills 2+3 → 2 rows, filled 5
-ordered 10 → remaining 5, PARTIALLY_FILLED
-weighted average → 11.2
-exact execution duplicate → 1 row
-cross-venue same odno → separate
-overfill → no clamp, data_integrity_error/HALT
+marker external symlink -> MARKER_ARTIFACT_INVALID, target bytes/mtime 불변, link 보존
+broken marker symlink + fresh snapshot -> freshness COMMIT_UNCERTAIN, link 보존
+lock external symlink -> LOCK_ARTIFACT_INVALID, target bytes/mtime 불변, link 보존
+directory/FIFO/socket/world-writable/hardlink marker·lock -> fail-closed
+symlink/broken-symlink TOCTOU -> O_NOFOLLOW 차단
 ```
 
-NASD/NYSE/AMEX sweep, partial exchange failure snapshot block, cash non-duplication, invalid/future/permission
-limiter fail-closed, ORDER/CANCEL EGW00201 UNKNOWN 및 retry 0, future token rejection과 multi-process token
-single issuance도 통과했다.
+marker 존재/비정상 artifact 검사는 snapshot JSON/schema/freshness보다 먼저 수행되어 fresh clean snapshot도
+승인하지 않는다. cross-namespace `.OTHER.json.*` artifact는 수정·삭제·차단하지 않는다. 단 regular-file
+TOCTOU 및 exact lock mode findings는 남아 있다.
 
-CODEX-042~060의 exit quantity safety, UNKNOWN account-wide block, reconciliation failure gate, terminal audit
-exactly once, fatal repository exit 4, single-run lock cleanup과 secret redaction의 회귀는 발견하지 않았다.
+## Durable intent 및 SIGKILL
 
-## 테스트와 네트워크
+production 순서는 writer lock -> artifact validation/temp cleanup -> marker exclusive create/write/file fsync
+-> marker directory fsync -> snapshot temp/write/file fsync -> replace -> snapshot directory fsync -> marker unlink
+-> marker directory fsync -> unlock이다. marker는 replace 전에 durable하다.
 
-저장소 밖 netguard로 `socket.create_connection`, `socket.connect`, `connect_ex`를 차단했다.
+저장소 밖 실제 subprocess 핵심 결과:
 
 ```text
-집중 안전: 1201 passed, 0 failed/skipped/xfailed, socket attempts 0
-정방향:    2636 passed, 0 failed/skipped/xfailed, socket attempts 0
-역방향:    2636 passed, 0 failed/skipped/xfailed, socket attempts 0
+D: replace 직후 snapshot directory fsync 전 SIGKILL
+  return=-9, 새 snapshot 노출 가능, marker 존재, temp 0
+  새 process freshness -> RECONCILIATION_SNAPSHOT_COMMIT_UNCERTAIN
+  다음 정상 reconciliation -> marker 0/temp 0, 새 snapshot 및 freshness 정상
+
+F: marker unlink 후 marker directory fsync 전 SIGKILL
+  current view marker 0, snapshot directory fsync는 이미 완료
+  fresh-clean 새 process freshness -> ACCEPT
 ```
 
-집중 범위는 요구된 601개 이상이고 전체 수는 기대값과 일치한다. 순서 의존성은 없었다.
+F 결과는 marker 삭제가 유지된 경우 snapshot이 이미 durable하므로 허용 정책과 일치한다. marker가 crash
+후 다시 나타나는 경우에는 marker 우선 검사로 차단되고 다음 정상 reconciliation이 full lifecycle을
+다시 수행한다.
 
-## 운영 파일과 artifact
+A~E crash 지점에서는 replace 전 기존 snapshot 보존 또는 durable marker 존재로 새 process
+freshness/approval/runtime이 차단된다. C의 dead-PID temp는 다음 정상 write가 lock 안에서 삭제하고
+directory fsync한다. temp/marker unlink 실패 및 cleanup directory fsync 실패는 성공 반환하지 않으며 gate
+차단을 유지한다. recovery는 marker만 지우지 않고 새 reconciliation payload를 다시 기록한다.
 
-검증 전후 값은 동일했다.
+## Strict schema·freshness·운영 회귀
+
+strict schema는 clean 문자열/정수, count 문자열/bool, 필수 필드 누락, schema version 누락/문자열/미지원을
+계속 차단한다. invalid approval은 enable 0/start 0이고 runtime Shadow body 0이다.
+
+정상 6필드 snapshot에서 30일 stale 차단, TTL 899/900 허용·901 차단, future 29/30 허용·31 차단,
+naive timestamp/partial JSON/world-writable snapshot 차단을 유지한다.
+
+installer live static·enable symlink 0, installer enable/start 0, 실패 후 timers disabled/inactive, approval
+exact true, rollback, JSONL fallback 0, IXN/ARCA KIS 호출 0, AAPL 정상/hypothetical, terminal exactly once,
+limiter artifact/SIGKILL/atomic persistence/4-process pacing, 3거래소 reconciliation, token cache 공유,
+partial fill 2+3=5, EGW00201 UNKNOWN, single-run lock cleanup과 redaction은 집중 회귀에서 통과했다.
+
+## 테스트 및 외부 네트워크
+
+자식 프로세스에도 적용되는 임시 netguard로 `socket.create_connection`, `connect`, `connect_ex`를
+차단·기록했고 완료 후 제거했다.
+
+```text
+collect-only: 3,040 tests
+focused: 1,781 passed, failed/skipped/xfailed 0, socket attempts 0
+forward: 3,040 passed, failed/skipped/xfailed 0, socket attempts 0
+reverse: 3,040 passed, failed/skipped/xfailed 0, socket attempts 0
+KIS/Alpaca/Slack external socket: 0
+```
+
+## 운영 파일 및 artifact
 
 | 파일 | SHA-256 | size | mtime |
 |---|---|---:|---:|
@@ -211,30 +184,18 @@ exactly once, fatal repository exit 4, single-run lock cleanup과 secret redacti
 | universe.csv | `9fdaf3ac0ba7d94e24b6276fc603709a0c79c6842cf8143b8a242acdd16188b3` | 833518 | 1784558966 |
 | strategy_performance.csv | `ca012439cb2ba6a8f285b3f95493f9b17d22abb5b01a924ef2bd4cfe96f66da8` | 69 | 1785083284 |
 
-숨김 파일을 포함한 `*.tmp`, `.*.tmp`, `*.temp`, `.*.temp`, lock, DB/sidecar, shadow JSONL, runtime
-rate-limit/token test state와 임시 env는 0건이다. 저장소 밖 probe, socket guard와 logs도 삭제했다.
+세 파일의 SHA-256/size/mtime는 전후 동일하다. repo의 TRADING_STATE.db, shadow JSONL, snapshot temp,
+commit marker, tmp/temp, DB/sidecar와 netguard pyc는 0건이다. 저장소 밖 probe와 socket logs도 제거했다.
+writer lock은 probe 임시 디렉터리에만 생성되어 함께 제거됐고 repo 상주 lock은 없다.
 
-## Oracle 재검증 조건과 허용 여부
+## 해제 조건
 
-코드 CRITICAL/HIGH/MEDIUM과 기존 Finding 회귀는 발견하지 않았다. 남은 조건은 Oracle host에서 실제
-shared-state directory 소유권/권한과 process 경쟁, 실제 KIS read 응답 및 Ubuntu systemd unit 검증이다.
+1. lock open 전 lstat와 open 후 fstat의 `st_dev/st_ino`를 비교하고 regular→regular swap을 차단한다.
+2. marker unlink 직전에 identity/device/inode/type를 재검증해 교체 inode를 삭제하지 않는다.
+3. 기존 및 신규 lock의 mode를 exact 0600으로 검증한다.
+4. regular→regular lock swap, marker unlink inode swap, 0640/0660/0644 lock matrix를 실제 회귀 테스트에
+   추가한다.
+5. 동일 commit에서 독립 A~F/subprocess/approval/runtime와 집중·정방향·역방향을 재검증한 후 Oracle 신규
+   release host 검증을 수행한다.
 
-```text
-Shadow timer: Oracle 재검증 전 비활성
-Oracle 배포: 아직 허용하지 않음
-실주문 활성화: 금지
-실계좌 취소: 금지
-```
-
-## 종료 상태
-
-```text
-$ git status --short
- M docs/autonomous/CODEX_REVIEW.md
-
-$ git diff --check
-(no output — pass)
-
-최종 변경 파일:
-docs/autonomous/CODEX_REVIEW.md
-```
+현재 Shadow timer 허용: **불가**. Oracle 재검증 전 비활성 유지. 실주문 활성화: **금지**.

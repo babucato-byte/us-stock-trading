@@ -794,6 +794,20 @@ writer는 자기 나름대로 일관된 inode를 보게 되므로 lock 파일만
 
 다른 snapshot의 marker·lock(`.OTHER.json.*`)은 건드리지 않는다.
 
+**남아 있는 창구(운영자가 알아야 할 것).** inode를 지정해 unlink하는 syscall이 POSIX에 없으므로,
+marker의 마지막 검증 `lstat`과 `unlink` 사이 수 마이크로초에 이름이 교체되면 그 교체된 파일이
+지워진다. 이름 기반 unlink 앞의 어떤 검사도 이 간격을 없앨 수 없고, rename 기반 프로토콜은 같은
+간격을 다른 이름으로 옮길 뿐이다. 두 가지 이유로 gate 안전성에는 영향이 없다:
+
+- 이 간격에 도달하려면 state 디렉터리에 **서비스 계정과 같은 uid로 쓰기 권한**이 이미 있어야 한다
+  (`shared/state`는 0700 owner-only). 그 권한이면 snapshot을 직접 조작하는 쪽이 더 쉽다.
+- unlink는 snapshot의 directory fsync가 **성공한 뒤에만** 도달하므로, 이 race에서 져도
+  "durable하지 않은 snapshot이 fresh로 승인되는" 결과는 만들어지지 않는다.
+
+검증 `lstat` **이전**의 모든 교체는 `RECONCILIATION_MARKER_CHANGED`로 잡힌다
+(`tests/test_shadow_exit_halt_and_writer_recovery.py::TestTheUnlinkGapThatCannotBeClosed`가
+이 경계를 고정한다).
+
 stale temp는 `.{snapshot}.{pid}.{uuid}.tmp` 형식이며, 다음 정상 write가 lock을 쥔 채
 정리한다. dead PID의 정상 temp는 삭제하고, live PID temp·malformed 이름·symlink·디렉터리·
 FIFO는 **삭제하지 않고 write를 차단**한다(`RECONCILIATION_TEMP_ARTIFACT_INVALID`).

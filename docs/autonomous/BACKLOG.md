@@ -6,22 +6,7 @@
 
 ---
 
-## T1. Codex HIGH 3건 수정 커밋 독립 재검증 — `status: ready`
-
-커밋 `8c30e6c`(HALT exact bool)와 `e57b250`(marker before-replace + symlink 안전성)이
-`CODEX_REVIEW.md` 해제 조건 1~4를 실제로 충족하는지 **구현자와 독립된 관점으로** 재검증한다.
-
-Acceptance (CODEX_REVIEW.md 해제 조건 그대로):
-1. HALT lookup 결과 `type(value) is bool` 검증 — None/0/[]/{}/"false" 전부 exit 6, broker 0 probe 재현
-2. replace 후 SIGKILL probe: marker가 남아 재시작 freshness/approval 차단 확인
-3. marker/lock lstat·no-follow·regular-file·owner/mode 검증 probe (broken symlink, external target, lock symlink)
-4. 위 시나리오가 회귀 테스트로 추가되어 있는지 확인 (없으면 추가)
-5. 전체 회귀: `venv/bin/python -m pytest` 2,988+ 전건 통과, 외부 socket 0
-
-결과는 `CODEX_REVIEW.md` 스타일로 `docs/autonomous/AUTOPILOT_REVIEW_<date>.md`에 기록.
-판정이 PASS면 T2를 ready로 올린다.
-
-## T2. feature/kis-live-broker origin push + 로컬 미푸시 커밋 정리 — `status: blocked:after-T1`
+## T2. feature/kis-live-broker origin push + 로컬 미푸시 커밋 정리 — `status: ready`
 
 로컬 HEAD가 origin(673888c)보다 앞서 있다. T1 PASS 후 origin push.
 (main 병합은 하지 않는다 — 사용자 규칙: 검증 통과 후에만 병합, 병합 자체는 사용자 결정.)
@@ -48,4 +33,21 @@ Shadow 운영을 며칠/몇 건 이상 무결점 통과하면 제한 실거래 �
 
 ## 완료 기록
 
-(사이클 완료 시 여기로 이동)
+### T1. Codex HIGH 3건 수정 커밋 독립 재검증 — `status: done` (2026-08-06)
+
+커밋 `8c30e6c`(HALT exact bool), `e57b250`(marker before-replace + symlink 안전성),
+그 위의 `96e9236`(inode identity + exact mode)을 구현자와 독립된 probe로 재검증했다.
+
+판정 **PASS** — 해제 조건 1~5 전건 재현 확인. 기록:
+`docs/autonomous/AUTOPILOT_REVIEW_2026-08-06.md`.
+
+- 1: HALT raw matrix 14종(비-bool 13 + 예외 1) 전부 `main()` exit 6, broker 호출 0
+- 2: 실제 SIGKILL 자식 프로세스 — marker 잔존, freshness/승인 게이트 차단, 다음 write로 복구
+- 3: marker/lock 타입·exact mode·regular→regular TOCTOU matrix 전건 fail-closed
+- 4: 기존 커버리지 대조 후 공백 3건 보강(테스트만 추가, 프로덕션 코드 변경 없음)
+- 5: netguard 하 3,069 tests forward/reverse 전건 통과, 외부 socket 0
+
+INFO(잔여, 이미 `96e9236` 커밋 메시지가 공개한 항목): marker의 검증 `lstat`과 `unlink` 사이
+간격은 POSIX에 inode 지정 unlink가 없어 닫을 수 없다. `shared/state` 0700 owner-only이며
+unlink는 snapshot durable 이후에만 도달하므로 gate 안전성에는 영향이 없다. 운영자용 설명을
+`ORACLE_KIS_MIGRATION_RUNBOOK.md`에 추가하고 경계를 회귀 테스트로 고정했다.

@@ -1315,7 +1315,7 @@ class TestArtifactModesAreExact:
         _write(tmp_path)
         assert freshness.evaluate(path=tmp_path / "R.json", now=NOW).clean is True
 
-    @pytest.mark.parametrize("mode", [0o640, 0o644, 0o660])
+    @pytest.mark.parametrize("mode", [0o640, 0o644, 0o660, 0o666, 0o700, 0o400, 0o000])
     def test_a_non_0600_marker_is_refused(self, tmp_path, mode):
         marker = _marker(tmp_path)
         marker.write_text("residue\n", encoding="utf-8")
@@ -1323,6 +1323,21 @@ class TestArtifactModesAreExact:
         with pytest.raises(reconciliation_state.ReconciliationStateError) as excinfo:
             _write(tmp_path)
         assert excinfo.value.reason_code == "RECONCILIATION_MARKER_MODE_INVALID"
+        assert excinfo.value.detail == f"mode_{oct(mode)}"
+
+    def test_a_wrong_mode_marker_is_neither_corrected_nor_removed(self, tmp_path):
+        """Same rule as the lock: chmod-and-continue would adopt an
+        artifact of unknown origin, and deleting it would approve a
+        snapshot nobody re-derived."""
+        marker = _marker(tmp_path)
+        marker.write_text("residue\n", encoding="utf-8")
+        marker.chmod(0o644)
+        with pytest.raises(reconciliation_state.ReconciliationStateError):
+            _write(tmp_path)
+        assert marker.exists()
+        assert marker.read_text(encoding="utf-8") == "residue\n"
+        assert stat.S_IMODE(os.lstat(marker).st_mode) == 0o644
+        assert not (tmp_path / "R.json").exists()
 
     def test_the_created_lock_and_marker_are_0600(self, tmp_path, monkeypatch):
         seen = {}
@@ -1443,6 +1458,85 @@ class TestMarkerUnlinkIsBoundToOneInode:
         _write(tmp_path)
         assert not _marker(tmp_path).exists()
         assert freshness.evaluate(path=tmp_path / "R.json", now=NOW).clean is True
+
+
+class TestTheUnlinkGapThatCannotBeClosed:
+    """POSIX has no unlink-by-inode, so the identity check and the unlink
+    are two separate syscalls and a swap performed BETWEEN them cannot be
+    detected by any check-then-act sequence -- a rename-based protocol
+    only moves the same gap to a different name.
+
+    Every swap that happens earlier IS caught (see
+    TestMarkerUnlinkIsBoundToOneInode). What these pin down is the
+    property that survives losing the remaining race: the unlink is only
+    reached after the snapshot's directory fsync has already returned, so
+    a lost race can cost the marker but can never turn an unsynced
+    snapshot into an approved one.
+    """
+
+    def _swap_inside_the_gap(self, tmp_path, monkeypatch):
+        marker = _marker(tmp_path)
+        replacement = tmp_path / "markerB"
+        replacement.write_text("replacement", encoding="utf-8")
+        replacement.chmod(0o600)
+        real_lstat = os.lstat
+        real_replace = os.replace
+        state = {"committed": False, "swapped": False}
+
+        def _mark_commit(src, dst):
+            result = real_replace(src, dst)
+            if str(dst).endswith("R.json"):
+                state["committed"] = True
+            return result
+
+        def _lstat(name, *args, **kwargs):
+            info = real_lstat(name, *args, **kwargs)
+            if (state["committed"] and not state["swapped"]
+                    and str(name).endswith("commit-uncertain")):
+                # Exactly the gap: the stat above described the marker
+                # this writer created, and by the time the unlink runs the
+                # name points somewhere else.
+                state["swapped"] = True
+                real_replace(replacement, marker)
+            return info
+
+        monkeypatch.setattr(reconciliation_state.os, "replace", _mark_commit)
+        monkeypatch.setattr(reconciliation_state.os, "lstat", _lstat)
+        _write(tmp_path)
+        return state
+
+    def test_the_unlink_is_reached_only_after_the_snapshot_is_durable(self):
+        source = (REPO_ROOT / "reconciliation" / "reconciliation_state.py").read_text(
+            encoding="utf-8")
+        replace_at = source.index("os.replace(temp_path, target)")
+        fsync_at = source.index("os.fsync(directory_fd)", replace_at)
+        remove_at = source.index("_remove_marker(directory_fd, target, marker_bound)",
+                                 replace_at)
+        assert replace_at < fsync_at < remove_at
+
+    def test_losing_the_race_cannot_produce_a_false_clean(self, tmp_path, monkeypatch):
+        state = self._swap_inside_the_gap(tmp_path, monkeypatch)
+        assert state["swapped"], "the race was never actually run"
+        monkeypatch.undo()
+        # The snapshot the gate now reads is the one this writer committed
+        # and fsynced, so approving it is the correct answer, not a
+        # consequence of the swap.
+        result = freshness.evaluate(path=tmp_path / "R.json", now=NOW)
+        assert result.clean is True
+        assert json.loads((tmp_path / "R.json").read_text(encoding="utf-8"))[
+            "mismatch_count"] == 0
+
+    def test_the_documented_residual_is_the_swapped_file(self, tmp_path, monkeypatch):
+        """Documented residual, not an aspiration: the file swapped in
+        during the gap is the one unlinked. If a future change makes this
+        detectable, update docs/autonomous/AUTOPILOT_REVIEW_2026-08-06.md
+        rather than deleting this test."""
+        marker = _marker(tmp_path)
+        state = self._swap_inside_the_gap(tmp_path, monkeypatch)
+        monkeypatch.undo()
+        assert state["swapped"]
+        assert not marker.exists()
+        assert not (tmp_path / "markerB").exists()
 
 
 _SLOW_WRITER = textwrap.dedent(
