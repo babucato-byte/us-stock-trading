@@ -6,10 +6,36 @@
 
 ---
 
-## T2. feature/kis-live-broker origin push + 로컬 미푸시 커밋 정리 — `status: ready`
+## T2. feature/kis-live-broker origin push — `status: ready`
 
-로컬 HEAD가 origin(673888c)보다 앞서 있다. T1 PASS 후 origin push.
-(main 병합은 하지 않는다 — 사용자 규칙: 검증 통과 후에만 병합, 병합 자체는 사용자 결정.)
+T1 재검증 PASS(`AUTOPILOT_REVIEW_2026-08-06.md`)로 사용자의 "검증 통과 후 push" 조건이 충족됐다.
+로컬 HEAD(`6c21d87`)가 origin(`673888c`)보다 14커밋 앞서 있다.
+`git push origin feature/kis-live-broker` 실행 후 origin/HEAD 일치를 확인하고 이 항목을 done으로.
+(main 병합은 여전히 하지 않는다 — 사용자 결정 사항.)
+
+## T8. 유니버스 확장 + 계좌 금액대 필터 — `status: ready`
+
+현재 universe.csv 약 5,000종목. 사용자 지시: 확장하거나 금액대 기준으로 최적화.
+구현 (기존 원칙 유지 — 소수점 금지, 최소 1주 매수 가능):
+- `universe_builder.py` 확장: 기존 심볼 소스 경로를 재사용해 후보 풀을 넓히고,
+  가격 상한 = 계좌 가용 현금 × 기존 `risk_config` 포지션 비율로 1주 이상 매수 가능한
+  종목만 포함. 유동성 하한(평균 거래대금)은 기존 스캐너 기준 재사용.
+- 계좌 잔고는 KIS 조회값 기준 일일 갱신 (`universe_daily_runner.py`에 배선, 조회 실패 시 직전값 유지).
+- 포함/제외 사유별 통계를 로그·리포트로 남긴다.
+- 전체 회귀 + 신규 테스트. 실계좌 조회 부분은 fake session 테스트 + 실행 스크립트 분리.
+
+## T9. 실시간 실테스트 하네스 (스캐너 + 매수·매도 조건) — `status: ready`
+
+사용자 지시: 스캐너와 매수매도 조건을 실시간으로 실테스트.
+구현:
+- `scripts/start_live_pilot.sh` — 장중 실시간 루프 실행기. `KIS_ENV=paper|live` 전환식.
+  모의투자(paper)로 즉시 실테스트 시작 가능, live 전환은 .env 스위치 1줄.
+- 시작 전 자동 체크리스트: TBD_VERIFY_LIVE_DOCS 2건 검증 상태, kill switch,
+  reconciliation freshness, 계좌/유니버스 로드 — 하나라도 실패 시 기동 거부.
+- 스캐너 → 신호 → 매수 → lifecycle 매도(`check_and_manage()`) 전 구간을 실시간
+  데이터로 돌리고 tick별 JSONL + 일일 리포트 기록.
+- 실주문 플래그 코드 기본값은 안전측 유지. 활성화는 사용자의 .env 1줄 —
+  절차를 NEEDS_USER에 3줄로 기록한다.
 
 ## T3. Oracle 서버 재검증 + Shadow 타이머 배포 준비 — `status: blocked:needs-user`
 
@@ -17,21 +43,45 @@
 `ORACLE_KIS_MIGRATION_RUNBOOK.md` §11의 `TBD_VERIFY_LIVE_DOCS` 2건(취소 TR_ID, 현재가 응답 필드)
 실계좌 조회로 확인하는 것 포함.
 
-## T4. Shadow Mode 운영 기간 판정 기준 문서화 — `status: ready`
-
-Shadow 운영을 며칠/몇 건 이상 무결점 통과하면 제한 실거래 검토로 넘어가는지의
-객관 기준이 없다. `SCALPING_V1_ROADMAP.md`와 기존 문서 기반으로 기준안 작성
-(구현 아님, 문서만 — 실거래 활성화 결정 자체는 사용자 몫).
-
 ## T5. 매도 전략 인터페이스 잔여 지시 복원 — `status: blocked:needs-user-decision`
 
 사용자의 전략 인터페이스 지시 메시지가 `entry_rules`~`end_of_day_exit_rules` 필드 목록
 도중에 끊겨 수신 못함 (CURRENT_STATUS 2026-07-28 항목). 안전 크리티컬이므로 임의로 채우지 않는다.
 → 사용자가 나머지 지시를 아무 세션에나 다시 전달하면 ready로 전환.
 
+## T6. Shadow 성과 트랙 선택 — `status: done` (2026-08-06 사용자 결정: 실거래 진행)
+
+사용자가 실거래 트랙 진행을 지시했다. 실행 준비는 T8·T9로 구체화. (선택지 상세는 SHADOW_MODE_EXIT_CRITERIA.md §6)
+
+## T7. Oracle 환경파일에 Shadow 증거 보관 설정 확정 — `status: blocked:needs-user`
+
+`SHADOW_MODE_EXIT_CRITERIA.md` G11. `SHADOW_AUDIT_RETENTION_DAYS` 기본값이 30일이고
+`purge_old_events()`/`purge_old_files()`가 reconciliation 틱에서 실제로 삭제하므로,
+20 거래일(≈28 캘린더일) 창구를 기본값으로 돌리면 판정 시점에 창구 앞부분 증거가 이미
+삭제돼 있다. **창구 시작 전에** ≥45일로 올려야 하며 사후 복구 불가.
+서버 환경파일 수정이 필요해 `NEEDS_USER.md` §3에 명령 기록.
+
 ---
 
 ## 완료 기록
+
+### T4. Shadow Mode 운영 기간 판정 기준 문서화 — `status: done` (2026-08-06)
+
+`docs/autonomous/SHADOW_MODE_EXIT_CRITERIA.md` 신규 작성. 문서만, 코드 변경 0.
+
+- Shadow 창구를 **운영 무결성 게이트**로 정의하고 성과 게이트와 명시적으로 분리(§1 매핑표).
+- 종료 기준 G1~G11 — 전부 실재하는 산출물(`shadow_audit_events` DB / `shadow_mode` JSONL /
+  `run_health_report.collect()` / `reconciliation_state`)로 측정 가능한 형태로만 기술,
+  확인 명령 동봉. 기간 20 거래일은 Phase 8 수치를 낮추지 않고 그대로 승계.
+- 계수일 인정 조건(§4)과 리셋 규칙(§5) — "무결점"을 셀 수 있는 0-항목 집합으로 조작적 정의하고,
+  정상 차단(LIVE_FLAG/ENTRY_DISABLED/가격편차/잔고/중복)은 결함에서 제외.
+- 확정된 구조적 공백 2건: ① Shadow 창구는 포지션이 0이라 **매도/청산 경로를 실증하지 못한다**
+  (`run_shadow_exit_evaluation.py:331`이 `store.load_non_terminal()`을 순회) → G5는 표본 0을
+  허용하되 판정 기록에 미검증 명시 의무. ② 기본 보관 30일이 창구 길이보다 짧다 → G11, T7로 분리.
+- 근거 없는 수치는 전부 `ASSUMPTION`으로 표기(§8). 값을 올리는 재검토는 자율 루프가 하고,
+  낮추려면 사용자 결정을 요구하도록 규정.
+- 검증: 문서가 인용한 심볼/이벤트/env/경로/유닛/산술 **81건 전건 실재 확인**(독립 probe),
+  전체 회귀 3,069 passed.
 
 ### T1. Codex HIGH 3건 수정 커밋 독립 재검증 — `status: done` (2026-08-06)
 
