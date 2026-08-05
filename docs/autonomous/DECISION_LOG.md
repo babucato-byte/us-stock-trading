@@ -793,3 +793,64 @@
   기존 자격증명/kill-switch 게이트를 그대로 통과해야 함을 회귀 테스트로 고정했다.
 - 승인 필요 여부: 아니오(코드 구현·테스트 추가·문서화 범위). `main` 병합/origin push는
   수행하지 않았다.
+
+### 2026-08-06 — T8 유니버스 계좌 금액대 필터: `universe.csv`를 좁히지 않고 별도 파일로 분리
+
+- **결정 1(가장 중요): `universe.csv`는 행을 줄이지 않는다. 필터 결과는
+  `universe_tradable.csv`라는 별도 파일에 쓴다.**
+  - 근거: `universe.csv`는 스캐너 후보 피드일 뿐 아니라 KIS 주문 경로의 **거래소 메타데이터
+    권위 소스**다. `market_data/exchange_registry.py::ExchangeRegistry._load_universe()`가 이
+    파일을 읽고, 목록에 없는 심볼은 `resolve()`가 `EXCHANGE_UNKNOWN`으로 하드 블록한다.
+    그리고 그 해석은 **매도에도 실행된다**. 유니버스를 "지금 계좌가 살 수 있는 종목"으로
+    좁히면, 보유 중인 종목의 주가가 상한을 넘어선 순간 그 종목이 목록에서 빠지고 **청산
+    주문의 거래소 해석이 불가능해진다.** 진입 최적화를 위해 청산 경로를 깨뜨리는 것은
+    안전 회귀이므로 채택하지 않았다.
+  - 독립 확인: 목록에 없는 심볼로 `resolve_exchange()`를 호출하면 실제로
+    `REASON_EXCHANGE_UNKNOWN`이 발생함을 verifier probe로 재현했고,
+    `tests/test_universe_tradable_build.py::test_a_held_symbol_priced_out_of_the_budget_stays_resolvable`
+    로 회귀 고정했다.
+  - 대안(기각): ① `universe.csv`를 직접 필터링 — 위 이유로 기각. ② 필터 결과를
+    `universe.csv`의 추가 컬럼으로 표시 — 컬럼 계약이 바뀌어 기존 소비자
+    (`exchange_registry`, `premarket_momentum_score`, `test_universe_builder`)를 모두
+    건드려야 하고, 이득이 없다.
+- **결정 2(가격 상한 공식):**
+  `price_ceiling = available_cash_usd × (cash_usage_percent/100) × risk_config.MAX_POSITION_RATE`.
+  사용자 지시는 "계좌 가용 현금 × risk_config 포지션 비율"이었지만, 거기에
+  `live_readiness/trusted_operator_config.get_cash_usage_percent()`(90%)를 **추가로 곱해
+  더 좁혔다**. PROJECT_CONSTITUTION "계층 분리 원칙"이 `cash_usage_percent`를 오직 그
+  모듈에서만 읽도록 규정하고 있고, 곱셈은 상한을 낮추는 방향이라 안전측이다. caller가
+  넘긴 percent는 `min()`으로 낮추기만 가능하다(기존 order_gateway/account_engine와 동일).
+- **결정 3(1주 이상 = `floor()`):** `max_affordable_shares = floor(ceiling / price)`가 1 미만이면
+  제외. 소수점 매수 금지 원칙이 있으므로 `live_readiness/watchlist_affordability.py`는
+  **재사용하지 않았다** — 그 모듈은 설계상 `AFFORDABLE_FRACTIONAL`을 반환할 수 있어 이
+  유니버스에서는 합법적인 결과가 아니고, KRW·예약원장·주문시점 게이트라는 다른 질문에
+  답하는 모듈이다. 대신 그 모듈의 "계좌 상태는 스캔당 1회 계산해 전 심볼이 공유한다"는
+  규율은 그대로 가져왔다(`UniverseBudget`).
+- **결정 4(유동성 하한은 스캐너 기준 그대로):** `config/scanner_rules.json`의
+  `price >= 5`, `avg_dollar_volume >= 20,000,000`을 읽어서 쓴다. 새 임계값을 만들지 않았다 —
+  유니버스가 스캐너가 어차피 탈락시킬 종목을 통과시키면 필터의 의미가 없다.
+  `daily_candidate_scanner`를 import하지 않고 JSON을 직접 읽는 이유는 그 모듈 import가
+  yfinance·dotenv·Slack 클라이언트를 끌고 오기 때문이다(숫자 2개를 읽으려고). `>=` 연산자만
+  미러링하고 다른 연산자는 무시 후 기본값 — 추측하면 조용히 느슨해진다.
+- **결정 5(가격 데이터 소스: yfinance 배치):** `market_data/alpaca_provider.py`가 문서화한
+  대로 이 저장소의 실제 가격 피드는 yfinance다. 다만 `yf.Ticker().history()` 심볼당 1회는
+  12,887종목에 쓸 수 없어 `yf.download()` 배치(기본 200개 묶음)로 **같은 소스를 다른
+  엔드포인트로** 호출한다. 새 유료 API를 도입하지 않았다(승인 필요 항목).
+  실측: 100종목 8.2초 → 전체는 분 단위. 청크 1개가 실패해도 그 종목만 데이터 없음으로
+  빠지고 나머지는 계속된다.
+- **결정 6(계좌 조회 분리):** KIS 잔고 조회는 `scripts/refresh_universe_budget.py` 한 곳에만
+  있고, 결과를 `state/universe_budget.json`에 원자적으로 영속한다. 빌드 단계는 그 JSON만
+  읽으므로 소켓을 열지 않는다 — 그래서 전체 빌드가 broker 없이 테스트된다.
+  조회 실패 시: 이전 파일을 **바이트 그대로 두고** 이전 값을 `stale=True`,
+  `source="cached:..."`로 반환한다. 값을 지어내지 않고, `as_of`를 새로 찍지 않으며,
+  상한을 넓히지 않는다. 이전 값조차 없으면 `None`을 반환하고 빌더는 필터된 유니버스를
+  **쓰지 않는다**(이전 파일 유지).
+- **결정 7(스캐너 배선):** `daily_candidate_scanner.load_scan_universe()`가
+  `universe_tradable.csv`가 있으면 그것을, 없거나 파싱 불가면 `universe.csv`를 쓴다.
+  **0행짜리 필터 파일은 그대로 존중한다** — "지금은 살 수 있는 게 없다"는 실제 답이고,
+  여기서 전체 목록으로 되돌아가면 예산 필터가 배제한 종목이 그대로 다시 들어온다.
+  폴백은 파일이 없거나 손상된 경우에만 발생하며, 그것은 T8 이전 동작으로의 복귀일 뿐
+  어떤 게이트도 느슨하게 만들지 않는다(주문 경로의 자체 affordability 검사는 무관하게 유지).
+- 승인 필요 여부: 아니오(코드 구현·테스트 추가·문서화 범위). 실주문 플래그·서버 설정·
+  main 병합은 건드리지 않았다. 사용자 몫으로 남은 것은 KIS 자격증명 + 읽기 플래그 1개 +
+  명령 1줄뿐이다(`NEEDS_USER.md` §6).

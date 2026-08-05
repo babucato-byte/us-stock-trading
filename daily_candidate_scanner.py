@@ -750,10 +750,39 @@ def format_yes_no(value):
     return "YES" if value is True or str(value).lower() in {"true", "1", "yes"} else "NO"
 
 
+def load_scan_universe(base_dir=None):
+    """Returns (frame, source_path).
+
+    Prefers `universe_tradable.csv` -- the account-budget/liquidity
+    filtered pool built by universe_builder.build_tradable_universe() --
+    because scanning a symbol the account cannot buy one whole share of
+    spends the scan budget on a candidate that can never become an order.
+
+    A filtered file with ZERO rows is honoured as-is: "nothing is
+    affordable right now" is a real answer, and falling back to the full
+    listing there would re-admit exactly the symbols the filter excluded.
+    The fallback applies only when the file is absent or unparseable,
+    which restores the pre-T8 behaviour rather than loosening any gate
+    (the order path's own affordability checks are unaffected either way).
+    """
+    root = Path(base_dir) if base_dir is not None else BASE_DIR
+    tradable_path = root / "universe_tradable.csv"
+    if tradable_path.exists():
+        try:
+            frame = pd.read_csv(tradable_path)
+            if "symbol" in frame.columns:
+                return frame, tradable_path
+            print(f"[SCAN UNIVERSE] {tradable_path} has no symbol column; falling back to universe.csv")
+        except Exception as exc:
+            print(f"[SCAN UNIVERSE] {tradable_path} unreadable ({exc}); falling back to universe.csv")
+    return pd.read_csv(root / "universe.csv"), root / "universe.csv"
+
+
 def scan(preset_name=None, send_slack=True, scan_limit=None):
     rules = load_scanner_rules(preset_name)
     scan_id = create_scan_id()
-    universe = pd.read_csv(BASE_DIR / "universe.csv")
+    universe, universe_source = load_scan_universe()
+    print(f"[SCAN UNIVERSE] source={universe_source} rows={len(universe)}")
 
     if "exchange" in universe.columns:
         universe = universe[universe["exchange"].astype(str).str.upper() != "OTC"]

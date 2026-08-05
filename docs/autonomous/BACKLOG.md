@@ -6,17 +6,6 @@
 
 ---
 
-## T8. 유니버스 확장 + 계좌 금액대 필터 — `status: ready`
-
-현재 universe.csv 약 5,000종목. 사용자 지시: 확장하거나 금액대 기준으로 최적화.
-구현 (기존 원칙 유지 — 소수점 금지, 최소 1주 매수 가능):
-- `universe_builder.py` 확장: 기존 심볼 소스 경로를 재사용해 후보 풀을 넓히고,
-  가격 상한 = 계좌 가용 현금 × 기존 `risk_config` 포지션 비율로 1주 이상 매수 가능한
-  종목만 포함. 유동성 하한(평균 거래대금)은 기존 스캐너 기준 재사용.
-- 계좌 잔고는 KIS 조회값 기준 일일 갱신 (`universe_daily_runner.py`에 배선, 조회 실패 시 직전값 유지).
-- 포함/제외 사유별 통계를 로그·리포트로 남긴다.
-- 전체 회귀 + 신규 테스트. 실계좌 조회 부분은 fake session 테스트 + 실행 스크립트 분리.
-
 ## T9. 실시간 실테스트 하네스 (스캐너 + 매수·매도 조건) — `status: ready`
 
 사용자 지시: 스캐너와 매수매도 조건을 실시간으로 실테스트.
@@ -57,6 +46,34 @@
 ---
 
 ## 완료 기록
+
+### T8. 유니버스 확장 + 계좌 금액대 필터 — `status: done` (2026-08-06)
+
+계좌 가용 현금으로 **1주 이상 살 수 있는 종목만** 남기는 진입측 유니버스를 만들었다.
+end-to-end 동작 확인됨(실제 12,887행 목록 + 실제 yfinance 데이터).
+
+신규: `universe_filter.py`(순수 판정), `universe_budget.py`(잔고 영속·폴백),
+`universe_metrics.py`(배치 시세), `scripts/refresh_universe_budget.py`(유일한 실계좌 접점).
+변경: `universe_builder.py`(+`build_tradable_universe()`), `universe_daily_runner.py`(3단계 배선),
+`daily_candidate_scanner.py`(+`load_scan_universe()`).
+
+- **`universe.csv`는 좁히지 않았다.** 그 파일은 `market_data/exchange_registry.py`가 읽는
+  거래소 메타데이터 권위 소스이고, 그 해석은 **매도에도 실행된다**. 좁히면 주가가 상한을
+  넘어선 보유 종목의 청산 경로가 `EXCHANGE_UNKNOWN`으로 막힌다. 필터 결과는
+  `universe_tradable.csv`로 분리했다(DECISION_LOG 2026-08-06 결정 1, 회귀 테스트 고정).
+- 상한 = `가용현금 × cash_usage_percent(90%, trusted_operator_config) × MAX_POSITION_RATE(0.10)`.
+  지시받은 공식에 신뢰 운영자 비율을 **추가로 곱해 더 좁혔다**(안전측). 1주 미만은
+  `floor()`로 제외 — 소수점 경로 없음.
+- 유동성·가격 하한은 `config/scanner_rules.json`의 스캐너 기준(`>= $5`, `>= $20M`) 그대로 재사용.
+- 잔고 조회 실패 시 이전 파일을 바이트 그대로 두고 직전값을 `stale`로 반환. 값 조작·
+  `as_of` 재기록·상한 확대 없음. 직전값도 없으면 필터 파일을 아예 쓰지 않는다.
+- 산출물 3종: `universe_tradable.csv`(유동성 내림차순), `logs/universe_decisions.csv`
+  (심볼별 포함/제외 사유 전건), `logs/universe_filter_report.json`(사유별 통계 + 예산 출처).
+- 검증: 전체 회귀 **3,227 passed / 0 failed**(신규 150). 독립 verifier probe 17/17 —
+  상한 산술 재유도, 단조성(현금↑ ⇒ 포함집합 superset), 반올림 없음, 미등재 심볼
+  `EXCHANGE_UNKNOWN` 재현, 신규 모듈의 주문 메서드 호출 0(AST).
+- 실행 확인: 실제 목록 12,887행 필터 0.26초, 실제 yfinance 100종목 8.2초에 44종목 통과.
+- 사용자 몫은 자격증명 + 읽기 플래그 1개 + 명령 1줄 → `NEEDS_USER.md` §6.
 
 ### T2. feature/kis-live-broker origin push — `status: done` (2026-08-06)
 

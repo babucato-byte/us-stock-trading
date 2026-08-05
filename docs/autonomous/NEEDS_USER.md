@@ -63,3 +63,41 @@ sudo systemctl daemon-reload
 ```bash
 cd ~/Projects/us-stock-trading && rm -f .git/HEAD.lock
 ```
+
+## 6. 유니버스 계좌 금액대 필터 활성화 (T8) — 자격증명 + 플래그 1개 + 명령 1줄
+
+T8의 코드·테스트·스크립트·러너 배선은 전부 완료됐다. 남은 사용자 몫은 **KIS 계좌 읽기
+자격증명을 넣고 명령 한 줄을 실행하는 것**뿐이다. 이것을 하기 전까지
+`state/universe_budget.json`이 없어서 `universe_tradable.csv`가 만들어지지 않고,
+스캐너는 기존 `universe.csv`를 그대로 쓴다(= T8 이전과 동일하게 동작, 안전).
+
+**실주문과 무관하다.** 이 경로는 잔고 조회(read)만 하며 `KIS_LIVE_ORDER_ENABLED`는
+건드리지 않는다 — 읽기 게이트(`KIS_ACCOUNT_READ_ENABLED`)와 주문 게이트는 별개다.
+
+```bash
+# 1) .env (git 밖)에 KIS 읽기 자격증명 — 이미 있으면 3)으로
+#    KIS_ENV=paper 로 모의계좌부터 시작할 수 있다
+cat >> .env <<'EOF'
+KIS_ENV=paper
+KIS_APP_KEY=<발급값>
+KIS_APP_SECRET=<발급값>
+KIS_ACCOUNT_NO=<계좌번호 앞 8자리>
+KIS_ACCOUNT_PRODUCT_CD=01
+KIS_ACCOUNT_READ_ENABLED=true
+EOF
+
+# 2) 잔고를 읽어 예산으로 영속 (--show 로 산출된 1주 가격 상한까지 확인)
+venv/bin/python scripts/refresh_universe_budget.py --show
+#    종료코드 0=조회 성공, 1=조회 실패라 직전값 유지, 2=쓸 수 있는 값이 아예 없음
+
+# 3) 전체 일일 갱신 (목록 갱신 → 잔고 갱신 → 필터된 유니버스 생성)
+venv/bin/python universe_daily_runner.py
+```
+
+결과 확인:
+
+```bash
+head -3 universe_tradable.csv          # 살 수 있는 종목만, 유동성 높은 순
+cat logs/universe_filter_report.json   # 포함/제외 사유별 통계 + 사용된 예산·상한
+head -5 logs/universe_decisions.csv    # 심볼별 포함/제외 사유 전건
+```

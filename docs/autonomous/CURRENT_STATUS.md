@@ -2,6 +2,50 @@
 
 마지막 갱신: 2026-08-06
 
+## 자율 사이클 2026-08-06 (4) — T8 유니버스 계좌 금액대 필터 **완료**
+
+`AUTOPILOT.md` 계약에 따른 네 번째 사이클. BACKLOG 최상위 `ready` 항목 T8을 처리했다.
+계좌 가용 현금으로 **1주 이상 살 수 있는 종목만** 남기는 진입측 유니버스가 실제로 동작한다
+(실제 12,887행 목록 + 실제 yfinance 데이터로 확인).
+
+- **설계 판단(가장 중요): `universe.csv`를 좁히지 않았다.** 그 파일은 스캐너 후보 피드일 뿐
+  아니라 `market_data/exchange_registry.py`가 읽는 **거래소 메타데이터 권위 소스**이고, 그
+  해석은 **매도에도 실행된다**. "지금 살 수 있는 종목"으로 좁히면 보유 종목의 주가가 상한을
+  넘어선 순간 목록에서 빠지고 청산 주문의 거래소 해석이 `EXCHANGE_UNKNOWN`으로 막힌다.
+  진입 최적화를 위해 청산 경로를 깨는 것은 안전 회귀이므로, 필터 결과를
+  **`universe_tradable.csv`라는 별도 파일**로 분리했다. 이 위험은 가정이 아니라 verifier
+  probe로 재현했고 회귀 테스트로 고정했다.
+- **상한 공식**: `가용현금 × cash_usage_percent(90%) × MAX_POSITION_RATE(0.10)`.
+  지시받은 "가용현금 × 포지션 비율"에 `trusted_operator_config`의 신뢰 운영자 비율을
+  **추가로 곱해 더 좁혔다** — PROJECT_CONSTITUTION 계층 분리 원칙을 따르면서 상한을 낮추는
+  방향이라 안전측이다. 1주 미만은 `floor()`로 제외하며 소수점 경로는 코드에 존재하지 않는다.
+  `live_readiness/watchlist_affordability.py`는 설계상 `AFFORDABLE_FRACTIONAL`을 반환할 수
+  있어 이 유니버스에서는 합법 결과가 아니므로 재사용하지 않았다(규율만 승계).
+- **잔고 조회 실패 정책**: 이전 상태 파일을 **바이트 그대로** 두고 직전값을 `stale=True`,
+  `source="cached:..."`로 반환한다. 값을 지어내지 않고 `as_of`를 재기록하지 않으며 상한을
+  넓히지 않는다. 직전값조차 없으면 필터 파일을 **아예 쓰지 않는다**(이전 파일 유지).
+- **산출물 3종**: `universe_tradable.csv`(유동성 내림차순 — 다운스트림 `scan_limit`이
+  임의의 CSV 꼬리가 아니라 유동성 낮은 쪽부터 자르게 된다), `logs/universe_decisions.csv`
+  (심볼별 포함/제외 사유 **전건**), `logs/universe_filter_report.json`(사유별 통계 + 예산 출처·
+  상한·임계값 출처).
+- **실계좌 접점 분리**: KIS 잔고 조회는 `scripts/refresh_universe_budget.py` 한 곳뿐이고,
+  빌드 단계는 영속된 JSON만 읽어 소켓을 열지 않는다. 덕분에 전체 빌드가 broker 없이
+  테스트되고, KIS 경로 자체는 fake requests.Session으로 실 KISBroker를 통해 검증했다.
+- **검증**: 전체 회귀 **3,227 passed / 0 failed** (305.7s, 신규 150).
+  독립 verifier probe **17/17** — 상한 산술 재유도, 단조성(현금↑ ⇒ 포함집합 superset),
+  반올림 없음, 미등재 심볼 `EXCHANGE_UNKNOWN` 재현, 신규 모듈의 주문 메서드 호출 0(AST).
+  실행 확인: 실제 목록 12,887행 필터 0.26초(포함 3,176 / 미지원거래소 4,271 / 예산초과 1,739 /
+  유동성미달 2,473 — 합성 시세 기준 분포), 실제 yfinance 100종목 8.2초에 44종목 통과.
+  상장폐지 심볼(`IRAB.WS`, `TRAD.RT`)은 데이터 없음으로 빠지고 나머지는 계속 진행됐다.
+
+**사용자 몫은 1단계만 남았다**: KIS 읽기 자격증명 + `KIS_ACCOUNT_READ_ENABLED=true` +
+`venv/bin/python scripts/refresh_universe_budget.py --show` → `NEEDS_USER.md` §6.
+그 전까지는 `universe_tradable.csv`가 생성되지 않고 스캐너는 기존 `universe.csv`를 그대로
+쓴다(= T8 이전과 동일 동작, 안전).
+
+**다음 ready 항목**: T9(실시간 실테스트 하네스).
+**Shadow timer 활성화 불가, 실주문 활성화 금지**는 그대로다.
+
 ## 자율 사이클 2026-08-06 (3) — T2 origin push **완료**
 
 `AUTOPILOT.md` 계약에 따른 세 번째 사이클. BACKLOG 최상위 `ready` 항목 T2를 처리했다.

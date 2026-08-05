@@ -25,6 +25,10 @@ score_scanner/*.bak
 .pytest_tmp/
 *.lock
 
+# T8: persisted account budget for the universe filter
+# (universe_budget.DEFAULT_STATE_FILE). Runtime state, never committed.
+state/
+
 # Stage 5: local SQLite trading state store (state_store/db.py DEFAULT_DB_FILE)
 TRADING_STATE.db
 TRADING_STATE.db-wal
