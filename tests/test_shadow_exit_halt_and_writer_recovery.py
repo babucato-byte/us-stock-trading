@@ -707,11 +707,13 @@ class TestStaleTempRecovery:
     def test_the_cleanup_runs_inside_the_writer_lock(self):
         source = (REPO_ROOT / "reconciliation" / "reconciliation_state.py").read_text(
             encoding="utf-8")
-        lock_at = source.index("fcntl.flock(lock_fd, fcntl.LOCK_EX)")
+        open_at = source.index("lock_fd, lock_bound = _open_writer_lock(")
+        lock_at = source.index("fcntl.flock(lock_fd, fcntl.LOCK_EX)", open_at)
         cleanup_at = source.index("_cleanup_stale_temps(target)", lock_at)
         marker_at = source.index("_ensure_marker(directory_fd, target)", lock_at)
         replace_at = source.index("os.replace(temp_path, target)")
-        remove_at = source.index("_remove_marker(directory_fd, target)", replace_at)
+        remove_at = source.index("_remove_marker(directory_fd, target, marker_bound)",
+                                 replace_at)
         unlock_at = source.index("fcntl.flock(lock_fd, fcntl.LOCK_UN)")
         assert lock_at < cleanup_at < marker_at < replace_at < remove_at < unlock_at
 
@@ -979,11 +981,12 @@ class TestMarkerIsSymlinkSafe:
         _marker(tmp_path).chmod(0o666)
         with pytest.raises(reconciliation_state.ReconciliationStateError) as excinfo:
             _write(tmp_path)
-        assert excinfo.value.detail == "world_writable"
+        assert excinfo.value.detail == "mode_0o666"
 
     def test_a_hardlinked_marker_is_refused(self, tmp_path):
         real = tmp_path / "elsewhere.txt"
         real.write_text("x", encoding="utf-8")
+        real.chmod(0o600)              # so the LINK COUNT is what fails
         os.link(real, _marker(tmp_path))
         with pytest.raises(reconciliation_state.ReconciliationStateError) as excinfo:
             _write(tmp_path)
@@ -1010,6 +1013,7 @@ class TestMarkerIsSymlinkSafe:
         the new reconciliation that clears it, not a truncation of it."""
         marker = _marker(tmp_path)
         marker.write_text("earlier attempt\n", encoding="utf-8")
+        marker.chmod(0o600)
         before = marker.read_bytes()
         seen = {}
         real_replace = os.replace
@@ -1074,13 +1078,14 @@ class TestWriterLockIsSymlinkSafe:
         _lock(tmp_path).chmod(0o666)
         with pytest.raises(reconciliation_state.ReconciliationStateError) as excinfo:
             _write(tmp_path)
-        assert excinfo.value.detail == "world_writable"
+        assert excinfo.value.detail == "mode_0o666"
 
     def test_a_hardlinked_lock_is_refused(self, tmp_path):
         """An outside inode hardlinked in would mean two writers locking
         different files while both believe they hold the lock."""
         real = tmp_path / "elsewhere.lock"
         real.write_text("", encoding="utf-8")
+        real.chmod(0o600)              # so the LINK COUNT is what fails
         os.link(real, _lock(tmp_path))
         with pytest.raises(reconciliation_state.ReconciliationStateError) as excinfo:
             _write(tmp_path)
@@ -1094,6 +1099,7 @@ class TestWriterLockIsSymlinkSafe:
         outside.write_text("intact", encoding="utf-8")
         lock = _lock(tmp_path)
         lock.write_text("", encoding="utf-8")
+        lock.chmod(0o600)
 
         real_lstat = os.lstat
         swapped = []
@@ -1118,7 +1124,7 @@ class TestWriterLockIsSymlinkSafe:
     def test_the_lock_open_uses_a_directory_descriptor(self):
         source = (REPO_ROOT / "reconciliation" / "reconciliation_state.py").read_text(
             encoding="utf-8")
-        assert "os.open(name, flags, 0o600, dir_fd=directory_fd)" in source
+        assert "os.open(name, flags, REQUIRED_ARTIFACT_MODE, dir_fd=directory_fd)" in source
         assert 'open(lock_path, "a+")' not in source
 
     def test_another_snapshots_lock_is_untouched(self, tmp_path):
@@ -1173,8 +1179,362 @@ class TestMarkerRemovalFailures:
         target = tmp_path / "R.json"
         _write(tmp_path, clean=True, mismatch_count=0)
         _marker(tmp_path).write_text("residue\n", encoding="utf-8")
+        _marker(tmp_path).chmod(0o600)
         with pytest.raises(freshness.SnapshotUnusable):
             freshness.evaluate(path=target, now=NOW)
         _write(tmp_path, clean=True, mismatch_count=0)
         assert not _marker(tmp_path).exists()
         assert freshness.evaluate(path=target, now=NOW).clean is True
+
+
+# =====================================================================
+# Inode binding: a pathname check cannot survive a regular->regular swap.
+# =====================================================================
+
+class TestWriterLockIsBoundToOneInode:
+    """lstat -> open -> fstat is not enough. Between the lstat and the
+    open a regular file can be replaced by a DIFFERENT regular file, and
+    fstat only confirms "this is a regular file", not "this is the file I
+    looked at" -- so the writer would flock an inode nobody validated,
+    and two writers holding "the lock" on different inodes can write at
+    the same time."""
+
+    def _prepare(self, tmp_path):
+        lock = _lock(tmp_path)
+        first = tmp_path / "lockA"
+        first.write_text("", encoding="utf-8")
+        first.chmod(0o600)
+        os.rename(first, lock)
+        other = tmp_path / "lockB"
+        other.write_text("other", encoding="utf-8")
+        other.chmod(0o600)
+        return lock, other
+
+    def test_control_an_unswapped_lock_is_accepted(self, tmp_path):
+        self._prepare(tmp_path)
+        _write(tmp_path)
+        assert (tmp_path / "R.json").exists()
+
+    def test_a_swap_before_the_open_is_refused(self, tmp_path, monkeypatch):
+        lock, other = self._prepare(tmp_path)
+        real_lstat = os.lstat
+        swapped = []
+
+        def _lstat(name, *args, **kwargs):
+            info = real_lstat(name, *args, **kwargs)
+            if str(name).endswith(".writer.lock") and not swapped:
+                swapped.append(True)
+                os.rename(other, lock)
+            return info
+
+        monkeypatch.setattr(reconciliation_state.os, "lstat", _lstat)
+        with pytest.raises(reconciliation_state.ReconciliationStateError) as excinfo:
+            _write(tmp_path)
+        assert excinfo.value.reason_code == "RECONCILIATION_WRITER_LOCK_CHANGED"
+        assert excinfo.value.detail == "inode_changed=true"
+        assert not (tmp_path / "R.json").exists(), "a snapshot was written anyway"
+        assert lock.read_text(encoding="utf-8") == "other", "the swapped file was altered"
+
+    def test_a_swap_after_the_open_is_refused(self, tmp_path, monkeypatch):
+        lock, other = self._prepare(tmp_path)
+        real_open = os.open
+        swapped = []
+
+        def _open(name, *args, **kwargs):
+            fd = real_open(name, *args, **kwargs)
+            if str(name).endswith(".writer.lock") and not swapped:
+                swapped.append(True)
+                os.rename(other, lock)
+            return fd
+
+        monkeypatch.setattr(reconciliation_state.os, "open", _open)
+        with pytest.raises(reconciliation_state.ReconciliationStateError):
+            _write(tmp_path)
+        assert not (tmp_path / "R.json").exists()
+
+    def test_a_swap_while_the_lock_is_held_is_refused_before_committing(self, tmp_path,
+                                                                         monkeypatch):
+        """The binding is re-confirmed after flock and again immediately
+        before the replace, so a name that stops pointing at the locked
+        inode stops the commit."""
+        lock, other = self._prepare(tmp_path)
+        real_flock = reconciliation_state.fcntl.flock
+        swapped = []
+
+        def _flock(fd, operation):
+            result = real_flock(fd, operation)
+            if operation == reconciliation_state.fcntl.LOCK_EX and not swapped:
+                swapped.append(True)
+                os.rename(other, lock)
+            return result
+
+        monkeypatch.setattr(reconciliation_state.fcntl, "flock", _flock)
+        with pytest.raises(reconciliation_state.ReconciliationStateError) as excinfo:
+            _write(tmp_path)
+        assert excinfo.value.reason_code == "RECONCILIATION_WRITER_LOCK_CHANGED"
+        assert not (tmp_path / "R.json").exists()
+
+    def test_the_binding_is_checked_three_ways_then_re_checked(self):
+        source = (REPO_ROOT / "reconciliation" / "reconciliation_state.py").read_text(
+            encoding="utf-8")
+        assert "_same_inode(pre, bound)" in source
+        assert source.count("_assert_lock_binding(") >= 4   # def + 3 call sites
+        open_at = source.index("def _open_writer_lock")
+        flock_at = source.index("fcntl.flock(lock_fd, fcntl.LOCK_EX)")
+        replace_at = source.index("os.replace(temp_path, target)")
+        after_flock = source.index("_assert_lock_binding(directory_fd, lock_name", flock_at)
+        before_commit = source.index("_assert_lock_binding(directory_fd, lock_name",
+                                     after_flock + 1)
+        assert open_at < flock_at < after_flock < before_commit < replace_at
+
+
+class TestArtifactModesAreExact:
+    @pytest.mark.parametrize("mode", [0o640, 0o660, 0o644, 0o666, 0o400, 0o000, 0o604])
+    def test_a_non_0600_lock_is_refused(self, tmp_path, mode):
+        _write(tmp_path)                        # creates a 0600 lock
+        _lock(tmp_path).chmod(mode)
+        with pytest.raises(reconciliation_state.ReconciliationStateError) as excinfo:
+            _write(tmp_path)
+        assert excinfo.value.reason_code == "RECONCILIATION_WRITER_LOCK_MODE_INVALID"
+        assert excinfo.value.detail == f"mode_{oct(mode)}"
+
+    def test_a_wrong_mode_is_not_silently_corrected(self, tmp_path):
+        """chmod-and-continue would adopt an artifact of unknown origin."""
+        _write(tmp_path)
+        _lock(tmp_path).chmod(0o644)
+        with pytest.raises(reconciliation_state.ReconciliationStateError):
+            _write(tmp_path)
+        assert stat.S_IMODE(os.lstat(_lock(tmp_path)).st_mode) == 0o644
+
+    def test_restoring_0600_lets_the_writer_continue(self, tmp_path):
+        _write(tmp_path)
+        _lock(tmp_path).chmod(0o644)
+        with pytest.raises(reconciliation_state.ReconciliationStateError):
+            _write(tmp_path)
+        _lock(tmp_path).chmod(0o600)
+        _write(tmp_path)
+        assert freshness.evaluate(path=tmp_path / "R.json", now=NOW).clean is True
+
+    @pytest.mark.parametrize("mode", [0o640, 0o644, 0o660])
+    def test_a_non_0600_marker_is_refused(self, tmp_path, mode):
+        marker = _marker(tmp_path)
+        marker.write_text("residue\n", encoding="utf-8")
+        marker.chmod(mode)
+        with pytest.raises(reconciliation_state.ReconciliationStateError) as excinfo:
+            _write(tmp_path)
+        assert excinfo.value.reason_code == "RECONCILIATION_MARKER_MODE_INVALID"
+
+    def test_the_created_lock_and_marker_are_0600(self, tmp_path, monkeypatch):
+        seen = {}
+        real_replace = os.replace
+
+        def _capture(src, dst):
+            marker = _marker(tmp_path)
+            seen["marker_mode"] = stat.S_IMODE(os.lstat(marker).st_mode)
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(reconciliation_state.os, "replace", _capture)
+        _write(tmp_path)
+        assert seen["marker_mode"] == 0o600
+        assert stat.S_IMODE(os.lstat(_lock(tmp_path)).st_mode) == 0o600
+
+    def test_the_check_is_exact_not_a_permission_mask(self):
+        source = (REPO_ROOT / "reconciliation" / "reconciliation_state.py").read_text(
+            encoding="utf-8")
+        assert "stat.S_IMODE(info.st_mode) != REQUIRED_ARTIFACT_MODE" in source
+        assert "st_mode & stat.S_IWOTH" not in source
+
+
+class TestMarkerUnlinkIsBoundToOneInode:
+    """Codex's reproduction: a regular marker replaced by a DIFFERENT
+    regular marker before the unlink got deleted, and the write reported
+    success."""
+
+    def test_a_replaced_marker_is_not_deleted(self, tmp_path, monkeypatch):
+        marker = _marker(tmp_path)
+        replacement = tmp_path / "markerB"
+        replacement.write_text("replacement", encoding="utf-8")
+        replacement.chmod(0o600)
+        real_replace = os.replace
+
+        def _swap_at_commit(src, dst):
+            result = real_replace(src, dst)
+            if str(dst).endswith("R.json"):
+                real_replace(replacement, marker)
+            return result
+
+        monkeypatch.setattr(reconciliation_state.os, "replace", _swap_at_commit)
+        with pytest.raises(reconciliation_state.ReconciliationStateError) as excinfo:
+            _write(tmp_path)
+        assert excinfo.value.reason_code == "RECONCILIATION_MARKER_CHANGED"
+        assert excinfo.value.detail == "inode_changed=true"
+        assert marker.exists(), "the replacement was deleted"
+        assert marker.read_text(encoding="utf-8") == "replacement"
+
+    def test_the_write_does_not_report_success_after_a_swap(self, tmp_path, monkeypatch):
+        marker = _marker(tmp_path)
+        replacement = tmp_path / "markerB"
+        replacement.write_text("replacement", encoding="utf-8")
+        replacement.chmod(0o600)
+        real_replace = os.replace
+
+        def _swap_at_commit(src, dst):
+            result = real_replace(src, dst)
+            if str(dst).endswith("R.json"):
+                real_replace(replacement, marker)
+            return result
+
+        monkeypatch.setattr(reconciliation_state.os, "replace", _swap_at_commit)
+        with pytest.raises(reconciliation_state.ReconciliationStateError):
+            _write(tmp_path)
+        monkeypatch.undo()
+        # And the gate stays shut, because a marker is still there.
+        with pytest.raises(freshness.SnapshotUnusable) as excinfo:
+            freshness.evaluate(path=tmp_path / "R.json", now=NOW)
+        assert excinfo.value.reason_code == "RECONCILIATION_SNAPSHOT_COMMIT_UNCERTAIN"
+
+    def test_a_marker_that_vanishes_is_not_a_success_either(self, tmp_path, monkeypatch):
+        marker = _marker(tmp_path)
+        real_replace = os.replace
+
+        def _remove_at_commit(src, dst):
+            result = real_replace(src, dst)
+            if str(dst).endswith("R.json") and marker.exists():
+                marker.unlink()
+            return result
+
+        monkeypatch.setattr(reconciliation_state.os, "replace", _remove_at_commit)
+        with pytest.raises(reconciliation_state.ReconciliationStateError) as excinfo:
+            _write(tmp_path)
+        assert excinfo.value.reason_code == "RECONCILIATION_MARKER_CHANGED"
+        assert excinfo.value.detail == "absent_at_unlink"
+
+    def test_a_marker_recreated_after_the_unlink_is_detected(self, tmp_path, monkeypatch):
+        marker = _marker(tmp_path)
+        real_unlink = os.unlink
+
+        def _recreate(name, *args, **kwargs):
+            result = real_unlink(name, *args, **kwargs)
+            if str(name).endswith("commit-uncertain"):
+                marker.write_text("someone else\n", encoding="utf-8")
+                marker.chmod(0o600)
+            return result
+
+        monkeypatch.setattr(reconciliation_state.os, "unlink", _recreate)
+        with pytest.raises(reconciliation_state.ReconciliationStateError) as excinfo:
+            _write(tmp_path)
+        assert excinfo.value.reason_code == "RECONCILIATION_MARKER_REAPPEARED"
+        monkeypatch.undo()
+        assert marker.exists()
+
+    def test_the_observed_inode_is_carried_to_the_unlink(self):
+        source = (REPO_ROOT / "reconciliation" / "reconciliation_state.py").read_text(
+            encoding="utf-8")
+        assert "_remove_marker(directory_fd, target, marker_bound)" in source
+        assert "marker_bound = _ensure_marker(directory_fd, target)" in source
+        assert "_same_inode(observed, current)" in source
+
+    def test_the_unlink_goes_through_the_directory_descriptor(self):
+        source = (REPO_ROOT / "reconciliation" / "reconciliation_state.py").read_text(
+            encoding="utf-8")
+        assert "os.unlink(name, dir_fd=directory_fd)" in source
+
+    def test_a_normal_write_still_clears_the_marker(self, tmp_path):
+        _write(tmp_path)
+        assert not _marker(tmp_path).exists()
+        assert freshness.evaluate(path=tmp_path / "R.json", now=NOW).clean is True
+
+
+_SLOW_WRITER = textwrap.dedent(
+    """
+    import pathlib, sys, time
+    from datetime import datetime, timezone
+    sys.path.insert(0, sys.argv[1])
+    from reconciliation import reconciliation_state as rs
+    real_replace = rs.os.replace
+    def slow(src, dst):
+        print("IN_SECTION", flush=True)
+        time.sleep(5)
+        return real_replace(src, dst)
+    rs.os.replace = slow
+    rs.record_result(clean=True, mismatch_count=1, unknown_count=0, halt=False,
+                     now=datetime.now(timezone.utc), path=pathlib.Path(sys.argv[2]))
+    print("A_WROTE", flush=True)
+    """
+)
+
+_PLAIN_WRITER = textwrap.dedent(
+    """
+    import pathlib, sys
+    from datetime import datetime, timezone
+    sys.path.insert(0, sys.argv[1])
+    from reconciliation import reconciliation_state as rs
+    try:
+        rs.record_result(clean=False, mismatch_count=9, unknown_count=0, halt=False,
+                         now=datetime.now(timezone.utc), path=pathlib.Path(sys.argv[2]))
+        print("B_WROTE")
+    except rs.ReconciliationStateError as exc:
+        print("B_BLOCKED", exc.reason_code)
+    """
+)
+
+
+class TestTwoWritersCannotOverlap:
+    """A lock FILE cannot give mutual exclusion on its own: a writer
+    whose pathname was swapped for a different regular file sees a
+    perfectly self-consistent inode and locks that instead. The exclusive
+    lock is therefore taken on the state DIRECTORY, whose inode nothing
+    inside it can change."""
+
+    def test_the_lock_is_taken_on_the_directory(self):
+        source = (REPO_ROOT / "reconciliation" / "reconciliation_state.py").read_text(
+            encoding="utf-8")
+        assert "fcntl.flock(directory_fd, fcntl.LOCK_EX)" in source
+        assert "fcntl.flock(directory_fd, fcntl.LOCK_UN)" in source
+
+    def test_a_second_writer_waits_even_after_the_lock_file_is_swapped(self, tmp_path):
+        import time
+
+        target = tmp_path / "R.json"
+        _write(tmp_path)
+        first = subprocess.Popen(
+            [sys.executable, "-c", _SLOW_WRITER, str(REPO_ROOT), str(target)],
+            stdout=subprocess.PIPE, text=True)
+        try:
+            assert first.stdout.readline().strip() == "IN_SECTION"
+            # Swap the lock pathname to a different regular inode.
+            other = tmp_path / "lockB"
+            other.write_text("", encoding="utf-8")
+            other.chmod(0o600)
+            os.rename(other, _lock(tmp_path))
+
+            started = time.time()
+            second = subprocess.run(
+                [sys.executable, "-c", _PLAIN_WRITER, str(REPO_ROOT), str(target)],
+                capture_output=True, text=True, timeout=120)
+            waited = time.time() - started
+        finally:
+            first.wait(timeout=60)
+
+        # Either it waited for the directory lock, or it refused outright.
+        assert waited >= 3 or second.stdout.strip().startswith("B_BLOCKED"), (
+            f"second writer returned in {waited:.1f}s: {second.stdout!r}")
+
+    def test_the_snapshot_is_never_written_by_both_at_once(self, tmp_path):
+        target = tmp_path / "R.json"
+        _write(tmp_path)
+        first = subprocess.Popen(
+            [sys.executable, "-c", _SLOW_WRITER, str(REPO_ROOT), str(target)],
+            stdout=subprocess.PIPE, text=True)
+        try:
+            assert first.stdout.readline().strip() == "IN_SECTION"
+            second = subprocess.run(
+                [sys.executable, "-c", _PLAIN_WRITER, str(REPO_ROOT), str(target)],
+                capture_output=True, text=True, timeout=120)
+        finally:
+            first.wait(timeout=60)
+        # Whichever won, the file is one writer's complete document.
+        payload = json.loads(target.read_text(encoding="utf-8"))
+        assert payload["mismatch_count"] in (1, 9)
+        assert freshness.validate_schema(payload) is payload
+        assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []

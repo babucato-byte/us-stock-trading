@@ -764,11 +764,35 @@ replace 후 (directory fsync 실패)
 Shadow timer를 켤 수 없다.**
 
 marker(`.{snapshot}.commit-uncertain`)와 writer lock(`.{snapshot}.writer.lock`)은 모두
-**symlink를 따라가지 않는다.** 열기 전에 `lstat()`으로 검사하고 `dir_fd` + `O_NOFOLLOW`로
-연다. symlink·broken symlink·디렉터리·FIFO·world-writable·소유자 불일치·`st_nlink != 1`은
-전부 fail-closed이며 삭제하거나 target에 쓰지 않는다. lock이 symlink면 writer가 엉뚱한
-inode를 잠그게 되어 두 writer가 동시에 쓸 수 있으므로 특히 중요하다. 다른 snapshot의
-marker·lock(`.OTHER.json.*`)은 건드리지 않는다.
+**symlink를 따라가지 않고, 특정 inode에 binding된다.** 열기 전에 `lstat()`으로 검사하고
+`dir_fd` + `O_NOFOLLOW`로 연다.
+
+```text
+mode        정확히 0600만 허용 (0640·0644·0660·0666·0400 전부 거부)
+            자동 chmod 교정 없음 — 예상 밖 mode는 다른 주체가 만든 파일이라는 뜻이다
+owner       현재 사용자
+st_nlink    1
+type        regular file (symlink·broken symlink·디렉터리·FIFO·socket 거부)
+```
+
+**pathname은 신뢰하지 않는다.** `lstat → open → fstat`만으로는 그 사이에 regular file이
+*다른* regular file로 교체되는 것을 잡을 수 없다(fstat은 "regular인가"만 확인한다). 그래서
+lock은 open 전 lstat, fd의 fstat, open 후 lstat의 `(st_dev, st_ino)`가 모두 같아야 하고,
+flock 직후와 commit 직전에 다시 확인한다. 불일치는
+`RECONCILIATION_WRITER_LOCK_CHANGED`로 차단한다.
+
+marker 역시 생성 시점의 inode를 기억해 unlink 직전에 대조한다. 다르면
+`RECONCILIATION_MARKER_CHANGED`로 **삭제하지 않고** 차단한다 — 교체된 파일을 지우고 성공을
+반환하면 남의 파일을 지운 뒤 gate까지 열어주는 셈이다. unlink 후에는 이름이 실제로
+비었는지 확인하며, 즉시 재생성돼 있으면 `RECONCILIATION_MARKER_REAPPEARED`다.
+
+**상호 배제는 lock 파일이 아니라 state 디렉터리 inode에 건다.** pathname이 교체되면 두 번째
+writer는 자기 나름대로 일관된 inode를 보게 되므로 lock 파일만으로는 동시 쓰기를 막을 수
+없다. 디렉터리 inode는 그 안에서 무슨 일이 일어나도 바뀌지 않으므로 두 writer가 항상 같은
+객체를 두고 경합한다(실제 2-process probe로 확인: lock pathname을 교체해도 두 번째 writer가
+6초간 대기 후 직렬 실행). lock 파일 검증은 변조 탐지 수단으로 유지한다.
+
+다른 snapshot의 marker·lock(`.OTHER.json.*`)은 건드리지 않는다.
 
 stale temp는 `.{snapshot}.{pid}.{uuid}.tmp` 형식이며, 다음 정상 write가 lock을 쥔 채
 정리한다. dead PID의 정상 temp는 삭제하고, live PID temp·malformed 이름·symlink·디렉터리·

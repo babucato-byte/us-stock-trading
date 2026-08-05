@@ -56,6 +56,17 @@ MARKER_VALID = "VALID_MARKER"
 MARKER_INVALID = "INVALID_MARKER_ARTIFACT"
 REASON_MARKER_ARTIFACT_INVALID = "RECONCILIATION_MARKER_ARTIFACT_INVALID"
 REASON_LOCK_ARTIFACT_INVALID = "RECONCILIATION_LOCK_ARTIFACT_INVALID"
+REASON_LOCK_CHANGED = "RECONCILIATION_WRITER_LOCK_CHANGED"
+REASON_LOCK_MODE_INVALID = "RECONCILIATION_WRITER_LOCK_MODE_INVALID"
+REASON_MARKER_CHANGED = "RECONCILIATION_MARKER_CHANGED"
+REASON_MARKER_MODE_INVALID = "RECONCILIATION_MARKER_MODE_INVALID"
+REASON_MARKER_REAPPEARED = "RECONCILIATION_MARKER_REAPPEARED"
+
+# Both artifacts are created by this module and by nothing else, so the
+# contract is an EXACT mode, not "no worse than". 0640 or 0644 means
+# something other than this writer made the file, which is the case
+# worth stopping for.
+REQUIRED_ARTIFACT_MODE = 0o600
 
 
 def _marker_name(target):
@@ -74,33 +85,52 @@ def _open_dir(directory):
     return os.open(str(directory), os.O_RDONLY)
 
 
+def _validate_stat(info):
+    """None when this stat describes a file this module could have
+    written, otherwise why not."""
+    if stat.S_ISLNK(info.st_mode):
+        return "symlink"
+    if stat.S_ISDIR(info.st_mode):
+        return "directory"
+    if not stat.S_ISREG(info.st_mode):
+        return "non_regular_file"
+    if stat.S_IMODE(info.st_mode) != REQUIRED_ARTIFACT_MODE:
+        # EXACT. `mode & 0o077 == 0` would accept 0640 and 0644, and a
+        # mode this module never sets means another writer made the
+        # file. Not auto-corrected either: chmod-and-continue would
+        # adopt an artifact of unknown origin.
+        return f"mode_{oct(stat.S_IMODE(info.st_mode))}"
+    if info.st_uid != os.getuid() and os.getuid() != 0:
+        return "unexpected_owner"
+    if info.st_nlink != 1:
+        # A hardlink to an inode outside this directory would make the
+        # file we act on not the file we validated.
+        return "unexpected_link_count"
+    return None
+
+
+def _same_inode(first, second):
+    return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
+
+
 def _classify_file_artifact(directory_fd, name):
-    """(state, detail) for a file this module owns, judged by lstat().
+    """(state, detail, info) for a file this module owns, by lstat().
 
     Never follows: a symlink here could point anywhere, and following one
-    would let an outside file be truncated, locked, or unlinked.
+    would let an outside file be truncated, locked, or unlinked. The stat
+    comes back so the caller can BIND to that exact inode -- a pathname
+    check alone cannot survive a regular-to-regular swap.
     """
     try:
         info = os.lstat(name, dir_fd=directory_fd)
     except FileNotFoundError:
-        return MARKER_ABSENT, None
+        return MARKER_ABSENT, None, None
     except OSError as exc:
-        return MARKER_INVALID, type(exc).__name__
-    if stat.S_ISLNK(info.st_mode):
-        return MARKER_INVALID, "symlink"
-    if stat.S_ISDIR(info.st_mode):
-        return MARKER_INVALID, "directory"
-    if not stat.S_ISREG(info.st_mode):
-        return MARKER_INVALID, "non_regular_file"
-    if info.st_mode & stat.S_IWOTH:
-        return MARKER_INVALID, "world_writable"
-    if info.st_uid != os.getuid() and os.getuid() != 0:
-        return MARKER_INVALID, "unexpected_owner"
-    if info.st_nlink != 1:
-        # A hardlink to an inode outside this directory would make the
-        # file we act on not the file we validated.
-        return MARKER_INVALID, "unexpected_link_count"
-    return MARKER_VALID, None
+        return MARKER_INVALID, type(exc).__name__, None
+    problem = _validate_stat(info)
+    if problem is not None:
+        return MARKER_INVALID, problem, info
+    return MARKER_VALID, None, info
 
 
 def marker_state(path=None):
@@ -112,7 +142,8 @@ def marker_state(path=None):
     except OSError as exc:
         return MARKER_INVALID, type(exc).__name__
     try:
-        return _classify_file_artifact(directory_fd, _marker_name(target))
+        state, detail, _info = _classify_file_artifact(directory_fd, _marker_name(target))
+        return state, detail
     finally:
         os.close(directory_fd)
 
@@ -277,20 +308,22 @@ def _ensure_marker(directory_fd, target):
     approve a snapshot nobody re-derived. An INVALID one is fail-closed.
     """
     name = _marker_name(target)
-    state, detail = _classify_file_artifact(directory_fd, name)
+    state, detail, info = _classify_file_artifact(directory_fd, name)
     if state == MARKER_INVALID:
         raise ReconciliationStateError(
             "the commit-uncertain marker is not a file this writer may use",
-            reason_code=REASON_MARKER_ARTIFACT_INVALID, detail=detail)
+            reason_code=(REASON_MARKER_MODE_INVALID if str(detail).startswith("mode_")
+                         else REASON_MARKER_ARTIFACT_INVALID),
+            detail=detail)
     if state == MARKER_VALID:
         logger.warning(
             "a commit-uncertain marker from an earlier attempt is present; "
             "this reconciliation must complete before anything is armed")
-        return
+        return info
 
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(name, flags, 0o600, dir_fd=directory_fd)
+        fd = os.open(name, flags, REQUIRED_ARTIFACT_MODE, dir_fd=directory_fd)
     except OSError as exc:
         raise ReconciliationStateError(
             "the commit-uncertain marker could not be created",
@@ -298,6 +331,7 @@ def _ensure_marker(directory_fd, target):
     try:
         os.write(fd, b"reconciliation write in progress\n")
         os.fsync(fd)
+        created = os.fstat(fd)
     except OSError as exc:
         raise ReconciliationStateError(
             "the commit-uncertain marker could not be synced",
@@ -306,77 +340,152 @@ def _ensure_marker(directory_fd, target):
         os.close(fd)
     # Durable before the replace, or the crash window reopens.
     os.fsync(directory_fd)
+    # Bind to the inode we just made: the unlink at the end must target
+    # THIS file, not whatever the name happens to point at by then.
+    return created
 
 
-def _remove_marker(directory_fd, target):
+def _remove_marker(directory_fd, target, observed):
     """The LAST step, after the replace has been made durable.
 
-    Re-checks identity through the same directory descriptor: the entry
-    unlinked must be the regular file that was validated, not something
-    swapped in since.
+    Bound to the INODE observed at the start, not to the pathname. A
+    re-lstat that only confirmed "still a regular file" would happily
+    unlink a different regular file swapped in since -- which is exactly
+    the case Codex reproduced: the replacement got deleted and the write
+    reported success.
     """
     name = _marker_name(target)
-    state, detail = _classify_file_artifact(directory_fd, name)
+    state, detail, current = _classify_file_artifact(directory_fd, name)
     if state == MARKER_ABSENT:
-        return
+        # Someone else removed it. Not ours to call a success.
+        raise ReconciliationStateError(
+            "the commit-uncertain marker disappeared before it could be removed",
+            reason_code=REASON_MARKER_CHANGED, detail="absent_at_unlink")
     if state == MARKER_INVALID:
         raise ReconciliationStateError(
             "the commit-uncertain marker changed into something unusable",
-            reason_code=REASON_MARKER_ARTIFACT_INVALID, detail=detail)
+            reason_code=(REASON_MARKER_MODE_INVALID if str(detail).startswith("mode_")
+                         else REASON_MARKER_ARTIFACT_INVALID),
+            detail=detail)
+    if observed is not None and not _same_inode(observed, current):
+        raise ReconciliationStateError(
+            "the commit-uncertain marker is a different file than the one written",
+            reason_code=REASON_MARKER_CHANGED, detail="inode_changed=true")
+
     try:
         os.unlink(name, dir_fd=directory_fd)
+    except OSError as exc:
+        raise ReconciliationStateError(
+            "the commit-uncertain marker could not be removed",
+            reason_code=REASON_MARKER_ARTIFACT_INVALID, detail=type(exc).__name__)
+
+    # The name must actually be free now. A file recreated in the gap is
+    # not this writer's, and leaving it while reporting success would
+    # block every gate with nobody knowing why.
+    after, _detail, _info = _classify_file_artifact(directory_fd, name)
+    if after != MARKER_ABSENT:
+        raise ReconciliationStateError(
+            "a commit-uncertain marker reappeared immediately after removal",
+            reason_code=REASON_MARKER_REAPPEARED, detail="recreated")
+
+    try:
         os.fsync(directory_fd)
     except OSError as exc:
         # Returning success here would tell an operator the write
-        # completed while the marker still blocks every gate.
+        # completed while the removal may not have survived a crash.
         raise ReconciliationStateError(
-            "the commit-uncertain marker could not be removed durably",
+            "the commit-uncertain marker removal could not be made durable",
             reason_code=REASON_MARKER_ARTIFACT_INVALID, detail=type(exc).__name__)
 
 
 def _open_writer_lock(directory_fd, target):
-    """Opens the flock file without ever following a symlink.
+    """Opens the flock file and binds it to ONE inode.
 
-    A symlinked lock path would have this writer locking some other
-    inode -- two writers could then hold "the lock" on different files
-    and write concurrently, which is the one thing the lock exists to
-    prevent. O_NOFOLLOW also turns "it became a symlink between the
-    lstat and the open" into an error rather than a follow.
+    lstat -> open -> fstat is not enough: between the lstat and the open,
+    a regular file can be replaced by a DIFFERENT regular file, and fstat
+    only confirms "this is a regular file", not "this is the file I
+    looked at". The writer would then flock an inode nobody validated --
+    and two writers holding "the lock" on different inodes can write at
+    the same time, which is the one thing the lock exists to prevent.
+
+    So the identity is checked three ways: the lstat before the open, the
+    fstat of the descriptor, and an lstat after the open must all name
+    the same (st_dev, st_ino). O_NOFOLLOW additionally turns "it became a
+    symlink" into an error rather than a follow.
+
+    This validation cannot, on its own, give mutual exclusion: a writer
+    whose pathname was swapped for a DIFFERENT regular file sees a
+    perfectly self-consistent inode and would lock it happily while
+    another writer holds the original. So the exclusive lock is taken on
+    the state DIRECTORY, whose inode no game inside it can change, and
+    this file's integrity is checked as evidence of tampering rather
+    than as the mutual-exclusion mechanism.
+
+    Returns (fd, bound_stat); the caller re-confirms the binding after
+    taking the lock and again before it commits.
     """
     name = _lock_name(target)
-    state, detail = _classify_file_artifact(directory_fd, name)
+    state, detail, pre = _classify_file_artifact(directory_fd, name)
     if state == MARKER_INVALID:
         raise ReconciliationStateError(
             "the writer lock is not a file this writer may use",
-            reason_code=REASON_LOCK_ARTIFACT_INVALID, detail=detail)
+            reason_code=(REASON_LOCK_MODE_INVALID if str(detail).startswith("mode_")
+                         else REASON_LOCK_ARTIFACT_INVALID),
+            detail=detail)
 
     flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
     if state == MARKER_ABSENT:
         flags |= os.O_CREAT | os.O_EXCL
     try:
-        fd = os.open(name, flags, 0o600, dir_fd=directory_fd)
+        fd = os.open(name, flags, REQUIRED_ARTIFACT_MODE, dir_fd=directory_fd)
     except OSError as exc:
         raise ReconciliationStateError(
             "the writer lock could not be opened safely",
             reason_code=REASON_LOCK_ARTIFACT_INVALID, detail=type(exc).__name__)
+
     try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
+        bound = os.fstat(fd)
+        problem = _validate_stat(bound)
+        if problem is not None:
             raise ReconciliationStateError(
-                "the writer lock is not a regular file",
-                reason_code=REASON_LOCK_ARTIFACT_INVALID, detail="non_regular_file")
-        if info.st_nlink != 1:
+                "the writer lock is not a usable lock file",
+                reason_code=(REASON_LOCK_MODE_INVALID if problem.startswith("mode_")
+                             else REASON_LOCK_ARTIFACT_INVALID),
+                detail=problem)
+        if pre is not None and not _same_inode(pre, bound):
             raise ReconciliationStateError(
-                "the writer lock has more than one link",
-                reason_code=REASON_LOCK_ARTIFACT_INVALID, detail="unexpected_link_count")
-        if info.st_mode & stat.S_IWOTH:
-            raise ReconciliationStateError(
-                "the writer lock is world-writable",
-                reason_code=REASON_LOCK_ARTIFACT_INVALID, detail="world_writable")
+                "the writer lock was replaced between the check and the open",
+                reason_code=REASON_LOCK_CHANGED, detail="inode_changed=true")
+        _assert_lock_binding(directory_fd, name, bound)
     except BaseException:
         os.close(fd)
         raise
-    return fd
+    return fd, bound
+
+
+def _assert_lock_binding(directory_fd, name, bound):
+    """The pathname must still resolve to the locked inode.
+
+    Called after the open, again after flock, and again before the
+    snapshot is committed -- a lock held on an inode the name no longer
+    points at protects nothing, and another process would be free to
+    lock the new one.
+    """
+    state, detail, current = _classify_file_artifact(directory_fd, name)
+    if state == MARKER_ABSENT:
+        raise ReconciliationStateError(
+            "the writer lock disappeared while it was held",
+            reason_code=REASON_LOCK_CHANGED, detail="absent")
+    if state == MARKER_INVALID:
+        raise ReconciliationStateError(
+            "the writer lock became unusable while it was held",
+            reason_code=(REASON_LOCK_MODE_INVALID if str(detail).startswith("mode_")
+                         else REASON_LOCK_ARTIFACT_INVALID),
+            detail=detail)
+    if not _same_inode(bound, current):
+        raise ReconciliationStateError(
+            "the writer lock pathname now names a different file",
+            reason_code=REASON_LOCK_CHANGED, detail="inode_changed=true")
 
 
 def record_result(*, clean: bool, mismatch_count: int, unknown_count: int,
@@ -441,9 +550,16 @@ def record_result(*, clean: bool, mismatch_count: int, unknown_count: int,
             reason_code=REASON_LOCK_FAILED, detail=type(exc).__name__) from exc
 
     try:
-        lock_fd = _open_writer_lock(directory_fd, target)
+        lock_fd, lock_bound = _open_writer_lock(directory_fd, target)
+        lock_name = _lock_name(target)
         try:
             try:
+                # The DIRECTORY is the anchor. Its inode cannot be
+                # swapped by anything happening inside it, so two writers
+                # always contend for the same object -- which a lock FILE
+                # cannot guarantee, since a swapped pathname gives the
+                # second writer a self-consistent inode of its own.
+                fcntl.flock(directory_fd, fcntl.LOCK_EX)
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
             except OSError as exc:
                 raise ReconciliationStateError(
@@ -451,14 +567,19 @@ def record_result(*, clean: bool, mismatch_count: int, unknown_count: int,
                     reason_code=REASON_LOCK_FAILED, detail=type(exc).__name__) from exc
 
             try:
+                # The name could have been swapped while we waited for
+                # the lock; a lock held on an orphaned inode is not a
+                # lock on this snapshot.
+                _assert_lock_binding(directory_fd, lock_name, lock_bound)
                 # Cleanup failure blocks the write: a directory this
                 # module cannot tidy is one it should not add to.
                 _cleanup_stale_temps(target)
 
                 # BEFORE the replace, and durable. This is what makes a
                 # crash between os.replace() and the directory fsync
-                # visible afterwards.
-                _ensure_marker(directory_fd, target)
+                # visible afterwards. The returned stat binds the unlink
+                # at the end to this exact inode.
+                marker_bound = _ensure_marker(directory_fd, target)
 
                 temp_name = f".{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
                 temp_path = target.with_name(temp_name)
@@ -475,6 +596,10 @@ def record_result(*, clean: bool, mismatch_count: int, unknown_count: int,
                         pass
                     raise ReconciliationStateError(
                         f"failed to persist reconciliation result: {exc}") from exc
+
+                # Last check before anything becomes visible: if the
+                # lock stopped protecting this snapshot, do not commit.
+                _assert_lock_binding(directory_fd, lock_name, lock_bound)
 
                 try:
                     os.replace(temp_path, target)
@@ -501,10 +626,14 @@ def record_result(*, clean: bool, mismatch_count: int, unknown_count: int,
 
                 # Only now: the snapshot is durable, so the intent it
                 # recorded is complete.
-                _remove_marker(directory_fd, target)
+                _remove_marker(directory_fd, target, marker_bound)
             finally:
                 try:
                     fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                try:
+                    fcntl.flock(directory_fd, fcntl.LOCK_UN)
                 except OSError:
                     pass
         finally:
