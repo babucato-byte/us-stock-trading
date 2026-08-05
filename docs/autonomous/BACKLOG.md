@@ -6,13 +6,6 @@
 
 ---
 
-## T2. feature/kis-live-broker origin push — `status: ready`
-
-T1 재검증 PASS(`AUTOPILOT_REVIEW_2026-08-06.md`)로 사용자의 "검증 통과 후 push" 조건이 충족됐다.
-로컬 HEAD(`6c21d87`)가 origin(`673888c`)보다 14커밋 앞서 있다.
-`git push origin feature/kis-live-broker` 실행 후 origin/HEAD 일치를 확인하고 이 항목을 done으로.
-(main 병합은 여전히 하지 않는다 — 사용자 결정 사항.)
-
 ## T8. 유니버스 확장 + 계좌 금액대 필터 — `status: ready`
 
 현재 universe.csv 약 5,000종목. 사용자 지시: 확장하거나 금액대 기준으로 최적화.
@@ -64,6 +57,19 @@ T1 재검증 PASS(`AUTOPILOT_REVIEW_2026-08-06.md`)로 사용자의 "검증 통�
 ---
 
 ## 완료 기록
+
+### T2. feature/kis-live-broker origin push — `status: done` (2026-08-06)
+
+`673888c` → `b36a8a6` fast-forward push 완료. `git fetch` 후 origin/local 양방향 0/0 확인.
+`origin/main`은 `fdf2217`로 불변 — main 병합·push 없음.
+
+- push 전 발견한 불일치를 먼저 해소했다: 커밋 `571e03a`가 T4를 done으로 표시하고
+  `SHADOW_MODE_EXIT_CRITERIA.md`를 인용하는데 정작 그 파일이 **untracked**였다. 그대로 push하면
+  origin의 BACKLOG가 히스토리에 없는 파일을 가리키게 되므로, 직전 사이클 산출물(criteria 문서 +
+  NEEDS_USER §3 + CURRENT_STATUS 사이클2 기록)을 `b36a8a6`으로 먼저 커밋했다.
+- 같은 커밋에서 CURRENT_STATUS의 미치환 `REGRESSION_PLACEHOLDER`를 실측값으로 교체했다.
+- 검증: 전체 회귀 **3,077 passed** (0 failed, 299.6s) — push 직전 실행.
+- push 대상 14커밋에 `.env`/`.pem`/`.key`/secret 계열 신규 파일 0건 확인.
 
 ### T4. Shadow Mode 운영 기간 판정 기준 문서화 — `status: done` (2026-08-06)
 

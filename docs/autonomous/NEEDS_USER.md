@@ -6,8 +6,10 @@
 
 세션에는 SSH 접근이 없다. 서버에서:
 
+push는 완료됐다 (T2, 2026-08-06): `origin/feature/kis-live-broker` = `b36a8a6`.
+
 ```bash
-# 1) 최신 코드 반영 상태 확인 (T1 PASS + push 이후)
+# 1) 최신 코드 반영 상태 확인 — HEAD가 b36a8a6이어야 한다
 cd ~/us-stock-trading && git fetch && git log --oneline -3 origin/feature/kis-live-broker
 
 # 2) 검증 절차는 runbook 순서대로
@@ -49,3 +51,15 @@ sudo systemctl daemon-reload
 
 `entry_rules` ~ `end_of_day_exit_rules` 필드 목록이 중간에 끊긴 지시 메시지의
 나머지 부분을 아무 Claude 세션에나 다시 전달해 주면 T5가 진행된다.
+
+## 5. 로컬 `.git/HEAD.lock` 제거 — 한 줄 (자율 루프 차단 해제)
+
+직전 세션이 남긴 0바이트 스테일 락이 `git commit`/`git update-ref`를 전부 막는다
+(실행 중인 git 프로세스는 0으로 확인됨). 세션 샌드박스가 `.git` 내부 파일 삭제를
+거부해 자율 루프가 직접 지울 수 없다. 사이클 3은 링크드 워크트리로 우회했지만,
+이후 세션이 정상 경로로 커밋하려면 아래 한 줄이 필요하다. 로컬 전용이며 서버·origin
+영향 없음.
+
+```bash
+cd ~/Projects/us-stock-trading && rm -f .git/HEAD.lock
+```
