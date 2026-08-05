@@ -2,6 +2,49 @@
 
 마지막 갱신: 2026-08-06
 
+## 자율 사이클 2026-08-06 (2) — T4 Shadow 판정 기준 문서화 **완료**
+
+`AUTOPILOT.md` 계약에 따른 두 번째 사이클. BACKLOG 최상위 `ready` 항목 T4를 처리했다.
+산출물: `docs/autonomous/SHADOW_MODE_EXIT_CRITERIA.md` (신규). **문서만, 프로덕션 코드 변경 0.**
+
+- **설계 판단**: Shadow는 체결이 0이므로 손익 기반 게이트를 원리상 판정할 수 없다. 따라서 Shadow
+  창구를 **운영 무결성 게이트**로 좁게 정의하고, 성과 게이트는 별도 트랙으로 분리했다. Shadow
+  통과를 "성과 검증 통과"로 읽지 못하도록 `ACCEPTANCE_CRITERIA.md` §Phase 8 14개 항목 전부를
+  판정 가능/부분/불가로 매핑한 표를 문서 앞에 뒀다(가능 6, 부분 2, 불가 6).
+- **종료 기준 G1~G11**: 전부 실재하는 산출물로 측정 가능한 형태로만 작성했다 —
+  `shadow_audit_events`(권위), `shadow_mode` JSONL(조건부), `run_health_report.collect()`,
+  `reconciliation_state`. 확인 명령을 못 붙이는 항목은 기준으로 채택하지 않았다.
+  기간은 Phase 8의 "최소 20거래일"을 **낮추지 않고 그대로** 승계.
+- **"무결점"의 조작적 정의**: 계수일 인정 조건(§4)과 리셋 규칙(§5)으로 분해했다. 정상 차단
+  (`LIVE_FLAG`/`ENTRY_DISABLED`/가격편차/잔고/중복)은 안전장치가 일한 기록이므로 결함 집합에서
+  제외했고, 실주문 발생·감사 무결성 위반·`SHADOW_ERROR`·reconciliation dirty·HALT·배포 커밋
+  변경만 전체 리셋 사유로 뒀다.
+- **이번에 확정된 구조적 공백 2건**(둘 다 신규 위험이 아니라 지금까지 기준이 없어 안 보이던 것):
+  1. **Shadow는 매도/청산 경로를 실증하지 못한다.** `scripts/run_shadow_exit_evaluation.py:331`이
+     `store.load_non_terminal()`을 순회하는데, 실주문 0이면 포지션도 0이라 매도 타이머는 평가
+     대상 없이 돈다. "shadow-exit 무사고"가 매도 로직 검증의 근거가 될 수 없다 → G5는 표본 0을
+     허용하되 판정 기록에 `미검증` 명시를 의무화했다.
+  2. **기본 보관 기간(30일)이 판정 창구(20 거래일 ≈ 28일)보다 짧다.** `purge_old_events()`/
+     `purge_old_files()`가 reconciliation 틱에서 실제로 삭제하므로, 기본값 그대로 창구를 돌리면
+     판정 시점에 창구 앞부분 증거가 이미 사라진다. 사후 복구 불가 → G11(창구 시작 **전** 확정,
+     ≥45일 권고) + BACKLOG `T7` + `NEEDS_USER.md` §3.
+- **파생 항목**: `T6`(성과 트랙 A/B/C 선택, `blocked:needs-user-decision` — Alpaca 주문 차단으로
+  기존 "Paper 100회 체결" 경로가 성립하지 않는다. 권고는 A: 이미 구현된 KIS 모의투자 TR_ID 활용),
+  `T7`(보관 설정, `blocked:needs-user`).
+- **검증**: 문서가 인용한 심볼·이벤트 타입·env·경로·systemd 유닛·산술 **81건을 저장소 밖 독립
+  probe로 전건 실재 확인**(probe 최초 실행에서 1건 오탐을 잡아 AST 기반으로 교정 — `run_shadow_
+  mode.py`의 `execution_engine` 언급은 import가 아니라 그 보장을 설명하는 docstring이었다).
+  전체 회귀 **3,077 passed**(사이클 3에서 커밋 직전 재실행해 확정. 이 자리에 미치환 플레이스홀더가
+  남아 있던 것을 사이클 3이 실측값으로 교체했다).
+
+**다음**: ready 항목 없음. T3·T7은 서버 접근, T5·T6은 사용자 결정 대기.
+**Shadow timer 활성화 불가, 실주문 활성화 금지**는 그대로다.
+
+**BACKLOG T2 관련 주의**: 이 사이클 시작 시점의 워킹 트리에 T2(origin push) 항목이 커밋되지 않은
+채 삭제돼 있었다. 확인 결과 **푸시는 실제로 일어나지 않았다** — `origin/feature/kis-live-broker`는
+여전히 `673888c`이고 로컬은 13커밋 앞서 있다. 남의 미커밋 편집을 되돌리지 않기 위해 삭제 상태를
+그대로 두고 이 사실만 기록한다. 푸시가 필요하면 별도 지시 바람.
+
 ## 자율 사이클 2026-08-06 — T1 독립 재검증 **PASS**
 
 `AUTOPILOT.md` 계약에 따른 첫 사이클. BACKLOG T1(Codex HIGH 3건 수정 커밋 독립 재검증)을
