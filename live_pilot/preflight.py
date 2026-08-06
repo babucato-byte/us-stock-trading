@@ -47,6 +47,7 @@ ACK_LIVE_ENV = "LIVE_PILOT_ACK_LIVE_ENV"
 RESULT_PASS = "PASS"
 RESULT_FAIL = "FAIL"
 RESULT_INFO = "INFO"
+RESULT_WARN = "WARN"
 
 
 @dataclass
@@ -71,9 +72,18 @@ class PreflightReport:
         posture that is sanctioned today (paper)."""
         self._add(RESULT_INFO, name, reason_code, detail)
 
+    def warn(self, name, reason_code, detail=None):
+        """Visible, recorded, and not a refusal for THIS posture -- but
+        it does name something the next posture is still blocked on."""
+        self._add(RESULT_WARN, name, reason_code, detail)
+
     @property
     def failures(self):
         return [row for row in self.rows if row["status"] == RESULT_FAIL]
+
+    @property
+    def warnings(self):
+        return [row for row in self.rows if row["status"] == RESULT_WARN]
 
     @property
     def passed(self):
@@ -128,38 +138,79 @@ def check_kis_env(report, env):
 #    runtime switch inside kis_broker -- the constraint that test
 #    enforces is about that module, not about a consumer of it.
 # ---------------------------------------------------------------------
-def check_live_response_pending(report, kis_env):
-    from brokers.kis_broker import LIVE_RESPONSE_PENDING_ITEMS
+def check_live_response_pending(report, kis_env, posture=None):
+    """Gates on what THIS posture actually uses.
 
-    pending = list(LIVE_RESPONSE_PENDING_ITEMS)
-    if not pending:
-        report.ok("live_response_pending", "every matrix value is live-confirmed")
-        return
-    listed = ", ".join(pending)
-    # Deliberately ALL pending items, not a subset judged "relevant to
-    # live". Some of them (e.g. the paper cancel TR_ID) only matter on
-    # 모의투자, so this is stricter than strictly necessary -- but the
-    # alternative is a hand-written relevance map, and getting that map
-    # wrong would silently un-gate a value that does matter. Erring
-    # toward refusing costs an operator one more confirmation pass;
-    # erring the other way costs a real order.
-    if kis_env == "live":
-        report.fail(
-            "live_response_pending", "LIVE_RESPONSE_PENDING",
-            f"{len(pending)} KIS value(s) unconfirmed by a real response ({listed}) -- "
-            "confirm them on 모의투자 and mark them LIVE_RESPONSE_CONFIRMED in "
-            "brokers/kis_broker.py; there is no environment variable that skips this",
-        )
-        return
-    # Paper is the only sanctioned way to confirm these at all: the
-    # runbook forbids confirming the cancel TR_ID with a real order. A
-    # paper pilot IS the confirming procedure, so refusing to run it
-    # because the confirmation has not happened would be circular.
-    report.info(
-        "live_response_pending", "LIVE_RESPONSE_PENDING_PAPER_OK",
-        f"{len(pending)} value(s) still unconfirmed ({listed}) -- allowed on paper, "
-        "and confirming them here is the point of a paper pilot",
+    It used to gate on the whole matrix, on the reasoning that a
+    hand-written relevance map could un-gate a value that mattered. The
+    map is no longer hand-written: `required_for` lives on the matrix
+    entry itself and is derived from where the value is REFERENCED, with
+    tests/test_kis_verification_matrix.py proving the classification
+    against the source. So the reason for the blanket rule is gone,
+    while its cost was real -- OBSERVE reads nothing through the order
+    or cancel endpoints, and refusing to observe because an order-only
+    TR_ID is unconfirmed blocked the one activity that could confirm
+    anything.
+
+    OBSERVE requirements are still enforced exactly as before. ARMED-only
+    pending values are reported, loudly, as what ARMED remains blocked
+    on.
+    """
+    from brokers.kis_broker import (
+        REQUIRED_FOR_ARMED, REQUIRED_FOR_OBSERVE, matrix_entries_for,
+        pending_items_for,
     )
+
+    resolved = posture or posture_module.resolve_posture().posture
+    needed = REQUIRED_FOR_ARMED if resolved == posture_module.POSTURE_ARMED \
+        else REQUIRED_FOR_OBSERVE
+    pending = list(pending_items_for(needed))
+    confirmed = len(matrix_entries_for(needed)) - len(pending)
+
+    if pending:
+        listed = ", ".join(pending)
+        if kis_env == "live":
+            report.fail(
+                "live_response_pending", "LIVE_RESPONSE_PENDING",
+                f"{len(pending)} of {resolved}'s KIS value(s) unconfirmed by a real "
+                f"response ({listed}) -- confirm them with a read-only probe "
+                "(scripts/verify_kis_observe_responses.py) or on 모의투자 and mark them "
+                "LIVE_RESPONSE_CONFIRMED in brokers/kis_broker.py; there is no "
+                "environment variable that skips this",
+            )
+            return
+        # Paper is the only sanctioned way to confirm some of these at
+        # all: the runbook forbids confirming the cancel TR_ID with a
+        # real order. A paper pilot IS the confirming procedure, so
+        # refusing to run it because the confirmation has not happened
+        # would be circular.
+        report.info(
+            "live_response_pending", "LIVE_RESPONSE_PENDING_PAPER_OK",
+            f"{len(pending)} value(s) still unconfirmed ({listed}) -- allowed on paper, "
+            "and confirming them here is the point of a paper pilot",
+        )
+    else:
+        report.ok(
+            "live_response_pending",
+            f"{resolved} requires {confirmed} wire value(s); all live-confirmed",
+        )
+
+    # What the NEXT posture is still blocked on. Never a refusal here --
+    # this run is not armed -- but it must be visible, or an operator
+    # could read a clean OBSERVE preflight as readiness to arm.
+    if resolved != posture_module.POSTURE_ARMED:
+        armed_pending = list(pending_items_for(REQUIRED_FOR_ARMED))
+        armed_total = len(matrix_entries_for(REQUIRED_FOR_ARMED))
+        if armed_pending:
+            report.warn(
+                "armed_response_requirements", "BLOCKED_FOR_ARMED_ONLY",
+                f"{len(armed_pending)} of {armed_total} ARMED wire value(s) remain "
+                f"unconfirmed ({', '.join(armed_pending)}); OBSERVE is allowed, "
+                "ARMED stays blocked until every one is live-confirmed",
+            )
+        else:
+            report.ok("armed_response_requirements",
+                      f"all {armed_total} ARMED wire value(s) are live-confirmed")
 
 
 # ---------------------------------------------------------------------
@@ -347,7 +398,8 @@ def run_preflight(*, env=None, broker=None, log_dir=None, scan_enabled=True):
     report = PreflightReport()
 
     kis_env = check_kis_env(report, mapping)
-    check_live_response_pending(report, kis_env)
+    check_live_response_pending(report, kis_env,
+                                posture=posture_module.resolve_posture(mapping).posture)
     check_kill_switch(report)
     check_reconciliation(report)
     check_account(report, mapping, broker)

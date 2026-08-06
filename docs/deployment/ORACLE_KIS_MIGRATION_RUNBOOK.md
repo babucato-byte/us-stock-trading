@@ -241,30 +241,61 @@ repository 기준으로는 확인됐지만(`REFERENCE_VERIFIED`), **실제 KIS �
 확인되지 않았다**(`LIVE_RESPONSE_PENDING`). 두 상태는 서로 다른 축이며, 코드의
 `VERIFICATION_MATRIX`가 그 유일한 기준이다.
 
-이 단계에서 확인해야 할 항목 전체를 코드에서 직접 뽑아 쓴다.
+**요구 수준은 posture별로 다르다.** 각 항목에는 `required_for`가 붙어 있고, 이 값은
+이름이 아니라 **실제 참조 위치**에서 도출된다.
+
+```text
+OBSERVE_REQUIRED (3)  price_path, price_field_last, order_exchange_code_space
+ARMED_REQUIRED  (9)   위 3개 + order_path, order_tr_id_live_buy, cancel_path,
+                      cancel_tr_id_live, cancel_tr_id_paper, cancel_price_field_rule
+```
+
+`order_exchange_code_space`가 OBSERVE에 포함되는 이유가 이 분류를 이름으로 하면 안 되는
+이유다 — 이름은 주문 전용처럼 보이지만 `OVRS_EXCG_CD`는 `_sweep_exchanges()`가 잔고·미체결·
+체결 **조회**에 붙이는 값이라 OBSERVE가 전적으로 의존한다.
+
+이 단계에서 확인해야 할 항목을 코드에서 직접 뽑아 쓴다.
 
 ```bash
 python3 -c "
-from brokers.kis_broker import VERIFICATION_MATRIX, LIVE_RESPONSE_PENDING
-for e in VERIFICATION_MATRIX:
-    if e.live_status == LIVE_RESPONSE_PENDING:
-        print(f'{e.name:28} {e.value:45} <- {e.source}')
+from brokers.kis_broker import (
+    REQUIRED_FOR_OBSERVE, REQUIRED_FOR_ARMED, matrix_entries_for, pending_items_for)
+for posture in (REQUIRED_FOR_OBSERVE, REQUIRED_FOR_ARMED):
+    pending = pending_items_for(posture)
+    total = len(matrix_entries_for(posture))
+    print(f'{posture}: {total - len(pending)}/{total} confirmed; pending={list(pending)}')
 "
 ```
 
-특히 다음 두 가지는 실주문 활성화 전에 반드시 실응답으로 확인한다.
+**OBSERVE 3개는 읽기 전용으로 확인할 수 있다.**
 
-```text
-price_field_last     현재가 응답의 실제 가격 field 이름 (output.last)
-cancel_tr_id_live    일반 주문 취소 TR_ID (TTTT1004U / VTTT1004U) 및 요청 field
+```bash
+python3 scripts/verify_kis_observe_responses.py --symbols AAPL,MSFT
 ```
 
-현재가 field는 §12의 읽기 전용 조회 응답으로 바로 확인할 수 있다. 취소 TR_ID는 읽기
-전용으로 확인할 수 없으므로 **모의투자(paper) 환경에서 주문 후 취소**로 확인한다. 실계좌
+이 스크립트는 주문·취소 메서드에 도달할 수 없는 read-only proxy를 사용하며, 시세·잔고·
+포지션·미체결·체결 조회만 수행한다. 응답의 **필드 존재와 타입만** 기록하고 값·토큰·전체
+계좌번호는 출력하지 않는다.
+
+**ARMED 6개는 읽기 전용으로 확인할 수 없다.**
+
+```text
+order_path, order_tr_id_live_buy, cancel_path,
+cancel_tr_id_live, cancel_tr_id_paper, cancel_price_field_rule
+```
+
+`cancel_tr_id_live`와 `order_tr_id_live_buy`는 live 전용 값이라 **모의투자 응답으로 확인
+처리하면 안 된다.** 나머지는 **모의투자(paper) 환경에서 주문 후 취소**로 확인한다. 실계좌
 주문으로 확인하지 않는다.
 
-확인된 항목은 `VERIFICATION_MATRIX`의 `live_status`를 `LIVE_RESPONSE_CONFIRMED`로 갱신하고,
-값이 실제와 다르면 코드를 수정한 뒤 다시 Codex 검증을 받는다.
+확인된 항목은 `VERIFICATION_MATRIX`의 `live_status`를 `LIVE_RESPONSE_CONFIRMED`로 갱신하고
+`source`에 그 근거(어떤 probe가 언제 무엇을 봤는지)를 남긴다. 값이 실제와 다르면 코드를
+수정한 뒤 다시 Codex 검증을 받는다. 문서만 보고 CONFIRMED로 바꾸지 않는다.
+
+**preflight 동작**: OBSERVE 세션은 OBSERVE 3개만 강제한다. ARMED 전용 미확인 항목은
+`[WARN] armed_response_requirements [BLOCKED_FOR_ARMED_ONLY]`로 보고되며 OBSERVE 기동을
+막지 않는다. ARMED posture(세 플래그 전부 on)에서는 9개 전부를 강제한다. 우회 환경변수는
+없다.
 
 ## 13. KIS 잔고·미체결 대조 (계정 전체 reconciliation, CODEX-044)
 

@@ -191,30 +191,72 @@ class TestPreflightGates:
                                          preflight.ACK_LIVE_ENV: "true"})
         assert not report.failures
 
-    def test_unconfirmed_kis_values_block_a_live_session(self):
-        """The BACKLOG's 'TBD_VERIFY_LIVE_DOCS 2건'. They are still
-        pending today, so this must actually refuse."""
-        from brokers.kis_broker import LIVE_RESPONSE_PENDING_ITEMS
+    def test_an_unconfirmed_value_this_posture_uses_blocks_a_live_session(self,
+                                                                            monkeypatch):
+        """The gate now asks what THIS posture depends on. An OBSERVE
+        value left pending must still refuse a live session -- that is
+        the half of the old blanket rule worth keeping."""
+        from brokers import kis_broker
+        from live_pilot import posture as posture_module
 
-        assert LIVE_RESPONSE_PENDING_ITEMS, "this test is meaningless if nothing is pending"
+        rewritten = tuple(
+            entry._replace(live_status=kis_broker.LIVE_RESPONSE_PENDING)
+            if entry.name == "price_field_last" else entry
+            for entry in kis_broker.VERIFICATION_MATRIX
+        )
+        monkeypatch.setattr(kis_broker, "VERIFICATION_MATRIX", rewritten)
         report = preflight.PreflightReport()
-        preflight.check_live_response_pending(report, "live")
+        preflight.check_live_response_pending(
+            report, "live", posture=posture_module.POSTURE_OBSERVE)
         assert report.failures[0]["reason_code"] == "LIVE_RESPONSE_PENDING"
-        for item in LIVE_RESPONSE_PENDING_ITEMS:
-            assert item in report.failures[0]["detail"]
+        assert "price_field_last" in report.failures[0]["detail"]
 
-    def test_unconfirmed_kis_values_do_not_block_a_paper_session(self):
+    def test_order_only_values_no_longer_block_observe(self):
+        """OBSERVE never reaches the order or cancel endpoints, so the
+        values that describe them cannot be a reason to refuse it. ARMED
+        is still blocked by them -- reported as a warning here."""
+        from live_pilot import posture as posture_module
+
         report = preflight.PreflightReport()
-        preflight.check_live_response_pending(report, "paper")
+        preflight.check_live_response_pending(
+            report, "live", posture=posture_module.POSTURE_OBSERVE)
+        assert not report.failures, report.render()
+        warned = [r for r in report.warnings
+                  if r["check"] == "armed_response_requirements"]
+        assert warned and warned[0]["reason_code"] == "BLOCKED_FOR_ARMED_ONLY"
+
+    def test_unconfirmed_kis_values_do_not_block_a_paper_session(self, monkeypatch):
+        from brokers import kis_broker
+        from live_pilot import posture as posture_module
+
+        rewritten = tuple(
+            entry._replace(live_status=kis_broker.LIVE_RESPONSE_PENDING)
+            for entry in kis_broker.VERIFICATION_MATRIX
+        )
+        monkeypatch.setattr(kis_broker, "VERIFICATION_MATRIX", rewritten)
+        report = preflight.PreflightReport()
+        preflight.check_live_response_pending(
+            report, "paper", posture=posture_module.POSTURE_OBSERVE)
         assert not report.failures
         assert self._rows(report)["live_response_pending"]["status"] == preflight.RESULT_INFO
 
     def test_no_environment_variable_can_skip_the_pending_gate(self, monkeypatch):
+        from brokers import kis_broker
+        from live_pilot import posture as posture_module
+
+        rewritten = tuple(
+            entry._replace(live_status=kis_broker.LIVE_RESPONSE_PENDING)
+            if entry.name == "price_path" else entry
+            for entry in kis_broker.VERIFICATION_MATRIX
+        )
+        monkeypatch.setattr(kis_broker, "VERIFICATION_MATRIX", rewritten)
         for name in ("LIVE_RESPONSE_PENDING_OK", "SKIP_PREFLIGHT",
-                     "LIVE_PILOT_SKIP_PENDING", "LIVE_PILOT_FORCE"):
+                     "LIVE_PILOT_SKIP_PENDING", "LIVE_PILOT_FORCE",
+                     "SKIP_LIVE_RESPONSE_CHECK", "FORCE_OBSERVE"):
             monkeypatch.setenv(name, "true")
         report = preflight.PreflightReport()
-        preflight.check_live_response_pending(report, "live")
+        preflight.check_live_response_pending(
+            report, "live", posture=posture_module.POSTURE_OBSERVE)
         assert report.failures
 
     def test_halt_blocks(self, monkeypatch):

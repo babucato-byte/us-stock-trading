@@ -161,55 +161,90 @@ LIVE_RESPONSE_CONFIRMED = "LIVE_RESPONSE_CONFIRMED"
 LIVE_RESPONSE_PENDING = "LIVE_RESPONSE_PENDING"
 
 
+# Which pilot posture actually depends on a value. Named here, beside
+# the matrix, so preflight and runtime cannot each keep their own list.
+REQUIRED_FOR_OBSERVE = "OBSERVE"
+REQUIRED_FOR_ARMED = "ARMED"
+
+# Everything ARMED does, it does on top of what OBSERVE does, so an
+# OBSERVE requirement is automatically an ARMED requirement too.
+_OBSERVE_AND_ARMED = frozenset({REQUIRED_FOR_OBSERVE, REQUIRED_FOR_ARMED})
+_ARMED_ONLY = frozenset({REQUIRED_FOR_ARMED})
+
+
 class WireValueVerification(NamedTuple):
-    """One wire-format value and how far its verification actually got."""
+    """One wire-format value, how far its verification got, and which
+    posture actually depends on it.
+
+    `required_for` is derived from where the value is REFERENCED, not
+    from what its name suggests. `order_exchange_code_space` is the
+    example that matters: it reads like an order-only concern, but
+    OVRS_EXCG_CD is what `_sweep_exchanges()` puts on the balance,
+    open-order and fill reads, so OBSERVE depends on it completely.
+    Classifying by name would have un-gated it.
+    """
 
     name: str
     value: str
     reference_status: str
     live_status: str
     source: str
+    required_for: frozenset = _OBSERVE_AND_ARMED
 
 
 VERIFICATION_MATRIX = (
     WireValueVerification(
         "order_path", ORDER_PATH, REFERENCE_VERIFIED, LIVE_RESPONSE_PENDING,
         "examples_user/overseas_stock/overseas_stock_functions.py::order()",
+        required_for=_ARMED_ONLY,
     ),
     WireValueVerification(
         "order_tr_id_live_buy", TR_ID_ORDER_US[("live", "buy")], REFERENCE_VERIFIED,
         LIVE_RESPONSE_PENDING,
         "examples_user/overseas_stock/overseas_stock_functions.py::order()",
+        required_for=_ARMED_ONLY,
     ),
     WireValueVerification(
         "cancel_path", CANCEL_PATH, REFERENCE_VERIFIED, LIVE_RESPONSE_PENDING,
         "examples_llm/overseas_stock/order_rvsecncl/order_rvsecncl.py",
+        required_for=_ARMED_ONLY,
     ),
     WireValueVerification(
         "cancel_tr_id_live", TR_ID_CANCEL["live"], REFERENCE_VERIFIED, LIVE_RESPONSE_PENDING,
         "examples_llm/overseas_stock/order_rvsecncl/order_rvsecncl.py",
+        required_for=_ARMED_ONLY,
     ),
     WireValueVerification(
         "cancel_tr_id_paper", TR_ID_CANCEL["paper"], REFERENCE_VERIFIED, LIVE_RESPONSE_PENDING,
         "examples_llm/overseas_stock/order_rvsecncl/order_rvsecncl.py",
+        required_for=_ARMED_ONLY,
     ),
     WireValueVerification(
         "cancel_price_field_rule", "OVRS_ORD_UNPR=0", REFERENCE_VERIFIED,
         LIVE_RESPONSE_PENDING,
         "order_rvsecncl.py docstring: 취소주문 시, '0' 입력",
+        required_for=_ARMED_ONLY,
+    ),
+    # Confirmed by a REAL live-account read, not by documentation:
+    # scripts/verify_kis_observe_responses.py on the Oracle host,
+    # 2026-08-06, 12/12 checks -- AAPL and MSFT both answered on
+    # PRICE_PATH with output.last carrying a positive float.
+    WireValueVerification(
+        "price_path", PRICE_PATH, REFERENCE_VERIFIED, LIVE_RESPONSE_CONFIRMED,
+        "live read-only probe: verify_kis_observe_responses.py (Oracle, 2026-08-06)",
     ),
     WireValueVerification(
-        "price_path", PRICE_PATH, REFERENCE_VERIFIED, LIVE_RESPONSE_PENDING,
-        "examples_llm/overseas_stock/price/chk_price.py",
+        "price_field_last", "output.last", REFERENCE_VERIFIED, LIVE_RESPONSE_CONFIRMED,
+        "live read-only probe: output.last -> positive float for AAPL/MSFT via EXCD=NAS",
     ),
-    WireValueVerification(
-        "price_field_last", "output.last", REFERENCE_VERIFIED, LIVE_RESPONSE_PENDING,
-        "chk_price.py field comment: 'last': '현재가'",
-    ),
+    # Confirmed by the account READS, which is where this code space is
+    # actually used: _sweep_exchanges() puts OVRS_EXCG_CD on balance,
+    # open-order and fill queries, and all three venues answered.
     WireValueVerification(
         "order_exchange_code_space", "NASD/NYSE/AMEX", REFERENCE_VERIFIED,
-        LIVE_RESPONSE_PENDING,
-        "reference repo order.py / order_rvsecncl.py / inquire_psamount docstrings",
+        LIVE_RESPONSE_CONFIRMED,
+        "live read-only probe: NASD/NYSE/AMEX accepted on balance, positions, "
+        "open-orders and fills (Oracle, 2026-08-06)",
     ),
 )
 
@@ -220,6 +255,24 @@ LIVE_RESPONSE_PENDING_ITEMS = tuple(
     entry.name for entry in VERIFICATION_MATRIX
     if entry.live_status == LIVE_RESPONSE_PENDING
 )
+
+
+def matrix_entries_for(posture):
+    """Every wire value the given posture actually depends on."""
+    return tuple(entry for entry in VERIFICATION_MATRIX
+                 if posture in entry.required_for)
+
+
+def pending_items_for(posture):
+    """The values that posture needs and a real response has not yet
+    confirmed. Empty means that posture's wire format is established.
+
+    The one place either preflight or runtime should ask. A second,
+    hand-written relevance list somewhere else is exactly how a value
+    that does matter gets silently un-gated.
+    """
+    return tuple(entry.name for entry in matrix_entries_for(posture)
+                 if entry.live_status == LIVE_RESPONSE_PENDING)
 
 
 class KISBrokerError(Exception):

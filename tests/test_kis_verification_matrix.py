@@ -120,13 +120,29 @@ class TestRunbookMatchesTheMatrix:
         assert "VERIFICATION_MATRIX" in RUNBOOK
 
     def test_runbook_names_the_two_items_that_must_be_confirmed_live(self):
-        # The two Codex has tracked as the residual MEDIUM.
+        # Both remain named in the runbook: price_field_last as the
+        # OBSERVE value a read-only probe confirmed, cancel_tr_id_live as
+        # one ARMED still waits on.
         assert "price_field_last" in RUNBOOK
         assert "cancel_tr_id_live" in RUNBOOK
 
     def test_runbook_tells_the_operator_how_to_list_every_pending_item(self):
-        assert "LIVE_RESPONSE_PENDING" in RUNBOOK
-        assert "from brokers.kis_broker import VERIFICATION_MATRIX" in RUNBOOK
+        """It now lists them PER POSTURE, through the accessors, rather
+        than iterating the raw matrix -- so the runbook and preflight
+        cannot disagree about what a posture needs."""
+        assert "LIVE_RESPONSE_PENDING" in RUNBOOK or "pending_items_for" in RUNBOOK
+        assert "from brokers.kis_broker import (" in RUNBOOK
+        assert "pending_items_for" in RUNBOOK
+        assert "matrix_entries_for" in RUNBOOK
+
+    def test_runbook_documents_the_posture_split(self):
+        assert "OBSERVE_REQUIRED" in RUNBOOK
+        assert "ARMED_REQUIRED" in RUNBOOK
+        assert "order_exchange_code_space" in RUNBOOK
+
+    def test_runbook_forbids_confirming_live_only_ids_from_paper(self):
+        collapsed = " ".join(RUNBOOK.split())
+        assert "모의투자 응답으로 확인 처리하면 안 된다" in collapsed
 
     def test_runbook_forbids_confirming_the_cancel_tr_id_with_a_real_order(self):
         assert "모의투자" in RUNBOOK
@@ -134,9 +150,21 @@ class TestRunbookMatchesTheMatrix:
         collapsed = " ".join(RUNBOOK.split())
         assert "실계좌 주문으로 확인하지 않는다" in collapsed
 
-    @pytest.mark.parametrize("item", ["price_field_last", "cancel_tr_id_live"])
+    @pytest.mark.parametrize("item", ["cancel_tr_id_live", "order_tr_id_live_buy"])
     def test_named_items_are_actually_pending_in_the_matrix(self, item):
+        """The live-only TR_IDs: no paper response and no document can
+        confirm these, so they stay pending until a sanctioned live
+        probe, and ARMED stays blocked."""
         assert item in kis_broker.LIVE_RESPONSE_PENDING_ITEMS
+
+    def test_the_observe_values_are_confirmed_by_a_real_response(self):
+        """price_field_last moved to CONFIRMED on the strength of a live
+        read-only probe, not a document."""
+        by_name = {entry.name: entry for entry in kis_broker.VERIFICATION_MATRIX}
+        for name in ("price_path", "price_field_last", "order_exchange_code_space"):
+            entry = by_name[name]
+            assert entry.live_status == kis_broker.LIVE_RESPONSE_CONFIRMED, name
+            assert "probe" in entry.source, f"{name} cites no live evidence"
 
 
 class TestVerificationStatusIsNotARuntimeSwitch:
@@ -160,9 +188,52 @@ class TestVerificationStatusIsNotARuntimeSwitch:
                 assert not _reads_matrix(node.test), (
                     f"line {node.lineno}: control flow branches on the verification matrix"
                 )
-            # No function body may read it either -- module-level
-            # derivation of the pending tuple is the only sanctioned use.
+            # No function body may read it either, with one exception:
+            # the two pure accessors that exist so preflight has a single
+            # authority to ask. They RETURN matrix rows; they contain no
+            # branch on a status, which the control-flow check above
+            # enforces for every node including theirs. Broker behaviour
+            # still cannot consult the matrix.
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name in ("matrix_entries_for", "pending_items_for"):
+                    continue
                 assert not _reads_matrix(node), (
                     f"{node.name}() reads the verification matrix at runtime"
                 )
+
+    def test_the_accessors_only_filter_and_never_branch_on_status(self):
+        """The exemption above is safe only while those two functions
+        stay pure projections of the matrix."""
+        import ast
+
+        tree = ast.parse(SOURCE)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            if node.name not in ("matrix_entries_for", "pending_items_for"):
+                continue
+            for child in ast.walk(node):
+                assert not isinstance(child, (ast.If, ast.While)), (
+                    f"{node.name}() branches; it must only filter"
+                )
+            calls = [c for c in ast.walk(node) if isinstance(c, ast.Call)]
+            for call in calls:
+                name = getattr(call.func, "id", None) or getattr(call.func, "attr", None)
+                assert name in ("tuple", "matrix_entries_for"), (
+                    f"{node.name}() calls {name}(); it must only filter"
+                )
+
+    def test_no_broker_method_consults_the_matrix(self):
+        """The property that actually matters: editing documentation must
+        not change what the broker does."""
+        import ast
+
+        tree = ast.parse(SOURCE)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef) or node.name != "KISBroker":
+                continue
+            for child in ast.walk(node):
+                if isinstance(child, ast.Name) and child.id in (
+                    "VERIFICATION_MATRIX", "LIVE_RESPONSE_PENDING_ITEMS",
+                ):
+                    raise AssertionError("KISBroker reads the verification matrix")
