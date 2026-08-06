@@ -854,3 +854,63 @@
 - 승인 필요 여부: 아니오(코드 구현·테스트 추가·문서화 범위). 실주문 플래그·서버 설정·
   main 병합은 건드리지 않았다. 사용자 몫으로 남은 것은 KIS 자격증명 + 읽기 플래그 1개 +
   명령 1줄뿐이다(`NEEDS_USER.md` §6).
+
+## 실시간 실테스트 하네스 (T9, 2026-08-06, feature/kis-live-broker)
+
+사용자 지시: "스캐너와 매수매도 조건을 실시간으로 실테스트". 설계 요약(구현 착수 전 기록,
+`AUTOPILOT.md` 작업 루프 2단계):
+
+- **결정 1(자세[posture]는 코드가 고르지 않고 환경이 정한다):** 파일럿은 매 tick마다
+  `KIS_LIVE_ORDER_ENABLED`/`LIVE_ROLLOUT_ENABLED`/`ENTRY_DISABLED`를 읽어 두 자세 중 하나로
+  분기한다. `OBSERVE`(기본) = 스캐너·신호·게이트·매도조건을 전부 실시간으로 평가하되 주문
+  경로를 **import조차 하지 않는다**. `ARMED` = 운영자가 세 플래그를 켰을 때만, 그때 처음
+  `kis_live_trading`/`kis_position_manager`를 지연 import해 실제 매수·매도를 돌린다.
+  코드 기본값은 어떤 플래그도 켜지 않는다. 전환은 사용자의 `.env` 한 줄이다(`NEEDS_USER` §7).
+- **결정 2(평가 로직을 복제하지 않는다):** `OBSERVE`는 `scripts/run_shadow_mode.py`와
+  `scripts/run_shadow_exit_evaluation.py`의 `run_once()`를 그대로 호출한다(파일 경로
+  importlib 로드 — `scripts/`는 패키지가 아니다). 매수 게이트와 매도 판정을 파일럿 안에
+  다시 쓰면 실거래 경로와 조용히 갈라진다. `ARMED`도 마찬가지로 이미 검증된
+  `run_live_buy_entry_cycle()`/`sync_kis_fills_and_manage_exits()`만 부른다 —
+  이 하네스에는 새 매수 규칙도 새 매도 규칙도 없다.
+- **결정 3(기동 거부 게이트 10종):** 하나라도 실패하면 루프에 진입하지 않고 exit 3으로 죽는다.
+  게이트를 끄는 CLI 옵션도 환경변수도 만들지 않았다.
+  ① KIS 환경(`paper`/`live`, live는 `LIVE_PILOT_ACK_LIVE_ENV=true` 추가 요구)
+  ② `brokers.kis_broker.LIVE_RESPONSE_PENDING_ITEMS` — 지시서가 말한 `TBD_VERIFY_LIVE_DOCS`
+  2건은 CODEX-052에서 마커 자체가 제거됐고(`test_kis_verification_matrix.py`가 부재를 고정)
+  지금은 이 매트릭스가 권위 소스다. **실측 결과 미확인 값은 2건이 아니라 9건**이며
+  (runbook이 추적하던 `price_field_last`/`cancel_tr_id_live` 포함) 게이트는 9건 전부를 본다.
+  **paper에서는 INFO**(모의투자가 이 값들을 확인하는 유일한 인가 수단이라고 RUNBOOK이
+  규정하므로 paper까지 막으면 확인 절차가 순환이 된다), **live에서는 FAIL** — 해제는 env
+  스위치가 아니라 매트릭스를 `LIVE_RESPONSE_CONFIRMED`로 바꾸는 코드 변경뿐이다.
+  ③ kill switch(HALT clear + ENTRY 허용, 값이 bool이 아니면 실패)
+  ④ reconciliation freshness(`require_unknown_zero`/`require_halt_clear`)
+  ⑤ 계좌 조회 성공 + `KIS_ALLOWED_ACCOUNT_NO` 일치
+  ⑥ 스캔 유니버스 로드(T8의 `universe_tradable.csv` 우선)
+  ⑦ 워치리스트 로드(비어 있고 스캔도 안 돌면 실패 — 아무 것도 안 하는 기동은 성공이 아니다)
+  ⑧ 플래그 정합성(반쯤 켜진 자세는 거부) ⑨ tick 로그 디렉터리 쓰기 가능
+  ⑩ 공용 단일실행락이 비어 있음.
+- **결정 4(단일 인스턴스 락은 파일럿 전용):** `execution.idempotency.single_run_lock()`을
+  장시간 붙잡으면 reconcile 타이머가 굶는다. 파일럿은 자기 락 파일만 flock으로 잡고,
+  preflight에서 공용 락은 "지금 비어 있는지"만 확인 후 즉시 놓는다.
+- **결정 5(증거는 tick 단위 JSONL + 일일 리포트):** `shadow_mode.persist()`의 규율
+  (flock → append → flush → fsync, `redact_value` 전건 적용, 하루 1파일)을 그대로 따르되
+  파일은 분리한다(`live-pilot-YYYY-MM-DD.jsonl`). Shadow 감사 증거를 파일럿 tick으로
+  희석하지 않기 위해서다. 일일 리포트는 그날 JSONL만 읽어 재생성 가능한 순수 집계이며,
+  손상된 줄은 건너뛰지 않고 리포트에 카운트로 남긴다.
+- **결정 6(장 세션 밖에서는 평가하지 않는다):** `market_hours.get_us_market_session()`이
+  파일럿의 허용 세션(`--sessions`, 기본 `regular`)에 없으면 그 tick은 `IDLE`로 기록만 하고
+  스캐너·KIS 읽기·게이트를 전부 건너뛴다. 휴장 중 KIS 읽기는 rate limit만 태운다.
+- 승인 필요 여부: 아니오(코드·테스트·문서). 실주문 플래그는 이 사이클에서도 켜지 않았다.
+- **결정 7(ARMED 결과 리스트의 모양이 서로 다르다는 것을 구현 중 발견):** `run_live_buy_entry_
+  cycle()`의 `submitted`는 **심볼 문자열**, `blocked`/`skipped`는 **(심볼, 사유) 튜플**이다
+  (`kis_live_trading.py:464` vs `:272`/`:303`). `sync_kis_fills_and_manage_exits()`도 같은
+  식으로 `managed`/`synced_fills`는 심볼, `skipped`/`reconciliation_blocked`는 튜플이다
+  (`kis_position_manager.py:332` vs `:273`/`:304`). 첫 구현이 `skipped`를 심볼 목록으로 읽어
+  튜플 전체가 `symbol` 필드에 들어갈 뻔했고, 이는 ARMED 세션의 tick 기록에서만 드러나는
+  종류의 결함이라 실행 없이는 잡히지 않는다. 두 모양을 모두 받는 `_split_pair()`로 정규화하고
+  회귀 테스트로 각 리스트의 **실제** 모양을 고정했다.
+- **결정 8(매도 사유는 지어내지 않는다):** `managed` 리스트는 심볼만 담고 어떤 exit 조건이
+  발화했는지는 담지 않는다(`check_and_manage()`가 반환한 레코드를 매니저가 버린다). 파일럿의
+  tick은 `reason_code="MANAGED"`까지만 기록하고 사유는 **그 값이 실제로 생성되는 곳**
+  (포지션 레코드와 `brokers/kis_broker_adapter.py`가 쓰는 매도측 감사 이벤트)에 맡긴다.
+  여기서 추정해 채우면 tick 로그가 근거 없는 사유를 권위 있는 것처럼 보여준다.

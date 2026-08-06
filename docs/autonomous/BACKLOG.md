@@ -6,18 +6,10 @@
 
 ---
 
-## T9. 실시간 실테스트 하네스 (스캐너 + 매수·매도 조건) — `status: ready`
+## T10. 미푸시 커밋 origin push — `status: ready`
 
-사용자 지시: 스캐너와 매수매도 조건을 실시간으로 실테스트.
-구현:
-- `scripts/start_live_pilot.sh` — 장중 실시간 루프 실행기. `KIS_ENV=paper|live` 전환식.
-  모의투자(paper)로 즉시 실테스트 시작 가능, live 전환은 .env 스위치 1줄.
-- 시작 전 자동 체크리스트: TBD_VERIFY_LIVE_DOCS 2건 검증 상태, kill switch,
-  reconciliation freshness, 계좌/유니버스 로드 — 하나라도 실패 시 기동 거부.
-- 스캐너 → 신호 → 매수 → lifecycle 매도(`check_and_manage()`) 전 구간을 실시간
-  데이터로 돌리고 tick별 JSONL + 일일 리포트 기록.
-- 실주문 플래그 코드 기본값은 안전측 유지. 활성화는 사용자의 .env 1줄 —
-  절차를 NEEDS_USER에 3줄로 기록한다.
+T9 산출물 커밋(live_pilot 하네스) 이후 origin push가 남았다.
+`git push origin feature/kis-live-broker` 실행 후 origin과 HEAD 일치 확인, 이 항목을 done으로.
 
 ## T3. Oracle 서버 재검증 + Shadow 타이머 배포 준비 — `status: blocked:needs-user`
 
@@ -46,6 +38,35 @@
 ---
 
 ## 완료 기록
+
+### T9. 실시간 실테스트 하네스 (스캐너 + 매수·매도 조건) — `status: done` (2026-08-06)
+
+장중에 스캐너 → 신호 → 매수 → lifecycle 매도까지 tick 단위로 반복 실행하는 하네스가
+실제로 동작한다. 신규: `live_pilot/` 패키지(7모듈), `scripts/run_live_pilot.py`,
+`scripts/start_live_pilot.sh`. 변경: `tests/test_fatal_connection_propagation.py`(목록 추가만).
+
+- **자세(posture)는 코드가 아니라 환경이 정한다.** 기본은 `OBSERVE` — 전 구간을 실시간
+  데이터로 평가하되 주문 경로를 **import조차 하지 않는다**. 운영자가 기존 플래그 3개를
+  켜면(`.env` 3줄) 그때 처음 `live_pilot/armed.py`를 지연 import해 이미 검증된
+  `run_live_buy_entry_cycle()`/`sync_kis_fills_and_manage_exits()`를 부른다.
+  자율 루프는 어떤 플래그도 켜지 않았다.
+- **평가 로직 복제 0.** `OBSERVE`는 `scripts/run_shadow_mode.py`와
+  `run_shadow_exit_evaluation.py`의 `run_once()`를 그대로 호출한다. 새 매수 규칙도
+  새 매도 규칙도 만들지 않았다.
+- **기동 게이트 10종** — 하나라도 실패하면 루프에 진입하지 않고 exit 3. 스킵 수단(플래그·
+  환경변수·CLI) 없음. BACKLOG가 말한 `TBD_VERIFY_LIVE_DOCS` 건은 그 마커를 대체한
+  `VERIFICATION_MATRIX`/`LIVE_RESPONSE_PENDING_ITEMS`로 검사한다 — **실측 결과 미확인 값은
+  2건이 아니라 9건**이고, `KIS_ENV=live`에서는 전부 FAIL(해제는 코드 변경뿐), paper에서는
+  INFO(모의투자가 그 값들을 확인하는 유일한 인가 수단이라 순환이 된다).
+- 증거: tick 단위 JSONL(flock→append→fsync, `redact_value` 전건) + 그날 JSONL만 읽어
+  재생성 가능한 일일 리포트. 손상된 줄은 버리지 않고 `unreadable_lines`로 센다.
+- 구현 중 실제 결함 1건을 잡았다: `run_live_buy_entry_cycle()`의 `submitted`(심볼)와
+  `skipped`/`blocked`(심볼·사유 튜플)가 **서로 다른 모양**이라, 첫 구현이 튜플 전체를
+  `symbol` 필드에 넣을 뻔했다. 두 모양을 모두 받도록 정규화하고 실제 모양을 회귀로 고정.
+- 검증: 전체 회귀 **3,350 passed / 0 failed**(신규 123). 실행 확인 — 실제 스캐너 1회
+  통과(12종목 3.1초), 실제 yfinance 분석으로 tick 1회, 4-tick 루프에서 tick 전건 기록·
+  shadow_audit 12행 기록·주문 메서드 도달 0, 게이트 실패 시 exit 3 재현.
+- 사용자 몫: 자격증명 + 명령 1줄(관찰), 실주문은 `.env` 3줄 → `NEEDS_USER.md` §7.
 
 ### T8. 유니버스 확장 + 계좌 금액대 필터 — `status: done` (2026-08-06)
 

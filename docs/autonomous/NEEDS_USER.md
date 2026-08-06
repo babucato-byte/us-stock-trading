@@ -52,7 +52,12 @@ sudo systemctl daemon-reload
 `entry_rules` ~ `end_of_day_exit_rules` 필드 목록이 중간에 끊긴 지시 메시지의
 나머지 부분을 아무 Claude 세션에나 다시 전달해 주면 T5가 진행된다.
 
-## 5. 로컬 `.git/HEAD.lock` 제거 — 한 줄 (자율 루프 차단 해제)
+## 5. 로컬 `.git/HEAD.lock` 제거 — **해소됨 (2026-08-06 사이클 5)**
+
+사이클 5에서 자율 루프가 직접 제거했다(실행 중인 git 프로세스 0을 확인한 뒤 `os.unlink`).
+아래 내용은 재발 시 참고용으로 남긴다. 사용자 조치는 더 이상 필요 없다.
+
+<details><summary>원래 기록</summary>
 
 직전 세션이 남긴 0바이트 스테일 락이 `git commit`/`git update-ref`를 전부 막는다
 (실행 중인 git 프로세스는 0으로 확인됨). 세션 샌드박스가 `.git` 내부 파일 삭제를
@@ -63,6 +68,8 @@ sudo systemctl daemon-reload
 ```bash
 cd ~/Projects/us-stock-trading && rm -f .git/HEAD.lock
 ```
+
+</details>
 
 ## 6. 유니버스 계좌 금액대 필터 활성화 (T8) — 자격증명 + 플래그 1개 + 명령 1줄
 
@@ -101,3 +108,78 @@ head -3 universe_tradable.csv          # 살 수 있는 종목만, 유동성 높
 cat logs/universe_filter_report.json   # 포함/제외 사유별 통계 + 사용된 예산·상한
 head -5 logs/universe_decisions.csv    # 심볼별 포함/제외 사유 전건
 ```
+
+## 7. 실시간 실테스트 하네스 실행 (T9) — 자격증명 + 명령 1줄 (+ 실주문은 .env 1줄)
+
+T9의 코드·테스트·기동 게이트·기록·리포트는 전부 완료됐다. 남은 사용자 몫은 **KIS 읽기
+자격증명을 넣고 명령 한 줄을 실행하는 것**이다. 실주문까지 켜려면 그 다음에 `.env` 한 줄이
+더 필요하다 — 자율 루프는 그 줄을 대신 쓰지 않는다(불변 안전 규칙).
+
+### 7-1. 관찰 모드로 실시간 실테스트 시작 (실주문 없음, 지금 바로 가능)
+
+```bash
+# 1) .env — §6에서 이미 넣었다면 그대로 재사용한다. 모의투자부터 시작한다.
+#    KIS_ALLOWED_ACCOUNT_NO 는 KIS_ACCOUNT_NO 와 같은 값이어야 기동 게이트를 통과한다.
+cat >> .env <<'ENVEOF'
+KIS_ENV=paper
+KIS_APP_KEY=<발급값>
+KIS_APP_SECRET=<발급값>
+KIS_ACCOUNT_NO=<계좌번호 앞 8자리>
+KIS_ACCOUNT_PRODUCT_CD=01
+KIS_ALLOWED_ACCOUNT_NO=<KIS_ACCOUNT_NO 와 동일>
+KIS_ACCOUNT_READ_ENABLED=true
+ENVEOF
+
+# 2) reconciliation 스냅샷을 한 번 갱신한다 (기동 게이트가 신선도를 요구한다)
+venv/bin/python scripts/run_reconciliation.py
+
+# 3) 기동 체크리스트만 먼저 확인 — 실패한 게이트가 이름과 사유코드로 나온다
+scripts/start_live_pilot.sh --preflight-only
+
+# 4) 실시간 루프 시작 (정규장, 60초 tick, 15분마다 스캐너 재실행)
+scripts/start_live_pilot.sh
+```
+
+멈추려면 `Ctrl+C` 한 번 — 진행 중인 tick을 끝내고 그날 리포트를 쓴 뒤 종료한다.
+
+결과 확인:
+
+```bash
+tail -3 logs/live_pilot/live-pilot-$(date -u +%F).jsonl   # tick 단위 전건 기록
+cat logs/live_pilot/live-pilot-report-$(date -u +%F).json # 그날 집계 리포트
+scripts/start_live_pilot.sh --report-only --date 2026-08-06  # 지난 날짜 리포트 재생성
+```
+
+자주 쓰는 옵션: `--once`(1 tick만), `--interval 30`, `--sessions premarket,regular`,
+`--scan-interval 0`(스캐너 끄고 기존 후보 파일 재사용), `--scan-limit 200`,
+`--until 2026-08-06T20:00:00+00:00`.
+
+### 7-2. 실주문까지 켜기 — 사용자의 `.env` 3줄 (모의투자 권장)
+
+관찰 모드에서 하루치 tick 기록이 납득될 때까지 확인한 뒤에만 한다.
+**이 3줄을 넣기 전까지 하네스는 어떤 주문도 낼 수 없다** — 주문 경로를 import조차 하지 않는다.
+
+```bash
+cat >> .env <<'ENVEOF'
+KIS_LIVE_ORDER_ENABLED=true
+LIVE_ROLLOUT_ENABLED=true
+ENTRY_DISABLED=false
+ENVEOF
+```
+
+`KIS_ENV=paper`이면 모의투자 계좌에 실제 주문이 나가고, `positions/lifecycle.check_and_manage()`
+매도 경로까지 실제로 돈다 — 이것이 매도 로직을 실증하는 유일한 경로다
+(`SHADOW_MODE_EXIT_CRITERIA.md` G5가 기록한 구조적 공백).
+되돌리려면 `KIS_LIVE_ORDER_ENABLED=false` 한 줄이면 되고, 다음 tick부터 즉시 관찰 모드로
+돌아온다(자세는 tick마다 다시 읽는다).
+
+### 7-3. 실계좌(`KIS_ENV=live`)로 올리는 조건
+
+```bash
+KIS_ENV=live LIVE_PILOT_ACK_LIVE_ENV=true scripts/start_live_pilot.sh --preflight-only
+```
+
+이 명령은 **지금은 반드시 실패한다.** `brokers/kis_broker.py`의 `VERIFICATION_MATRIX`에
+실응답으로 확인되지 않은 값이 남아 있는 동안 기동 게이트가 거부하기 때문이다(현재 9건).
+해제 방법은 환경변수가 아니라 **모의투자로 값을 확인한 뒤 매트릭스를
+`LIVE_RESPONSE_CONFIRMED`로 바꾸는 코드 변경**뿐이다(§2와 같은 작업).

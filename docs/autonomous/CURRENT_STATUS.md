@@ -2,6 +2,73 @@
 
 마지막 갱신: 2026-08-06
 
+## 자율 사이클 2026-08-06 (5) — T9 실시간 실테스트 하네스 **완료**
+
+`AUTOPILOT.md` 계약에 따른 다섯 번째 사이클. BACKLOG 최상위 `ready` 항목 T9를 처리했다.
+장중에 **스캐너 → 신호 → 매수 → lifecycle 매도**를 tick 단위로 반복 실행하는 하네스가
+실제로 동작한다(실제 스캐너 1회 + 실제 yfinance 분석 + 4-tick 루프로 확인).
+
+- **설계 판단(가장 중요): 자세(posture)를 코드가 고르지 않게 했다.** 파일럿은 매 tick마다
+  `KIS_LIVE_ORDER_ENABLED`/`LIVE_ROLLOUT_ENABLED`/`ENTRY_DISABLED`를 **다시 읽어** 두 갈래로
+  분기한다. `OBSERVE`(기본)는 전 구간을 실시간 데이터로 평가하되 주문 경로를 **import조차
+  하지 않는다** — 플래그를 검사해서 안 하는 게 아니라 그 모듈이 프로세스에 없다(회귀 테스트가
+  `sys.modules`로 고정). `ARMED`는 운영자가 세 플래그를 켰을 때만 `live_pilot/armed.py`를
+  지연 import한다. 자율 루프는 이 사이클에서도 어떤 플래그도 켜지 않았다. 자세를 시작 시
+  한 번 고정하지 않은 이유는, 장중에 `ENTRY_DISABLED`를 켠 운영자가 **재시작이 아니라 다음
+  tick에** 즉시 반영되기를 기대하기 때문이다. 위험한 방향(OBSERVE→ARMED)은 세 플래그가 전부
+  필요하므로 편집이 중간에 끊기면 항상 OBSERVE로 떨어진다.
+- **평가 로직을 한 줄도 복제하지 않았다.** `OBSERVE`는 `scripts/run_shadow_mode.py`와
+  `scripts/run_shadow_exit_evaluation.py`의 `run_once()`를, `ARMED`는
+  `run_live_buy_entry_cycle()`과 `sync_kis_fills_and_manage_exits()`를 그대로 호출한다.
+  매수 게이트나 매도 조건을 하네스 안에 다시 쓰면 실거래 경로와 조용히 갈라진다 —
+  Shadow 서비스가 애초에 그 이유로 만들어졌다. `armed.py`가 자체 게이트를 넣지 않는 것도
+  회귀 테스트로 고정했다(`is_halted(`/`evaluate_buy_gate(`/플래그 이름 등장 금지).
+- **기동 게이트 10종, 스킵 수단 없음**: KIS 환경 / 미확인 KIS 응답값 / kill switch /
+  reconciliation freshness / 실계좌 조회 + 허용계좌 일치 / 스캔 유니버스 / 워치리스트 /
+  플래그 정합성 / 로그 디렉터리 / 공용 단일실행락. 하나라도 실패하면 루프에 **진입하지 않고**
+  exit 3. `--skip-preflight`도, 게이트를 끄는 환경변수도 만들지 않았다(테스트가 파서 옵션을
+  직접 읽어 고정).
+- **BACKLOG가 말한 `TBD_VERIFY_LIVE_DOCS` 2건은 실제로 9건이었다.** 그 마커는 CODEX-052에서
+  이미 제거됐고(`test_kis_verification_matrix.py`가 부재를 고정한다) 권위 소스는
+  `VERIFICATION_MATRIX`다. 지금 `LIVE_RESPONSE_PENDING`인 값은 runbook이 추적하던 2건
+  (`price_field_last`, `cancel_tr_id_live`)을 포함해 **9건**이다. 게이트는 9건 전부를 보고,
+  `KIS_ENV=live`에서는 FAIL·`paper`에서는 INFO로 갈랐다 — paper가 이 값들을 확인하는 유일한
+  인가 수단이라고 runbook이 규정하므로("실계좌 주문으로 확인하지 않는다"), paper까지 막으면
+  확인 절차 자체가 순환이 된다. 해제는 환경변수가 아니라 매트릭스를 코드에서
+  `LIVE_RESPONSE_CONFIRMED`로 바꾸는 변경뿐이다.
+- **증거 파일을 Shadow와 분리했다.** tick JSONL은 `logs/live_pilot/live-pilot-YYYY-MM-DD.jsonl`.
+  `shadow_mode.persist()`의 규율(flock → append → flush → fsync, `redact_value` 전건 +
+  free-text `redact_text`)은 그대로 가져왔지만 파일은 나눴다 — Shadow JSONL은 판정 창구의
+  증거이고(G1~G11이 그 행을 센다), 거기에 파일럿 tick을 섞으면 창구 증거가 희석된다.
+  일일 리포트는 그날 JSONL만 읽는 순수 집계라 언제든 재생성 가능하고(`--report-only --date`),
+  손상된 줄은 건너뛰지 않고 `unreadable_lines`에 센다.
+- **공용 단일실행락을 붙잡지 않는다.** `execution.idempotency.single_run_lock()`을 몇 시간짜리
+  세션 동안 쥐면 reconcile·shadow·health 타이머가 전부 굶는다. preflight는 그 락이 지금
+  비어 있는지만 확인하고 즉시 놓고, 파일럿의 배타성은 자기 락 파일로 따로 잡는다.
+- **이번 사이클에 잡은 실제 결함 1건**: `run_live_buy_entry_cycle()`이 돌려주는 세 리스트의
+  모양이 서로 다르다 — `submitted`는 **심볼 문자열**, `blocked`/`skipped`는 **(심볼, 사유)
+  튜플**이다(`kis_live_trading.py:464` vs `:272`/`:303`). `sync_kis_fills_and_manage_exits()`도
+  같은 식이다(`kis_position_manager.py:332` vs `:273`/`:304`). 첫 구현이 `skipped`를 심볼
+  목록으로 읽어 튜플 전체가 tick 로그의 `symbol` 필드에 들어갈 뻔했다. **ARMED 세션에서만
+  드러나는 결함**이라 실행 없이는 안 잡히고, 이 세션에는 실거래 자격증명이 없어 그 경로를
+  돌릴 수 없으므로 호출 대상 소스를 직접 대조해서 찾았다. 두 모양을 모두 받는 `_split_pair()`로
+  정규화하고 각 리스트의 **실제** 모양을 회귀 테스트로 고정했다.
+- **매도 사유는 지어내지 않았다**: `managed` 리스트에는 심볼만 담기고 어떤 exit 조건이
+  발화했는지는 담기지 않는다. tick은 `reason_code="MANAGED"`까지만 기록하고 사유는 그 값이
+  실제로 생성되는 곳(포지션 레코드 + 매도측 감사 이벤트)에 맡긴다.
+- **검증**: 전체 회귀 **3,350 passed / 0 failed** (391.2s, 신규 123).
+  독립 probe 23/23 — ① 실제 스캐너 1회 통과(12종목 3.1초, `candidates.csv` 등 실제 생성)
+  ② 실제 yfinance 분석으로 tick 1회(AAPL/MSFT `BELOW_SCORE_THRESHOLD`) ③ 4-tick 루프에서
+  tick 4/4 기록·워치리스트 3종목 전건 평가·`shadow_audit_events` 12행 실제 기록
+  ④ 주문 메서드 도달 0(submit_order가 예외를 던지는 broker double로 실행 확인)
+  ⑤ HALT 세팅 시 preflight 거부 재현 ⑥ 스냅샷 삭제 시 실제 프로세스 exit 3 재현
+  ⑦ 리포트 재생성 결정성 ⑧ `KIS_ENV=live` + ack 없음 → python 도달 전 거부.
+
+**사용자 몫**: 관찰 모드는 자격증명 + 명령 1줄, 실주문은 `.env` 3줄 → `NEEDS_USER.md` §7.
+그 전까지 하네스는 주문 경로를 import하지 않는다(= 안전).
+**다음 ready 항목**: 없음. T3·T7은 서버 접근, T5는 사용자 지시 재전송 대기.
+**Shadow timer 활성화 불가, 실주문 활성화 금지**는 그대로다.
+
 ## 자율 사이클 2026-08-06 (4) — T8 유니버스 계좌 금액대 필터 **완료**
 
 `AUTOPILOT.md` 계약에 따른 네 번째 사이클. BACKLOG 최상위 `ready` 항목 T8을 처리했다.

@@ -412,6 +412,12 @@ class TestExceptionPrecedenceIsStatic:
         "scripts/run_shadow_exit_evaluation.py",
         "scripts/run_live_buy_entry.py",
         "scripts/run_health_report.py",
+        # T9: the pilot drives the same cycles on a loop, so a poisoned
+        # connection must reach ITS exit path too -- a broad handler here
+        # would keep the process (and the SQLite write lock) alive.
+        "scripts/run_live_pilot.py",
+        "live_pilot/runner.py",
+        "live_pilot/armed.py",
     ]
     BROAD = {"Exception", "BaseException", "OrderRepositoryError"}
     REACHES_REPOSITORY = (
