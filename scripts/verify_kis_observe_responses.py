@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
 """Confirms the wire values OBSERVE depends on, against real KIS reads.
 
-OBSERVE needs three of the nine matrix values -- the price endpoint, the
-field the price is read from, and the OVRS_EXCG_CD code space that every
-account read is swept over. The other six belong to order and cancel
-submission, which OBSERVE never reaches. This script is how the three get
-from LIVE_RESPONSE_PENDING to LIVE_RESPONSE_CONFIRMED without anyone
-guessing from documentation.
+OBSERVE needs seven of the matrix values -- the price endpoint, the field
+the price is read from, the OVRS_EXCG_CD code space every account read is
+swept over, the orderable-amount endpoint/TR/field every candidate is
+sized with, and the fact that the balance response carries no cash field
+at all. The other six belong to order and cancel submission, which
+OBSERVE never reaches. This script is how the seven get from
+LIVE_RESPONSE_PENDING to LIVE_RESPONSE_CONFIRMED without anyone guessing
+from documentation.
+
+ORACLE-CASH-01 is why the cash values are in that list: the balance
+response's cash fields were never in the matrix, so nothing ever compared
+them against a real response, and a field name that does not exist
+survived as a confident $0 for a funded account.
 
 It CANNOT place, amend or cancel an order. Not "does not": it never
 imports execution.execution_engine or the KIS adapter, and the broker
 handle it uses is wrapped in a proxy whose allow-list contains read
-methods only, so an order call raises before a request is built.
+methods only, so an order call raises before a request is built. The
+orderable-amount check passes a symbol and a limit price because the
+QUERY takes them as inputs; nothing is submitted.
 
 What it reports is the SHAPE of the response -- which field was present
 and what type it held -- never a price it should not, never a token, a
@@ -26,6 +35,7 @@ Exit codes:
 import argparse
 import json
 import logging
+import math
 import sys
 from pathlib import Path
 
@@ -34,8 +44,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from brokers.kis_broker import (  # noqa: E402
+    ORDERABLE_AMOUNT_FIELD,
     PRICE_PATH,
+    PSAMOUNT_PATH,
+    TR_ID_PSAMOUNT,
     KISBroker,
+    KISOrderableCashUnavailableError,
     KISPriceUnavailableError,
 )
 from domain.exchange import supported_kis_order_exchange_codes  # noqa: E402
@@ -53,7 +67,16 @@ logger = logging.getLogger("verify_kis_observe")
 # does expose the split, `_cross_check_matrix()` asserts the two agree,
 # so this stays a statement of what the probe covers rather than a second
 # authority on what OBSERVE requires.
-PROBE_CONFIRMS = ("price_path", "price_field_last", "order_exchange_code_space")
+PROBE_CONFIRMS = (
+    "price_path", "price_field_last", "order_exchange_code_space",
+    # ORACLE-CASH-01: the orderable-amount contract. OBSERVE sizes every
+    # candidate from this endpoint, so an unconfirmed field name here
+    # blocks the entry evaluation at the cash stage -- which is exactly
+    # what happened when the cash figure was read from the balance
+    # response instead.
+    "orderable_amount_path", "orderable_amount_tr_id_live", "orderable_amount_field",
+    "balance_cash_fields_absent",
+)
 
 
 def _cross_check_matrix(results):
@@ -89,7 +112,7 @@ class ReadOnlyViolation(Exception):
 class ReadOnlyBroker:
     ALLOWED = frozenset({
         "get_current_price", "get_account_snapshot", "get_positions",
-        "get_open_orders", "get_fills", "config",
+        "get_open_orders", "get_fills", "get_orderable_usd", "config",
     })
 
     def __init__(self, broker):
@@ -136,6 +159,7 @@ def check_price_endpoint(results, broker, symbols):
     """
     confirmed_path = False
     confirmed_field = False
+    quoted = {}
     for symbol in symbols:
         try:
             instrument, record = build_kis_instrument(symbol)
@@ -163,6 +187,12 @@ def check_price_endpoint(results, broker, symbols):
         )
         confirmed_path = confirmed_path or usable
         confirmed_field = confirmed_field or usable
+        if usable:
+            # Kept so the orderable-amount check can ask at a REAL price
+            # for this symbol -- KIS answers orderable cash per (symbol,
+            # exchange, limit price), so a made-up price would verify a
+            # different question than the one entry sizing asks.
+            quoted[symbol] = (instrument, price)
 
     results.record("price_path", confirmed_path,
                    reason_code=None if confirmed_path else "NO_USABLE_QUOTE",
@@ -170,7 +200,94 @@ def check_price_endpoint(results, broker, symbols):
     results.record("price_field_last", confirmed_field,
                    reason_code=None if confirmed_field else "NO_USABLE_QUOTE",
                    detail="output.last carried a positive float")
-    return confirmed_path and confirmed_field
+    return quoted
+
+
+def check_orderable_amount(results, broker, quoted):
+    """ORACLE-CASH-01: the orderable-amount contract OBSERVE sizes with.
+
+    This is a QUERY (TTTS3007R on inquire-psamount). It passes a symbol
+    and a limit price because that is what the endpoint asks for -- KIS's
+    answer depends on both -- and it submits nothing: no order body, no
+    hashkey, no order TR_ID. The broker handle here physically cannot
+    reach a submission method (see ReadOnlyBroker).
+
+    Reports SHAPE, not the account: the field's presence, the value's
+    type, that it is finite and non-negative. The amount itself is a
+    balance figure and is printed, which the operator needs to see; the
+    account number, token and raw body are not.
+    """
+    confirmed_any = False
+    for symbol, (instrument, price) in sorted(quoted.items()):
+        try:
+            amount = broker.get_orderable_usd(instrument, price)
+        except KISOrderableCashUnavailableError as exc:
+            results.record(f"orderable:{symbol}", False, reason_code=exc.reason_code,
+                           detail=str(exc.diagnostic()))
+            continue
+        except Exception as exc:  # noqa: BLE001 -- any read failure is a failure
+            results.record(f"orderable:{symbol}", False,
+                           reason_code="ORDERABLE_READ_FAILED", detail=type(exc).__name__)
+            continue
+        # The parser already enforced these; asserting them here is what
+        # makes the probe's PASS mean "a real response satisfied them",
+        # not "the parser did not raise".
+        usable = (
+            isinstance(amount, float)
+            and not isinstance(amount, bool)
+            and math.isfinite(amount)
+            and amount >= 0
+        )
+        results.record(
+            f"orderable:{symbol}", usable,
+            reason_code=None if usable else "ORDERABLE_NOT_USABLE",
+            detail=(f"{TR_ID_PSAMOUNT['live']} output.{ORDERABLE_AMOUNT_FIELD} -> "
+                    f"{type(amount).__name__}, finite={math.isfinite(amount) if isinstance(amount, float) else False}, "
+                    f">=0={amount >= 0 if isinstance(amount, (int, float)) else False}, "
+                    f"value={amount} at limit {price}"),
+        )
+        confirmed_any = confirmed_any or usable
+
+    results.record("orderable_amount_path", confirmed_any,
+                   reason_code=None if confirmed_any else "NO_USABLE_ORDERABLE_READ",
+                   detail=PSAMOUNT_PATH)
+    results.record("orderable_amount_tr_id_live", confirmed_any,
+                   reason_code=None if confirmed_any else "NO_USABLE_ORDERABLE_READ",
+                   detail=f"{TR_ID_PSAMOUNT['live']} (live account; the paper TR_ID is a "
+                          "separate value this cannot confirm)")
+    results.record("orderable_amount_field", confirmed_any,
+                   reason_code=None if confirmed_any else "NO_USABLE_ORDERABLE_READ",
+                   detail=f"output.{ORDERABLE_AMOUNT_FIELD}")
+    return confirmed_any
+
+
+def check_balance_carries_no_cash(results, broker):
+    """The disproved value: the balance read must NOT be treated as a cash
+    source.
+
+    Confirms the shape that caused ORACLE-CASH-01 -- the snapshot comes
+    back with its USD cash marked unavailable rather than a fabricated
+    $0. A release where this check FAILS is one where a balance response
+    did carry cash fields, and the matrix entry would need re-deciding
+    rather than the fallback quietly returning.
+    """
+    try:
+        snapshot = broker.get_account_snapshot()
+    except Exception as exc:  # noqa: BLE001
+        results.record("balance_cash_fields_absent", False, reason_code="READ_FAILED",
+                       detail=type(exc).__name__)
+        return False
+    absent = snapshot.usd_orderable_cash is None and snapshot.usd_cash is None
+    results.record(
+        "balance_cash_fields_absent", absent,
+        reason_code=None if absent else "BALANCE_UNEXPECTEDLY_CARRIED_CASH",
+        detail=(f"cash_status={snapshot.cash_status} cash_source={snapshot.cash_source}"
+                if absent else
+                f"balance returned usd_cash={snapshot.usd_cash} "
+                f"usd_orderable_cash={snapshot.usd_orderable_cash}; the matrix entry "
+                "says this response carries no cash field"),
+    )
+    return absent
 
 
 def check_order_exchange_code_space(results, broker):
@@ -230,8 +347,10 @@ def main(argv=None):
                    detail=f"{len(FORBIDDEN_METHODS)} mutating method(s) unreachable")
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-    check_price_endpoint(results, broker, symbols)
+    quoted = check_price_endpoint(results, broker, symbols)
     check_order_exchange_code_space(results, broker)
+    check_orderable_amount(results, broker, quoted)
+    check_balance_carries_no_cash(results, broker)
 
     # Which OBSERVE values this run has now established, so the operator
     # can see the matrix edit this justifies.

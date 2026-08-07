@@ -166,6 +166,45 @@ class TestRunbookMatchesTheMatrix:
             assert entry.live_status == kis_broker.LIVE_RESPONSE_CONFIRMED, name
             assert "probe" in entry.source, f"{name} cites no live evidence"
 
+    def test_every_observe_value_cites_live_evidence(self):
+        """The stronger form: whatever OBSERVE requires, a real response
+        established it. ORACLE-CASH-01 is why -- the cash contract was
+        never in the matrix, so nothing ever compared the field names the
+        code used against a response, and a name that does not exist
+        survived as a confident $0."""
+        for entry in kis_broker.matrix_entries_for(kis_broker.REQUIRED_FOR_OBSERVE):
+            assert entry.live_status == kis_broker.LIVE_RESPONSE_CONFIRMED, entry.name
+            assert "probe" in entry.source, f"{entry.name} cites no live evidence"
+
+    def test_the_orderable_amount_contract_is_in_the_matrix(self):
+        """The three values entry sizing depends on, plus the disproved
+        one, recorded so the wrong field cannot quietly return."""
+        by_name = {entry.name: entry for entry in kis_broker.VERIFICATION_MATRIX}
+        assert by_name["orderable_amount_path"].value == kis_broker.PSAMOUNT_PATH
+        assert by_name["orderable_amount_tr_id_live"].value == kis_broker.TR_ID_PSAMOUNT["live"]
+        assert by_name["orderable_amount_field"].value == (
+            f"output.{kis_broker.ORDERABLE_AMOUNT_FIELD}")
+        assert "balance_cash_fields_absent" in by_name
+        for name in ("orderable_amount_path", "orderable_amount_tr_id_live",
+                     "orderable_amount_field", "balance_cash_fields_absent"):
+            assert kis_broker.REQUIRED_FOR_OBSERVE in by_name[name].required_for, name
+
+    def test_the_paper_orderable_tr_id_is_not_claimed_as_confirmed(self):
+        """A live probe confirms the LIVE TR_ID only. Claiming the paper
+        one on the same evidence is the mistake the ARMED items exist to
+        prevent."""
+        values = {entry.value for entry in kis_broker.VERIFICATION_MATRIX
+                  if entry.live_status == kis_broker.LIVE_RESPONSE_CONFIRMED}
+        assert kis_broker.TR_ID_PSAMOUNT["paper"] not in values
+
+    def test_armed_still_waits_on_exactly_the_order_and_cancel_values(self):
+        """Adding OBSERVE requirements must not quietly un-gate ARMED."""
+        assert set(kis_broker.pending_items_for(kis_broker.REQUIRED_FOR_ARMED)) == {
+            "order_path", "order_tr_id_live_buy", "cancel_path",
+            "cancel_tr_id_live", "cancel_tr_id_paper", "cancel_price_field_rule",
+        }
+        assert kis_broker.pending_items_for(kis_broker.REQUIRED_FOR_OBSERVE) == ()
+
 
 class TestVerificationStatusIsNotARuntimeSwitch:
     def test_matrix_does_not_gate_any_behaviour(self):

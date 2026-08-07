@@ -149,9 +149,26 @@ def save_budget_state(state: BudgetState, path=None) -> Path:
 def state_from_account_snapshot(snapshot, *, source=SOURCE_KIS) -> BudgetState:
     """Converts a `domain.account_snapshot.AccountSnapshot` (what
     `brokers/kis_broker.py::KISBroker.get_account_snapshot()` returns)
-    into a persistable budget state. The snapshot type already validates
-    non-negative/finite cash and a tz-aware `as_of` in __post_init__."""
+    into a persistable budget state.
+
+    ORACLE-CASH-01: an UNKNOWN account-wide cash figure raises here, and
+    that raise is the correct outcome, not a degradation. `refresh_budget`
+    turns it into "keep the previous value" or "no budget at all", and
+    `universe_builder.build_tradable_universe` refuses to write a filtered
+    universe without a budget. What must never happen is the middle
+    ground the defect produced: an unknown balance read as $0, which
+    yields a $0 price ceiling, which excludes all ~12,000 symbols and
+    writes an EMPTY universe_tradable.csv that looks like a legitimate
+    build. Unknown is not zero, and it is not unlimited either -- it is
+    "do not rebuild".
+    """
     cash = snapshot.usd_available_for_new_order
+    if cash is None:
+        raise UniverseBudgetError(
+            f"account snapshot reports no usable cash figure "
+            f"(cash_status={snapshot.cash_status}, source={snapshot.cash_source!r}); "
+            "refusing to size a universe against an unknown balance"
+        )
     if not _is_usable_cash(cash):  # pragma: no cover -- AccountSnapshot forbids it
         raise UniverseBudgetError(f"account snapshot produced an unusable cash figure {cash!r}")
     return BudgetState(

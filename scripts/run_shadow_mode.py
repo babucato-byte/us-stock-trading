@@ -57,9 +57,18 @@ from market_data.exchange_registry import (  # noqa: E402
     supported_analysis_exchanges,
 )
 import shadow_mode  # noqa: E402
-from brokers.kis_broker import KISBroker, KISBrokerError  # noqa: E402
+from brokers.kis_broker import (  # noqa: E402
+    KISBroker,
+    KISBrokerError,
+    KISOrderableCashUnavailableError,
+)
 from config import scalping_strategy_v1_config as strat_cfg  # noqa: E402
 from config.live_rollout_config import LiveRolloutConfig  # noqa: E402
+from domain.cash_sizing import (  # noqa: E402
+    INSUFFICIENT_CASH,
+    ORDERABLE_CASH_UNAVAILABLE,
+    whole_shares_affordable,
+)
 from domain.instrument import InstrumentError, build_instrument  # noqa: E402
 from domain.order_intent import OrderIntent, OrderIntentError  # noqa: E402
 from domain.signal import SignalError, build_signal  # noqa: E402
@@ -339,15 +348,42 @@ def _evaluate_symbol(*, symbol, broker, rollout, conn, kis_validation, deployed_
                    detail=str(exc), now=now)
             return outcome
 
-        available_usd = account_snapshot.usd_available_for_new_order
+        # ORACLE-CASH-01: cash comes from the per-candidate orderable
+        # amount, NOT from the account snapshot. The balance read carries
+        # no cash field at all (see kis_broker.get_account_snapshot), and
+        # KIS answers orderable cash per (symbol, exchange, limit price)
+        # -- so it must be asked at the price this candidate would
+        # actually order at. `price` is fixed here and is the same value
+        # used for the OrderIntent limit below and for the gate's price
+        # checks: sizing against one price and ordering at another is how
+        # a quantity ends up exceeding the cash that justified it.
         price = kis_quote.price_usd
-        quantity = min(int(available_usd // price) if price > 0 else 0,
+        try:
+            # Exactly one orderable-amount read per candidate per tick.
+            # Every later consumer (sizing, gate context, shadow record)
+            # reuses this value; none re-queries, and none borrows another
+            # symbol's answer.
+            orderable_usd = broker.get_orderable_usd(instrument, price)
+        except KISOrderableCashUnavailableError as exc:
+            # NOT insufficient cash: unknown cash. Recording this as
+            # INSUFFICIENT_CASH would make an API fault indistinguishable
+            # from an underfunded account in the audit trail.
+            outcome["reason_code"] = ORDERABLE_CASH_UNAVAILABLE
+            progress.blocked(STAGE_CASH, ORDERABLE_CASH_UNAVAILABLE)
+            _audit(run_id, shadow_audit.CASH_BLOCKED, shadow_audit.RESULT_BLOCKED, symbol=symbol,
+                   signal_id=signal.signal_id, reason_code=ORDERABLE_CASH_UNAVAILABLE,
+                   detail=str(exc.diagnostic()), now=now)
+            return outcome
+
+        available_usd = orderable_usd
+        quantity = min(whole_shares_affordable(available_usd, price),
                        rollout.max_quantity_per_order)
         if quantity < 1:
-            outcome["reason_code"] = "INSUFFICIENT_CASH"
-            progress.blocked(STAGE_CASH, "INSUFFICIENT_CASH")
+            outcome["reason_code"] = INSUFFICIENT_CASH
+            progress.blocked(STAGE_CASH, INSUFFICIENT_CASH)
             _audit(run_id, shadow_audit.CASH_BLOCKED, shadow_audit.RESULT_BLOCKED, symbol=symbol,
-                   signal_id=signal.signal_id, reason_code="INSUFFICIENT_CASH", now=now)
+                   signal_id=signal.signal_id, reason_code=INSUFFICIENT_CASH,
+                   detail=f"orderable_usd={available_usd} limit_price={price}", now=now)
             return outcome
 
         try:

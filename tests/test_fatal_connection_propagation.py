@@ -364,11 +364,15 @@ class TestFatalAbortsTheBuyCycle:
                 return 100.1
 
             def get_account_snapshot(self, *, source_label="kis_balance"):
+                # ORACLE-CASH-01: the balance read carries no cash field.
                 return AccountSnapshot(
-                    krw_cash=0.0, usd_cash=1000.0, usd_orderable_cash=1000.0,
+                    krw_cash=None, usd_cash=None, usd_orderable_cash=None,
                     usd_reserved_in_open_orders=0.0, as_of=NOW, source=source_label,
-                    account_id=ACCOUNT_ID,
+                    account_id=ACCOUNT_ID, cash_source="TTTS3012R_DOES_NOT_PROVIDE",
                 )
+
+            def get_orderable_usd(self, instrument, limit_price_usd):
+                return 1000.0
 
         monkeypatch.setenv("VALIDATED_COMMIT", "c1")
         monkeypatch.setenv("DEPLOYED_COMMIT", "c1")

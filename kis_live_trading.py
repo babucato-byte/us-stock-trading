@@ -45,9 +45,18 @@ import paper_strategy_order as pso
 import risk_config
 import shadow_audit
 import shadow_mode
-from brokers.kis_broker import KISAmbiguousResponseError, KISBrokerError
+from brokers.kis_broker import (
+    KISAmbiguousResponseError,
+    KISBrokerError,
+    KISOrderableCashUnavailableError,
+)
 from config import scalping_strategy_v1_config as strat_cfg
 from config.live_rollout_config import LiveRolloutConfig, LiveRolloutConfigError
+from domain.cash_sizing import (
+    INSUFFICIENT_CASH,
+    ORDERABLE_CASH_UNAVAILABLE,
+    whole_shares_affordable,
+)
 from domain.instrument import Instrument, InstrumentError, build_instrument
 from domain.order_intent import OrderIntent, OrderIntentError
 from domain.signal import Signal, SignalError, build_signal
@@ -340,9 +349,31 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None):
                            detail=reason, now=current)
                     continue
 
-                available_usd = account_snapshot.usd_available_for_new_order
+                # ORACLE-CASH-01: the same per-candidate orderable-amount
+                # read the Shadow path uses. The account snapshot carries
+                # no cash figure (TTTS3012R does not return one), and KIS
+                # answers orderable cash per (symbol, exchange, limit
+                # price) -- so it is asked at `buffered_price`, the exact
+                # price the OrderIntent below is built with.
                 buffered_price = kis_quote.price_usd
-                balance_qty = int(available_usd // buffered_price) if buffered_price > 0 else 0
+                try:
+                    # One read per candidate; reused for sizing, the gate
+                    # context and the shadow record below.
+                    available_usd = broker.get_orderable_usd(instrument, buffered_price)
+                except KISOrderableCashUnavailableError as exc:
+                    reason = f"KIS orderable-amount read unusable: {exc.diagnostic()}"
+                    results["blocked"].append((symbol, reason))
+                    _persist_blocked_record(
+                        symbol=symbol, signal_price=signal.signal_price, kis_price=kis_quote.price_usd,
+                        risk_gate_result="BLOCKED", rejection_reason=reason, now=current,
+                    )
+                    outcome["reason_code"] = ORDERABLE_CASH_UNAVAILABLE
+                    _audit(run_id, shadow_audit.CASH_BLOCKED, shadow_audit.RESULT_BLOCKED, symbol=symbol,
+                           signal_id=signal.signal_id, reason_code=ORDERABLE_CASH_UNAVAILABLE,
+                           detail=reason, now=current)
+                    continue
+
+                balance_qty = whole_shares_affordable(available_usd, buffered_price)
                 quantity = min(balance_qty, rollout.max_quantity_per_order)
                 if quantity < 1:
                     reason = "insufficient KIS orderable cash for even 1 share"
@@ -352,9 +383,9 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None):
                         account_available_usd=available_usd, risk_gate_result="BLOCKED",
                         rejection_reason=reason, now=current,
                     )
-                    outcome["reason_code"] = "INSUFFICIENT_CASH"
+                    outcome["reason_code"] = INSUFFICIENT_CASH
                     _audit(run_id, shadow_audit.CASH_BLOCKED, shadow_audit.RESULT_BLOCKED, symbol=symbol,
-                           signal_id=signal.signal_id, reason_code="INSUFFICIENT_CASH",
+                           signal_id=signal.signal_id, reason_code=INSUFFICIENT_CASH,
                            detail=reason, now=current)
                     continue
 

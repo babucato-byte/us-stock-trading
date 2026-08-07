@@ -110,11 +110,30 @@ def test_a_smaller_account_shrinks_the_universe(tmp_path):
     assert set(frame["symbol"]) == {"AAPL"}  # MSFT at 400 no longer affordable
 
 
-def test_an_account_that_can_afford_nothing_writes_an_empty_but_valid_file(tmp_path):
-    result = _build(tmp_path, budget=_budget(cash=1.0))
-    frame = pd.read_csv(result["output_path"])
-    assert frame.empty
-    assert list(frame.columns) == universe_builder.TRADABLE_COLUMNS
+def test_an_account_that_can_afford_nothing_refuses_to_write_an_empty_file(tmp_path):
+    """ORACLE-CASH-01: a build that would include NOTHING must not replace
+    the entry-side pool.
+
+    This used to write a zero-row file and log a warning. That is how an
+    unusable cash figure erased the pool silently: an unknown balance read
+    as $0 gives a $0 ceiling, every symbol falls to EXCLUDED_ABOVE_BUDGET,
+    and a valid-looking empty file lands under the name downstream
+    scanning trusts. Keeping the previous file is the safe direction --
+    affordability is re-checked per candidate at entry time anyway.
+    """
+    paths = _paths(tmp_path)
+    with pytest.raises(universe_builder.UniverseBuildError) as excinfo:
+        _build(tmp_path, budget=_budget(cash=1.0))
+    assert "0 of" in str(excinfo.value)
+    assert not paths["output_path"].exists()
+
+
+def test_a_previous_universe_survives_a_would_be_empty_build(tmp_path):
+    paths = _paths(tmp_path)
+    paths["output_path"].write_text("symbol\nOLD\n", encoding="utf-8")
+    with pytest.raises(universe_builder.UniverseBuildError):
+        _build(tmp_path, budget=_budget(cash=1.0))
+    assert paths["output_path"].read_text(encoding="utf-8") == "symbol\nOLD\n"
 
 
 def test_missing_budget_raises_and_writes_nothing(tmp_path):
@@ -196,12 +215,15 @@ def test_stale_budget_is_marked_in_the_report_and_logged(tmp_path):
     assert any("kept previous value" in m for m in messages)
 
 
-def test_empty_result_is_warned_about_loudly(tmp_path):
+def test_an_empty_result_aborts_instead_of_being_warned_about(tmp_path):
+    """A warning printed AFTER the write does not undo the write. The
+    empty universe is now refused, not announced."""
     messages = []
-    universe_builder.build_tradable_universe(
-        LISTING, StaticUniverseMetricsProvider(METRICS), _budget(cash=1.0),
-        thresholds=THRESHOLDS, now=NOW, logger=messages.append, **_paths(tmp_path))
-    assert any("EMPTY" in m for m in messages)
+    with pytest.raises(universe_builder.UniverseBuildError):
+        universe_builder.build_tradable_universe(
+            LISTING, StaticUniverseMetricsProvider(METRICS), _budget(cash=1.0),
+            thresholds=THRESHOLDS, now=NOW, logger=messages.append, **_paths(tmp_path))
+    assert not any("wrote" in m for m in messages)
 
 
 def test_summary_lines_are_logged(tmp_path):
@@ -264,8 +286,12 @@ def test_filtering_never_rewrites_the_full_listing(tmp_path):
     """The exchange registry (and therefore the KIS sell path) reads
     universe.csv; a build of the filtered universe must leave it alone."""
     listing = tmp_path / "universe.csv"
+    # AAPL keeps the build non-empty (an all-excluded build is refused
+    # outright now); BRKA is the priced-out symbol the listing must keep.
     listing.write_text(
-        "symbol,name,exchange,tradable,shortable\nBRKA,Berkshire A,NYSE,True,False\n",
+        "symbol,name,exchange,tradable,shortable\n"
+        "AAPL,Apple,NASDAQ,True,True\n"
+        "BRKA,Berkshire A,NYSE,True,False\n",
         encoding="utf-8")
     before = listing.read_bytes()
     _build(tmp_path, rows=universe_builder.load_universe_rows(listing))
@@ -280,9 +306,13 @@ def test_a_held_symbol_priced_out_of_the_budget_stays_resolvable(tmp_path, monke
 
     listing = tmp_path / "universe.csv"
     listing.write_text(
-        "symbol,name,exchange,tradable,shortable\nBRKA,Berkshire A,NYSE,True,False\n",
+        "symbol,name,exchange,tradable,shortable\n"
+        "AAPL,Apple,NASDAQ,True,True\n"
+        "BRKA,Berkshire A,NYSE,True,False\n",
         encoding="utf-8")
-    _build(tmp_path, rows=universe_builder.load_universe_rows(listing))
+    result = _build(tmp_path, rows=universe_builder.load_universe_rows(listing))
+    # BRKA really was filtered OUT of the entry-side pool...
+    assert "BRKA" not in set(pd.read_csv(result["output_path"])["symbol"])
 
     monkeypatch.setenv("UNIVERSE_FILE", str(listing))
     exchange_registry.reset_registry()

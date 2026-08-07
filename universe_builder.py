@@ -234,6 +234,27 @@ def build_tradable_universe(
     decisions = filter_universe(rows, metrics_by_symbol, budget, thresholds)
     summary = summarize(decisions, budget=budget, thresholds=thresholds)
 
+    # ORACLE-CASH-01: refuse to REPLACE the entry-side universe with an
+    # empty one. This used to be a warning printed after the write, which
+    # is how an unusable cash figure could erase the pool silently: an
+    # unknown balance read as $0 gives a $0 price ceiling, every symbol
+    # falls to EXCLUDED_ABOVE_BUDGET, and a zero-row file lands under the
+    # name downstream scanning trusts.
+    #
+    # Keeping the previous file is the safe direction. universe_tradable
+    # is an entry-side PRE-filter, never an exit input (`universe.csv`
+    # remains the exchange-metadata source, so a held position stays
+    # resolvable), and the per-candidate orderable-amount read at entry
+    # time is the final authority on affordability -- a symbol this pool
+    # keeps but the account cannot afford is still blocked there.
+    if summary.reason_counts.get(REASON_INCLUDED, 0) == 0:
+        raise UniverseBuildError(
+            f"filter included 0 of {len(decisions)} symbols; refusing to replace "
+            f"{output_path} with an empty universe (budget source={budget.source!r}, "
+            f"price_ceiling_usd={budget.price_ceiling_usd}). The previous file is "
+            "left in place; downstream entry is still gated per candidate."
+        )
+
     frame = _tradable_frame(rows, decisions)
     if not atomic_write_csv(output_path, frame):
         raise UniverseBuildError(f"failed to write filtered universe to {output_path}")
@@ -255,11 +276,6 @@ def build_tradable_universe(
         logger(
             "[UNIVERSE FILTER] WARNING: budget is a kept previous value "
             f"(as_of={budget.as_of}); today's KIS balance read did not succeed"
-        )
-    if summary.reason_counts.get(REASON_INCLUDED, 0) == 0:
-        logger(
-            "[UNIVERSE FILTER] WARNING: zero symbols passed. The filtered universe is EMPTY -- "
-            "downstream scanning will find no candidates until the budget or the data improves."
         )
     logger(f"[UNIVERSE FILTER] wrote {output_path} ({summary.included} symbols)")
     logger(f"[UNIVERSE FILTER] report {report_path}")

@@ -69,8 +69,15 @@ def write_snapshot(tmp_path, *, checked_at=None, clean=True, mismatch=0, unknown
 class _Snapshot:
     def __init__(self, account_id=ACCOUNT_ID):
         self.account_id = account_id
-        self.usd_orderable_cash = 1000.0
-        self.usd_available_for_new_order = 1000.0
+        # ORACLE-CASH-01: a real balance read reports no cash figure at
+        # all. Preflight must render that as UNAVAILABLE rather than
+        # printing a bare None, and must not fail the gate over it --
+        # orderable cash is established per candidate at entry time.
+        self.usd_cash = None
+        self.usd_orderable_cash = None
+        self.usd_available_for_new_order = None
+        self.cash_status = "UNAVAILABLE"
+        self.cash_source = "TTTS3012R_DOES_NOT_PROVIDE"
 
 
 class _ReadOnlyBroker:

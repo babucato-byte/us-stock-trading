@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from broker.broker_config import env_bool
+from domain.account_snapshot import CASH_AVAILABLE
 from execution.secret_redaction import mask_account_number
 from live_pilot import posture as posture_module
 
@@ -292,9 +293,20 @@ def check_account(report, env, broker):
             f"KIS_ALLOWED_ACCOUNT_NO ({mask_account_number(allowed)})",
         )
         return None
-    report.ok("account",
-              f"account={mask_account_number(snapshot.account_id)} "
-              f"orderable_usd={snapshot.usd_orderable_cash}")
+    # ORACLE-CASH-01: the balance read does not carry a cash figure, so
+    # this reports the STATUS rather than printing a bare `None` that
+    # reads like "$0". Orderable cash is established per candidate at
+    # entry time (TTTS3007R), not here -- and this is deliberately not a
+    # failed gate: OBSERVE must still start so an operator can watch the
+    # per-candidate reads happen.
+    if snapshot.cash_status == CASH_AVAILABLE:
+        cash_detail = f"orderable_usd={snapshot.usd_orderable_cash}"
+    else:
+        cash_detail = (
+            f"orderable_usd=UNAVAILABLE ({snapshot.cash_source}); "
+            "sized per candidate at entry time"
+        )
+    report.ok("account", f"account={mask_account_number(snapshot.account_id)} {cash_detail}")
     return snapshot
 
 

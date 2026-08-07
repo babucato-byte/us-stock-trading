@@ -12,8 +12,14 @@ from brokers.kis_broker import (
     KISAmbiguousResponseError,
     KISBroker,
     KISBrokerError,
+    KISOrderableCashUnavailableError,
 )
 from brokers.kis_config import KISConfig, KISConfigError
+from domain.account_snapshot import (
+    CASH_SOURCE_BALANCE_LACKS_FIELDS,
+    CASH_UNAVAILABLE,
+    AccountCashUnavailableError,
+)
 from domain.instrument import build_instrument
 from domain.order_intent import OrderIntent
 from execution import authorization as authz
@@ -228,18 +234,70 @@ class TestGetCurrentPrice:
         assert session.requests == []
 
 
+# ORACLE-CASH-01: the REAL output2 of a live TTTS3012R balance read,
+# observed on the Oracle host 2026-08-06 on all three venue legs. Nine
+# purchase/valuation/P&L fields and no cash field whatsoever. The old
+# fixture invented `frcr_dncl_amt1`/`frcr_use_psbl_amt`, which is why the
+# suite passed while a funded live account reported $0.
+LIVE_BALANCE_OUTPUT2 = {
+    "frcr_pchs_amt1": "0.00000",
+    "ovrs_rlzt_pfls_amt": "0.00000",
+    "ovrs_tot_pfls": "0.00000",
+    "rlzt_erng_rt": "0.00000000",
+    "tot_evlu_pfls_amt": "0.00000000",
+    "tot_pftrt": "0.00000000",
+    "frcr_buy_amt_smtl1": "0.000000",
+    "ovrs_rlzt_pfls_amt2": "0.00000",
+    "frcr_buy_amt_smtl2": "0.000000",
+}
+
+
 class TestAccountAndPositions:
-    def test_get_account_snapshot(self):
+    def test_get_account_snapshot_reports_cash_unavailable(self):
+        """The balance endpoint carries no cash, so the snapshot must say
+        UNAVAILABLE -- not $0, which is a number a caller would size on."""
         session = _FakeSession()
         session.queue("/oauth2/tokenP", TOKEN_OK)
         session.queue(
             "/uapi/overseas-stock/v1/trading/inquire-balance",
-            _StubResponse(200, {"output1": [], "output2": {"frcr_dncl_amt1": "1000.50", "frcr_use_psbl_amt": "900.25"}}),
+            _StubResponse(200, {"output1": [], "output2": dict(LIVE_BALANCE_OUTPUT2)}),
+        )
+        snap = _broker(session=session).get_account_snapshot()
+        assert snap.usd_cash is None
+        assert snap.usd_orderable_cash is None
+        assert snap.krw_cash is None
+        assert snap.cash_status == CASH_UNAVAILABLE
+        assert snap.cash_source == CASH_SOURCE_BALANCE_LACKS_FIELDS
+        assert snap.usd_available_for_new_order is None
+        assert snap.source == "kis_balance"
+
+    def test_account_snapshot_refuses_to_hand_out_an_unknown_cash_figure(self):
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", TOKEN_OK)
+        session.queue(
+            "/uapi/overseas-stock/v1/trading/inquire-balance",
+            _StubResponse(200, {"output1": [], "output2": dict(LIVE_BALANCE_OUTPUT2)}),
+        )
+        snap = _broker(session=session).get_account_snapshot()
+        with pytest.raises(AccountCashUnavailableError):
+            snap.require_usd_available_for_new_order()
+
+    def test_a_cash_field_that_IS_present_is_still_honoured(self):
+        """Not a rejection of cash fields as such: if KIS ever does return
+        one, an explicit number is used -- including an explicit 0."""
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", TOKEN_OK)
+        payload = dict(LIVE_BALANCE_OUTPUT2)
+        payload.update({"frcr_dncl_amt1": "1000.50", "frcr_use_psbl_amt": "0"})
+        session.queue(
+            "/uapi/overseas-stock/v1/trading/inquire-balance",
+            _StubResponse(200, {"output1": [], "output2": payload}),
         )
         snap = _broker(session=session).get_account_snapshot()
         assert snap.usd_cash == pytest.approx(1000.50)
-        assert snap.usd_orderable_cash == pytest.approx(900.25)
-        assert snap.source == "kis_balance"
+        assert snap.usd_orderable_cash == 0.0
+        assert snap.cash_status == "AVAILABLE"
+        assert snap.usd_available_for_new_order == 0.0
 
     def test_get_positions_filters_zero_quantity(self):
         session = _VenueSession("/uapi/overseas-stock/v1/trading/inquire-balance", {

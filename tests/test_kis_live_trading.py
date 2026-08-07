@@ -4,7 +4,10 @@ import pytest
 
 from brokers.kis_broker import KISAmbiguousResponseError, KISBrokerError
 from config.live_rollout_config import LiveRolloutConfig
-from domain.account_snapshot import AccountSnapshot
+from domain.account_snapshot import (
+    CASH_SOURCE_BALANCE_LACKS_FIELDS,
+    AccountSnapshot,
+)
 from domain.execution_event import ExecutionRecord
 import kis_live_trading as klt
 import shadow_mode
@@ -74,10 +77,20 @@ class _FakeBroker:
         return self.price
 
     def get_account_snapshot(self):
+        # ORACLE-CASH-01: a real balance response carries no cash field,
+        # so the snapshot reports UNAVAILABLE and sizing comes from the
+        # per-candidate orderable-amount read below.
         return AccountSnapshot(
-            krw_cash=0.0, usd_cash=self.cash_usd, usd_orderable_cash=self.cash_usd,
-            usd_reserved_in_open_orders=0.0, as_of=NOW, source="kis_balance", account_id="12345678",
+            krw_cash=None, usd_cash=None, usd_orderable_cash=None,
+            usd_reserved_in_open_orders=0.0, as_of=NOW, source="kis_balance",
+            account_id="12345678", cash_source=CASH_SOURCE_BALANCE_LACKS_FIELDS,
         )
+
+    def get_orderable_usd(self, instrument, limit_price_usd):
+        self.call_log.append(f"get_orderable_usd:{instrument.symbol}@{limit_price_usd}")
+        if isinstance(self.cash_usd, Exception):
+            raise self.cash_usd
+        return self.cash_usd
 
     def get_open_orders(self):
         self.call_log.append("get_open_orders")

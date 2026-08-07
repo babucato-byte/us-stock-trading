@@ -70,11 +70,16 @@ class _FakeBroker:
         return self.price
 
     def get_account_snapshot(self, *, source_label="kis_balance"):
+        # ORACLE-CASH-01: the balance read carries no cash field; sizing
+        # comes from the per-candidate orderable-amount read below.
         return AccountSnapshot(
-            krw_cash=0.0, usd_cash=self.cash_usd, usd_orderable_cash=self.cash_usd,
+            krw_cash=None, usd_cash=None, usd_orderable_cash=None,
             usd_reserved_in_open_orders=0.0, as_of=NOW, source=source_label,
-            account_id=ACCOUNT_ID,
+            account_id=ACCOUNT_ID, cash_source="TTTS3012R_DOES_NOT_PROVIDE",
         )
+
+    def get_orderable_usd(self, instrument, limit_price_usd):
+        return self.cash_usd
 
     def get_positions(self):
         if self.read_exc is not None:

@@ -303,12 +303,22 @@ class _Broker:
     def _account(self):
         class Snapshot:
             account_id = "44xxxxxx"
-            usd_available_for_new_order = self._usd
+            # ORACLE-CASH-01: the balance read carries no cash figure.
+            # Sizing goes through get_orderable_usd() below.
+            usd_cash = None
+            usd_orderable_cash = None
+            usd_available_for_new_order = None
+            cash_status = "UNAVAILABLE"
+            cash_source = "TTTS3012R_DOES_NOT_PROVIDE"
         return Snapshot()
 
     def get_account_snapshot(self):
         self.calls.append("get_account_snapshot")
         return self._account()
+
+    def get_orderable_usd(self, instrument, limit_price_usd):
+        self.calls.append(f"get_orderable_usd:{instrument.symbol}@{limit_price_usd}")
+        return self._usd
 
     def get_open_orders(self):
         self.calls.append("get_open_orders")

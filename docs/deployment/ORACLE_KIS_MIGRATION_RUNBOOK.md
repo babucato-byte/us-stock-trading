@@ -245,14 +245,28 @@ repository 기준으로는 확인됐지만(`REFERENCE_VERIFIED`), **실제 KIS �
 이름이 아니라 **실제 참조 위치**에서 도출된다.
 
 ```text
-OBSERVE_REQUIRED (3)  price_path, price_field_last, order_exchange_code_space
-ARMED_REQUIRED  (9)   위 3개 + order_path, order_tr_id_live_buy, cancel_path,
+OBSERVE_REQUIRED (7)  price_path, price_field_last, order_exchange_code_space,
+                      orderable_amount_path, orderable_amount_tr_id_live,
+                      orderable_amount_field, balance_cash_fields_absent
+ARMED_REQUIRED  (13)  위 7개 + order_path, order_tr_id_live_buy, cancel_path,
                       cancel_tr_id_live, cancel_tr_id_paper, cancel_price_field_rule
 ```
 
 `order_exchange_code_space`가 OBSERVE에 포함되는 이유가 이 분류를 이름으로 하면 안 되는
 이유다 — 이름은 주문 전용처럼 보이지만 `OVRS_EXCG_CD`는 `_sweep_exchanges()`가 잔고·미체결·
 체결 **조회**에 붙이는 값이라 OBSERVE가 전적으로 의존한다.
+
+`orderable_amount_*` 3개와 `balance_cash_fields_absent`는 **ORACLE-CASH-01** 때문에
+추가됐다. 잔고 조회(`TTTS3012R`)의 `output2`에는 현금 필드가 **없다** — Oracle 실계좌
+응답은 매입·평가·손익 계열 9개만 반환한다. 그런데 코드는 `frcr_dncl_amt1` /
+`frcr_use_psbl_amt`를 `.get(field, 0) or 0`으로 읽고 있어서, **자금이 있는 계좌가 $0으로
+보고**됐고 모든 후보가 다른 게이트에 닿기 전에 `INSUFFICIENT_CASH`로 막혔다. 현금 필드는
+애초에 matrix에 없었기 때문에 실제 응답과 대조된 적이 없었다 — 그게 이 결함이 살아남은
+이유이고, 이 4개 항목이 OBSERVE 요구에 들어간 이유다.
+
+주문가능금액의 권위는 **후보별** `inquire-psamount`(`TTTS3007R`,
+`output.ord_psbl_frcr_amt`)다. KIS는 이 값을 (종목, 거래소, 지정가)별로 답하므로
+계좌 단위 상수가 아니며, **주문에 사용할 제한가격과 같은 가격으로** 조회해야 한다.
 
 이 단계에서 확인해야 할 항목을 코드에서 직접 뽑아 쓴다.
 
@@ -267,15 +281,63 @@ for posture in (REQUIRED_FOR_OBSERVE, REQUIRED_FOR_ARMED):
 "
 ```
 
-**OBSERVE 3개는 읽기 전용으로 확인할 수 있다.**
+**OBSERVE 7개는 읽기 전용으로 확인할 수 있다.**
 
 ```bash
 python3 scripts/verify_kis_observe_responses.py --symbols AAPL,MSFT
 ```
 
 이 스크립트는 주문·취소 메서드에 도달할 수 없는 read-only proxy를 사용하며, 시세·잔고·
-포지션·미체결·체결 조회만 수행한다. 응답의 **필드 존재와 타입만** 기록하고 값·토큰·전체
-계좌번호는 출력하지 않는다.
+포지션·미체결·체결·주문가능금액 **조회만** 수행한다. 응답의 **필드 존재와 타입만**
+기록하고 토큰·전체 계좌번호·원본 응답은 출력하지 않는다.
+
+`get_orderable_usd`는 allow-list에 있지만 **조회**다(`TTTS3007R`). 종목과 지정가를
+파라미터로 넘기는 이유는 endpoint가 그 두 값을 입력으로 받기 때문이며, 주문 body도
+hashkey도 전송하지 않는다.
+
+### ORACLE-CASH-01 재배포 후 read-only 확인 절차
+
+현금 수정이 들어간 커밋을 배포한 뒤 Oracle에서 **조회만** 수행한다. 실주문·실취소·
+systemd/timer 변경·환경파일 변경·안전 플래그 변경은 하지 않는다.
+
+```bash
+cd "$TRADING_PROJECT_ROOT"
+KIS_ENV=live LIVE_PILOT_ACK_LIVE_ENV=true \
+  venv/bin/python scripts/verify_kis_observe_responses.py --symbols AAPL,MSFT
+```
+
+기대 결과:
+
+```text
+exit 0
+observe_requirements  7/7 confirmed
+orderable:<SYMBOL>    TTTS3007R output.ord_psbl_frcr_amt -> float, finite, >= 0
+balance_cash_fields_absent  cash_status=UNAVAILABLE
+                            cash_source=TTTS3012R_DOES_NOT_PROVIDE
+matrix_split          OBSERVE requires [7개 항목]
+broker methods used   조회 메서드만
+order transport 0 / cancel transport 0 / secrets exposed 0
+```
+
+`balance_cash_fields_absent`가 FAIL이면 잔고 응답이 실제로 현금 필드를 실어 왔다는 뜻이므로
+**matrix 항목을 다시 판단해야 한다** — 조용히 fallback으로 되돌리지 않는다.
+
+이어서 preflight와 OBSERVE `--once`를 실행하고 다음을 확인한다.
+
+```text
+preflight  [PASS] account  account=****XXXX orderable_usd=UNAVAILABLE
+                           (TTTS3012R_DOES_NOT_PROVIDE); sized per candidate at entry time
+           exit 0, OBSERVE_ALLOWED, ARMED_BLOCKED, ARMED 6개 pending 경고
+
+OBSERVE --once
+  후보별 get_orderable_usd 1회 (같은 지정가로)
+  주문가능금액 >= 1주 → cash gate 통과 → 후속 gate 평가 → hypothetical 기록
+  주문가능금액 = 0     → INSUFFICIENT_CASH
+  조회 실패·필드 이상  → ORDERABLE_CASH_UNAVAILABLE (INSUFFICIENT_CASH 아님)
+  order transport 0 / cancel transport 0
+  orders·fills·kis_order_idempotency·live_entry_reservations delta 0
+  run당 terminal 이벤트 정확히 1
+```
 
 **ARMED 6개는 읽기 전용으로 확인할 수 없다.**
 
@@ -292,9 +354,9 @@ cancel_tr_id_live, cancel_tr_id_paper, cancel_price_field_rule
 `source`에 그 근거(어떤 probe가 언제 무엇을 봤는지)를 남긴다. 값이 실제와 다르면 코드를
 수정한 뒤 다시 Codex 검증을 받는다. 문서만 보고 CONFIRMED로 바꾸지 않는다.
 
-**preflight 동작**: OBSERVE 세션은 OBSERVE 3개만 강제한다. ARMED 전용 미확인 항목은
+**preflight 동작**: OBSERVE 세션은 OBSERVE 요구 항목만 강제한다. ARMED 전용 미확인 항목은
 `[WARN] armed_response_requirements [BLOCKED_FOR_ARMED_ONLY]`로 보고되며 OBSERVE 기동을
-막지 않는다. ARMED posture(세 플래그 전부 on)에서는 9개 전부를 강제한다. 우회 환경변수는
+막지 않는다. ARMED posture(세 플래그 전부 on)에서는 전부를 강제한다. 우회 환경변수는
 없다.
 
 ## 13. KIS 잔고·미체결 대조 (계정 전체 reconciliation, CODEX-044)

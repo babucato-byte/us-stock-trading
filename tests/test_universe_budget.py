@@ -65,21 +65,38 @@ def _kis_broker(session):
     return KISBroker(config=_kis_config(), session=session, now_fn=lambda: NOW)
 
 
-def _balance_session(cash="1000.50", orderable="900.25"):
+# ORACLE-CASH-01: the REAL output2 a live TTTS3012R balance read returns
+# (Oracle, 2026-08-06) -- purchase/valuation/P&L only, no cash field. The
+# previous fixture invented `frcr_dncl_amt1`/`frcr_use_psbl_amt`, so this
+# file tested a budget refresh that cannot happen against a real account.
+LIVE_BALANCE_OUTPUT2 = {
+    "frcr_pchs_amt1": "0.00000",
+    "ovrs_rlzt_pfls_amt": "0.00000",
+    "ovrs_tot_pfls": "0.00000",
+    "rlzt_erng_rt": "0.00000000",
+    "tot_evlu_pfls_amt": "0.00000000",
+    "tot_pftrt": "0.00000000",
+    "frcr_buy_amt_smtl1": "0.000000",
+    "ovrs_rlzt_pfls_amt2": "0.00000",
+    "frcr_buy_amt_smtl2": "0.000000",
+}
+
+
+def _balance_session(output2=None):
     session = _FakeSession()
     session.queue("/oauth2/tokenP", TOKEN_OK)
     session.queue(BALANCE_PATH, _StubResponse(200, {
         "output1": [],
-        "output2": {"frcr_dncl_amt1": cash, "frcr_use_psbl_amt": orderable},
+        "output2": dict(LIVE_BALANCE_OUTPUT2 if output2 is None else output2),
     }))
     return session
 
 
 def _snapshot(cash=1000.0, orderable=900.0, reserved=0.0):
     return AccountSnapshot(
-        krw_cash=0.0, usd_cash=cash, usd_orderable_cash=orderable,
+        krw_cash=None, usd_cash=cash, usd_orderable_cash=orderable,
         usd_reserved_in_open_orders=reserved, as_of=NOW, source="kis_balance",
-        account_id="12345678",
+        account_id="12345678", cash_source="test",
     )
 
 
@@ -173,20 +190,50 @@ def test_refresh_persists_a_successful_read(tmp_path):
     assert ub.load_budget_state(path).available_cash_usd == pytest.approx(900.0)
 
 
-def test_refresh_through_a_real_kis_broker_with_a_fake_session(tmp_path):
-    session = _balance_session(cash="1000.50", orderable="900.25")
+def test_a_real_balance_shape_yields_no_budget_at_all(tmp_path):
+    """ORACLE-CASH-01, the defect end to end.
+
+    A real live balance response carries no cash field. The refresh must
+    end with NO budget -- not a $0 budget, which is what the old
+    `.get(field, 0) or 0` produced and what silently emptied the
+    entry-side universe.
+    """
+    session = _balance_session()
+    path = tmp_path / "b.json"
     state, error = ub.refresh_budget(
-        _kis_broker(session), path=tmp_path / "b.json", logger=lambda *_: None)
-    assert error is None
-    assert state.available_cash_usd == pytest.approx(900.25)
-    assert state.source == ub.SOURCE_KIS
+        _kis_broker(session), path=path, logger=lambda *_: None)
+    assert state is None
+    assert error is not None
+    assert "cash" in error.lower()
+    # Nothing was persisted from an unknown balance.
+    assert not path.exists()
     # token + balance sweep; no other endpoint was touched.
     assert all(url.endswith(("/oauth2/tokenP", BALANCE_PATH)) for _, url, _ in session.requests)
 
 
-def test_budget_from_a_fake_session_read_drives_the_price_ceiling(tmp_path):
+def test_an_unknown_balance_keeps_the_previous_budget_untouched(tmp_path):
+    """The previous figure survives byte-for-byte: unknown must not widen,
+    narrow or erase a budget that was read successfully before."""
+    path = tmp_path / "b.json"
+    ub.save_budget_state(
+        ub.BudgetState(available_cash_usd=777.0, as_of="2026-08-05T00:00:00+00:00",
+                       source=ub.SOURCE_KIS), path)
+    before = path.read_bytes()
+    state, error = ub.refresh_budget(
+        _kis_broker(_balance_session()), path=path, logger=lambda *_: None)
+    assert error is not None
+    assert state is not None and state.stale is True
+    assert state.available_cash_usd == pytest.approx(777.0)
+    assert path.read_bytes() == before
+
+
+def test_a_balance_that_DOES_carry_cash_still_drives_the_price_ceiling(tmp_path):
+    """The fail-closed path is about UNKNOWN, not about refusing numbers:
+    an explicitly-reported figure is still used."""
+    payload = dict(LIVE_BALANCE_OUTPUT2)
+    payload["frcr_use_psbl_amt"] = "10000"
     state, _ = ub.refresh_budget(
-        _kis_broker(_balance_session(orderable="10000")), path=tmp_path / "b.json",
+        _kis_broker(_balance_session(payload)), path=tmp_path / "b.json",
         logger=lambda *_: None)
     budget = state.to_budget()
     # 10,000 USD * 90% trusted usage * 0.10 position rate = 900 USD/share ceiling.

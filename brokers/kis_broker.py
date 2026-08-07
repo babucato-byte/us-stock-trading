@@ -69,7 +69,11 @@ import requests
 
 from brokers import kis_rate_limiter, kis_token_cache
 from brokers.kis_config import KISConfig, KISConfigError
-from domain.account_snapshot import AccountSnapshot
+from domain.account_snapshot import (
+    CASH_SOURCE_BALANCE_LACKS_FIELDS,
+    AccountSnapshot,
+)
+from domain.cash_sizing import ORDERABLE_CASH_UNAVAILABLE
 from domain.execution_event import ExecutionRecord
 from domain.order_intent import OrderIntent
 from domain.position import Position
@@ -100,6 +104,9 @@ CCNL_PATH = "/uapi/overseas-stock/v1/trading/inquire-ccnl"
 
 TR_ID_BALANCE = {"live": "TTTS3012R", "paper": "VTTS3012R"}
 TR_ID_PSAMOUNT = {"live": "TTTS3007R", "paper": "VTTS3007R"}
+# The single field the orderable amount is read from, named once so the
+# parser, the verification matrix and the read-only probe cannot disagree.
+ORDERABLE_AMOUNT_FIELD = "ord_psbl_frcr_amt"
 TR_ID_NCCS = {"live": "TTTS3018R", "paper": "TTTS3018R"}
 TR_ID_CCNL = {"live": "TTTS3035R", "paper": "VTTS3035R"}
 TR_ID_PRICE = "HHDFS00000300"
@@ -245,6 +252,42 @@ VERIFICATION_MATRIX = (
         LIVE_RESPONSE_CONFIRMED,
         "live read-only probe: NASD/NYSE/AMEX accepted on balance, positions, "
         "open-orders and fills (Oracle, 2026-08-06)",
+    ),
+    # ORACLE-CASH-01. Orderable cash is an OBSERVE requirement because
+    # OBSERVE sizes every candidate: without this endpoint there is no
+    # cash figure at all, and the entry evaluation stops before any other
+    # gate runs. The three entries were confirmed together by one live
+    # read on the Oracle host (2026-08-06): TTTS3007R on PSAMOUNT_PATH
+    # answered for AAPL/NASD at a real limit price with
+    # output.ord_psbl_frcr_amt carrying a positive float.
+    WireValueVerification(
+        "orderable_amount_path", PSAMOUNT_PATH, REFERENCE_VERIFIED, LIVE_RESPONSE_CONFIRMED,
+        "live read-only probe: inquire-psamount answered on the live account "
+        "(Oracle, 2026-08-06)",
+    ),
+    WireValueVerification(
+        "orderable_amount_tr_id_live", TR_ID_PSAMOUNT["live"], REFERENCE_VERIFIED,
+        LIVE_RESPONSE_CONFIRMED,
+        "live read-only probe: TTTS3007R accepted on the LIVE account -- the paper "
+        "TR_ID (VTTS3007R) is a separate value and is not confirmed by this "
+        "(Oracle, 2026-08-06)",
+    ),
+    WireValueVerification(
+        "orderable_amount_field", f"output.{ORDERABLE_AMOUNT_FIELD}", REFERENCE_VERIFIED,
+        LIVE_RESPONSE_CONFIRMED,
+        "live read-only probe: output.ord_psbl_frcr_amt carried a positive float "
+        "(Oracle, 2026-08-06)",
+    ),
+    # The DISPROVED value, recorded so it cannot quietly come back. This
+    # one was never in the matrix, which is exactly why a wrong field name
+    # survived: the matrix only covered price and order values, so nothing
+    # ever compared the balance response's cash fields against a real one.
+    WireValueVerification(
+        "balance_cash_fields_absent", f"{TR_ID_BALANCE['live']}:no-cash-fields",
+        REFERENCE_VERIFIED, LIVE_RESPONSE_CONFIRMED,
+        "live read-only probe: TTTS3012R output2 returned nine purchase/valuation/"
+        "P&L fields on every venue leg and NO frcr_dncl_amt1 / frcr_use_psbl_amt "
+        "(Oracle, 2026-08-06)",
     ),
 )
 
@@ -397,6 +440,69 @@ class KISAmbiguousResponseError(KISBrokerError):
     responses to a state-mutating call (order/cancel) -- the caller
     (execution/order_state_machine.py) must treat this as UNKNOWN, never
     as a definite failure eligible for retry (spec §9)."""
+
+
+class KISOrderableCashUnavailableError(KISBrokerError):
+    """The orderable-amount read did not yield a usable number.
+
+    A distinct type because the caller's correct response is distinct: an
+    unusable read must be recorded as ORDERABLE_CASH_UNAVAILABLE and stop
+    the candidate, NOT recorded as INSUFFICIENT_CASH. Collapsing the two
+    is how an API outage reads, in the audit trail, exactly like an
+    ordinary underfunded day.
+    """
+
+    def __init__(self, message, *, symbol=None, detail=None):
+        super().__init__(message)
+        self.reason_code = ORDERABLE_CASH_UNAVAILABLE
+        self.symbol = symbol
+        self.detail = detail
+
+    def diagnostic(self):
+        """Operator-facing detail only -- never a raw body or an account."""
+        return {"symbol": self.symbol, "reason_code": self.reason_code,
+                "detail": self.detail, "field": ORDERABLE_AMOUNT_FIELD}
+
+
+def _parse_orderable_amount(body, *, symbol=None):
+    """Strict: `output.ord_psbl_frcr_amt` as a finite, non-negative float.
+
+    Everything else raises -- missing `output`, wrong `output` type,
+    missing field, None, "", "NaN", "Infinity", a negative amount, a bool,
+    a list, a dict. There is deliberately no default and no coercion of a
+    doubtful value, because the only safe interpretation of "I could not
+    read the balance" is "do not size an order".
+
+    An explicit numeric 0 is NOT an error: it is a real, successfully-read
+    zero balance, and the caller reports it as INSUFFICIENT_CASH.
+    """
+    def _fail(detail):
+        return KISOrderableCashUnavailableError(
+            f"KIS orderable-amount response unusable ({detail})",
+            symbol=symbol, detail=detail,
+        )
+
+    if not isinstance(body, dict):
+        raise _fail("body_not_an_object")
+    output = body.get("output")
+    if not isinstance(output, dict):
+        raise _fail("output_missing" if output is None else "output_not_an_object")
+    if ORDERABLE_AMOUNT_FIELD not in output:
+        raise _fail("field_missing")
+    raw = output.get(ORDERABLE_AMOUNT_FIELD)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+        raise _fail(f"field_type_{type(raw).__name__}")
+    if isinstance(raw, str) and not raw.strip():
+        raise _fail("field_empty")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise _fail("field_not_numeric") from None
+    if not math.isfinite(value):
+        raise _fail("field_not_finite")
+    if value < 0:
+        raise _fail("field_negative")
+    return value
 
 
 def _excd_for(exchange: str) -> str:
@@ -669,34 +775,90 @@ class KISBroker:
         summary_rows = legs[0][1].get("output2") or {} if legs else {}
         if isinstance(summary_rows, list):
             summary_rows = summary_rows[0] if summary_rows else {}
-        try:
-            usd_cash = float(summary_rows.get("frcr_dncl_amt1", 0) or 0)
-            usd_orderable_cash = float(summary_rows.get("frcr_use_psbl_amt", usd_cash) or usd_cash)
-        except (TypeError, ValueError) as exc:
-            raise KISBrokerError(
-                f"KIS balance response has non-numeric cash fields: {redact_text(str(exc))}"
-            ) from exc
+        # ORACLE-CASH-01: this response does NOT carry cash. A live read
+        # showed TTTS3012R's output2 returning exactly nine
+        # purchase/valuation/P&L fields -- frcr_pchs_amt1,
+        # ovrs_rlzt_pfls_amt, ovrs_tot_pfls, rlzt_erng_rt,
+        # tot_evlu_pfls_amt, tot_pftrt, frcr_buy_amt_smtl1,
+        # ovrs_rlzt_pfls_amt2, frcr_buy_amt_smtl2 -- and no deposit or
+        # orderable-amount field at all. The previous code read
+        # `frcr_dncl_amt1`/`frcr_use_psbl_amt` with a `.get(field, 0) or 0`
+        # fallback, so a funded account reported $0 and every candidate
+        # sized to zero shares. Orderable cash comes from
+        # `get_orderable_usd()` (TTTS3007R), which is per symbol and price
+        # and therefore cannot be answered by an account-level read.
+        usd_cash, usd_orderable_cash = self._read_balance_cash(summary_rows)
         return AccountSnapshot(
-            krw_cash=0.0, usd_cash=usd_cash, usd_orderable_cash=usd_orderable_cash,
+            # KRW is not queried by this path at all, and was previously
+            # hardcoded to 0.0 -- indistinguishable from "the account holds
+            # no KRW", which this read cannot establish either way.
+            krw_cash=None, usd_cash=usd_cash, usd_orderable_cash=usd_orderable_cash,
             usd_reserved_in_open_orders=0.0, as_of=self._now(), source=source_label,
             account_id=self.config.account_no or "",
+            cash_source=(
+                CASH_SOURCE_BALANCE_LACKS_FIELDS if usd_orderable_cash is None
+                else f"{tr_id}:output2"
+            ),
         )
 
+    @staticmethod
+    def _read_balance_cash(summary_rows):
+        """(usd_cash, usd_orderable_cash), each None when the response did
+        not carry the field.
+
+        A field that IS present is parsed strictly: an explicit numeric 0
+        from KIS is a real zero balance and stays 0.0, which is the one
+        case a zero may be reported. Absent, null, blank or non-numeric is
+        None -- unknown -- never 0.
+        """
+        def _parse(field):
+            if field not in summary_rows:
+                return None
+            raw = summary_rows.get(field)
+            if raw is None or (isinstance(raw, str) and not raw.strip()):
+                return None
+            if isinstance(raw, bool):
+                return None
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(value) or value < 0:
+                return None
+            return value
+
+        return _parse("frcr_dncl_amt1"), _parse("frcr_use_psbl_amt")
+
     def get_orderable_usd(self, instrument, limit_price_usd: float) -> float:
+        """The account's orderable USD FOR THIS SYMBOL AT THIS PRICE.
+
+        KIS answers orderable cash per (symbol, exchange, limit price) --
+        it is not an account-wide constant -- so the caller must pass the
+        same limit price it intends to order at. Sizing against a
+        different price would size against a different answer.
+
+        Fail-closed: anything short of a well-formed, finite, non-negative
+        number raises KISOrderableCashUnavailableError. It never degrades
+        to 0.0, because "the read failed" and "the account has no money"
+        must not produce the same record.
+        """
         self.config.validate_read_allowed()
         tr_id = TR_ID_PSAMOUNT[self._env_key()]
-        body = self._get(PSAMOUNT_PATH, tr_id, {
-            "CANO": self.config.account_no, "ACNT_PRDT_CD": self.config.account_product_cd,
-            "OVRS_EXCG_CD": _order_excg_for(instrument.exchange),
-            "OVRS_ORD_UNPR": str(limit_price_usd), "ITEM_CD": instrument.kis_symbol,
-        })
-        output = body.get("output") or {}
         try:
-            return float(output.get("ord_psbl_frcr_amt", 0) or 0)
-        except (TypeError, ValueError) as exc:
-            raise KISBrokerError(
-                f"KIS orderable-amount response malformed: {redact_text(str(exc))}"
+            body = self._get(PSAMOUNT_PATH, tr_id, {
+                "CANO": self.config.account_no, "ACNT_PRDT_CD": self.config.account_product_cd,
+                "OVRS_EXCG_CD": _order_excg_for(instrument.exchange),
+                "OVRS_ORD_UNPR": str(limit_price_usd), "ITEM_CD": instrument.kis_symbol,
+            })
+        except KISBrokerError as exc:
+            # Network fault, auth failure or a non-success KIS body. All
+            # of them mean "unknown", none of them mean "zero".
+            raise KISOrderableCashUnavailableError(
+                f"KIS orderable-amount read failed: {redact_text(str(exc))}",
+                symbol=getattr(instrument, "kis_symbol", None), detail="read_failed",
             ) from exc
+        return _parse_orderable_amount(
+            body, symbol=getattr(instrument, "kis_symbol", None))
 
     def get_positions(self) -> List[Position]:
         self.config.validate_read_allowed()

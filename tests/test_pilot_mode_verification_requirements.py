@@ -227,7 +227,12 @@ class TestObserveIsAllowedWithArmedOnlyPending:
         preflight.check_live_response_pending(
             report, "live", posture=posture_module.POSTURE_OBSERVE)
         row = next(r for r in report.rows if r["check"] == "live_response_pending")
-        assert "OBSERVE requires 3" in row["detail"]
+        # The count is derived from the matrix, not written down twice:
+        # ORACLE-CASH-01 added the orderable-amount contract to OBSERVE's
+        # requirements, and this line must move with it.
+        needed = len(kis_broker.matrix_entries_for(kis_broker.REQUIRED_FOR_OBSERVE))
+        assert f"OBSERVE requires {needed}" in row["detail"]
+        assert needed >= 3
 
 
 class TestObserveValuesStillGateObserve:
@@ -345,11 +350,17 @@ class TestObserveTouchesNoOrderPath:
             module = importlib.import_module("verify_kis_observe_responses")
         finally:
             sys.path.remove(str(REPO_ROOT / "scripts"))
+        # get_orderable_usd is a QUERY (TTTS3007R). It takes a symbol and
+        # a limit price because the endpoint's answer depends on both, and
+        # it submits nothing -- ORACLE-CASH-01 put it on the allow-list so
+        # the probe can confirm the field OBSERVE sizes with.
         assert module.ReadOnlyBroker.ALLOWED == frozenset({
             "get_current_price", "get_account_snapshot", "get_positions",
-            "get_open_orders", "get_fills", "config"})
+            "get_open_orders", "get_fills", "get_orderable_usd", "config"})
         assert "submit_order" in module.FORBIDDEN_METHODS
         assert "cancel_order" in module.FORBIDDEN_METHODS
+        # Whatever is allowed, nothing that mutates state may be.
+        assert not (module.ReadOnlyBroker.ALLOWED & module.FORBIDDEN_METHODS)
 
     def test_a_forbidden_method_raises_before_any_request(self):
         sys.path.insert(0, str(REPO_ROOT / "scripts"))
