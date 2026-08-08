@@ -104,6 +104,8 @@ class _Rollout:
     max_quantity_per_order = 1
     max_price_deviation_percent = 30.0
     regular_session_only = False
+    max_open_positions = 99
+    max_daily_entries = 99
 
 
 @pytest.fixture
@@ -358,6 +360,34 @@ class TestUnusableReadsFailClosed:
 # ---------------------------------------------------------------------
 # The defect itself: an unavailable BALANCE must not read as $0 anywhere.
 # ---------------------------------------------------------------------
+class TestEntryLimitObservability:
+    """The two rollout caps are visible in the audit trail (ORACLE-LIMIT-01
+    §19). A cap block that recorded only its reason code would leave an
+    operator unable to tell 1-of-1 from 1-of-5 without querying the DB."""
+
+    def test_the_gate_events_carry_the_capacity_numbers(self, shadow_env, monkeypatch):
+        module = _shadow_module()
+        _evaluate(module, _Broker(), monkeypatch=monkeypatch)
+        gate_events = [e for e in _events("IOVA")
+                       if e["event_type"] in (shadow_audit.GATE_APPROVED,
+                                              shadow_audit.GATE_REJECTED)]
+        assert gate_events, "no gate verdict was recorded"
+        payload = gate_events[0]["payload"] or {}
+        for key in ("max_open_positions", "open_positions", "pending_entries",
+                    "effective_positions", "max_daily_entries", "daily_entries",
+                    "trading_day"):
+            assert key in payload, f"{key} missing from the gate audit payload"
+
+    def test_the_payload_carries_no_identifier(self, shadow_env, monkeypatch):
+        module = _shadow_module()
+        _evaluate(module, _Broker(), monkeypatch=monkeypatch)
+        gate_events = [e for e in _events("IOVA")
+                       if e["event_type"] in (shadow_audit.GATE_APPROVED,
+                                              shadow_audit.GATE_REJECTED)]
+        text = repr(gate_events[0]["payload"])
+        assert "44xxxxxx" not in text
+
+
 class TestTheAccountSnapshotIsNoLongerACashSource:
     def test_the_pipeline_does_not_size_from_the_snapshot(self, shadow_env, monkeypatch):
         """The regression guard. This broker's snapshot reports cash as

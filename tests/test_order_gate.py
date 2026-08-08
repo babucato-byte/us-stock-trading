@@ -16,6 +16,7 @@ from execution.order_gate import (
 )
 
 from reconciliation.snapshot import ReconciliationSnapshot
+import entry_limit_fixtures
 
 NOW = datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc)
 
@@ -67,7 +68,7 @@ def _buy_ctx(**overrides):
         signal=_signal(), is_regular_session=True, kis_price_usd=100.1,
         max_price_deviation_percent=0.30, usd_orderable_cash=1000.0,
         has_open_order_for_symbol=False, has_order_for_signal_id=False,
-        allowed_symbols=frozenset({"AAPL"}), reconciliation=_snapshot(), now=NOW,
+        allowed_symbols=frozenset({"AAPL"}), reconciliation=_snapshot(), entry_limits=entry_limit_fixtures.unlimited(), now=NOW,
     )
     kwargs.update(overrides)
     return BuyGateContext(**kwargs)

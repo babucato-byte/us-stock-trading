@@ -49,6 +49,7 @@ Exit codes:
 """
 
 import argparse
+import dataclasses
 import json
 import logging
 import sys
@@ -76,7 +77,7 @@ from domain.cash_sizing import (  # noqa: E402
 )
 from domain.order_intent import OrderIntent  # noqa: E402
 from domain.signal import build_signal  # noqa: E402
-from execution import order_gate  # noqa: E402
+from execution import entry_limits, order_gate  # noqa: E402
 from execution.secret_redaction import (  # noqa: E402
     install_logging_redaction,
     mask_account_number,
@@ -117,6 +118,9 @@ GATE_SEQUENCE = (
     "BROKER", "LIVE_FLAG", "ENTRY_DISABLED", "COMMIT", "ACCOUNT", "QUANTITY",
     "ORDER_TYPE", "SESSION", "SIGNAL_EXPIRED", "PRICE_INVALID", "PRICE_DEVIATION",
     "CASH", "OPEN_ORDER", "DUPLICATE_SIGNAL", "SYMBOL", "INSTRUMENT", "RECONCILIATION",
+    # The two account-capacity caps, raised by the helper the gate calls
+    # last. They come after every candidate-specific check.
+    entry_limits.MAX_OPEN_POSITIONS, entry_limits.MAX_DAILY_ENTRIES,
 )
 
 FORBIDDEN_METHODS = frozenset({
@@ -298,6 +302,11 @@ def evaluate_gates(found, *, broker, rollout, env, now):
             broker=broker, conn=conn, account_id=account.account_id, symbol=symbol,
             now=now, source="observe_cash_path_validation",
         )
+        # Read-only: counts held positions and reads the durable entry
+        # ledger. It creates no reservation and writes no row -- the
+        # probe's DB-delta assertion covers exactly that.
+        limits = entry_limits.collect(
+            broker=broker, conn=conn, rollout=rollout, now=now)
     finally:
         conn.close()
 
@@ -319,7 +328,8 @@ def evaluate_gates(found, *, broker, rollout, env, now):
             max_price_deviation_percent=rollout.max_price_deviation_percent,
             usd_orderable_cash=found["orderable_usd"],
             has_open_order_for_symbol=has_open_order, has_order_for_signal_id=False,
-            allowed_symbols=rollout.allowed_symbols, reconciliation=snapshot, now=now,
+            allowed_symbols=rollout.allowed_symbols, reconciliation=snapshot,
+            entry_limits=limits, now=now,
         )
 
     def _run(ctx):
@@ -332,11 +342,43 @@ def evaluate_gates(found, *, broker, rollout, env, now):
     real = _run(_ctx(live_order_enabled=_flag(env, "KIS_LIVE_ORDER_ENABLED"),
                      entry_disabled=_flag(env, "ENTRY_DISABLED")))
     hypothetical = _run(_ctx(live_order_enabled=True, entry_disabled=False))
+    # Synthetic controls for the two account-capacity caps.
+    #
+    # Both caps sit AFTER the allow-list check, and the allow-list is
+    # empty in this posture, so a plain hypothetical evaluation stops at
+    # SYMBOL and never reaches them. To observe the caps themselves, the
+    # controls substitute an allow-list containing this symbol -- in a
+    # COPY of the context object, exactly as the flag flip above is done.
+    # No configuration is changed, no reservation is created, no row is
+    # written, and the two real evaluations above are untouched.
+    # `is_regular_session` is forced true here for the same reason the
+    # allow-list is substituted: outside market hours the SESSION check
+    # fires first and every control would report SESSION, telling the
+    # operator nothing about the caps. The real and hypothetical
+    # evaluations above keep the true session state.
+    def _limits_ctx(limit_state):
+        return dataclasses.replace(
+            _ctx(live_order_enabled=True, entry_disabled=False),
+            allowed_symbols=frozenset({symbol}), is_regular_session=True,
+            entry_limits=limit_state)
+
+    at_position_cap = dataclasses.replace(
+        limits,
+        open_position_symbols=frozenset(
+            f"CAP{i}" for i in range(limits.max_open_positions)),
+        pending_entry_symbols=frozenset())
+    at_daily_cap = dataclasses.replace(limits, daily_entry_count=limits.max_daily_entries)
+    controls = {
+        "real_state": _run(_limits_ctx(limits)),
+        "position_cap": _run(_limits_ctx(at_position_cap)),
+        "daily_cap": _run(_limits_ctx(at_daily_cap)),
+    }
+
     return {
         "account": account, "signal": signal, "order_intent": order_intent,
         "snapshot": snapshot, "is_regular_session": is_regular_session,
         "real_blocked": real, "hypothetical_blocked": hypothetical,
-        "context_constructed": True,
+        "context_constructed": True, "limits": limits, "controls": controls,
     }
 
 
@@ -444,13 +486,40 @@ def main(argv=None):
     passed_cash = code is None or (
         code in GATE_SEQUENCE and GATE_SEQUENCE.index(code) > GATE_SEQUENCE.index("CASH")
     )
-    report.record("cash_gate_passed", passed_cash,
-                  f"hypothetical evaluation reached {reached}; stopped_at={stopped_at}")
+    detail = f"hypothetical evaluation reached {reached}; stopped_at={stopped_at}"
+    if not passed_cash and code == "SESSION":
+        # Not a defect and worth saying so: the session check runs before
+        # CASH, so outside US regular hours this probe cannot demonstrate
+        # the cash path at all. Re-run during the session.
+        detail += (" -- the US regular session is closed, so the evaluation stops "
+                   "before CASH; re-run during regular hours")
+    report.record("cash_gate_passed", passed_cash, detail)
 
     real = gates["real_blocked"]
     report.record("real_posture_still_blocks", real is not None and real.code == "LIVE_FLAG",
                   f"real evaluation blocked at {real.code if real else 'NOTHING'} "
                   "(OBSERVE must not approve)")
+
+    # The two rollout caps, observed with real state and with synthetic
+    # at-capacity state. No reservation is created for either.
+    controls = gates["controls"]
+    limits = gates["limits"]
+    real_state = controls["real_state"]
+    report.record("entry_limits_pass_at_real_state", real_state is None,
+                  f"effective_positions={limits.effective_position_count}/"
+                  f"{limits.max_open_positions}, daily_entries="
+                  f"{limits.daily_entry_count}/{limits.max_daily_entries} on "
+                  f"{limits.trading_day} -> "
+                  f"{real_state.code if real_state else 'ALL GATES PASSED'}")
+    blocked = controls["position_cap"]
+    report.record("position_cap_blocks_when_full",
+                  blocked is not None and blocked.code == entry_limits.MAX_OPEN_POSITIONS,
+                  f"synthetic at-capacity state -> "
+                  f"{blocked.code if blocked else 'APPROVED'}")
+    blocked = controls["daily_cap"]
+    report.record("daily_cap_blocks_when_used",
+                  blocked is not None and blocked.code == entry_limits.MAX_DAILY_ENTRIES,
+                  f"synthetic day-used state -> {blocked.code if blocked else 'APPROVED'}")
 
     # Control group: the SAME production function, one cent short of a
     # single share. No API call -- the point is that the arithmetic, not
@@ -510,6 +579,14 @@ def _print_tail(report, broker, db_before, rollout, env, *, examined,
         print(f"  regular_session: {gates['is_regular_session']}")
         print(f"  reconciliation:  clean={gates['snapshot'].is_clean()} "
               f"unknown={gates['snapshot'].has_unknown_orders}")
+        limits = gates["limits"]
+        print("\nEntry limits:")
+        for key, value in limits.as_audit_payload().items():
+            print(f"  {key}: {value}")
+        print(f"  open_position_symbols:  {sorted(limits.open_position_symbols)}")
+        print(f"  pending_entry_symbols:  {sorted(limits.pending_entry_symbols)}")
+        for label, blocked in gates["controls"].items():
+            print(f"  control[{label}]: {blocked.code if blocked else 'APPROVED'}")
 
     print("\nTransport:")
     print(f"  order_calls:  {broker.order_calls}")

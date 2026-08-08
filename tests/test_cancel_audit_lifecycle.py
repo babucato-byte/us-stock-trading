@@ -25,6 +25,7 @@ from domain.signal import build_signal
 from execution import execution_engine, idempotency, order_gate, order_repository
 from execution.execution_engine import ExecutionEngineError
 from state_store import db as state_db
+import entry_limit_fixtures
 
 NOW = datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc)
 ACCOUNT_ID = "12345678"
@@ -70,7 +71,7 @@ def _buy_ctx_builder(order_intent):
             is_regular_session=True, kis_price_usd=100.1, max_price_deviation_percent=0.30,
             usd_orderable_cash=1000.0, has_open_order_for_symbol=False,
             has_order_for_signal_id=False, allowed_symbols=frozenset({"AAPL"}),
-            reconciliation=reconciliation, now=NOW,
+            reconciliation=reconciliation, entry_limits=entry_limit_fixtures.unlimited(), now=NOW,
         )
     return _build
 

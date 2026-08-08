@@ -35,6 +35,7 @@ from execution.order_repository import (
     OrderRepositoryReadError,
 )
 from state_store import db as state_db
+import entry_limit_fixtures
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 NOW = datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc)
@@ -95,7 +96,7 @@ def _buy_ctx_builder(order_intent):
             is_regular_session=True, kis_price_usd=100.1, max_price_deviation_percent=0.30,
             usd_orderable_cash=1000.0, has_open_order_for_symbol=False,
             has_order_for_signal_id=False, allowed_symbols=frozenset({"AAPL"}),
-            reconciliation=reconciliation, now=NOW,
+            reconciliation=reconciliation, entry_limits=entry_limit_fixtures.unlimited(), now=NOW,
         )
     return _build
 

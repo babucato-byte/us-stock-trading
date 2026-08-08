@@ -22,6 +22,8 @@ from typing import FrozenSet, Optional
 from domain.instrument import Instrument
 from domain.order_intent import OrderIntent
 from domain.signal import Signal
+from execution import entry_limits
+from execution.entry_limits import EntryLimitState
 from execution.secret_redaction import mask_account_number
 from reconciliation.snapshot import (
     ReconciliationBlockedError,
@@ -68,6 +70,12 @@ class BuyGateContext:
     # `reconciliation_ok=True`/`has_unknown_order=False` boolean a caller
     # could simply assert. See reconciliation/snapshot.py.
     reconciliation: ReconciliationSnapshot
+    # The two rollout caps' authoritative state, collected by the context
+    # builder (execution/entry_limits.py) exactly like `reconciliation`
+    # is -- the gate performs no I/O. Required, with no default: a caller
+    # that forgets it must fail to construct a context, not silently skip
+    # a safety limit, which is the defect this field exists to close.
+    entry_limits: EntryLimitState
     now: datetime
 
 
@@ -172,7 +180,47 @@ def evaluate_buy_gate(ctx: BuyGateContext) -> bool:
         ctx.reconciliation, account_id=ctx.kis_account_no,
         symbol=ctx.order_intent.symbol, now=ctx.now,
     )
+    _check_entry_limits(ctx)
     return True
+
+
+def _check_entry_limits(ctx):
+    """LIVE_ROLLOUT_MAX_POSITIONS and LIVE_ROLLOUT_MAX_DAILY_ENTRIES.
+
+    Last, deliberately. Both are ACCOUNT-scoped capacity limits rather
+    than facts about this candidate, so every candidate-specific reason
+    an order would be refused anyway -- wrong symbol, ineligible
+    instrument, stale reconciliation -- is reported first. An operator
+    reading "MAX_OPEN_POSITIONS" then knows the candidate was otherwise
+    fit and the account was simply full, which is a different action from
+    "that symbol is not allow-listed".
+
+    They still run before any transport: this is the same gate the
+    execution engine must pass before it will call the broker at all.
+
+    SELLS ARE NOT SUBJECT TO EITHER. An account at its position cap must
+    always be able to close what it holds -- see evaluate_sell_gate,
+    which does not call this.
+    """
+    limits = ctx.entry_limits
+    if limits is None:
+        raise OrderGateBlockedError(
+            "entry-limit state was not supplied; the position and daily-entry caps "
+            "cannot be enforced", code=entry_limits.POSITION_LIMIT_STATE_UNKNOWN,
+        )
+    if limits.effective_position_count >= limits.max_open_positions:
+        raise OrderGateBlockedError(
+            f"open-position cap reached: {limits.effective_position_count} of "
+            f"{limits.max_open_positions} slot(s) in use "
+            f"({limits.open_position_count} held, {limits.pending_entry_count} in flight)",
+            code=entry_limits.MAX_OPEN_POSITIONS,
+        )
+    if limits.daily_entry_count >= limits.max_daily_entries:
+        raise OrderGateBlockedError(
+            f"daily-entry cap reached for {limits.trading_day}: "
+            f"{limits.daily_entry_count} of {limits.max_daily_entries} entr(y/ies) used",
+            code=entry_limits.MAX_DAILY_ENTRIES,
+        )
 
 
 def evaluate_sell_gate(ctx: SellGateContext) -> bool:

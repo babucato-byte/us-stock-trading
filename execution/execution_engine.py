@@ -53,6 +53,7 @@ from execution.order_repository import (
     OrderRepositoryRollbackError,
 )
 from execution.order_state_machine import OrderStateTransitionError
+from market_hours import us_trading_day
 import shadow_audit
 from reconciliation import snapshot as reconciliation_snapshot
 from execution.secret_redaction import safe_repr
@@ -308,7 +309,14 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
     # before the gate, before the network. No audit context, no order.
     audit_run_id = validate_audit_run_id(audit_run_id)
     current = now or datetime.now(timezone.utc)
-    trading_date = current.date().isoformat()
+    # The US-Eastern calendar date, not the UTC one. This value is both
+    # half of the idempotency uniqueness key AND what the daily-entry cap
+    # counts against (execution/entry_limits.py), so the ledger that
+    # RECORDS an entry and the gate that COUNTS entries must derive the
+    # day identically. `current.date()` is the UTC date: during the
+    # regular session the two agree, but any evaluation after 20:00 ET
+    # would have rolled the UTC date while the trading day had not.
+    trading_date = us_trading_day(current)
     with idempotency.single_run_lock():
         try:
             idempotency.register(

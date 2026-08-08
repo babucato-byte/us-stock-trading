@@ -60,7 +60,7 @@ from domain.cash_sizing import (
 from domain.instrument import Instrument, InstrumentError, build_instrument
 from domain.order_intent import OrderIntent, OrderIntentError
 from domain.signal import Signal, SignalError, build_signal
-from execution import execution_engine, order_gate
+from execution import entry_limits, execution_engine, order_gate
 from market_data.exchange_registry import (
     ExchangeResolutionError,
     build_kis_instrument,
@@ -449,6 +449,15 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None):
                     kis_price=kis_quote.price_usd, available_usd=available_usd,
                     has_open_order_for_symbol=has_open_order_for_symbol,
                 ):
+                    # Collected inside the builder, so it is read at gate
+                    # time rather than at candidate-selection time -- the
+                    # execution engine has already registered this
+                    # attempt's idempotency row by now, which is why the
+                    # attempt excludes itself from its own counts.
+                    limits = entry_limits.collect(
+                        broker=broker, conn=conn, rollout=rollout, now=current,
+                        exclude_internal_order_id=order_intent.internal_order_id,
+                    )
                     return order_gate.BuyGateContext(
                         execution_broker="kis", live_order_enabled=True, entry_disabled=False,
                         validated_commit=validated_commit, deployed_commit=deployed_commit,
@@ -463,6 +472,7 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None):
                         # reconciliation status, only pass through what the
                         # engine actually observed.
                         reconciliation=reconciliation,
+                        entry_limits=limits,
                         now=current,
                     )
 

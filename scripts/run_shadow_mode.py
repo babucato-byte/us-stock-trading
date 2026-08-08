@@ -72,7 +72,7 @@ from domain.cash_sizing import (  # noqa: E402
 from domain.instrument import InstrumentError, build_instrument  # noqa: E402
 from domain.order_intent import OrderIntent, OrderIntentError  # noqa: E402
 from domain.signal import SignalError, build_signal  # noqa: E402
-from execution import order_gate  # noqa: E402
+from execution import entry_limits, order_gate  # noqa: E402
 from execution.order_repository import (  # noqa: E402
     FatalRepositoryConnectionError,
 )
@@ -419,6 +419,22 @@ def _evaluate_symbol(*, symbol, broker, rollout, conn, kis_validation, deployed_
 
         has_open_order = any((o.get("pdno") or o.get("PDNO")) == symbol for o in open_orders)
 
+        # The two rollout caps' authoritative state. Collected here, once,
+        # by the same module the live path uses -- OBSERVE must evaluate
+        # them identically or its hypothetical verdict would be more
+        # permissive than the real one. Shadow registers no idempotency
+        # row, so there is no own-attempt to exclude.
+        try:
+            limits = entry_limits.collect(
+                broker=broker, conn=conn, rollout=rollout, now=now)
+        except entry_limits.EntryLimitStateUnavailable as exc:
+            outcome["reason_code"] = exc.reason_code
+            progress.blocked(STAGE_RECONCILIATION, exc.reason_code)
+            _audit(run_id, shadow_audit.RECONCILIATION_BLOCKED, shadow_audit.RESULT_BLOCKED,
+                   symbol=symbol, signal_id=signal.signal_id,
+                   reason_code=exc.reason_code, detail=str(exc), now=now)
+            return outcome
+
         def _ctx(*, live_order_enabled, entry_disabled):
             return order_gate.BuyGateContext(
                 execution_broker="kis", live_order_enabled=live_order_enabled,
@@ -429,7 +445,7 @@ def _evaluate_symbol(*, symbol, broker, rollout, conn, kis_validation, deployed_
                 kis_price_usd=price, max_price_deviation_percent=rollout.max_price_deviation_percent,
                 usd_orderable_cash=available_usd, has_open_order_for_symbol=has_open_order,
                 has_order_for_signal_id=False, allowed_symbols=rollout.allowed_symbols,
-                reconciliation=snapshot, now=now,
+                reconciliation=snapshot, entry_limits=limits, now=now,
             )
 
         real_blocked = None
@@ -461,26 +477,42 @@ def _evaluate_symbol(*, symbol, broker, rollout, conn, kis_validation, deployed_
             existing_open_order=has_open_order, now=now,
         ))
 
+        # The capacity numbers behind the two rollout caps, on every gate
+        # outcome. Without them a MAX_OPEN_POSITIONS block reads as a bare
+        # refusal; with them an operator can see it was 1 of 1 slots used
+        # and which day the count belongs to. Counts and a date only --
+        # no account, no order id.
+        limits_payload = limits.as_audit_payload()
+
         if real_blocked is not None:
             outcome["reason_code"] = f"GATE:{real_blocked.code}"
             _audit(run_id, shadow_audit.event_type_for_reason_code(f"GATE:{real_blocked.code}"),
                    shadow_audit.RESULT_BLOCKED, symbol=symbol, signal_id=signal.signal_id,
-                   reason_code=f"GATE:{real_blocked.code}", detail=str(real_blocked), now=now)
+                   reason_code=f"GATE:{real_blocked.code}", detail=str(real_blocked),
+                   payload=limits_payload, now=now)
         if hypothetical_blocked is not None:
             outcome["hypothetical"] = f"BLOCKED:{hypothetical_blocked.code}"
             _audit(run_id, shadow_audit.GATE_REJECTED, shadow_audit.RESULT_BLOCKED, symbol=symbol,
                    signal_id=signal.signal_id, reason_code=f"HYPOTHETICAL:{hypothetical_blocked.code}",
-                   detail=str(hypothetical_blocked), now=now)
+                   detail=str(hypothetical_blocked), payload=limits_payload, now=now)
         else:
             outcome["hypothetical"] = "WOULD_APPROVE"
             _audit(run_id, shadow_audit.GATE_APPROVED, shadow_audit.RESULT_INFO, symbol=symbol,
-                   signal_id=signal.signal_id, reason_code="HYPOTHETICAL_APPROVED", now=now)
+                   signal_id=signal.signal_id, reason_code="HYPOTHETICAL_APPROVED",
+                   payload=limits_payload, now=now)
             _audit(run_id, shadow_audit.EXECUTION_PLANNED, shadow_audit.RESULT_INFO, symbol=symbol,
                    signal_id=signal.signal_id, reason_code="NO_ORDER_PLACED_SHADOW_MODE",
                    detail=f"quantity={quantity} limit={price}", now=now)
         if real_blocked is None and hypothetical_blocked is None:
             outcome["result"] = shadow_audit.RESULT_APPROVED
         return outcome
+    except FatalRepositoryConnectionError:
+        # CODEX-059: fatal outranks the "record an outcome and continue"
+        # path below. The entry-limit collector reads the durable order
+        # ledger, so this handler must precede the broad catch or a fatal
+        # connection fault would be recorded as an ordinary UNEXPECTED
+        # and the process would keep running with HALT set.
+        raise
     except Exception as exc:  # noqa: BLE001 -- every run must end in a recorded outcome
         outcome["result"] = shadow_audit.RESULT_ERROR
         outcome["reason_code"] = "UNEXPECTED"

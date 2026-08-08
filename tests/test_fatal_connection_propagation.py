@@ -31,6 +31,7 @@ from domain.signal import build_signal
 from execution import execution_engine, idempotency, order_gate, order_repository
 from execution.order_repository import FatalRepositoryConnectionError
 from state_store import db as state_db
+import entry_limit_fixtures
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 NOW = datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc)
@@ -99,7 +100,7 @@ def _buy_ctx_builder(order_intent):
             is_regular_session=True, kis_price_usd=100.1, max_price_deviation_percent=0.30,
             usd_orderable_cash=1000.0, has_open_order_for_symbol=False,
             has_order_for_signal_id=False, allowed_symbols=frozenset({"AAPL"}),
-            reconciliation=reconciliation, now=NOW,
+            reconciliation=reconciliation, entry_limits=entry_limit_fixtures.unlimited(), now=NOW,
         )
     return _build
 
@@ -563,6 +564,10 @@ _CHILD = textwrap.dedent(
 
     conn = state_db.open_db(sys.argv[1])
     b = B()
+    from execution.entry_limits import EntryLimitState
+    LIMITS = EntryLimitState(max_open_positions=99, max_daily_entries=99,
+        open_position_symbols=frozenset(), pending_entry_symbols=frozenset(),
+        daily_entry_count=0, trading_day='2026-07-29')
     execution_engine.submit_buy_order(order_intent=oi,
         buy_gate_context_builder=lambda rec: order_gate.BuyGateContext(execution_broker="kis",
             live_order_enabled=True, entry_disabled=False, validated_commit="c1",
@@ -571,7 +576,7 @@ _CHILD = textwrap.dedent(
             is_regular_session=True, kis_price_usd=100.1, max_price_deviation_percent=0.30,
             usd_orderable_cash=1000.0, has_open_order_for_symbol=False,
             has_order_for_signal_id=False, allowed_symbols=frozenset({"AAPL"}),
-            reconciliation=rec, now=NOW),
+            reconciliation=rec, entry_limits=LIMITS, now=NOW),
         conn=conn, broker=b, instrument=build_instrument("AAPL", exchange="NASDAQ"),
         account_id=ACC, audit_run_id=shadow_audit.new_run_id(), now=NOW)
 

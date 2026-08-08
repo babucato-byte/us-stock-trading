@@ -359,6 +359,50 @@ cancel_tr_id_live, cancel_tr_id_paper, cancel_price_field_rule
 막지 않는다. ARMED posture(세 플래그 전부 on)에서는 전부를 강제한다. 우회 환경변수는
 없다.
 
+### 진입 한도 두 가지 (ORACLE-LIMIT-01)
+
+`LIVE_ROLLOUT_MAX_POSITIONS`와 `LIVE_ROLLOUT_MAX_DAILY_ENTRIES`는 **설정만 있고 강제되지
+않았다.** 두 값은 `config/live_rollout_config.py`가 읽고 타입 검증까지 했지만 진입 경로
+어디에서도 소비되지 않았다 — `evaluate_buy_gate`에도, `kis_live_trading`에도,
+shadow 평가에도 없었다. `LIVE_ROLLOUT_MAX_POSITIONS=1`로 설정한 운영자는 아무것도
+제한하지 않는 숫자를 읽고 있었다.
+
+지금은 Order Gate가 **RECONCILIATION 다음에, 모든 후보별 검사 뒤에** 강제한다.
+
+```text
+... → SYMBOL → INSTRUMENT → RECONCILIATION → MAX_OPEN_POSITIONS → MAX_DAILY_ENTRIES
+```
+
+계정 단위 용량 제한이므로 마지막이다. 후보 자체가 부적격이면 그 이유가 먼저 보고되고,
+`MAX_OPEN_POSITIONS`가 나왔다면 후보는 멀쩡한데 계좌가 찼다는 뜻이다.
+
+권위 있는 수치는 두 곳에서만 온다.
+
+```text
+보유 포지션  KIS get_positions()에서 quantity > 0
+진입 시도    kis_order_idempotency — execution_engine이 네트워크 호출 전에,
+             single_run_lock() 안에서 쓰는 원장. 그 순서가 이걸 예약으로 만든다:
+             행을 쓴 뒤 crash해도 slot은 소비된 채로 남는다
+```
+
+포지션 한도는 **보유 + 진행 중**을 심볼 합집합으로 센다. 합집합인 이유는 체결되어
+포지션이 된 주문을 두 번 세지 않기 위해서고, 진행 중을 포함하는 이유는 한 슬롯을 두
+후보가 동시에 통과하는 race를 막기 위해서다.
+
+일일 슬롯은 그날의 모든 매수 시도가 소비한다 — **UNKNOWN 포함, 재조정될 때까지 영구히.**
+유일한 예외는 브로커가 본 적 없는 시도(`REJECTED` + `broker_order_id` 없음)다.
+
+거래일은 **미국 동부 달력 날짜**(`market_hours.us_trading_day`)다. 기록하는 원장과
+세는 게이트가 같은 함수를 쓰므로 둘이 어긋날 수 없다. UTC 날짜를 쓰면 20:00 ET 이후
+평가에서 거래일은 그대로인데 UTC 날짜만 넘어간다.
+
+읽을 수 없으면 진입을 막는다: `POSITION_LIMIT_STATE_UNKNOWN` /
+`DAILY_ENTRY_STATE_UNKNOWN`. 카운트를 0으로 가정하는 경로는 없다 — 한도 검사기가 낼 수
+있는 가장 위험한 오답이 "아직 아무것도 없다"이기 때문이다.
+
+**매도는 어느 한도에도 걸리지 않는다.** 포지션 한도에 찬 계좌도 보유분은 항상 정리할 수
+있어야 한다(`evaluate_sell_gate`는 이 검사를 호출하지 않는다).
+
 ## 13. KIS 잔고·미체결 대조 (계정 전체 reconciliation, CODEX-044)
 
 reconciliation은 두 층으로 동작한다.

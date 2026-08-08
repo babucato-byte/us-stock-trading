@@ -348,6 +348,10 @@ class _Rollout:
     max_quantity_per_order = 1
     max_price_deviation_percent = 30.0
     regular_session_only = False
+    # The two rollout caps the gate now enforces. Generous here so the
+    # subject of these tests stays the path they are about, not capacity.
+    max_open_positions = 99
+    max_daily_entries = 99
 
 
 @pytest.fixture

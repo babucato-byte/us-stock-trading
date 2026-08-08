@@ -99,6 +99,23 @@ def is_market_day(day):
     return day.weekday() < 5 and not is_market_holiday(day)
 
 
+def us_trading_day(now=None):
+    """The US-Eastern calendar date, as an ISO string -- the day boundary
+    every per-day trading limit is scoped to.
+
+    Not the UTC date and not the KST date. A 15:50 ET entry on Aug 7 is
+    already Aug 8 in UTC and in Korea; scoping a daily limit to either of
+    those would reset the count in the middle of a session, or carry it
+    into the next one. This is the same Eastern-calendar boundary
+    live_readiness/entry_reservation_ledger.trading_day_start_utc() uses,
+    stated once here so the ledger that RECORDS an entry and the gate that
+    COUNTS entries cannot disagree about which day it is.
+
+    DST is handled by the zoneinfo conversion, not by an offset constant.
+    """
+    return eastern_now(now).date().isoformat()
+
+
 def combine_eastern(day, clock):
     return datetime.combine(day, clock, tzinfo=EASTERN)
 

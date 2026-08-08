@@ -24,6 +24,8 @@ import sys
 
 import pytest
 
+from execution import entry_limits as entry_limits_module
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 PROBE_PATH = REPO_ROOT / "scripts" / "verify_kis_observe_cash_path.py"
 PROBE_SOURCE = PROBE_PATH.read_text(encoding="utf-8")
@@ -190,6 +192,25 @@ class TestGateSequenceMatchesTheGate:
                     codes.append(keyword.value.value)
         return codes
 
+    def _helper_codes_in_source_order(self, function_name):
+        """The codes raised by a helper the gate calls. These are
+        `entry_limits.X` attribute references, not string literals."""
+        source = (REPO_ROOT / "execution" / "order_gate.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        function = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == function_name)
+        codes = []
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Call):
+                continue
+            if getattr(node.func, "id", None) != "OrderGateBlockedError":
+                continue
+            for keyword in node.keywords:
+                if keyword.arg == "code" and isinstance(keyword.value, ast.Attribute):
+                    codes.append(getattr(entry_limits_module, keyword.value.attr))
+        return codes
+
     def test_the_probe_sequence_matches_the_gate_source(self):
         probe = _probe()
         codes = self._gate_codes_in_source_order()
@@ -201,9 +222,15 @@ class TestGateSequenceMatchesTheGate:
         for code in codes:
             if not deduped or deduped[-1] != code:
                 deduped.append(code)
-        # RECONCILIATION is raised by the helper the gate calls last, so
-        # it is not among evaluate_buy_gate's own literals.
-        expected = tuple(deduped) + ("RECONCILIATION",)
+        # RECONCILIATION and the two capacity caps are raised by the two
+        # helpers the gate calls last, so they are not among
+        # evaluate_buy_gate's own literals. The caps are read from the
+        # helper's source rather than hard-coded, so adding a third cap
+        # fails here instead of silently going unreported.
+        caps = self._helper_codes_in_source_order("_check_entry_limits")
+        caps = [c for c in caps
+                if c != entry_limits_module.POSITION_LIMIT_STATE_UNKNOWN]
+        expected = tuple(deduped) + ("RECONCILIATION",) + tuple(caps)
         assert probe.GATE_SEQUENCE == expected, (
             "GATE_SEQUENCE drifted from order_gate.evaluate_buy_gate")
 
