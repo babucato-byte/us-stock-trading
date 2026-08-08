@@ -403,6 +403,58 @@ shadow 평가에도 없었다. `LIVE_ROLLOUT_MAX_POSITIONS=1`로 설정한 운�
 **매도는 어느 한도에도 걸리지 않는다.** 포지션 한도에 찬 계좌도 보유분은 항상 정리할 수
 있어야 한다(`evaluate_sell_gate`는 이 검사를 호출하지 않는다).
 
+### allow-list 두 개는 서로 다른 것을 결정한다 (ORACLE-SCOPE-01)
+
+```text
+SHADOW_ALLOWED_SYMBOLS        OBSERVE가 무엇을 평가할지 (evaluation scope)
+                              unset/빈 값 → 모든 scanner 후보 평가 (기본)
+                              "A,B"       → 그 둘만 평가
+                              실주문 승인에는 어떤 경로로도 쓰이지 않는다
+
+LIVE_ROLLOUT_ALLOWED_SYMBOLS  실제 주문이 허용된 종목 (execution authorization)
+                              ARMED에서 hard block. 비어 있으면 신규 BUY 전부 차단
+```
+
+문제는 allow-list가 게이트 순서상 `SYMBOL`에 있고, 그 뒤에 `INSTRUMENT`,
+`RECONCILIATION`, `MAX_OPEN_POSITIONS`, `MAX_DAILY_ENTRIES`가 온다는 점이었다. 읽기 전용
+자세에서는 목록이 비어 있는 것이 정상이므로 **모든 OBSERVE 평가가 SYMBOL에서 멈추고 뒤의
+네 게이트는 한 번도 관찰되지 않았다.** Oracle 세션 두 번이 정확히 그 모습이었다 —
+`furthest_gate=DUPLICATE_SIGNAL, stopped_at=SYMBOL`.
+
+OBSERVE는 이제 두 축을 따로 보고한다.
+
+```text
+live_authorization  "이 주문을 실제로 낼 수 있는가?"
+                    allow-list 포함, 그대로 차단한다
+                    → WOULD_APPROVE 또는 LIVE_BLOCKED:SYMBOL
+
+diagnostic          "allow-list 뒤의 안전 게이트들은 정상인가?"
+                    allow-list만 지나쳐 계속 평가한다
+                    → DIAGNOSTIC_PASS 또는 DIAGNOSTIC_BLOCKED:<gate>
+                    furthest_gate로 어디까지 갔는지 기록
+```
+
+`DIAGNOSTIC_PASS`는 **승인이 아니다.** live 목록에 없는 종목이 downstream을 전부 통과해도
+`APPROVED`라는 문자열은 어디에도 기록되지 않는다.
+
+이것은 게이트 우회가 아니다. `evaluate_buy_gate()`에는 "계속 진행" 파라미터가 없고 앞으로도
+없어야 한다. diagnostic은 같은 게이트를 **컨텍스트 사본에 다른 allow-list를 넣어** 한 번 더
+호출할 뿐이다 — 설정은 건드리지 않으며, 실제 호출자에게 게이트는 여전히 첫 위반에서 멈춘다.
+`execution/authorization.py`와 `execution_engine.py`는 diagnostic에 도달할 수 없다(테스트로 고정).
+
+audit에는 `DIAGNOSTIC_COMPLETED` 이벤트가 두 축과 용량 수치를 함께 남긴다. terminal 이벤트
+계약(run당 정확히 1)은 그대로다 — 이 이벤트는 terminal이 아니다.
+
+**권장 운영 상태**
+
+```text
+LIVE_ROLLOUT_ALLOWED_SYMBOLS=     (비움 — 실주문 승인 범위 0)
+SHADOW_ALLOWED_SYMBOLS            unset 유지 (scanner 후보 전체 평가)
+```
+
+이 조합에서 후보가 나오면 live 축은 `LIVE_BLOCKED:SYMBOL`로 정확히 기록되고, diagnostic 축이
+INSTRUMENT / RECONCILIATION / 두 용량 게이트까지 계속 관찰한다. 주문 transport는 0이다.
+
 ## 13. KIS 잔고·미체결 대조 (계정 전체 reconciliation, CODEX-044)
 
 reconciliation은 두 층으로 동작한다.

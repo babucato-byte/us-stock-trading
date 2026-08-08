@@ -110,18 +110,10 @@ ORDER_TABLES = (
     "live_entry_reservations", "exit_intents", "order_state_events",
 )
 
-# The buy gate's checks, in the order `order_gate.evaluate_buy_gate()`
-# runs them. Used ONLY to report how far an evaluation got; the gate
-# itself is the authority on what passes. tests/test_observe_cash_path_
-# probe.py parses the gate's source and fails if this list drifts.
-GATE_SEQUENCE = (
-    "BROKER", "LIVE_FLAG", "ENTRY_DISABLED", "COMMIT", "ACCOUNT", "QUANTITY",
-    "ORDER_TYPE", "SESSION", "SIGNAL_EXPIRED", "PRICE_INVALID", "PRICE_DEVIATION",
-    "CASH", "OPEN_ORDER", "DUPLICATE_SIGNAL", "SYMBOL", "INSTRUMENT", "RECONCILIATION",
-    # The two account-capacity caps, raised by the helper the gate calls
-    # last. They come after every candidate-specific check.
-    entry_limits.MAX_OPEN_POSITIONS, entry_limits.MAX_DAILY_ENTRIES,
-)
+# The buy gate's check order, imported rather than copied: the gate is
+# the authority on what it checks and in what order, and a second list
+# here would be a second authority that could drift from it.
+GATE_SEQUENCE = order_gate.BUY_GATE_SEQUENCE
 
 FORBIDDEN_METHODS = frozenset({
     "submit_order", "cancel_order", "submit_buy_order", "submit_sell_order",
@@ -341,7 +333,13 @@ def evaluate_gates(found, *, broker, rollout, env, now):
 
     real = _run(_ctx(live_order_enabled=_flag(env, "KIS_LIVE_ORDER_ENABLED"),
                      entry_disabled=_flag(env, "ENTRY_DISABLED")))
-    hypothetical = _run(_ctx(live_order_enabled=True, entry_disabled=False))
+    hypothetical_ctx = _ctx(live_order_enabled=True, entry_disabled=False)
+    hypothetical = _run(hypothetical_ctx)
+    # The two axes, from the production evaluator the OBSERVE path uses:
+    # live authorization (allow-list included, and it really blocks) and
+    # the diagnostic that continues past the allow-list so the downstream
+    # gates can be seen while it is still empty.
+    diagnosis = order_gate.evaluate_buy_gate_diagnostic(hypothetical_ctx)
     # Synthetic controls for the two account-capacity caps.
     #
     # Both caps sit AFTER the allow-list check, and the allow-list is
@@ -379,6 +377,7 @@ def evaluate_gates(found, *, broker, rollout, env, now):
         "snapshot": snapshot, "is_regular_session": is_regular_session,
         "real_blocked": real, "hypothetical_blocked": hypothetical,
         "context_constructed": True, "limits": limits, "controls": controls,
+        "diagnosis": diagnosis,
     }
 
 
@@ -500,6 +499,29 @@ def main(argv=None):
                   f"real evaluation blocked at {real.code if real else 'NOTHING'} "
                   "(OBSERVE must not approve)")
 
+    # The allow-list split: a symbol the live list does not hold must be
+    # reported as live-blocked AND still diagnosed downstream.
+    diagnosis = gates["diagnosis"]
+    reached_diag, stopped_diag = _furthest_gate(diagnosis.diagnostic_blocked_code)
+    report.record(
+        "live_authorization_is_reported_separately",
+        diagnosis.live_allowlist_allowed == (diagnosis.live_blocked_code != "SYMBOL"),
+        f"live_allowlist_allowed={diagnosis.live_allowlist_allowed} "
+        f"live={diagnosis.live_authorization_result} "
+        f"diagnostic={diagnosis.diagnostic_result} (furthest {reached_diag})")
+    if not diagnosis.live_allowlist_allowed:
+        # The whole point of the split: the allow-list miss must not cost
+        # the operator the downstream verdicts.
+        past_symbol = (diagnosis.diagnostic_blocked_code is None or
+                       GATE_SEQUENCE.index(diagnosis.diagnostic_blocked_code) >
+                       GATE_SEQUENCE.index("SYMBOL"))
+        report.record("diagnostic_continues_past_the_allowlist", past_symbol,
+                      f"{subject['symbol']} is not on the live allow-list; the diagnostic "
+                      f"reached {reached_diag} (stopped_at={stopped_diag})")
+        report.record("the_diagnostic_is_not_called_approved",
+                      "APPROVED" not in diagnosis.diagnostic_result,
+                      f"diagnostic_result={diagnosis.diagnostic_result}")
+
     # The two rollout caps, observed with real state and with synthetic
     # at-capacity state. No reservation is created for either.
     controls = gates["controls"]
@@ -568,9 +590,17 @@ def _print_tail(report, broker, db_before, rollout, env, *, examined,
     if gates is not None:
         real = gates["real_blocked"]
         hyp = gates["hypothetical_blocked"]
+        diagnosis = gates["diagnosis"]
         print("\nGate:")
         print(f"  BuyGateContext:  constructed")
         print(f"  real posture:    {'BLOCKED:' + real.code if real else 'APPROVED'}")
+        print("\n  live_authorization (may this actually be ordered?):")
+        print(f"    live_allowlist_allowed: {diagnosis.live_allowlist_allowed}")
+        print(f"    result:                 {diagnosis.live_authorization_result}")
+        print("\n  diagnostic (are the gates behind the allow-list healthy?):")
+        print(f"    result:                 {diagnosis.diagnostic_result}")
+        print(f"    furthest_gate:          {diagnosis.diagnostic_furthest_gate}")
+        print()
         print(f"  hypothetical:    {'BLOCKED:' + hyp.code if hyp else 'WOULD_APPROVE'}")
         print(f"  furthest_gate:   {reached}")
         print(f"  stopped_at:      {stopped_at}")

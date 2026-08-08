@@ -456,11 +456,18 @@ def _evaluate_symbol(*, symbol, broker, rollout, conn, kis_validation, deployed_
         except order_gate.OrderGateBlockedError as exc:
             real_blocked = exc
 
-        hypothetical_blocked = None
-        try:
-            order_gate.evaluate_buy_gate(_ctx(live_order_enabled=True, entry_disabled=False))
-        except order_gate.OrderGateBlockedError as exc:
-            hypothetical_blocked = exc
+        # Two axes, deliberately separate (see order_gate.
+        # DiagnosticGateResult). `hypothetical_blocked` stays what it has
+        # always been -- the LIVE AUTHORIZATION answer, in which the
+        # allow-list is a real control that really blocks. `diagnosis`
+        # additionally answers "are the gates BEHIND the allow-list
+        # healthy for this candidate?", which is unanswerable from the
+        # live axis while the allow-list is empty: every candidate stops
+        # at SYMBOL and INSTRUMENT/RECONCILIATION/the two capacity caps
+        # are never observed at all.
+        diagnosis = order_gate.evaluate_buy_gate_diagnostic(
+            _ctx(live_order_enabled=True, entry_disabled=False))
+        hypothetical_blocked = diagnosis.live_blocked
 
         planned_stop = price * (1 + risk_config.STOP_LOSS_RATE)
         planned_target = price + (price - planned_stop) * strat_cfg.TARGET_1_R_MULTIPLE
@@ -483,6 +490,21 @@ def _evaluate_symbol(*, symbol, broker, rollout, conn, kis_validation, deployed_
         # and which day the count belongs to. Counts and a date only --
         # no account, no order id.
         limits_payload = limits.as_audit_payload()
+
+        # The two axes, on the outcome and in the audit trail. Reported
+        # separately so "may this be ordered?" and "are the remaining
+        # safety gates healthy?" cannot be read as one answer.
+        outcome["live_allowlist_allowed"] = diagnosis.live_allowlist_allowed
+        outcome["diagnostic"] = diagnosis.diagnostic_result
+        outcome["diagnostic_furthest_gate"] = diagnosis.diagnostic_furthest_gate
+        diagnostic_payload = dict(limits_payload)
+        diagnostic_payload.update(diagnosis.as_audit_payload())
+        _audit(run_id, shadow_audit.DIAGNOSTIC_COMPLETED, shadow_audit.RESULT_INFO,
+               symbol=symbol, signal_id=signal.signal_id,
+               reason_code=diagnosis.diagnostic_result,
+               detail=(str(diagnosis.diagnostic_blocked)
+                       if diagnosis.diagnostic_blocked is not None else None),
+               payload=diagnostic_payload, now=now)
 
         if real_blocked is not None:
             outcome["reason_code"] = f"GATE:{real_blocked.code}"

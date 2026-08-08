@@ -14,6 +14,7 @@ Buy and sell are two entirely separate gates (`evaluate_buy_gate()` /
 order gate" that would blur the two.
 """
 
+import dataclasses
 import math
 from dataclasses import dataclass
 from datetime import datetime
@@ -221,6 +222,132 @@ def _check_entry_limits(ctx):
             f"{limits.daily_entry_count} of {limits.max_daily_entries} entr(y/ies) used",
             code=entry_limits.MAX_DAILY_ENTRIES,
         )
+
+
+# The buy gate's checks, in the order evaluate_buy_gate() runs them.
+# Stated once, here, so the diagnostic evaluator and the read-only probe
+# report "how far did this get" against the gate itself rather than
+# against a hand-maintained copy. tests/test_observe_cash_path_probe.py
+# parses evaluate_buy_gate's source and fails if this drifts.
+BUY_GATE_SEQUENCE = (
+    "BROKER", "LIVE_FLAG", "ENTRY_DISABLED", "COMMIT", "ACCOUNT", "QUANTITY",
+    "ORDER_TYPE", "SESSION", "SIGNAL_EXPIRED", "PRICE_INVALID", "PRICE_DEVIATION",
+    "CASH", "OPEN_ORDER", "DUPLICATE_SIGNAL", "SYMBOL", "INSTRUMENT", "RECONCILIATION",
+    entry_limits.MAX_OPEN_POSITIONS, entry_limits.MAX_DAILY_ENTRIES,
+)
+
+# The one gate that expresses LIVE ORDER AUTHORIZATION rather than a fact
+# about the candidate or the account's safety state.
+LIVE_ALLOWLIST_GATE = "SYMBOL"
+
+DIAGNOSTIC_PASS = "DIAGNOSTIC_PASS"
+
+
+@dataclass(frozen=True)
+class DiagnosticGateResult:
+    """Two answers to two different questions, deliberately not merged.
+
+    `live_authorization_result` answers "may this order actually be
+    placed?" -- the allow-list is part of that answer and blocks it.
+    `diagnostic_result` answers "are the remaining safety gates healthy
+    for this candidate?" -- a question an operator needs while the
+    allow-list is still empty, and one the live answer cannot express
+    because it stops at the first violation.
+
+    Neither field ever says APPROVED for a symbol the live allow-list
+    does not hold. A diagnostic that passed everything downstream reports
+    DIAGNOSTIC_PASS, which is not an authorization and does not read like
+    one.
+    """
+
+    live_allowlist_allowed: bool
+    # The raised errors themselves, so a caller reporting one does not
+    # have to re-run the gate to recover its message.
+    live_blocked: Optional[OrderGateBlockedError]
+    diagnostic_blocked: Optional[OrderGateBlockedError]
+
+    @property
+    def live_blocked_code(self):
+        return self.live_blocked.code if self.live_blocked is not None else None
+
+    @property
+    def diagnostic_blocked_code(self):
+        return self.diagnostic_blocked.code if self.diagnostic_blocked is not None else None
+
+    @property
+    def live_authorization_result(self):
+        if self.live_blocked_code is None:
+            return "WOULD_APPROVE"
+        return f"LIVE_BLOCKED:{self.live_blocked_code}"
+
+    @property
+    def diagnostic_result(self):
+        if self.diagnostic_blocked_code is None:
+            return DIAGNOSTIC_PASS
+        return f"DIAGNOSTIC_BLOCKED:{self.diagnostic_blocked_code}"
+
+    @property
+    def diagnostic_furthest_gate(self):
+        """The last check the diagnostic evaluation passed."""
+        code = self.diagnostic_blocked_code
+        if code is None:
+            return BUY_GATE_SEQUENCE[-1]
+        if code not in BUY_GATE_SEQUENCE:
+            return code
+        index = BUY_GATE_SEQUENCE.index(code)
+        return BUY_GATE_SEQUENCE[index - 1] if index else "NONE"
+
+    def as_audit_payload(self):
+        return {
+            "live_allowlist_allowed": self.live_allowlist_allowed,
+            "live_authorization_result": self.live_authorization_result,
+            "diagnostic_result": self.diagnostic_result,
+            "diagnostic_furthest_gate": self.diagnostic_furthest_gate,
+        }
+
+
+def _blocked(ctx):
+    try:
+        evaluate_buy_gate(ctx)
+        return None
+    except OrderGateBlockedError as exc:
+        return exc
+
+
+def evaluate_buy_gate_diagnostic(ctx: BuyGateContext) -> DiagnosticGateResult:
+    """OBSERVE only. Runs the real gate, then -- if and only if the real
+    gate stopped at the live allow-list -- runs it again past that one
+    check so the downstream gates can be observed.
+
+    This authorizes nothing. It returns a report; it mints no
+    authorization token, and execution/authorization.py cannot reach it.
+    The second evaluation substitutes the allow-list in a COPY of the
+    context, exactly as the hypothetical flag flip already does, so no
+    configuration is touched and `evaluate_buy_gate` keeps its
+    stop-at-the-first-violation semantics for every real caller.
+
+    Why the re-run rather than a "keep going" mode inside the gate: a
+    gate that can be asked to continue past a violation is a gate with a
+    bypass in it. This one cannot be told to skip anything -- the caller
+    hands it a different allow-list and gets a different answer, which is
+    a report about a hypothetical, not a relaxation of the real check.
+    """
+    live = _blocked(ctx)
+    allowed = ctx.order_intent.symbol in ctx.allowed_symbols
+
+    if live is not None and live.code == LIVE_ALLOWLIST_GATE:
+        # Look past the allow-list, and only the allow-list.
+        beyond = dataclasses.replace(
+            ctx, allowed_symbols=frozenset({ctx.order_intent.symbol}))
+        diagnostic = _blocked(beyond)
+    else:
+        # The real verdict already reflects everything the diagnostic
+        # would see; re-running would only risk the two disagreeing.
+        diagnostic = live
+
+    return DiagnosticGateResult(
+        live_allowlist_allowed=allowed, live_blocked=live, diagnostic_blocked=diagnostic,
+    )
 
 
 def evaluate_sell_gate(ctx: SellGateContext) -> bool:

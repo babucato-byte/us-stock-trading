@@ -60,6 +60,12 @@ _SENSITIVE_KEY_SUBSTRINGS = (
 _SAFE_KEY_EXACTS = frozenset({
     "accountalias", "accountfingerprint", "accountlast4", "accountidmasked",
     "tokenexpiresat", "tokentype",
+    # The OBSERVE gate's live-authorization VERDICT ("WOULD_APPROVE" /
+    # "LIVE_BLOCKED:SYMBOL"). It contains the word "authorization" and no
+    # credential; masking it turned the audit trail's most load-bearing
+    # field into ***REDACTED***. Exact match only -- a key actually named
+    # "authorization" is still masked.
+    "liveauthorizationresult",
 })
 
 

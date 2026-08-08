@@ -497,12 +497,31 @@ class TestPreGateRecordOnAnEarlyBlock:
         assert not [e for e in events if e["event_type"] in ("GATE_APPROVED", "GATE_REJECTED")]
 
     def test_the_gate_itself_is_not_bypassed(self):
-        """Both evaluations still call the real gate with real context."""
+        """Both evaluations still go through the real gate with real
+        context.
+
+        The hypothetical one now runs via
+        `order_gate.evaluate_buy_gate_diagnostic()`, which reports the
+        live-authorization verdict AND, separately, how far the
+        evaluation gets past the live allow-list. That is not a bypass:
+        the diagnostic calls the same `evaluate_buy_gate`, and the only
+        thing it changes is the allow-list in a COPY of the context --
+        `evaluate_buy_gate` itself takes no flag that would let any
+        caller skip a check (asserted below).
+        """
+        import inspect
+
+        from execution import order_gate
+
         assert "order_gate.evaluate_buy_gate(_ctx(" in SHADOW_SOURCE
         assert "live_order_enabled=klt_live_order_enabled(), entry_disabled=klt_entry_disabled()" \
             in SHADOW_SOURCE
-        assert "order_gate.evaluate_buy_gate(_ctx(live_order_enabled=True, entry_disabled=False))" \
-            in SHADOW_SOURCE
+        assert "order_gate.evaluate_buy_gate_diagnostic(" in SHADOW_SOURCE
+        assert "_ctx(live_order_enabled=True, entry_disabled=False)" in SHADOW_SOURCE
+        # The gate has no "keep going" parameter for anyone to pass.
+        assert set(inspect.signature(order_gate.evaluate_buy_gate).parameters) == {"ctx"}
+        # And the diagnostic reaches its verdict through that same gate.
+        assert "evaluate_buy_gate(ctx)" in inspect.getsource(order_gate._blocked)
 
     def test_no_order_transport_is_reached(self, shadow_env, monkeypatch):
         module = _shadow_module()
