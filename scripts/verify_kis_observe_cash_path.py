@@ -503,24 +503,39 @@ def main(argv=None):
     # reported as live-blocked AND still diagnosed downstream.
     diagnosis = gates["diagnosis"]
     reached_diag, stopped_diag = _furthest_gate(diagnosis.diagnostic_blocked_code)
+    stopped_by_allowlist = diagnosis.live_blocked_code == order_gate.LIVE_ALLOWLIST_GATE
+
+    # An allow-list MISS does not imply the allow-list is what stopped the
+    # evaluation: any earlier gate (SESSION outside market hours, for one)
+    # fires first and is the honest reason. The invariant is the other
+    # direction -- a block AT the allow-list means the symbol really is
+    # not on it.
     report.record(
         "live_authorization_is_reported_separately",
-        diagnosis.live_allowlist_allowed == (diagnosis.live_blocked_code != "SYMBOL"),
+        not (stopped_by_allowlist and diagnosis.live_allowlist_allowed),
         f"live_allowlist_allowed={diagnosis.live_allowlist_allowed} "
         f"live={diagnosis.live_authorization_result} "
         f"diagnostic={diagnosis.diagnostic_result} (furthest {reached_diag})")
-    if not diagnosis.live_allowlist_allowed:
+
+    if stopped_by_allowlist:
         # The whole point of the split: the allow-list miss must not cost
         # the operator the downstream verdicts.
         past_symbol = (diagnosis.diagnostic_blocked_code is None or
                        GATE_SEQUENCE.index(diagnosis.diagnostic_blocked_code) >
-                       GATE_SEQUENCE.index("SYMBOL"))
+                       GATE_SEQUENCE.index(order_gate.LIVE_ALLOWLIST_GATE))
         report.record("diagnostic_continues_past_the_allowlist", past_symbol,
                       f"{subject['symbol']} is not on the live allow-list; the diagnostic "
                       f"reached {reached_diag} (stopped_at={stopped_diag})")
-        report.record("the_diagnostic_is_not_called_approved",
-                      "APPROVED" not in diagnosis.diagnostic_result,
-                      f"diagnostic_result={diagnosis.diagnostic_result}")
+    else:
+        # Nothing to look past. Reported, not silently skipped, so the
+        # operator knows the split was not exercised this run.
+        print(f"  [info] diagnostic_continues_past_the_allowlist not exercised: the live "
+              f"evaluation stopped at {diagnosis.live_blocked_code}, which is before the "
+              f"allow-list; re-run during the US regular session")
+
+    report.record("the_diagnostic_is_not_called_approved",
+                  "APPROVED" not in diagnosis.diagnostic_result,
+                  f"diagnostic_result={diagnosis.diagnostic_result}")
 
     # The two rollout caps, observed with real state and with synthetic
     # at-capacity state. No reservation is created for either.

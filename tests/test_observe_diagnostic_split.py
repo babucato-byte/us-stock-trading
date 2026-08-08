@@ -443,6 +443,42 @@ class TestObserveWithAnEmptyLiveAllowlist:
         assert gate_events == [], "a non-allow-listed symbol was recorded as gate-approved"
 
 
+class TestAnAllowlistMissIsNotAlwaysTheReason:
+    """An allow-list MISS and a block AT the allow-list are different
+    facts, and conflating them produced a false failure on the server: a
+    Saturday run stopped at SESSION (which precedes SYMBOL), and a probe
+    assertion that assumed "not allow-listed => blocked at SYMBOL"
+    reported a defect where the behaviour was correct.
+
+    The invariant runs one way only: a block AT the allow-list means the
+    symbol really is not on it. The converse does not hold.
+    """
+
+    def test_an_earlier_gate_reports_itself_not_the_allowlist(self):
+        ctx = dataclasses.replace(_ctx(allowed=frozenset()), is_regular_session=False)
+        result = order_gate.evaluate_buy_gate_diagnostic(ctx)
+        assert result.live_allowlist_allowed is False
+        assert result.live_blocked_code == "SESSION"
+        assert result.diagnostic_blocked_code == "SESSION"
+
+    def test_the_one_way_invariant_holds(self):
+        """Blocked at the allow-list => the symbol is not on it."""
+        for allowed in (frozenset(), frozenset({"IOVA"}), frozenset({"MSFT"})):
+            for session in (True, False):
+                ctx = dataclasses.replace(_ctx(allowed=allowed),
+                                          is_regular_session=session)
+                result = order_gate.evaluate_buy_gate_diagnostic(ctx)
+                if result.live_blocked_code == order_gate.LIVE_ALLOWLIST_GATE:
+                    assert result.live_allowlist_allowed is False, (allowed, session)
+
+    def test_the_split_only_engages_at_the_allowlist_gate(self):
+        """When an earlier gate stops it, the diagnostic must mirror that
+        verdict rather than inventing progress past it."""
+        ctx = dataclasses.replace(_ctx(allowed=frozenset()), is_regular_session=False)
+        result = order_gate.evaluate_buy_gate_diagnostic(ctx)
+        assert result.diagnostic_blocked_code == result.live_blocked_code
+
+
 class TestTheAuditFieldSurvivesRedaction:
     """`live_authorization_result` contains the word "authorization", so
     the key-based redactor masked it into uselessness. The exemption
