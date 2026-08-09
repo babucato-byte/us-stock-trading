@@ -148,22 +148,51 @@ print(f"BOOTSTRAPABLE::{'yes' if armed_pending and not beyond_bootstrap else 'no
 # cannot be made, or a snapshot that is dirty / has unknowns / is
 # halted, is still a hard failure -- staleness is the only thing this
 # retries, and nothing here hides a mismatch.
+# freshness.evaluate() signals success by RETURNING and failure by
+# RAISING SnapshotUnusable -- there is no `.usable` flag to read. An
+# earlier version of this check read one, so a perfectly healthy
+# snapshot was reported as a blocker.
+def _reconciliation_detail(snapshot):
+    age = getattr(snapshot, "age_seconds", None)
+    return f"fresh and clean (age {age:.1f}s)" if isinstance(age, (int, float)) \
+        else "fresh and clean"
+
+
 try:
     snapshot = freshness.evaluate()
-    if not snapshot.usable:
-        reason = getattr(snapshot, "reason_code", "") or ""
-        if "STALE" in reason or "MISSING" in reason:
-            from reconciliation import reconciliation_state
-            import subprocess
-
-            subprocess.run(
-                [sys.executable, "scripts/run_reconciliation.py"],
-                capture_output=True, timeout=300, check=False)
-            snapshot = freshness.evaluate()
-    check("RECONCILIATION_NOT_USABLE", snapshot.usable,
-          getattr(snapshot, "reason_code", "") or "fresh and clean")
+    check("RECONCILIATION_NOT_USABLE", True, _reconciliation_detail(snapshot))
 except Exception as exc:  # noqa: BLE001
-    check("RECONCILIATION_NOT_USABLE", False, type(exc).__name__)
+    reason = str(getattr(exc, "reason_code", "") or exc)
+    # Only staleness is retried, and only once. A dirty snapshot, one
+    # carrying unknowns, a halted one, or a refresh that cannot be made
+    # all stay hard failures -- nothing here hides a mismatch.
+    stale = "STALE" in reason.upper() or "MISSING" in reason.upper()
+    allow_refresh = os.environ.get("PRE_LIVE_ALLOW_RECONCILE_REFRESH", "").strip().lower() \
+        in ("1", "true", "yes", "on")
+    if stale and allow_refresh:
+        # OPT-IN only. The contract of this checker is that it checks and never
+        # fixes; running reconciliation writes a snapshot, so it happens
+        # only when the operator asks. Default off keeps a plain run
+        # side-effect free -- which is also why a test suite invoking this
+        # script cannot leave state behind.
+        import subprocess
+
+        subprocess.run([sys.executable, "scripts/run_reconciliation.py"],
+                       capture_output=True, timeout=300, check=False)
+        try:
+            snapshot = freshness.evaluate()
+            check("RECONCILIATION_NOT_USABLE", True,
+                  f"refreshed; {_reconciliation_detail(snapshot)}")
+        except Exception as retry_exc:  # noqa: BLE001
+            check("RECONCILIATION_NOT_USABLE", False,
+                  f"{type(retry_exc).__name__} after refresh")
+    elif stale:
+        check("RECONCILIATION_NOT_USABLE", False,
+              "snapshot is stale; run scripts/run_reconciliation.py first "
+              "(or set PRE_LIVE_ALLOW_RECONCILE_REFRESH=true)")
+    else:
+        # Dirty, unknown-bearing or halted: never retried, never hidden.
+        check("RECONCILIATION_NOT_USABLE", False, type(exc).__name__)
 
 # -- HALT / kill switch
 try:

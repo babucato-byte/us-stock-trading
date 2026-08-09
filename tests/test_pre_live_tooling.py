@@ -303,12 +303,29 @@ class TestTheCheckerDistinguishesCashOutcomes:
 class TestTheCheckerRefreshesAStaleSnapshot:
     def test_only_staleness_is_retried(self):
         """A dirty / unknown / halted snapshot must stay a hard failure;
-        only an aged-out one is refreshed."""
-        assert 'if "STALE" in reason or "MISSING" in reason' in CHECK_SOURCE
+        only an aged-out one is refreshed, and only once."""
+        assert 'stale = "STALE" in reason.upper() or "MISSING" in reason.upper()' in CHECK_SOURCE
         assert "run_reconciliation.py" in CHECK_SOURCE
+        assert "after refresh" in CHECK_SOURCE
+        # Dirty/unknown/halted take the else branch and are never retried.
+        assert "never retried, never hidden" in CHECK_SOURCE
+
+    def test_the_refresh_is_opt_in_so_a_plain_run_writes_nothing(self):
+        """The checker's contract is that it checks and never fixes.
+        Running reconciliation writes a snapshot, so it happens only when
+        the operator asks -- which is also why invoking this script from
+        a test suite leaves no state behind."""
+        assert "PRE_LIVE_ALLOW_RECONCILE_REFRESH" in CHECK_SOURCE
+        assert "allow_refresh" in CHECK_SOURCE
 
     def test_the_refreshed_snapshot_is_the_one_judged(self):
         assert CHECK_SOURCE.count("snapshot = freshness.evaluate()") == 2
+
+    def test_success_is_not_read_from_a_nonexistent_flag(self):
+        """freshness.evaluate() signals success by returning and failure
+        by raising; it has no `.usable`. Reading one reported a healthy
+        snapshot as a blocker."""
+        assert "snapshot.usable" not in CHECK_SOURCE
 
 
 class TestTheThreeStateVerdict:
