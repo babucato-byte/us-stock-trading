@@ -549,3 +549,65 @@ class TestPositionMismatchNotification:
         source = inspect.getsource(kpm.sync_kis_fills_and_manage_exits)
         assert '"action": "NEW_ENTRY_BLOCKED"' in source
         assert "kis_account" not in source
+
+
+class TestTheKillSwitchNotificationCannotFeedItself:
+    """A feedback loop found by the existing notification_health tests.
+
+    notification_health counts consecutive Slack failures and escalates
+    the kill switch when they cross a threshold. Announcing that
+    escalation through the same tracker made the announcement's own
+    failure increment the counter that produced it -- so a Slack outage
+    would keep re-escalating itself. The announcement is therefore sent
+    outside health tracking.
+    """
+
+    def test_the_escalation_notice_is_not_health_tracked(self):
+        import inspect
+
+        import kill_switch_state
+
+        source = inspect.getsource(kill_switch_state.activate)
+        assert "track_health=False" in source
+
+    def test_untracked_sends_do_not_touch_the_failure_counter(self, monkeypatch, tmp_path):
+        import notification_health as nh
+
+        monkeypatch.setattr(nh, "STATE_FILE", tmp_path / "NH.json")
+        monkeypatch.setattr(nh, "LOG_FILE", tmp_path / "nh.log")
+        monkeypatch.delenv("NOTIFICATION_HEALTH_STATE_FILE", raising=False)
+        monkeypatch.delenv("NOTIFICATION_HEALTH_LOG_FILE", raising=False)
+
+        def _down(_message):
+            raise RuntimeError("slack is down")
+
+        before = nh.get_record()["consecutive_failures"]
+        live_notifications.notify(
+            live_notifications.KILL_SWITCH_ACTIVATED, {"reason": "drill"},
+            send_fn=_down, track_health=False)
+        assert nh.get_record()["consecutive_failures"] == before
+
+    def test_tracked_sends_still_count(self, monkeypatch, tmp_path):
+        """The bypass is narrow: ordinary events keep feeding health."""
+        import notification_health as nh
+
+        monkeypatch.setattr(nh, "STATE_FILE", tmp_path / "NH.json")
+        monkeypatch.setattr(nh, "LOG_FILE", tmp_path / "nh.log")
+        monkeypatch.delenv("NOTIFICATION_HEALTH_STATE_FILE", raising=False)
+        monkeypatch.delenv("NOTIFICATION_HEALTH_LOG_FILE", raising=False)
+
+        def _down(_message):
+            raise RuntimeError("slack is down")
+
+        before = nh.get_record()["consecutive_failures"]
+        live_notifications.notify(
+            live_notifications.ORDER_SUBMITTED, {"symbol": "AAPL"}, send_fn=_down)
+        assert nh.get_record()["consecutive_failures"] == before + 1
+
+    def test_an_untracked_send_still_never_raises(self):
+        def _boom(_message):
+            raise RuntimeError("down")
+
+        assert live_notifications.notify(
+            live_notifications.KILL_SWITCH_ACTIVATED, {"reason": "drill"},
+            send_fn=_boom, track_health=False) is False

@@ -69,6 +69,16 @@ def is_halted() -> bool:
 
 
 def set_halt(halted: bool, *, reason: str, actor: str) -> None:
+    # Read the PREVIOUS state first so the notification below fires on
+    # the false -> true transition only. Repeated set_halt(True) calls --
+    # which a polling caller or a retry can easily produce -- must not
+    # re-alert. A read failure here is not allowed to stop the write:
+    # setting HALT is the safety action and it happens regardless.
+    try:
+        was_halted = is_halted()
+    except Exception:  # noqa: BLE001 -- a corrupt file must not block halting
+        was_halted = None
+
     path = _resolve_halt_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -77,6 +87,17 @@ def set_halt(halted: bool, *, reason: str, actor: str) -> None:
     }
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh)
+
+    # After the write: the durable HALT state is what protects trading,
+    # and it now stands whether or not this message is delivered.
+    if halted and was_halted is not True:
+        from operations import live_notifications
+
+        live_notifications.notify(
+            live_notifications.HALT_ACTIVATED,
+            {"reason": reason, "source": actor, "new_entries_blocked": True,
+             "note": "all automatic orders blocked until HALT is cleared"},
+        )
 
 
 def is_automatic_order_allowed() -> bool:

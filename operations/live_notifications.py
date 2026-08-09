@@ -154,7 +154,7 @@ def _sender_for(event):
     return slack_utils.send_slack_message
 
 
-def notify(event, fields=None, *, test=False, send_fn=None):
+def notify(event, fields=None, *, test=False, send_fn=None, track_health=True):
     """Send one lifecycle event. Never raises. Return value is delivery
     status only and must not influence trading.
 
@@ -171,10 +171,26 @@ def notify(event, fields=None, *, test=False, send_fn=None):
         logger.exception("could not format live notification %s", event)
         return False
 
+    sender = send_fn or _sender_for(event)
+
+    if not track_health:
+        # Deliberately outside notification_health. The one caller that
+        # needs this is the kill-switch escalation: notification_health
+        # counts consecutive Slack failures and escalates the kill switch
+        # when they cross a threshold, so a message ANNOUNCING that
+        # escalation, sent through the same tracker, feeds the counter
+        # that produced it. A failing Slack would then keep re-escalating
+        # itself. Delivery is still best-effort and still never raises.
+        try:
+            return bool(sender(message))
+        except Exception:  # noqa: BLE001
+            logger.exception("live notification %s could not be delivered", event)
+            return False
+
     from notification_health import send_with_health_tracking
 
     try:
-        return bool(send_with_health_tracking(send_fn or _sender_for(event), message))
+        return bool(send_with_health_tracking(sender, message))
     except Exception:  # noqa: BLE001 -- belt and braces; the helper already swallows
         logger.exception("live notification %s could not be delivered", event)
         return False

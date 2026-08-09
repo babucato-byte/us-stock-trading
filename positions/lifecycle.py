@@ -348,8 +348,14 @@ def _apply_exit_fill_progress(conn, locked, intent, fill_state, confirmed_qty, c
             locked.get("target_1_price") if on_fully_filled_state == states.PARTIAL_EXITED else locked["stop_price"]
         )
         fill_validation.validate_fill_price(price)
+        realized_before = locked.get("realized_pnl") or 0.0
         _add_realized_pnl(locked, delta, price)
         locked["remaining_qty"] = max(0, locked["remaining_qty"] - delta)
+        # Guarded by `delta > 0`, which is the existing dedupe: a repeat
+        # observation of the same cumulative exit fill yields delta == 0
+        # and never reaches here, so polling cannot re-send this.
+        _notify_sell_filled(
+            locked, delta=delta, price=price, realized_before=realized_before)
 
     # CODEX-028: commit=False -- these exit_intents mutations must land in
     # the SAME SQLite transaction as this call's position/position_events
@@ -745,6 +751,14 @@ def check_and_manage(position_id, *, current_price, bars=None, now=None, clock=N
         enable_time_stop=enable_time_stop, enable_eod_exit=enable_eod_exit,
     )
 
+    if decision.action in (ACTION_FULL_EXIT, ACTION_PARTIAL_EXIT):
+        # Before the sell transport, and only when an exit was actually
+        # decided -- a tick with nothing to do sends nothing. The reason
+        # is the production reason code verbatim (STOP_LOSS,
+        # EOD_FORCED_CLOSE, TIME_STOP, PARTIAL_TARGET_1, ...), never a
+        # re-worded one.
+        _notify_exit_triggered(record, decision=decision, current_price=current_price)
+
     if decision.action == ACTION_FULL_EXIT:
         return _force_full_exit(position_id, symbol, order_date, broker, decision.reason, lock_timeout)
     if decision.action == ACTION_PARTIAL_EXIT:
@@ -792,6 +806,59 @@ def check_invalidation(position_id, strategy, bars, *, order_date=None, now=None
     order_date = order_date or now.strftime("%Y-%m-%d")
     return _force_full_exit(position_id, record["symbol"], order_date, broker,
                              "STRATEGY_INVALIDATION", lock_timeout)
+
+
+def _notify_sell_filled(record, *, delta, price, realized_before):
+    """SELL_FILLED for one confirmed exit-fill delta.
+
+    Realized PnL is taken from the position's own ledger -- the figure
+    `_add_realized_pnl()` just wrote -- not recomputed here. If the entry
+    price the ledger needs is not on record, no estimate is invented:
+    the message says UNAVAILABLE, which an operator can act on, whereas a
+    plausible wrong number is worse than none.
+    """
+    from operations import live_notifications
+
+    entry_price = record.get("average_fill_price")
+    realized_after = record.get("realized_pnl")
+    if entry_price is None or realized_after is None:
+        realized = "UNAVAILABLE"
+        realized_pct = "UNAVAILABLE"
+    else:
+        realized = round(realized_after - realized_before, 4)
+        cost = entry_price * delta
+        realized_pct = round(realized / cost * 100.0, 4) if cost else "UNAVAILABLE"
+    fields = live_notifications.sell_filled_fields(
+        symbol=record.get("symbol"), qty=delta, fill_price=price,
+        realized_pnl=realized, realized_pnl_pct=realized_pct,
+        position_after=record.get("remaining_qty"))
+    fields["average_buy_price"] = entry_price if entry_price is not None else "UNAVAILABLE"
+    live_notifications.notify(live_notifications.SELL_FILLED, fields)
+
+
+def _notify_exit_triggered(record, *, decision, current_price):
+    """EXIT_TRIGGERED, emitted before the sell reaches the broker.
+
+    Imported lazily so `positions.lifecycle` -- used by the Alpaca/paper
+    path too -- does not gain an import-time dependency on the KIS
+    operations package.
+    """
+    from operations import live_notifications
+
+    remaining = record.get("remaining_qty") or 0
+    if decision.action == ACTION_PARTIAL_EXIT:
+        # The same fraction _partial_exit_at_target_1's selector applies.
+        planned_qty = int(remaining * cfg.PARTIAL_EXIT_FRACTION_AT_TARGET_1)
+        planned_limit = record.get("target_1_price")
+    else:
+        planned_qty = remaining
+        planned_limit = record.get("stop_price")
+    fields = live_notifications.exit_triggered_fields(
+        symbol=record.get("symbol"), reason=decision.reason, position_qty=remaining,
+        current_price=current_price, average_cost=record.get("average_fill_price"))
+    fields["planned_qty"] = planned_qty
+    fields["planned_limit"] = planned_limit if planned_limit is not None else "unavailable"
+    live_notifications.notify(live_notifications.EXIT_TRIGGERED, fields)
 
 
 def _partial_exit_at_target_1(position_id, symbol, order_date, broker, lock_timeout):

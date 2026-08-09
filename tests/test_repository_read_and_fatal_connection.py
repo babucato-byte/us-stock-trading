@@ -437,6 +437,13 @@ _CHILD = textwrap.dedent(
     os.environ["STATE_STORE_DB_FILE"] = sys.argv[1]
     os.environ["OPERATIONS_HALT_STATE_FILE"] = sys.argv[3]
     os.environ["KILL_SWITCH_STATE_FILE"] = sys.argv[4]
+    # A fatal repository fault sets HALT, which now emits a Slack
+    # notification, and notification_health persists every send outcome.
+    # monkeypatch cannot reach a child process, so without these the
+    # child drops NOTIFICATION_HEALTH_STATE.json / notification_health.log
+    # into the repository root.
+    os.environ["NOTIFICATION_HEALTH_STATE_FILE"] = sys.argv[3] + ".nh.json"
+    os.environ["NOTIFICATION_HEALTH_LOG_FILE"] = sys.argv[3] + ".nh.log"
     from execution import idempotency, order_repository
     from state_store import db as state_db
 

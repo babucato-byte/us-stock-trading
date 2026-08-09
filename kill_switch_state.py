@@ -234,9 +234,31 @@ def activate(state, reason, activated_by, expires_at=None, incident_id=None,
             record["expires_at"] = expires_at
             record["incident_id"] = incident_id
 
+        transitioned = current.get("state") != state
         history.append(dict(record))
         _atomic_write(path, {"current": record, "history": history})
-        return record
+
+    # Outside the lock, and only on a genuine transition INTO a
+    # restricting state. Re-activating the state that is already current
+    # takes the idempotent branch above and sends nothing, so a polling
+    # or retrying caller cannot re-alert. The durable state is already
+    # written and stands whether or not this message is delivered.
+    if state != ACTIVE and transitioned:
+        from operations import live_notifications
+
+        live_notifications.notify(
+            live_notifications.KILL_SWITCH_ACTIVATED,
+            {"state": state, "reason": reason, "source": activated_by,
+             "new_entries_blocked": True,
+             "previous_state": current.get("state") or "none",
+             "incident_id": incident_id or "none"},
+            # NOT tracked by notification_health: consecutive Slack
+            # failures are one of the things that escalate the kill
+            # switch, so routing this announcement through that tracker
+            # would let a failing Slack re-escalate itself in a loop.
+            track_health=False,
+        )
+    return record
 
 
 def release(released_by, reason=None, lock_timeout=LOCK_TIMEOUT_SECONDS):
