@@ -27,6 +27,7 @@ from brokers.kis_broker import (
     LIVE_RESPONSE_PENDING,
     REQUIRED_FOR_ARMED,
     REQUIRED_FOR_OBSERVE,
+    REQUIRED_FOR_PAPER,
     VERIFICATION_MATRIX,
     WireValueVerification,
     matrix_entries_for,
@@ -38,8 +39,15 @@ from live_pilot import preflight
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BROKER_SOURCE = (REPO_ROOT / "brokers" / "kis_broker.py").read_text(encoding="utf-8")
 
+# Values a LIVE order or cancel actually puts on the wire. ARMED
+# requires every one of them.
 ORDER_ONLY = ("order_path", "order_tr_id_live_buy", "cancel_path",
-              "cancel_tr_id_live", "cancel_tr_id_paper", "cancel_price_field_rule")
+              "cancel_tr_id_live", "cancel_price_field_rule")
+# The paper cancel TR. `_env_key()` selects the LIVE one whenever
+# KIS_ENV=live, so no live order path can read this -- it is tracked
+# under its own scope and is not an ARMED requirement. Its evidence is
+# unchanged and still pending; only its scope differs.
+PAPER_ONLY = ("cancel_tr_id_paper",)
 OBSERVE_VALUES = ("price_path", "price_field_last", "order_exchange_code_space")
 
 
@@ -55,7 +63,8 @@ class TestRequirementsAreSplitByPosture:
     def test_every_entry_declares_who_needs_it(self):
         for entry in VERIFICATION_MATRIX:
             assert entry.required_for, entry.name
-            assert entry.required_for <= {REQUIRED_FOR_OBSERVE, REQUIRED_FOR_ARMED}
+            assert entry.required_for <= {
+                REQUIRED_FOR_OBSERVE, REQUIRED_FOR_ARMED, REQUIRED_FOR_PAPER}
 
     @pytest.mark.parametrize("name", OBSERVE_VALUES)
     def test_observe_values_are_required_by_both_postures(self, name):
@@ -74,11 +83,31 @@ class TestRequirementsAreSplitByPosture:
         observe = {e.name for e in matrix_entries_for(REQUIRED_FOR_OBSERVE)}
         armed = {e.name for e in matrix_entries_for(REQUIRED_FOR_ARMED)}
         assert observe < armed
-        assert armed == {e.name for e in VERIFICATION_MATRIX}
+        # Everything except the paper-only values.
+        assert armed == {e.name for e in VERIFICATION_MATRIX} - set(PAPER_ONLY)
 
     def test_armed_is_not_relaxed(self):
-        """ARMED must still require all nine."""
-        assert len(matrix_entries_for(REQUIRED_FOR_ARMED)) == len(VERIFICATION_MATRIX)
+        """ARMED must still require every value a LIVE order touches.
+
+        The one value it no longer requires is the PAPER cancel TR, which
+        no live code path reads. Dropping anything else from ARMED would
+        be a relaxation and fails here.
+        """
+        armed = {e.name for e in matrix_entries_for(REQUIRED_FOR_ARMED)}
+        for name in ORDER_ONLY:
+            assert name in armed, name
+        for name in OBSERVE_VALUES:
+            assert name in armed, name
+        assert set(PAPER_ONLY).isdisjoint(armed)
+
+    @pytest.mark.parametrize("name", PAPER_ONLY)
+    def test_paper_values_keep_their_evidence_pending(self, name):
+        """Out of ARMED scope is not the same as confirmed."""
+        from brokers.kis_broker import LIVE_RESPONSE_PENDING
+
+        entry = _entry(name)
+        assert entry.live_status == LIVE_RESPONSE_PENDING
+        assert entry.required_for == frozenset({REQUIRED_FOR_PAPER})
 
 
 class TestClassificationMatchesTheSource:

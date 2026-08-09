@@ -126,12 +126,40 @@ armed_pending = list(pending_items_for(REQUIRED_FOR_ARMED))
 check("OBSERVE_MATRIX_PENDING", not observe_pending,
       f"{len(matrix_entries_for(REQUIRED_FOR_OBSERVE)) - len(observe_pending)}"
       f"/{len(matrix_entries_for(REQUIRED_FOR_OBSERVE))} confirmed")
+LIVE_BOOTSTRAP_REQUIRED = {
+    "order_path", "order_tr_id_live_buy", "cancel_path",
+    "cancel_tr_id_live", "cancel_price_field_rule",
+}
+# The five that ONLY a real live response can establish. While exactly
+# those are outstanding the deployment is bootstrap-eligible but not
+# generally live-ready; anything else outstanding is a plain block.
+beyond_bootstrap = [n for n in armed_pending if n not in LIVE_BOOTSTRAP_REQUIRED]
 check("ARMED_MATRIX_PENDING", not armed_pending,
       f"pending: {', '.join(armed_pending) if armed_pending else 'none'}")
+check("ARMED_PENDING_BEYOND_BOOTSTRAP", not beyond_bootstrap,
+      f"beyond the live-bootstrap five: "
+      f"{', '.join(beyond_bootstrap) if beyond_bootstrap else 'none'}")
+print(f"BOOTSTRAPABLE::{'yes' if armed_pending and not beyond_bootstrap else 'no'}")
 
 # -- reconciliation
+# A snapshot made minutes ago by an earlier step can age past its TTL
+# while this checker is still running its KIS reads. Refresh once when
+# that is the reason, then judge the refreshed one. A refresh that
+# cannot be made, or a snapshot that is dirty / has unknowns / is
+# halted, is still a hard failure -- staleness is the only thing this
+# retries, and nothing here hides a mismatch.
 try:
     snapshot = freshness.evaluate()
+    if not snapshot.usable:
+        reason = getattr(snapshot, "reason_code", "") or ""
+        if "STALE" in reason or "MISSING" in reason:
+            from reconciliation import reconciliation_state
+            import subprocess
+
+            subprocess.run(
+                [sys.executable, "scripts/run_reconciliation.py"],
+                capture_output=True, timeout=300, check=False)
+            snapshot = freshness.evaluate()
     check("RECONCILIATION_NOT_USABLE", snapshot.usable,
           getattr(snapshot, "reason_code", "") or "fresh and clean")
 except Exception as exc:  # noqa: BLE001
@@ -195,8 +223,11 @@ try:
         check("INSUFFICIENT_ORDERABLE_CASH", orderable >= price,
               f"orderable={orderable} price={price}")
     else:
-        check("INSUFFICIENT_ORDERABLE_CASH", False,
-              "cannot price the candidate: the allow-list does not hold exactly one symbol")
+        # Not the same as "the account is short". Nothing was priced,
+        # so nothing is known about the cash -- reporting a shortfall
+        # here would be an invented finding.
+        check("ORDERABLE_CASH_NOT_EVALUATED", False,
+              "no candidate to price: the allow-list does not hold exactly one symbol")
 
     conn = state_db.open_db()
     try:
@@ -232,6 +263,8 @@ else
                 rest="${line#BAD::}"
                 fail "${rest%%::*}" "${rest#*::}"
                 ;;
+            BOOTSTRAPABLE::*)
+                ;;  # control line, consumed below
             *)
                 fail CHECK_OUTPUT_UNPARSEABLE "${line:0:80}"
                 ;;
@@ -244,6 +277,25 @@ if [ "${#REASONS[@]}" -eq 0 ]; then
     printf 'RESULT: PRE_LIVE_READY\n'
     exit 0
 fi
+
+# READY_FOR_LIVE_BOOTSTRAP is NOT a weaker PRE_LIVE_READY. It authorises
+# exactly one symbol, one share, one BUY attempt and at most one CANCEL
+# attempt -- the only way the five live-only wire values can be observed
+# at all. Every OTHER safety check must still have passed, which is why
+# it requires the reason list to contain nothing but ARMED_MATRIX_PENDING.
+BOOTSTRAPABLE="$(printf '%s\n' "${PY_OUTPUT}" | sed -n 's/^BOOTSTRAPABLE:://p' | tail -1)"
+if [ "${BOOTSTRAPABLE}" = "yes" ] && [ "${#REASONS[@]}" -eq 1 ] \
+   && [ "${REASONS[0]}" = "ARMED_MATRIX_PENDING" ]; then
+    printf 'RESULT: READY_FOR_LIVE_BOOTSTRAP\n'
+    printf 'Every safety check passed. The only outstanding items are the five\n'
+    printf 'wire values that a real live response is the only way to confirm:\n'
+    printf '  order_path, order_tr_id_live_buy, cancel_path,\n'
+    printf '  cancel_tr_id_live, cancel_price_field_rule\n'
+    printf 'Authorised scope: 1 symbol, 1 share, 1 BUY, at most 1 CANCEL.\n'
+    printf 'This is NOT approval for ARMED or AUTO LIVE.\n'
+    exit 0
+fi
+
 printf 'RESULT: PRE_LIVE_BLOCKED\n'
 printf 'BLOCKING REASON CODES (%s):\n' "${#REASONS[@]}"
 printf '  - %s\n' "${REASONS[@]}"

@@ -172,11 +172,17 @@ LIVE_RESPONSE_PENDING = "LIVE_RESPONSE_PENDING"
 # the matrix, so preflight and runtime cannot each keep their own list.
 REQUIRED_FOR_OBSERVE = "OBSERVE"
 REQUIRED_FOR_ARMED = "ARMED"
+# A value the PAPER environment uses and the live environment never
+# reads. Its evidence still matters -- it is tracked, and it is not
+# marked confirmed without a real response -- but it cannot gate live
+# eligibility, because no live order path can reach it.
+REQUIRED_FOR_PAPER = "PAPER"
 
 # Everything ARMED does, it does on top of what OBSERVE does, so an
 # OBSERVE requirement is automatically an ARMED requirement too.
 _OBSERVE_AND_ARMED = frozenset({REQUIRED_FOR_OBSERVE, REQUIRED_FOR_ARMED})
 _ARMED_ONLY = frozenset({REQUIRED_FOR_ARMED})
+_PAPER_ONLY = frozenset({REQUIRED_FOR_PAPER})
 
 
 class WireValueVerification(NamedTuple):
@@ -221,10 +227,21 @@ VERIFICATION_MATRIX = (
         "examples_llm/overseas_stock/order_rvsecncl/order_rvsecncl.py",
         required_for=_ARMED_ONLY,
     ),
+    # PAPER-only, and therefore not an ARMED requirement. `_env_key()`
+    # selects TR_ID_CANCEL["live"] whenever KIS_ENV=live, so no live
+    # order or cancel can read this value -- gating live eligibility on
+    # it would block a real order on evidence about a code path that
+    # real order can never take.
+    #
+    # Its status is NOT upgraded. It stays LIVE_RESPONSE_PENDING because
+    # no response has confirmed it; only its SCOPE changed. Fabricating
+    # a confirmation from documentation is the thing this matrix exists
+    # to prevent, and moving a value out of scope is not the same as
+    # confirming it.
     WireValueVerification(
         "cancel_tr_id_paper", TR_ID_CANCEL["paper"], REFERENCE_VERIFIED, LIVE_RESPONSE_PENDING,
         "examples_llm/overseas_stock/order_rvsecncl/order_rvsecncl.py",
-        required_for=_ARMED_ONLY,
+        required_for=_PAPER_ONLY,
     ),
     WireValueVerification(
         "cancel_price_field_rule", "OVRS_ORD_UNPR=0", REFERENCE_VERIFIED,

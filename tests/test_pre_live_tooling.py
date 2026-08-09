@@ -197,3 +197,134 @@ class TestTheBootstrapCannotRunByAccident:
                           "KIS_LIVE_ORDER_ENABLED=", "LIVE_ROLLOUT_ENABLED=",
                           "LIVE_ROLLOUT_ALLOWED_SYMBOLS="):
             assert forbidden not in BOOTSTRAP_CODE, forbidden
+
+
+class TestLiveAndPaperRequirementsAreSeparate:
+    """`cancel_tr_id_paper` is the paper cancel TR. `_env_key()` selects
+    the LIVE one whenever KIS_ENV=live, so no live order or cancel can
+    read it -- gating live eligibility on evidence about a code path a
+    live order cannot take would block a real order for no safety gain.
+
+    Its scope changed; its evidence did not. It is still
+    LIVE_RESPONSE_PENDING, because no response has confirmed it, and
+    that distinction is the point: moving a value out of scope is not
+    the same as confirming it.
+    """
+
+    def test_the_paper_value_is_not_an_armed_requirement(self):
+        from brokers import kis_broker
+
+        armed = {e.name for e in kis_broker.matrix_entries_for(kis_broker.REQUIRED_FOR_ARMED)}
+        assert "cancel_tr_id_paper" not in armed
+
+    def test_its_evidence_was_not_fabricated(self):
+        from brokers import kis_broker
+
+        entry = next(e for e in kis_broker.VERIFICATION_MATRIX
+                     if e.name == "cancel_tr_id_paper")
+        assert entry.live_status == kis_broker.LIVE_RESPONSE_PENDING
+        assert kis_broker.REQUIRED_FOR_PAPER in entry.required_for
+
+    def test_it_is_still_tracked_under_its_own_scope(self):
+        from brokers import kis_broker
+
+        assert list(kis_broker.pending_items_for(kis_broker.REQUIRED_FOR_PAPER)) == [
+            "cancel_tr_id_paper"]
+
+    def test_armed_now_waits_on_exactly_the_five_live_only_values(self):
+        from brokers import kis_broker
+
+        assert set(kis_broker.pending_items_for(kis_broker.REQUIRED_FOR_ARMED)) == {
+            "order_path", "order_tr_id_live_buy", "cancel_path",
+            "cancel_tr_id_live", "cancel_price_field_rule"}
+
+    def test_observe_is_unaffected(self):
+        from brokers import kis_broker
+
+        assert kis_broker.pending_items_for(kis_broker.REQUIRED_FOR_OBSERVE) == ()
+
+    def test_a_live_env_selects_only_the_live_cancel_tr(self):
+        from brokers.kis_broker import TR_ID_CANCEL
+
+        assert TR_ID_CANCEL["live"] != TR_ID_CANCEL["paper"]
+        # The selector the broker uses.
+        from brokers.kis_broker import KISBroker
+        from brokers.kis_config import KISConfig
+
+        live_cfg = KISConfig(kis_env="live", app_key="k", app_secret="s",
+                             account_no="12345678", account_product_cd="01",
+                             account_read_enabled=True, live_order_enabled=False)
+        broker = KISBroker(config=live_cfg, session=object())
+        assert TR_ID_CANCEL[broker._env_key()] == TR_ID_CANCEL["live"]
+
+    def test_no_live_cancel_path_references_the_paper_tr_id(self):
+        """Static: the paper TR literal must appear in exactly one place
+        in CODE -- the env-keyed table -- never hard-coded into a branch.
+
+        Prose is excluded: the module docstring and comments discuss both
+        TR ids by name, and matching those would fail a correct file.
+        """
+        import ast
+
+        path = REPO_ROOT / "brokers" / "kis_broker.py"
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        docstrings = {
+            id(node.body[0].value)
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef,
+                                 ast.ClassDef))
+            and getattr(node, "body", None)
+            and isinstance(node.body[0], ast.Expr)
+            and isinstance(node.body[0].value, ast.Constant)
+            and isinstance(node.body[0].value.value, str)
+        }
+        code_lines = {
+            node.lineno for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and node.value == "VTTT1004U"
+            and id(node) not in docstrings
+        }
+        assert len(code_lines) == 1, f"paper TR appears in code at lines {sorted(code_lines)}"
+        line = source.splitlines()[min(code_lines) - 1]
+        assert "TR_ID_CANCEL" in line, line
+
+
+class TestTheCheckerDistinguishesCashOutcomes:
+    def test_an_unpriced_candidate_is_not_reported_as_a_shortfall(self):
+        """"Nothing was priced" and "the account is short" are different
+        findings; reporting the first as the second is an invented one."""
+        assert "ORDERABLE_CASH_NOT_EVALUATED" in CHECK_SOURCE
+        assert "no candidate to price" in CHECK_SOURCE
+
+    def test_a_real_shortfall_keeps_its_own_code(self):
+        assert "INSUFFICIENT_ORDERABLE_CASH" in CHECK_SOURCE
+
+
+class TestTheCheckerRefreshesAStaleSnapshot:
+    def test_only_staleness_is_retried(self):
+        """A dirty / unknown / halted snapshot must stay a hard failure;
+        only an aged-out one is refreshed."""
+        assert 'if "STALE" in reason or "MISSING" in reason' in CHECK_SOURCE
+        assert "run_reconciliation.py" in CHECK_SOURCE
+
+    def test_the_refreshed_snapshot_is_the_one_judged(self):
+        assert CHECK_SOURCE.count("snapshot = freshness.evaluate()") == 2
+
+
+class TestTheThreeStateVerdict:
+    def test_all_three_states_exist(self):
+        for state in ("PRE_LIVE_READY", "PRE_LIVE_BLOCKED", "READY_FOR_LIVE_BOOTSTRAP"):
+            assert state in CHECK_SOURCE
+
+    def test_bootstrap_state_requires_everything_else_to_pass(self):
+        """It is not a weaker READY: the reason list must contain nothing
+        but the ARMED matrix item."""
+        assert '"${#REASONS[@]}" -eq 1' in CHECK_SOURCE
+        assert '"${REASONS[0]}" = "ARMED_MATRIX_PENDING"' in CHECK_SOURCE
+
+    def test_bootstrap_state_states_its_narrow_scope(self):
+        assert "1 symbol, 1 share, 1 BUY, at most 1 CANCEL" in CHECK_SOURCE
+        assert "NOT approval for ARMED or AUTO LIVE" in CHECK_SOURCE
+
+    def test_a_pending_item_beyond_the_five_blocks_outright(self):
+        assert "ARMED_PENDING_BEYOND_BOOTSTRAP" in CHECK_SOURCE

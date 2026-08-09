@@ -197,13 +197,22 @@ class TestRunbookMatchesTheMatrix:
                   if entry.live_status == kis_broker.LIVE_RESPONSE_CONFIRMED}
         assert kis_broker.TR_ID_PSAMOUNT["paper"] not in values
 
-    def test_armed_still_waits_on_exactly_the_order_and_cancel_values(self):
-        """Adding OBSERVE requirements must not quietly un-gate ARMED."""
+    def test_armed_still_waits_on_exactly_the_live_order_and_cancel_values(self):
+        """Adding OBSERVE requirements must not quietly un-gate ARMED.
+
+        `cancel_tr_id_paper` is deliberately absent: it is the PAPER
+        cancel TR, which no live path reads, so it is tracked under its
+        own scope instead of gating live eligibility. Its evidence is
+        still pending -- see the paper-scope test below."""
         assert set(kis_broker.pending_items_for(kis_broker.REQUIRED_FOR_ARMED)) == {
             "order_path", "order_tr_id_live_buy", "cancel_path",
-            "cancel_tr_id_live", "cancel_tr_id_paper", "cancel_price_field_rule",
+            "cancel_tr_id_live", "cancel_price_field_rule",
         }
         assert kis_broker.pending_items_for(kis_broker.REQUIRED_FOR_OBSERVE) == ()
+
+    def test_the_paper_value_is_still_tracked_and_still_unconfirmed(self):
+        assert set(kis_broker.pending_items_for(kis_broker.REQUIRED_FOR_PAPER)) == {
+            "cancel_tr_id_paper"}
 
 
 class TestVerificationStatusIsNotARuntimeSwitch:
