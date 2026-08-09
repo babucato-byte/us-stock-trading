@@ -54,6 +54,7 @@ from execution.order_repository import (
 )
 from execution.order_state_machine import OrderStateTransitionError
 from market_hours import us_trading_day
+from operations import live_notifications
 import shadow_audit
 from reconciliation import snapshot as reconciliation_snapshot
 from execution.secret_redaction import safe_repr
@@ -353,9 +354,20 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
             _reject(conn, record, event_type="RECONCILIATION_BLOCKED", reason=str(exc))
             raise
 
+        # The context the gate actually evaluated, captured so the
+        # pre-transport notification reports the SAME facts the gate
+        # decided on rather than re-deriving them. Capturing does not
+        # change when or how often the builder runs.
+        evaluated = {}
+
+        def _build_gate_context():
+            context = gate_context_builder(snapshot)
+            evaluated["context"] = context
+            return context
+
         try:
             authorized = authorization.authorize_new_order(
-                order_intent, lambda: gate_context_builder(snapshot), gate_fn, now=current,
+                order_intent, _build_gate_context, gate_fn, now=current,
             )
         except (order_gate.OrderGateBlockedError, UnauthorizedExecutionError) as exc:
             _reject(conn, record, event_type="GATE_REJECTED", reason=str(exc))
@@ -408,6 +420,17 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
             detail=f"quantity={order_intent.quantity} limit={order_intent.limit_price}",
         )
 
+        # The last thing before the wire, and the message an operator
+        # reads as "we are about to touch KIS". Its RETURN VALUE IS
+        # IGNORED on purpose: a Slack outage must not stop, delay or
+        # re-run the transport below, because the order would then be at
+        # risk of being submitted twice.
+        live_notifications.notify(
+            live_notifications.LIVE_ORDER_PREPARED,
+            _prepared_fields(order_intent, side_label=side_label,
+                             gate_context=evaluated.get("context")),
+        )
+
         try:
             execution_record = broker.submit_order(order_intent, instrument, authorization=authorized)
         except KISAmbiguousResponseError as exc:
@@ -415,10 +438,28 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
             # never automatically re-submitted -- only reconciliation
             # against KIS's own history may move it out of UNKNOWN.
             _force_unknown(conn, record, reason=str(exc), now=current)
+            # The durable UNKNOWN above is the safety state and stands
+            # whether or not this message is delivered.
+            live_notifications.notify(
+                live_notifications.ORDER_UNKNOWN,
+                live_notifications.unknown_order_fields(
+                    symbol=order_intent.symbol, side=side_label,
+                    quantity=order_intent.quantity, limit_price=order_intent.limit_price,
+                    internal_order_id=order_intent.internal_order_id,
+                    durable_state="UNKNOWN"),
+            )
             raise
         except KISBrokerError as exc:
             _reject(conn, record, event_type="TRANSPORT_REJECTED", reason=str(exc))
+            live_notifications.notify(
+                live_notifications.ORDER_REJECTED,
+                {"symbol": order_intent.symbol, "side": side_label,
+                 "quantity": order_intent.quantity, "limit_price": order_intent.limit_price,
+                 "reason": type(exc).__name__},
+            )
             raise
+
+        _notify_submitted(order_intent, side_label=side_label, record=execution_record)
 
         try:
             record = order_repository.advance(
@@ -437,6 +478,22 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
                 reason=f"could not durably record {execution_record.status}: {exc}", now=current,
                 broker_order_id=execution_record.broker_order_id,
             )
+            # The order IS at KIS; only our record of its outcome is
+            # missing. Same UNKNOWN contract, same no-retry rule.
+            live_notifications.notify(
+                live_notifications.ORDER_UNKNOWN,
+                live_notifications.unknown_order_fields(
+                    symbol=order_intent.symbol, side=side_label,
+                    quantity=order_intent.quantity, limit_price=order_intent.limit_price,
+                    broker_order_id=execution_record.broker_order_id,
+                    internal_order_id=order_intent.internal_order_id,
+                    durable_state="UNKNOWN"),
+            )
+            live_notifications.notify(
+                live_notifications.DB_FAILURE,
+                {"stage": "transport_result_persistence", "symbol": order_intent.symbol,
+                 "consequence": "order left UNKNOWN for reconciliation"},
+            )
             raise ExecutionEngineError(
                 f"{side_label} order reached KIS but its outcome could not be durably recorded "
                 f"-- left UNKNOWN for reconciliation: {exc}",
@@ -447,6 +504,83 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
             internal_order_id=order_intent.internal_order_id, status=execution_record.status,
             execution_record=execution_record,
         )
+
+
+def _prepared_fields(order_intent, *, side_label, gate_context):
+    """The pre-transport payload, taken from the context the gate just
+    evaluated. Every gate-derived field degrades to "unavailable" rather
+    than raising: this is a notification, and a missing field must never
+    be the reason an order does not go out."""
+    def _from_context(name, default="unavailable"):
+        if gate_context is None:
+            return default
+        return getattr(gate_context, name, default)
+
+    limits = _from_context("entry_limits", None)
+    if limits is not None and not isinstance(limits, str):
+        positions_used = getattr(limits, "effective_position_count", "unavailable")
+        positions_max = getattr(limits, "max_open_positions", "unavailable")
+        entries_used = getattr(limits, "daily_entry_count", "unavailable")
+        entries_max = getattr(limits, "max_daily_entries", "unavailable")
+    else:
+        positions_used = positions_max = entries_used = entries_max = "unavailable"
+
+    snapshot = _from_context("reconciliation", None)
+    if snapshot is not None and hasattr(snapshot, "is_clean"):
+        try:
+            reconciliation = "clean" if snapshot.is_clean() else "dirty"
+        except Exception:  # noqa: BLE001
+            reconciliation = "unavailable"
+    else:
+        reconciliation = "unavailable"
+
+    allowed = _from_context("allowed_symbols", None)
+    if allowed is None:
+        allowlist = "unavailable"
+    else:
+        allowlist = ", ".join(sorted(allowed)) if allowed else "(empty)"
+
+    live_enabled = _from_context("live_order_enabled", None)
+    entry_disabled = _from_context("entry_disabled", None)
+    mode = "ARMED" if live_enabled is True and entry_disabled is False else "OBSERVE"
+
+    return live_notifications.order_prepared_fields(
+        symbol=order_intent.symbol, side=side_label, quantity=order_intent.quantity,
+        limit_price=order_intent.limit_price,
+        cash_result=_from_context("usd_orderable_cash"),
+        positions_used=positions_used, positions_max=positions_max,
+        daily_entries_used=entries_used, daily_entries_max=entries_max,
+        reconciliation=reconciliation,
+        # HALT is checked by authorize_new_order() before this point, so
+        # reaching the transport means it was not set.
+        kill_switch="not halted",
+        live_allowlist=allowlist, mode=mode,
+    )
+
+
+def _notify_submitted(order_intent, *, side_label, record):
+    """ORDER_SUBMITTED (or SELL_SUBMITTED) plus the accepted/pending
+    follow-up, in that order, immediately after the wire returned."""
+    status = getattr(record, "status", None)
+    broker_order_id = getattr(record, "broker_order_id", None)
+    event = (live_notifications.SELL_SUBMITTED if side_label == "sell"
+             else live_notifications.ORDER_SUBMITTED)
+    live_notifications.notify(event, live_notifications.order_submitted_fields(
+        symbol=order_intent.symbol, side=side_label, quantity=order_intent.quantity,
+        limit_price=order_intent.limit_price, broker_order_id=broker_order_id, state=status))
+
+    # The state machine only permits SUBMITTING -> ACCEPTED/REJECTED/
+    # UNKNOWN, and the latter two raise rather than return, so ACCEPTED
+    # is the only status reachable here in practice. ORDER_PENDING is the
+    # defensive branch for a broker that answers with something else --
+    # it is reported as pending rather than silently treated as accepted.
+    if status in ("ACCEPTED", "PARTIALLY_FILLED"):
+        follow_up = live_notifications.ORDER_ACCEPTED
+    else:
+        follow_up = live_notifications.ORDER_PENDING
+    live_notifications.notify(follow_up, {
+        "symbol": order_intent.symbol, "side": side_label,
+        "broker_order_id": broker_order_id or "pending", "state": status})
 
 
 def _force_unknown(conn, record, *, reason, now, broker_order_id=None):
@@ -873,6 +1007,14 @@ def _cancel_inner(*, order_intent, broker_order_id, cancel_gate_context_builder,
             reason_code="CANCEL_PENDING", detail=f"broker_order_id={broker_order_id}",
         )
 
+        # Before the wire, same as the new-order path. Return value
+        # ignored: a Slack failure must not re-run a cancel either.
+        live_notifications.notify(
+            live_notifications.CANCEL_REQUESTED,
+            {"symbol": order_intent.symbol, "broker_order_id": broker_order_id,
+             "quantity": order_intent.quantity, "state": "CANCEL_PENDING"},
+        )
+
         # From here on, any failure is a POST-transport failure.
         transport["attempted"] = True
         try:
@@ -881,9 +1023,27 @@ def _cancel_inner(*, order_intent, broker_order_id, cancel_gate_context_builder,
             )
         except KISAmbiguousResponseError as exc:
             _force_unknown(conn, record, reason=str(exc), now=current)
+            live_notifications.notify(
+                live_notifications.CANCEL_FAILED,
+                {"symbol": order_intent.symbol, "broker_order_id": broker_order_id,
+                 "reason": "ambiguous response", "durable_state": "UNKNOWN"},
+            )
+            live_notifications.notify(
+                live_notifications.ORDER_UNKNOWN,
+                live_notifications.unknown_order_fields(
+                    symbol=order_intent.symbol, side="cancel",
+                    broker_order_id=broker_order_id,
+                    internal_order_id=order_intent.internal_order_id,
+                    durable_state="UNKNOWN"),
+            )
             raise
         except KISBrokerError as exc:
             _force_unknown(conn, record, reason=f"cancel failed: {exc}", now=current)
+            live_notifications.notify(
+                live_notifications.CANCEL_FAILED,
+                {"symbol": order_intent.symbol, "broker_order_id": broker_order_id,
+                 "reason": type(exc).__name__, "durable_state": "UNKNOWN"},
+            )
             raise
         transport["completed"] = True
 
@@ -892,6 +1052,12 @@ def _cancel_inner(*, order_intent, broker_order_id, cancel_gate_context_builder,
                 conn, record,
                 reason=f"KIS did not confirm the cancel (status={execution_record.status!r})",
                 now=current,
+            )
+            live_notifications.notify(
+                live_notifications.CANCEL_FAILED,
+                {"symbol": order_intent.symbol, "broker_order_id": broker_order_id,
+                 "reason": f"KIS did not confirm the cancel (status={execution_record.status!r})",
+                 "durable_state": "UNKNOWN"},
             )
             return ExecutionResult(
                 internal_order_id=order_intent.internal_order_id, status="UNKNOWN",
@@ -966,6 +1132,11 @@ def _cancel_inner(*, order_intent, broker_order_id, cancel_gate_context_builder,
                 str(normalized), reason_code=REASON_STATE_PERSISTENCE,
             ) from (unknown_error or exc)
 
+        live_notifications.notify(
+            live_notifications.CANCEL_COMPLETED,
+            {"symbol": order_intent.symbol, "broker_order_id": broker_order_id,
+             "state": execution_record.status},
+        )
         return ExecutionResult(
             internal_order_id=order_intent.internal_order_id, status=execution_record.status,
             execution_record=execution_record,

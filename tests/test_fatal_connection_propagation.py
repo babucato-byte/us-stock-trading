@@ -495,6 +495,13 @@ _CHILD = textwrap.dedent(
     os.environ["KILL_SWITCH_STATE_FILE"] = sys.argv[4]
     os.environ["POSITION_STORE_FILE"] = sys.argv[5]
     os.environ["SHADOW_MODE_LOG_FILE"] = sys.argv[6]
+    # The engine now emits Slack lifecycle notifications, and
+    # notification_health persists every send outcome. monkeypatch cannot
+    # reach a child process, so without these the child would drop
+    # NOTIFICATION_HEALTH_STATE.json / notification_health.log into the
+    # repository root.
+    os.environ["NOTIFICATION_HEALTH_STATE_FILE"] = sys.argv[7]
+    os.environ["NOTIFICATION_HEALTH_LOG_FILE"] = sys.argv[8]
     import pathlib
     from datetime import datetime, timezone
     from execution import idempotency
@@ -622,7 +629,8 @@ class TestRealProcessFailStopThroughARealCancel:
         result = subprocess.run(
             [sys.executable, "-c", _CHILD, db_path, str(REPO_ROOT),
              str(tmp_path / "HALT.json"), str(tmp_path / "KS.json"),
-             str(tmp_path / "POS.json"), str(tmp_path / "SH.jsonl")],
+             str(tmp_path / "POS.json"), str(tmp_path / "SH.jsonl"),
+             str(tmp_path / "NH.json"), str(tmp_path / "nh.log")],
             capture_output=True, text=True, cwd=str(REPO_ROOT), timeout=90,
         )
         assert "FATAL" in result.stdout, f"stdout={result.stdout} stderr={result.stderr[-2000:]}"
