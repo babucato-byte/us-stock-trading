@@ -334,10 +334,16 @@ class TestTheThreeStateVerdict:
             assert state in CHECK_SOURCE
 
     def test_bootstrap_state_requires_everything_else_to_pass(self):
-        """It is not a weaker READY: the reason list must contain nothing
-        but the ARMED matrix item."""
-        assert '"${#REASONS[@]}" -eq 1' in CHECK_SOURCE
-        assert '"${REASONS[0]}" = "ARMED_MATRIX_PENDING"' in CHECK_SOURCE
+        """It is not a weaker READY. Exactly two reason codes are
+        tolerated -- the ARMED matrix items the bootstrap exists to
+        confirm, and "not ARMED", which is the state it runs in. Every
+        other reason still blocks, which the count comparison enforces:
+        the tolerated ones must account for the WHOLE list."""
+        assert "ARMED_MATRIX_PENDING|POSTURE_NOT_ARMED" in CHECK_SOURCE
+        assert '"${BOOTSTRAP_TOLERATED}" -eq "${#REASONS[@]}"' in CHECK_SOURCE
+        # INVALID_BOOTSTRAP_POSTURE is not tolerated, so a posture that is
+        # neither ARMED nor LIMITED_LIVE_BOOTSTRAP still blocks.
+        assert "INVALID_BOOTSTRAP_POSTURE" in CHECK_SOURCE
 
     def test_bootstrap_state_states_its_narrow_scope(self):
         assert "1 symbol, 1 share, 1 BUY, at most 1 CANCEL" in CHECK_SOURCE
@@ -345,3 +351,78 @@ class TestTheThreeStateVerdict:
 
     def test_a_pending_item_beyond_the_five_blocks_outright(self):
         assert "ARMED_PENDING_BEYOND_BOOTSTRAP" in CHECK_SOURCE
+
+
+class TestTheBootstrapPostureIsASeparateCapability:
+    """LIMITED_LIVE_BOOTSTRAP is not a weaker ARMED.
+
+    Five wire values can only be established by a real live response.
+    Confirming them by switching the whole system to ARMED would mean the
+    first real order is placed by the general trading path rather than by
+    a one-shot with every precondition checked. So the capability is its
+    own flag and its own posture, and the three live-entry flags keep
+    their existing meaning untouched.
+    """
+
+    def _posture(self, **env):
+        from live_pilot.posture import resolve_posture
+
+        return resolve_posture(env)
+
+    def test_the_default_is_still_observe(self):
+        assert self._posture().posture == "OBSERVE"
+
+    def test_the_bootstrap_flag_alone_reaches_the_bootstrap_posture(self):
+        decision = self._posture(LIVE_BOOTSTRAP_ENABLED="true")
+        assert decision.posture == "LIMITED_LIVE_BOOTSTRAP"
+        assert decision.bootstrap is True
+        assert decision.armed is False
+
+    def test_it_does_not_turn_on_any_live_entry_flag(self):
+        """The general scanner -> live order path reads these three. The
+        bootstrap capability must leave all of them alone."""
+        decision = self._posture(LIVE_BOOTSTRAP_ENABLED="true")
+        assert decision.live_order_enabled is False
+        assert decision.rollout_enabled is False
+
+    def test_armed_still_requires_all_three_flags(self):
+        assert self._posture(KIS_LIVE_ORDER_ENABLED="true").posture == "OBSERVE"
+        assert self._posture(LIVE_ROLLOUT_ENABLED="true").posture == "OBSERVE"
+        assert self._posture(KIS_LIVE_ORDER_ENABLED="true",
+                             LIVE_ROLLOUT_ENABLED="true").posture == "ARMED"
+
+    def test_armed_is_not_shadowed_by_the_bootstrap_flag(self):
+        """Once the three flags really are on, ARMED is the honest
+        description; the bootstrap capability must not mask it."""
+        decision = self._posture(KIS_LIVE_ORDER_ENABLED="true",
+                                 LIVE_ROLLOUT_ENABLED="true",
+                                 LIVE_BOOTSTRAP_ENABLED="true")
+        assert decision.posture == "ARMED"
+
+    def test_entry_disabled_does_not_block_the_bootstrap_posture(self):
+        """ENTRY_DISABLED blocks the general entry path, which is exactly
+        the state the bootstrap runs in."""
+        assert self._posture(ENTRY_DISABLED="true",
+                             LIVE_BOOTSTRAP_ENABLED="true"
+                             ).posture == "LIMITED_LIVE_BOOTSTRAP"
+
+    def test_the_general_order_gate_ignores_the_bootstrap_flag(self):
+        """Capability isolation, statically: no gate, engine or entry
+        pipeline may read it."""
+        for rel in ("execution/order_gate.py", "execution/execution_engine.py",
+                    "kis_live_trading.py", "scripts/run_shadow_mode.py",
+                    "live_pilot/armed.py", "live_pilot/runner.py"):
+            source = (REPO_ROOT / rel).read_text(encoding="utf-8")
+            assert "LIVE_BOOTSTRAP_ENABLED" not in source, rel
+
+    def test_the_checker_uses_a_bootstrap_specific_reason(self):
+        assert "INVALID_BOOTSTRAP_POSTURE" in CHECK_SOURCE
+
+    def test_posture_not_armed_no_longer_blocks_the_bootstrap_verdict(self):
+        """The contradiction this fixes: requiring ARMED made
+        READY_FOR_LIVE_BOOTSTRAP unreachable, since reaching ARMED is
+        what the bootstrap exists to make possible."""
+        assert "ARMED_MATRIX_PENDING|POSTURE_NOT_ARMED" in CHECK_SOURCE
+
+    def test_pre_live_ready_still_requires_armed(self):
+        assert 'check("POSTURE_NOT_ARMED", decision.posture == "ARMED"' in CHECK_SOURCE

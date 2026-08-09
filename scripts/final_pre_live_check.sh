@@ -215,8 +215,16 @@ except Exception as exc:  # noqa: BLE001
     check("NOT_REGULAR_SESSION", False, type(exc).__name__)
 
 # -- posture
+# Two different questions. PRE_LIVE_READY means the general live path may
+# run, which requires ARMED. READY_FOR_LIVE_BOOTSTRAP means the one-shot
+# may run, which requires LIMITED_LIVE_BOOTSTRAP. Reporting the second as
+# "not ARMED" made the bootstrap state unreachable by construction, since
+# reaching ARMED is exactly what the bootstrap exists to make possible.
 decision = resolve_posture()
 check("POSTURE_NOT_ARMED", decision.posture == "ARMED", f"posture={decision.posture}")
+check("INVALID_BOOTSTRAP_POSTURE",
+      decision.posture in ("ARMED", "LIMITED_LIVE_BOOTSTRAP"),
+      f"posture={decision.posture}")
 
 # -- single-run lock
 try:
@@ -313,8 +321,14 @@ fi
 # at all. Every OTHER safety check must still have passed, which is why
 # it requires the reason list to contain nothing but ARMED_MATRIX_PENDING.
 BOOTSTRAPABLE="$(printf '%s\n' "${PY_OUTPUT}" | sed -n 's/^BOOTSTRAPABLE:://p' | tail -1)"
-if [ "${BOOTSTRAPABLE}" = "yes" ] && [ "${#REASONS[@]}" -eq 1 ] \
-   && [ "${REASONS[0]}" = "ARMED_MATRIX_PENDING" ]; then
+BOOTSTRAP_TOLERATED=0
+for reason in "${REASONS[@]-}"; do
+    case "${reason}" in
+        ARMED_MATRIX_PENDING|POSTURE_NOT_ARMED) BOOTSTRAP_TOLERATED=$((BOOTSTRAP_TOLERATED+1)) ;;
+    esac
+done
+if [ "${BOOTSTRAPABLE}" = "yes" ] \
+   && [ "${BOOTSTRAP_TOLERATED}" -eq "${#REASONS[@]}" ]; then
     printf 'RESULT: READY_FOR_LIVE_BOOTSTRAP\n'
     printf 'Every safety check passed. The only outstanding items are the five\n'
     printf 'wire values that a real live response is the only way to confirm:\n'

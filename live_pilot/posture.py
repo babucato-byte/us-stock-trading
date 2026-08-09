@@ -8,6 +8,18 @@ the posture cannot itself reach an order path.
     OBSERVE  the default. Everything is evaluated against live data;
              nothing can be submitted, because the modules that submit
              are never imported on this path.
+    LIMITED_LIVE_BOOTSTRAP
+             a SEPARATE capability, not a weaker ARMED. It exists for one
+             reason: five wire values can only be established by a real
+             live response, and confirming them by switching the whole
+             system to ARMED would mean the first real order is placed by
+             the general trading path rather than by a one-shot with
+             every precondition checked.
+
+             It authorises the bootstrap script and nothing else. The
+             general scanner -> live order path stays blocked, because
+             that path reads the three flags below and this posture does
+             not set them.
     ARMED    the operator turned the existing live-order flags on. The
              pilot then drives the ALREADY-EXISTING live entry and exit
              cycles. This module does not turn anything on; it only
@@ -25,6 +37,7 @@ from dataclasses import dataclass
 from broker.broker_config import env_bool
 
 POSTURE_OBSERVE = "OBSERVE"
+POSTURE_LIMITED_LIVE_BOOTSTRAP = "LIMITED_LIVE_BOOTSTRAP"
 POSTURE_ARMED = "ARMED"
 
 # The three flags that, together, mean "live entries are on". Named here
@@ -32,6 +45,12 @@ POSTURE_ARMED = "ARMED"
 FLAG_LIVE_ORDER = "KIS_LIVE_ORDER_ENABLED"
 FLAG_ROLLOUT = "LIVE_ROLLOUT_ENABLED"
 FLAG_ENTRY_DISABLED = "ENTRY_DISABLED"
+
+# A separate capability, deliberately NOT one of the three above. Setting
+# it does not enable live entries: the order gate, the live service unit
+# and the preflight all read the three flags, none of which this touches.
+# What it does is make the bootstrap posture reachable at all.
+FLAG_BOOTSTRAP_ENABLED = "LIVE_BOOTSTRAP_ENABLED"
 
 
 @dataclass(frozen=True)
@@ -46,9 +65,15 @@ class PostureDecision:
     rollout_enabled: bool
     entry_disabled: bool
 
+    bootstrap_enabled: bool = False
+
     @property
     def armed(self):
         return self.posture == POSTURE_ARMED
+
+    @property
+    def bootstrap(self):
+        return self.posture == POSTURE_LIMITED_LIVE_BOOTSTRAP
 
     def as_dict(self):
         return {
@@ -57,6 +82,7 @@ class PostureDecision:
             "live_order_enabled": self.live_order_enabled,
             "rollout_enabled": self.rollout_enabled,
             "entry_disabled": self.entry_disabled,
+            "bootstrap_enabled": self.bootstrap_enabled,
         }
 
 
@@ -74,23 +100,44 @@ def resolve_posture(env=None):
     live_order = env_bool(mapping, FLAG_LIVE_ORDER, False)
     rollout = env_bool(mapping, FLAG_ROLLOUT, False)
     entry_disabled = env_bool(mapping, FLAG_ENTRY_DISABLED, False)
+    bootstrap_enabled = env_bool(mapping, FLAG_BOOTSTRAP_ENABLED, False)
+
+    # ARMED is evaluated FIRST. The bootstrap capability is for reaching
+    # a live response while ARMED is still blocked; once the three flags
+    # really are on, ARMED is the honest description and the bootstrap
+    # capability must not shadow it.
+    if live_order and rollout and not entry_disabled:
+        return PostureDecision(
+            posture=POSTURE_ARMED,
+            reason="all three live-entry flags are set by the operator",
+            live_order_enabled=live_order, rollout_enabled=rollout,
+            entry_disabled=entry_disabled, bootstrap_enabled=bootstrap_enabled,
+        )
+
+    if bootstrap_enabled:
+        # Reachable with the three live flags in their SAFE state, which
+        # is the point: the general path stays blocked and only the
+        # one-shot script may act. The script itself still verifies every
+        # precondition and still needs LIVE_BOOTSTRAP_ACK at run time --
+        # this posture is permission to attempt, never permission to act.
+        return PostureDecision(
+            posture=POSTURE_LIMITED_LIVE_BOOTSTRAP,
+            reason=f"{FLAG_BOOTSTRAP_ENABLED} is set; one-shot bootstrap only, "
+                   "the general live path stays blocked",
+            live_order_enabled=live_order, rollout_enabled=rollout,
+            entry_disabled=entry_disabled, bootstrap_enabled=bootstrap_enabled,
+        )
 
     if not live_order:
         reason = f"{FLAG_LIVE_ORDER} is not enabled"
     elif not rollout:
         reason = f"{FLAG_ROLLOUT} is not enabled"
-    elif entry_disabled:
-        reason = f"{FLAG_ENTRY_DISABLED} is set"
     else:
-        return PostureDecision(
-            posture=POSTURE_ARMED,
-            reason="all three live-entry flags are set by the operator",
-            live_order_enabled=live_order, rollout_enabled=rollout,
-            entry_disabled=entry_disabled,
-        )
+        reason = f"{FLAG_ENTRY_DISABLED} is set"
     return PostureDecision(
         posture=POSTURE_OBSERVE, reason=reason, live_order_enabled=live_order,
         rollout_enabled=rollout, entry_disabled=entry_disabled,
+        bootstrap_enabled=bootstrap_enabled,
     )
 
 
