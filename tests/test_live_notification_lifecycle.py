@@ -466,3 +466,86 @@ class TestPayloadContracts:
             live_notifications.HALT_ACTIVATED, {"reason": "drill"}, test=True,
             send_fn=lambda m: captured.append(m) or True)
         assert captured[0].startswith("[TEST]")
+
+
+# ---------------------------------------------------------------------
+# PHASE A1/A4 + PHASE C -- fill deltas and position mismatch
+# ---------------------------------------------------------------------
+class TestFillDeltaNotifications:
+    """A poll loop observes the SAME cumulative fill repeatedly.
+    `lifecycle.record_fill()` is idempotent for a repeat observation, so
+    the notifier compares the cumulative quantity across the call and
+    stays silent when nothing moved. Without that, one 2-then-3 fill
+    would produce a message on every tick."""
+
+    def _record(self, *, filled, requested=5, price=100.0, remaining=None):
+        return {"filled_qty": filled, "requested_qty": requested,
+                "average_fill_price": price,
+                "remaining_qty": filled if remaining is None else remaining}
+
+    def _notified(self, monkeypatch, *, previously_filled, filled, requested=5):
+        import kis_position_manager as kpm
+
+        captured = []
+        monkeypatch.setattr(
+            live_notifications, "notify",
+            lambda event, fields=None, **kw: captured.append((event, fields)) or True)
+        kpm._notify_fill_delta(
+            self._record(filled=filled, requested=requested),
+            symbol="AAPL", previously_filled=previously_filled)
+        return captured
+
+    def test_a_partial_fill_reports_filled_and_remaining(self, monkeypatch):
+        captured = self._notified(monkeypatch, previously_filled=0, filled=2)
+        assert captured[0][0] == live_notifications.PARTIAL_FILL
+        assert captured[0][1]["filled_qty"] == 2
+        assert captured[0][1]["remaining_qty"] == 3
+
+    def test_the_completing_fill_reports_completion(self, monkeypatch):
+        captured = self._notified(monkeypatch, previously_filled=2, filled=5)
+        assert captured[0][0] == live_notifications.FILL_COMPLETED
+        assert captured[0][1]["filled_qty"] == 5
+
+    def test_the_2_plus_3_sequence_sends_exactly_two_messages(self, monkeypatch):
+        """The existing partial-fill regression, as a message sequence."""
+        first = self._notified(monkeypatch, previously_filled=0, filled=2)
+        second = self._notified(monkeypatch, previously_filled=2, filled=5)
+        assert [e for e, _ in first] == [live_notifications.PARTIAL_FILL]
+        assert [e for e, _ in second] == [live_notifications.FILL_COMPLETED]
+
+    def test_re_observing_the_same_fill_sends_nothing(self, monkeypatch):
+        assert self._notified(monkeypatch, previously_filled=2, filled=2) == []
+
+    def test_a_regressing_observation_sends_nothing(self, monkeypatch):
+        assert self._notified(monkeypatch, previously_filled=5, filled=2) == []
+
+    def test_no_duplicate_terminal_fill_event(self, monkeypatch):
+        """FILL_COMPLETED once, then silence on every later poll."""
+        first = self._notified(monkeypatch, previously_filled=2, filled=5)
+        again = self._notified(monkeypatch, previously_filled=5, filled=5)
+        assert [e for e, _ in first] == [live_notifications.FILL_COMPLETED]
+        assert again == []
+
+
+class TestPositionMismatchNotification:
+    def test_it_is_only_sent_on_a_real_divergence(self):
+        """A matching position must be silent -- an alert that fires every
+        tick on healthy state is an alert nobody reads."""
+        import ast
+        import pathlib
+
+        source = pathlib.Path("kis_position_manager.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        notifies = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                    and getattr(n.func, "attr", None) == "notify"]
+        mismatch = [n for n in notifies if any(
+            isinstance(a, ast.Attribute) and a.attr == "POSITION_MISMATCH" for a in n.args)]
+        assert len(mismatch) == 1, "POSITION_MISMATCH is emitted from more than one place"
+
+    def test_the_payload_names_the_blocking_action_and_no_account(self):
+        import kis_position_manager as kpm
+        import inspect
+
+        source = inspect.getsource(kpm.sync_kis_fills_and_manage_exits)
+        assert '"action": "NEW_ENTRY_BLOCKED"' in source
+        assert "kis_account" not in source

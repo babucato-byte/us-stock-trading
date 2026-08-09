@@ -58,6 +58,7 @@ from reconciliation import reconciliation_state
 from reconciliation.order_reconciler import reconcile_unknown_order
 from reconciliation.position_reconciler import reconcile_positions
 from state_store import db as state_db
+from operations import live_notifications
 
 
 class KISPositionManagerError(Exception):
@@ -232,6 +233,39 @@ def _reconcile_account_and_orders(*, kis_broker, conn, open_positions, kis_posit
     )
 
 
+def _notify_fill_delta(record, *, symbol, previously_filled):
+    """PARTIAL_FILL / FILL_COMPLETED, once per genuine fill delta.
+
+    The entry path polls KIS repeatedly, and `lifecycle.record_fill()` is
+    idempotent for a repeated observation of the same cumulative fill.
+    Notifying on every poll would turn a 2-then-3 fill into a stream of
+    identical messages, so this compares the cumulative quantity across
+    the call and stays silent when nothing moved.
+
+    Never raises: `notify()` cannot, and everything else here is
+    attribute reads with defaults.
+    """
+    filled = record.get("filled_qty") or 0
+    if filled <= (previously_filled or 0):
+        return  # the same fill observed again
+    requested = record.get("requested_qty") or 0
+    price = record.get("average_fill_price")
+    if requested and filled >= requested:
+        live_notifications.notify(
+            live_notifications.FILL_COMPLETED,
+            live_notifications.fill_completed_fields(
+                symbol=symbol, filled_qty=filled, fill_price=price,
+                position_qty=record.get("remaining_qty"), average_cost=price),
+        )
+    else:
+        live_notifications.notify(
+            live_notifications.PARTIAL_FILL,
+            live_notifications.partial_fill_fields(
+                symbol=symbol, filled_qty=filled,
+                remaining_qty=max(0, requested - filled), average_fill_price=price),
+        )
+
+
 def sync_kis_fills_and_manage_exits(*, kis_broker, broker_adapter, now=None, conn=None):
     """One tick of the sell/exit monitoring cycle. Never raises for a
     single-position failure -- returns a summary dict instead so a
@@ -276,6 +310,13 @@ def sync_kis_fills_and_manage_exits(*, kis_broker, broker_adapter, now=None, con
         if record["state"] in _FILL_PENDING_STATES:
             fill = _find_kis_fill_for_order(kis_broker, record.get("broker_order_id"), now=current)
             if fill is not None:
+                # Captured BEFORE the call so the notification below can
+                # tell a genuine new fill from the same cumulative fill
+                # observed again on the next poll. record_fill() is
+                # idempotent for a repeat observation, so comparing the
+                # cumulative quantity across it is the dedupe -- no new
+                # durable state is introduced for this.
+                previously_filled = record.get("filled_qty") or 0
                 try:
                     updated = lifecycle.record_fill(
                         position_id, fill["filled_qty"], fill["average_fill_price"],
@@ -284,6 +325,7 @@ def sync_kis_fills_and_manage_exits(*, kis_broker, broker_adapter, now=None, con
                     summary["skipped"].append((symbol, f"record_fill failed: {exc}"))
                     continue
                 summary["synced_fills"].append(symbol)
+                _notify_fill_delta(updated, symbol=symbol, previously_filled=previously_filled)
                 if updated["state"] == states.STOP_ACTIVE:
                     record = finalize_stop_and_targets_from_fill(position_id, fill["average_fill_price"])
                 else:
@@ -303,6 +345,15 @@ def sync_kis_fills_and_manage_exits(*, kis_broker, broker_adapter, now=None, con
         if kis_qty != record["remaining_qty"]:
             summary["reconciliation_blocked"].append(
                 (symbol, f"internal remaining_qty={record['remaining_qty']!r} != KIS quantity={kis_qty!r}")
+            )
+            # Only on a real divergence -- a matching position sends
+            # nothing. No account number: symbol and quantities only.
+            live_notifications.notify(
+                live_notifications.POSITION_MISMATCH,
+                {"symbol": symbol, "kis_qty": kis_qty,
+                 "local_qty": record["remaining_qty"],
+                 "reconciliation_state": "MISMATCH",
+                 "action": "NEW_ENTRY_BLOCKED"},
             )
             continue
 
