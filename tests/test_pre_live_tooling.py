@@ -166,17 +166,42 @@ class TestTheBootstrapCannotRunByAccident:
         the one that lets an order through."""
         assert "final_pre_live_check.sh" in BOOTSTRAP_SOURCE
 
-    def test_the_submission_step_is_not_wired(self):
-        """Until it is, the script must say so and exit non-zero rather
-        than appear to have succeeded."""
-        assert "BOOTSTRAP_NOT_IMPLEMENTED" in BOOTSTRAP_SOURCE
-        # The decisive property: it runs no Python at all, so it cannot
-        # reach a broker however its prose is worded.
+    def test_the_submission_step_is_wired_to_the_runner_only(self):
+        """The script itself must contain no order logic. It delegates to
+        one Python entry point and branches on its exit code -- so every
+        safety decision lives in testable Python rather than in bash."""
+        assert "BOOTSTRAP_NOT_IMPLEMENTED" not in BOOTSTRAP_SOURCE
+        assert "run_limited_live_bootstrap.py" in BOOTSTRAP_CODE
         executable = [l for l in BOOTSTRAP_CODE.splitlines()
                       if not l.strip().startswith(("printf", "echo"))]
         for line in executable:
-            for forbidden in ("python", "submit_order", "cancel_order"):
+            # It may INVOKE the runner; it may not name a transport verb
+            # itself, which would mean order logic had leaked into bash.
+            for forbidden in ("submit_order", "cancel_order", "submit_buy_order"):
                 assert forbidden not in line, f"{forbidden} in: {line.strip()}"
+
+    def test_it_invokes_the_runner_exactly_once_and_never_retries(self):
+        """A second invocation after an ambiguous first is precisely the
+        duplicate-order case the design exists to prevent."""
+        invocations = [l for l in BOOTSTRAP_CODE.splitlines()
+                       if "${PYTHON_BIN}" in l and "${RUNNER}" in l]
+        assert len(invocations) == 1, invocations
+        assigned = [l for l in BOOTSTRAP_CODE.splitlines()
+                    if l.strip().startswith("RUNNER=")]
+        assert len(assigned) == 1 and "run_limited_live_bootstrap.py" in assigned[0]
+        # No loop construct anywhere: the runner cannot be re-entered by
+        # the wrapper regardless of what it returned.
+        for looping in ("while ", "until ", "for ((", "for reason", " do\n"):
+            assert looping not in BOOTSTRAP_CODE, looping
+
+    def test_a_nonzero_runner_exit_is_never_treated_as_success(self):
+        for code, banner in (("1", "BOOTSTRAP_BLOCKED"),
+                             ("3", "BOOTSTRAP_UNKNOWN")):
+            assert f"{code})" in BOOTSTRAP_CODE
+            assert banner in BOOTSTRAP_CODE
+        assert "RETRY=BLOCKED" in BOOTSTRAP_CODE
+        assert "RECONCILIATION_REQUIRED=true" in BOOTSTRAP_CODE
+        assert "NEW_ENTRY_BLOCKED=true" in BOOTSTRAP_CODE
 
     def test_it_states_the_transport_and_retry_budget(self):
         assert "1 order, 0 retries" in BOOTSTRAP_SOURCE
@@ -426,3 +451,144 @@ class TestTheBootstrapPostureIsASeparateCapability:
 
     def test_pre_live_ready_still_requires_armed(self):
         assert 'check("POSTURE_NOT_ARMED", decision.posture == "ARMED"' in CHECK_SOURCE
+
+
+class TestReadyForLiveBootstrapIsActuallyReachable:
+    """A verdict that can never be produced is not a verdict.
+
+    Everything in this class runs the REAL checker script against a
+    throwaway git repository outside the project, with the Python half
+    replaced by a stub that emits a controlled result set. That isolates
+    what is being tested -- the shell-level checks and the verdict
+    arithmetic -- from a live KIS account and from whatever state this
+    working tree happens to be in.
+
+    The tolerated-reason list is deliberately tiny: ARMED_MATRIX_PENDING
+    and POSTURE_NOT_ARMED, the two things a bootstrap exists to resolve.
+    Anything else outstanding must still produce PRE_LIVE_BLOCKED, which
+    is what test_any_other_reason_blocks_it pins.
+    """
+
+    PY_LINES = [
+        "OK::OBSERVE_MATRIX_PENDING::7/7 confirmed",
+        "BAD::ARMED_MATRIX_PENDING::pending: order_path, order_tr_id_live_buy",
+        "OK::ARMED_PENDING_BEYOND_BOOTSTRAP::none",
+        "BOOTSTRAPABLE::yes",
+        "OK::RECONCILIATION_NOT_USABLE::fresh and clean (age 1.0s)",
+        "OK::HALT_ACTIVE::halted=False",
+        "BAD::POSTURE_NOT_ARMED::posture=LIMITED_LIVE_BOOTSTRAP",
+    ]
+
+    def _fixture(self, tmp_path, py_lines=None, env=None):
+        import os
+        import shutil
+
+        release = tmp_path / "release"
+        (release / "scripts").mkdir(parents=True)
+        shutil.copy(CHECK, release / "scripts" / CHECK.name)
+        (release / "README").write_text("fixture\n")
+        run = lambda *a: subprocess.run(  # noqa: E731
+            a, cwd=str(release), capture_output=True, text=True, timeout=60)
+        run("git", "init", "-q")
+        run("git", "config", "user.email", "fixture@example.invalid")
+        run("git", "config", "user.name", "fixture")
+        run("git", "add", "-A")
+        run("git", "commit", "-qm", "fixture")
+        head = run("git", "rev-parse", "HEAD").stdout.strip()
+
+        stub = tmp_path / "python-stub"
+        body = "\n".join(py_lines if py_lines is not None else self.PY_LINES)
+        stub.write_text("#!/usr/bin/env bash\ncat >/dev/null\n"
+                        f"cat <<'OUT'\n{body}\nOUT\n")
+        stub.chmod(0o755)
+
+        merged = {
+            **os.environ,
+            "TRADING_PROJECT_ROOT": str(release),
+            "PYTHON_BIN": str(stub),
+            "DEPLOYED_COMMIT": head,
+            "VALIDATED_COMMIT": head,
+            "KIS_ENV": "live",
+            "LIVE_ROLLOUT_MAX_POSITIONS": "1",
+            "LIVE_ROLLOUT_MAX_DAILY_ENTRIES": "1",
+            "LIVE_ROLLOUT_MAX_QUANTITY": "1",
+            "LIVE_ROLLOUT_ALLOWED_SYMBOLS": "AAPL",
+            "SLACK_WEBHOOK_URL": "https://hooks.slack.test/general",
+            "SLACK_ALERT_WEBHOOK_URL": "https://hooks.slack.test/alert",
+            "KIS_LIVE_SLACK_WEBHOOK_URL": "https://hooks.slack.test/kis-general",
+            "KIS_LIVE_SLACK_ALERT_WEBHOOK_URL": "https://hooks.slack.test/kis-alert",
+        }
+        merged.update(env or {})
+        return subprocess.run(
+            ["bash", str(release / "scripts" / CHECK.name)],
+            capture_output=True, text=True, timeout=180, env=merged, cwd=str(release))
+
+    def test_a_clean_fixture_reaches_ready_for_live_bootstrap(self, tmp_path):
+        result = self._fixture(tmp_path)
+        assert "READY_FOR_LIVE_BOOTSTRAP" in result.stdout, result.stdout
+        assert result.returncode == 0
+
+    def test_readiness_does_not_require_the_acknowledgement(self, tmp_path):
+        """READY -> operator ack -> BUY. Requiring the ack to reach READY
+        would invert that order and make the ack meaningless."""
+        for ack in ("false", ""):
+            result = self._fixture(tmp_path / f"ack-{ack or 'unset'}",
+                                   env={"LIVE_BOOTSTRAP_ACK": ack})
+            assert "READY_FOR_LIVE_BOOTSTRAP" in result.stdout, result.stdout
+
+    def test_a_missing_kis_live_webhook_blocks_readiness(self, tmp_path):
+        for missing in ("KIS_LIVE_SLACK_WEBHOOK_URL", "KIS_LIVE_SLACK_ALERT_WEBHOOK_URL"):
+            result = self._fixture(tmp_path / f"no-{missing}", env={missing: ""})
+            assert "KIS_LIVE_NOTIFICATION_NOT_CONFIGURED" in result.stdout
+            assert "READY_FOR_LIVE_BOOTSTRAP" not in result.stdout
+            assert result.returncode == 1
+
+    def test_the_alpaca_webhooks_alone_are_not_enough(self, tmp_path):
+        """The failure mode this closes: a deployment that looks notified
+        because the paper channels are configured."""
+        result = self._fixture(tmp_path, env={
+            "KIS_LIVE_SLACK_WEBHOOK_URL": "", "KIS_LIVE_SLACK_ALERT_WEBHOOK_URL": ""})
+        assert "SLACK_WEBHOOK_UNCONFIGURED" not in result.stdout
+        assert "KIS_LIVE_NOTIFICATION_NOT_CONFIGURED" in result.stdout
+
+    def test_the_kis_live_webhook_value_is_never_printed(self, tmp_path):
+        secret = "https://hooks.slack.test/kis-general-SECRETTOKEN"
+        result = self._fixture(tmp_path, env={"KIS_LIVE_SLACK_WEBHOOK_URL": secret})
+        assert "SECRETTOKEN" not in result.stdout
+        assert "SECRETTOKEN" not in result.stderr
+
+    def test_any_other_reason_blocks_it(self, tmp_path):
+        """The bootstrap verdict tolerates exactly two reason codes. A
+        third -- here, an unconfirmed OBSERVE value -- must still block."""
+        lines = list(self.PY_LINES)
+        lines[0] = "BAD::OBSERVE_MATRIX_PENDING::6/7 confirmed"
+        result = self._fixture(tmp_path, py_lines=lines)
+        assert "READY_FOR_LIVE_BOOTSTRAP" not in result.stdout
+        assert "PRE_LIVE_BLOCKED" in result.stdout
+
+    def test_an_allowlist_that_is_not_exactly_one_blocks_it(self, tmp_path):
+        for value in ("", "AAPL,MSFT"):
+            result = self._fixture(tmp_path / f"al-{len(value)}",
+                                   env={"LIVE_ROLLOUT_ALLOWED_SYMBOLS": value})
+            assert "LIVE_ALLOWLIST_NOT_EXACTLY_ONE" in result.stdout
+            assert "READY_FOR_LIVE_BOOTSTRAP" not in result.stdout
+
+    def test_a_non_bootstrapable_matrix_blocks_it(self, tmp_path):
+        """BOOTSTRAPABLE::no means something beyond the five live-only
+        values is unconfirmed, so the bootstrap would be premature."""
+        lines = [l.replace("BOOTSTRAPABLE::yes", "BOOTSTRAPABLE::no")
+                 for l in self.PY_LINES]
+        result = self._fixture(tmp_path, py_lines=lines)
+        assert "READY_FOR_LIVE_BOOTSTRAP" not in result.stdout
+
+    def test_the_checker_still_writes_nothing(self, tmp_path):
+        import hashlib
+
+        release = None
+        result = self._fixture(tmp_path)
+        assert result.returncode == 0
+        release = tmp_path / "release"
+        status = subprocess.run(["git", "status", "--porcelain"], cwd=str(release),
+                                capture_output=True, text=True, timeout=60)
+        assert status.stdout.strip() == "", status.stdout
+        assert hashlib.sha256  # the import is the point of the assertion above

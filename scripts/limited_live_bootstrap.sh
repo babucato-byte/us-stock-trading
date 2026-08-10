@@ -91,17 +91,36 @@ fi
 # Reached only when the readiness checker returned PRE_LIVE_READY and the
 # acknowledgement is set.
 #
-# NOT IMPLEMENTED YET, ON PURPOSE. The submission step is written once
-# the live-only bootstrap has an approved operating procedure and a named
-# candidate symbol; wiring a real-order call ahead of that would mean an
-# untested order path sitting behind one environment variable.
-#
-# When it is implemented it must go through execution_engine.
-# submit_buy_order() -- the same gate, idempotency ledger, reconciliation
-# snapshot and audit trail as every other order -- never a direct
-# broker.submit_order() call, and never inside a retry loop.
-printf '\nRESULT: BOOTSTRAP_NOT_IMPLEMENTED\n'
-printf 'All preconditions passed and the acknowledgement is set, but the\n'
-printf 'submission step is intentionally not wired yet. No order was placed.\n'
-printf 'Implement it via execution_engine.submit_buy_order() only.\n'
-exit 2
+# The runner goes through execution_engine.submit_buy_order() -- the same
+# gate, idempotency ledger, reservation, reconciliation snapshot, audit
+# trail and UNKNOWN policy as every other order -- never a direct
+# broker.submit_order() call, and never inside a retry loop. It is
+# invoked ONCE. This script does not loop, does not retry on any exit
+# code, and does not run it again after a failure: a second invocation
+# after an ambiguous first is exactly the duplicate-order case the whole
+# design exists to prevent.
+RUNNER="${RELEASE_ROOT}/scripts/run_limited_live_bootstrap.py"
+PYTHON_BIN="${PYTHON_BIN:-${RELEASE_ROOT}/venv/bin/python}"
+
+if [ ! -f "${RUNNER}" ]; then
+    printf '  [FAIL] bootstrap runner not found at %s\n' "${RUNNER}"
+    printf '\nRESULT: BOOTSTRAP_BLOCKED (RUNNER_MISSING)\n'
+    exit 1
+fi
+
+printf '\nSubmitting via execution_engine (one BUY, one share, no retry):\n'
+"${PYTHON_BIN}" "${RUNNER}"
+RUNNER_STATUS=$?
+
+printf '\n'
+case "${RUNNER_STATUS}" in
+    0) printf 'RESULT: BOOTSTRAP_COMPLETED\n' ;;
+    1) printf 'RESULT: BOOTSTRAP_BLOCKED\n'
+       printf 'No order was placed.\n' ;;
+    3) printf 'RESULT: BOOTSTRAP_UNKNOWN\n'
+       printf 'RETRY=BLOCKED  RECONCILIATION_REQUIRED=true  NEW_ENTRY_BLOCKED=true\n'
+       printf 'The order may be live at KIS. Do not re-run this script.\n' ;;
+    *) printf 'RESULT: BOOTSTRAP_FAULTED (exit %s)\n' "${RUNNER_STATUS}"
+       printf 'Do not re-run. Reconcile against KIS order history first.\n' ;;
+esac
+exit "${RUNNER_STATUS}"
