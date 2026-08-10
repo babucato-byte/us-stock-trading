@@ -940,7 +940,8 @@ class KISBroker:
 
     # -- order submission ---------------------------------------------
 
-    def submit_order(self, order_intent: OrderIntent, instrument, *, authorization=None) -> ExecutionRecord:
+    def submit_order(self, order_intent: OrderIntent, instrument, *, authorization=None,
+                     bootstrap_capability=None) -> ExecutionRecord:
         """The ONLY method in this codebase that places a real KIS order.
         CODEX-043: `authorization` MUST be a currently-valid
         `execution.authorization.AuthorizedExecution` for this exact
@@ -960,7 +961,12 @@ class KISBroker:
         credential-rotation-requires-new-instance pattern)."""
         from execution import authorization as _authz
         _authz.consume(authorization, order_intent, expected_action="order")
-        self.config.validate_live_order_allowed()
+        # Both checks are PRE-TRANSPORT by construction: neither touches
+        # the network, so a failure here means the order definitively did
+        # not reach KIS. execution_engine relies on that to release the
+        # durable row instead of leaving it possibly-in-flight.
+        self.config.validate_live_order_allowed(
+            bootstrap_capability=bootstrap_capability, order_intent=order_intent)
         if order_intent.order_type != "limit":
             raise KISBrokerError("only limit orders are permitted in this pilot")
         tr_id = TR_ID_ORDER_US.get((self._env_key(), order_intent.side))
@@ -1029,7 +1035,8 @@ class KISBroker:
             average_fill_price=None, status="ACCEPTED", submitted_at=current, updated_at=current,
         )
 
-    def cancel_order(self, order_intent: OrderIntent, instrument, broker_order_id: str, *, authorization=None) -> ExecutionRecord:
+    def cancel_order(self, order_intent: OrderIntent, instrument, broker_order_id: str, *,
+                     authorization=None, bootstrap_capability=None) -> ExecutionRecord:
         """CODEX-043: `authorization` MUST be a currently-valid
         AuthorizedExecution minted by `execution.authorization.
         authorize_cancel()` (which does NOT check HALT -- cancels of an
@@ -1037,7 +1044,8 @@ class KISBroker:
         policy -- but does run order_gate.evaluate_cancel_gate())."""
         from execution import authorization as _authz
         _authz.consume(authorization, order_intent, expected_action="cancel")
-        self.config.validate_live_order_allowed()
+        self.config.validate_live_order_allowed(
+            bootstrap_capability=bootstrap_capability, order_intent=order_intent)
         tr_id = TR_ID_CANCEL[self._env_key()]
         excg = _order_excg_for(order_intent.exchange)
         payload = {

@@ -77,6 +77,7 @@ from domain.cash_sizing import (
 from domain.instrument import InstrumentError
 from domain.order_intent import OrderIntent, OrderIntentError
 from domain.signal import SignalError, build_signal
+from execution import bootstrap_capability as capability_mod
 from execution import entry_limits, execution_engine, idempotency, order_gate
 from execution.execution_engine import ExecutionEngineError
 from live_pilot import posture as posture_mod
@@ -128,6 +129,7 @@ SAFETY_STATE_UNREADABLE = "SAFETY_STATE_UNREADABLE"
 TRANSPORT_BUDGET_EXHAUSTED = "TRANSPORT_BUDGET_EXHAUSTED"
 ORDER_UNKNOWN_TERMINAL = "ORDER_UNKNOWN_TERMINAL"
 CANCEL_NOT_OPEN_AT_BROKER = "CANCEL_NOT_OPEN_AT_BROKER"
+BOOTSTRAP_CAPABILITY_UNAVAILABLE = "BOOTSTRAP_CAPABILITY_UNAVAILABLE"
 
 
 class BootstrapBlocked(Exception):
@@ -525,7 +527,9 @@ def select_candidate(*, broker, rollout, deployed_commit, now):
 # ---------------------------------------------------------------------
 
 class BootstrapResult:
-    def __init__(self, *, candidate, order_intent, execution_result, guard, verification=None):
+    def __init__(self, *, candidate, order_intent, execution_result, guard, verification=None,
+                 capability=None):
+        self.capability = capability
         self.candidate = candidate
         self.order_intent = order_intent
         self.execution_result = execution_result
@@ -593,6 +597,19 @@ def run_bootstrap_buy(*, broker, conn, rollout=None, now=None, env=None):
             reason_codes=("ORDER_INTENT_INVALID",),
         ) from exc
 
+    # The authorisation the BROKER's last-line guard requires. Minted
+    # here and nowhere else: an ordinary trading path has no way to
+    # obtain one, which is what keeps LIVE_BOOTSTRAP_ENABLED from
+    # widening anything but this single order.
+    try:
+        capability = capability_mod.mint(
+            symbol=candidate.symbol, allowed_symbols=rollout.allowed_symbols, env=mapping)
+    except capability_mod.BootstrapCapabilityError as exc:
+        raise BootstrapBlocked(
+            f"bootstrap capability could not be minted: {exc}",
+            reason_codes=(BOOTSTRAP_CAPABILITY_UNAVAILABLE,),
+        ) from exc
+
     guard = BootstrapTransportGuard(broker)
     audit_run_id = shadow_audit.new_run_id()
     recheck = {"reasons": None}
@@ -642,6 +659,7 @@ def run_bootstrap_buy(*, broker, conn, rollout=None, now=None, env=None):
             order_intent=order_intent, buy_gate_context_builder=_buy_ctx_builder,
             conn=conn, broker=guard, instrument=candidate.instrument,
             account_id=account_id, now=current, audit_run_id=audit_run_id,
+            bootstrap_capability=capability,
         )
     except KISAmbiguousResponseError as exc:
         # The engine has already written durable UNKNOWN and sent
@@ -687,7 +705,7 @@ def run_bootstrap_buy(*, broker, conn, rollout=None, now=None, env=None):
             candidate.symbol)
 
     return BootstrapResult(candidate=candidate, order_intent=order_intent,
-                           execution_result=result, guard=guard)
+                           execution_result=result, guard=guard, capability=capability)
 
 
 # ---------------------------------------------------------------------
@@ -840,6 +858,7 @@ def cancel_if_open(*, conn, result, verification, order_intent, account_id, env=
             cancel_gate_context_builder=_cancel_ctx_builder, conn=conn,
             broker=guard, instrument=result.candidate.instrument,
             audit_run_id=shadow_audit.new_run_id(),
+            bootstrap_capability=getattr(result, "capability", None),
         )
     except BootstrapTransportBudgetExceeded:
         raise

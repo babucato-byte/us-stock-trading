@@ -109,16 +109,51 @@ class KISConfig:
             raise KISConfigError("KIS account read is disabled (KIS_ACCOUNT_READ_ENABLED is not true).")
         return True
 
-    def validate_live_order_allowed(self):
+    def validate_live_order_allowed(self, *, bootstrap_capability=None, order_intent=None):
         """Fail-closed order gate, independent of read access -- an
         operator can enable account/price reads (Shadow Mode) without
-        also enabling real order submission."""
+        also enabling real order submission.
+
+        Two authorisations are recognised, and only two:
+
+        1. KIS_LIVE_ORDER_ENABLED=true -- ordinary live trading. This is
+           the general grant and its condition is unchanged.
+        2. A `BootstrapCapability` for THIS order -- the one-shot LIMITED
+           LIVE bootstrap. Narrow by construction: it names the symbol,
+           side, quantity and order type it authorises, and
+           `bootstrap_capability.validate()` re-checks all of them
+           against `order_intent` plus the posture, capability flag and
+           acknowledgement.
+
+        The second exists because the bootstrap must be able to place its
+        one order while KIS_LIVE_ORDER_ENABLED stays false -- that flag
+        is the ARMED grant, and turning it on to place one share would
+        authorise everything else too.
+
+        Note what is NOT accepted: an environment variable on its own. A
+        caller with no capability object gets the same refusal it always
+        did, however LIVE_BOOTSTRAP_ENABLED is set. That is the whole
+        point -- the ordinary paths never construct a capability, so
+        enabling the bootstrap cannot widen them.
+        """
         self.validate_credentials()
         if self.kis_env not in ("paper", "live"):
             raise KISConfigError(f"KIS_ENV must be 'paper' or 'live', got {self.kis_env!r}")
-        if not self.live_order_enabled:
-            raise KISConfigError(
-                "KIS live order submission is disabled (KIS_LIVE_ORDER_ENABLED is not true). "
-                "This is the pre-activation default -- see spec §21/§28."
-            )
-        return True
+        if self.live_order_enabled:
+            return True
+
+        if bootstrap_capability is not None:
+            from execution import bootstrap_capability as _cap
+
+            try:
+                _cap.validate(bootstrap_capability, order_intent)
+            except _cap.BootstrapCapabilityError as exc:
+                raise KISConfigError(
+                    f"bootstrap capability does not authorise this order: {exc}") from exc
+            return True
+
+        raise KISConfigError(
+            "KIS live order submission is disabled (KIS_LIVE_ORDER_ENABLED is not true) "
+            "and no bootstrap capability was supplied. "
+            "This is the pre-activation default -- see spec §21/§28."
+        )

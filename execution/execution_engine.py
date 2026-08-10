@@ -44,6 +44,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 from brokers.kis_broker import KISAmbiguousResponseError, KISBrokerError
+from brokers.kis_config import KISConfigError
 from execution import authorization, idempotency, order_gate, order_repository
 from execution.authorization import UnauthorizedExecutionError
 from execution.order_repository import (
@@ -91,6 +92,11 @@ REASON_HALT = "HALT"
 REASON_GATE = "GATE"
 REASON_STATE_PERSISTENCE = "STATE_PERSISTENCE"
 REASON_AUDIT_PERSISTENCE = "AUDIT_PERSISTENCE"
+# The broker's own guard refused before it touched the network. Distinct
+# from REASON_GATE (our gate said no) and from a broker rejection (KIS
+# said no): here nothing was ever sent, which is what makes it safe to
+# release the durable row and the entry slot it was holding.
+REASON_PRE_TRANSPORT_CONFIG = "PRE_TRANSPORT_CONFIG_REJECTED"
 REASON_AUDIT_CONTEXT_MISSING = "AUDIT_CONTEXT_MISSING"
 REASON_CANCEL_FINAL_STATE_PERSISTENCE = "CANCEL_FINAL_STATE_PERSISTENCE"
 REASON_STATE_READ_FAILURE = "STATE_READ_FAILURE"
@@ -252,7 +258,7 @@ def _audit_before_transport(*, audit_run_id, event_type, order_intent, side_labe
 
 
 def submit_buy_order(*, order_intent, buy_gate_context_builder, conn, broker, instrument,
-                     account_id, audit_run_id, now=None):
+                     account_id, audit_run_id, now=None, bootstrap_capability=None):
     """`buy_gate_context_builder` is a ONE-ARG callable the caller
     supplies that takes the `ReconciliationSnapshot` this engine just
     built and returns a fully-populated `order_gate.BuyGateContext` --
@@ -266,6 +272,7 @@ def submit_buy_order(*, order_intent, buy_gate_context_builder, conn, broker, in
         order_intent=order_intent, gate_context_builder=buy_gate_context_builder,
         gate_fn=order_gate.evaluate_buy_gate, conn=conn, broker=broker, instrument=instrument,
         account_id=account_id, now=now, side_label="buy", audit_run_id=audit_run_id,
+        bootstrap_capability=bootstrap_capability,
     )
 
 
@@ -279,11 +286,13 @@ def submit_sell_order(*, order_intent, sell_gate_context_builder, conn, broker, 
         order_intent=order_intent, gate_context_builder=sell_gate_context_builder,
         gate_fn=order_gate.evaluate_sell_gate, conn=conn, broker=broker, instrument=instrument,
         account_id=account_id, now=now, side_label="sell", audit_run_id=audit_run_id,
+        # A SELL is never a bootstrap order: the bootstrap places one BUY.
+        bootstrap_capability=None,
     )
 
 
 def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, broker, instrument,
-                       account_id, now, side_label, audit_run_id):
+                       account_id, now, side_label, audit_run_id, bootstrap_capability=None):
     """The single new-order flow both submit_buy_order() and
     submit_sell_order() run -- buy and sell differ ONLY in which gate
     function evaluates the context, never in which safety steps run or
@@ -432,7 +441,40 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
         )
 
         try:
-            execution_record = broker.submit_order(order_intent, instrument, authorization=authorized)
+            # The capability is passed ONLY when one exists. An ordinary
+            # order's call is then byte-identical to what it always was:
+            # a caller without a capability cannot even name the
+            # parameter, let alone supply one.
+            _transport_kwargs = ({"bootstrap_capability": bootstrap_capability}
+                                 if bootstrap_capability is not None else {})
+            execution_record = broker.submit_order(
+                order_intent, instrument, authorization=authorized, **_transport_kwargs)
+        except KISConfigError as exc:
+            # The broker's own last-line guard refused BEFORE any network
+            # call -- validate_live_order_allowed() runs ahead of the
+            # request and touches nothing. So this order definitively did
+            # not reach KIS, and leaving it SUBMITTING would tell
+            # recovery the opposite: that it might be in flight, holding
+            # an entry slot and a position slot against an order that
+            # does not exist.
+            #
+            # Only exception types that are pre-transport BY CONSTRUCTION
+            # may be classified this way. KISBrokerError is NOT one of
+            # them (it is raised for definite broker rejections after the
+            # request), and KISAmbiguousResponseError certainly is not.
+            _reject(conn, record, event_type="TRANSPORT_NOT_ATTEMPTED",
+                    reason=f"{REASON_PRE_TRANSPORT_CONFIG}: {exc}")
+            live_notifications.notify(
+                live_notifications.ORDER_REJECTED,
+                {"symbol": order_intent.symbol, "side": side_label,
+                 "quantity": order_intent.quantity, "limit_price": order_intent.limit_price,
+                 "reason": REASON_PRE_TRANSPORT_CONFIG,
+                 "transport_attempted": False},
+            )
+            raise ExecutionEngineError(
+                f"{side_label} order refused by the broker guard before transport: {exc}",
+                reason_code=REASON_PRE_TRANSPORT_CONFIG,
+            ) from exc
         except KISAmbiguousResponseError as exc:
             # spec §9: the response was lost. The order is UNKNOWN and is
             # never automatically re-submitted -- only reconciliation
@@ -623,7 +665,7 @@ def _force_unknown_reported(conn, record, *, reason, now, broker_order_id=None):
 
 
 def submit_cancel(*, order_intent, broker_order_id, cancel_gate_context_builder, conn, broker,
-                   instrument, audit_run_id, now=None):
+                   instrument, audit_run_id, now=None, bootstrap_capability=None):
     """CODEX-043: cancels a durable, already-submitted order. Uses
     authorization.authorize_cancel() -- deliberately NOT blocked by HALT
     (an existing unfilled order may always be cancelled to reduce risk),
@@ -685,7 +727,7 @@ def submit_cancel(*, order_intent, broker_order_id, cancel_gate_context_builder,
             order_intent=order_intent, broker_order_id=broker_order_id,
             cancel_gate_context_builder=cancel_gate_context_builder, conn=conn, broker=broker,
             instrument=instrument, audit_run_id=audit_run_id, current=current,
-            transport=transport,
+            transport=transport, bootstrap_capability=bootstrap_capability,
         )
         inner_returned = True
     except FatalRepositoryConnectionError as exc:
@@ -936,6 +978,7 @@ def _finalize_cancel(*, audit_run_id, terminal_event, order_intent, broker_order
 
 
 def _cancel_inner(*, order_intent, broker_order_id, cancel_gate_context_builder, conn, broker,
+                   bootstrap_capability=None,
                    instrument, audit_run_id, current, transport):
     """The cancel flow itself. Raises for every refusal so submit_cancel()
     above owns terminal-event handling in exactly one place.
@@ -1018,8 +1061,11 @@ def _cancel_inner(*, order_intent, broker_order_id, cancel_gate_context_builder,
         # From here on, any failure is a POST-transport failure.
         transport["attempted"] = True
         try:
+            _cancel_kwargs = ({"bootstrap_capability": bootstrap_capability}
+                              if bootstrap_capability is not None else {})
             execution_record = broker.cancel_order(
                 order_intent, instrument, broker_order_id, authorization=authorized,
+                **_cancel_kwargs,
             )
         except KISAmbiguousResponseError as exc:
             _force_unknown(conn, record, reason=str(exc), now=current)

@@ -86,13 +86,15 @@ class _FakeBroker:
             raise self.read_exc
         return self.fills
 
-    def submit_order(self, order_intent, instrument, *, authorization=None):
+    def submit_order(self, order_intent, instrument, *, authorization=None,
+                     bootstrap_capability=None):
         self.calls.append((order_intent, instrument))
         if self.raise_exc is not None:
             raise self.raise_exc
         return self.response
 
-    def cancel_order(self, order_intent, instrument, broker_order_id, *, authorization=None):
+    def cancel_order(self, order_intent, instrument, broker_order_id, *, authorization=None,
+                     bootstrap_capability=None):
         self.cancel_calls.append((order_intent, instrument, broker_order_id))
         if self.raise_exc is not None:
             raise self.raise_exc

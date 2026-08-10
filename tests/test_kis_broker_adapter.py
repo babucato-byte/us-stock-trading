@@ -79,7 +79,8 @@ class _FakeKISBroker:
             account_id=ACCOUNT_ID,
         )
 
-    def submit_order(self, order_intent, instrument, *, authorization=None):
+    def submit_order(self, order_intent, instrument, *, authorization=None,
+                     bootstrap_capability=None):
         self.submit_calls.append((order_intent, instrument))
         if self.submit_raise is not None:
             raise self.submit_raise
