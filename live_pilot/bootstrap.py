@@ -82,6 +82,7 @@ from execution import entry_limits, execution_engine, idempotency, order_gate
 from execution.execution_engine import ExecutionEngineError
 from live_pilot import posture as posture_mod
 from market_data.base import MarketDataProviderError
+from market_data import candidate_store
 from market_data.exchange_registry import ExchangeResolutionError, build_kis_instrument
 from market_data.kis_validation_provider import KISValidationProvider
 from market_hours import us_trading_day
@@ -130,6 +131,9 @@ TRANSPORT_BUDGET_EXHAUSTED = "TRANSPORT_BUDGET_EXHAUSTED"
 ORDER_UNKNOWN_TERMINAL = "ORDER_UNKNOWN_TERMINAL"
 CANCEL_NOT_OPEN_AT_BROKER = "CANCEL_NOT_OPEN_AT_BROKER"
 BOOTSTRAP_CAPABILITY_UNAVAILABLE = "BOOTSTRAP_CAPABILITY_UNAVAILABLE"
+NO_CANDIDATE = "NO_CANDIDATE"
+STALE_CANDIDATE = "STALE_CANDIDATE"
+CANDIDATE_SYMBOL_NOT_PUBLISHED = "CANDIDATE_SYMBOL_NOT_PUBLISHED"
 
 
 class BootstrapBlocked(Exception):
@@ -451,6 +455,31 @@ def select_candidate(*, broker, rollout, deployed_commit, now):
             reason_codes=(LIVE_ALLOWLIST_NOT_EXACTLY_ONE,),
         )
     symbol = allowed[0]
+
+    # The published candidate set must be TODAY's and must actually
+    # contain this symbol. Without this, a stale file left in the shared
+    # store from a previous session would let the bootstrap trade on
+    # yesterday's reasoning -- and the live re-score below would not
+    # catch it, because a symbol can still score well on a day the
+    # scanner never nominated it.
+    try:
+        rows, manifest = candidate_store.load_verified(trading_day=us_trading_day(now))
+    except candidate_store.CandidatesStale as exc:
+        raise BootstrapBlocked(
+            f"published candidates are not usable: {exc}",
+            reason_codes=(STALE_CANDIDATE,),
+        ) from exc
+    except candidate_store.CandidatesUnavailable as exc:
+        raise BootstrapBlocked(
+            f"no published candidates: {exc}", reason_codes=(NO_CANDIDATE,),
+        ) from exc
+
+    if candidate_store.find(symbol, rows=rows) is None:
+        raise BootstrapBlocked(
+            f"{symbol} is allow-listed but today's scanner did not nominate it "
+            f"(published: {[r.get('symbol') for r in rows]})",
+            reason_codes=(CANDIDATE_SYMBOL_NOT_PUBLISHED,),
+        )
 
     analysis = pso.analyze_stock(symbol)
     if analysis is None or analysis.get("score", 0) < SCORE_THRESHOLD:

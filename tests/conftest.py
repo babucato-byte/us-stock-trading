@@ -45,6 +45,13 @@ def _isolate_kis_rate_limiter(monkeypatch, tmp_path):
     # MEDIUM: same reasoning for the shared token cache -- an unisolated
     # test would read/write a real token file at the repo root.
     monkeypatch.setenv("KIS_TOKEN_CACHE_FILE", str(tmp_path / "KIS_TOKEN_CACHE.json"))
+    # Same reasoning again for the shared candidate store. The scanner
+    # publishes to it from save_candidate_files(), and that path is
+    # resolved at call time -- so redirecting the scanner's module-level
+    # file constants, as several tests do, does NOT cover it. Without
+    # this, any test that runs the scanner publishes a candidate CSV and
+    # manifest into the repository root.
+    monkeypatch.setenv("KIS_CANDIDATE_DIR", str(tmp_path / "candidates"))
     monkeypatch.setenv("KIS_READ_MIN_INTERVAL_SECONDS", "0")
     monkeypatch.setenv("KIS_TOKEN_MIN_INTERVAL_SECONDS", "0")
     monkeypatch.setenv("KIS_ORDER_MIN_INTERVAL_SECONDS", "0")

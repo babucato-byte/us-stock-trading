@@ -495,6 +495,21 @@ def _load_symbols_from_csv(path):
 
 
 def load_watchlist():
+    """Shared store first, then this release's own CSVs.
+
+    The shared store is release-independent, so a freshly deployed
+    release sees the same candidates as every other one. The local files
+    remain as a fallback for the legacy working copy, which still writes
+    them beside its own source -- removing that fallback would break the
+    dashboard and health-check paths for no gain here.
+    """
+    from market_data import candidate_store
+
+    shared = candidate_store.symbols()
+    if shared:
+        print(f"Loaded {len(shared)} symbols from the shared candidate store")
+        return shared
+
     order_symbols = _load_symbols_from_csv(ORDER_CANDIDATES_FILE)
     if order_symbols:
         print(f"Loaded {len(order_symbols)} symbols from order_candidates.csv")

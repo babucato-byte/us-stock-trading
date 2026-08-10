@@ -132,6 +132,29 @@ SAFE_ENV = {
 }
 
 
+@pytest.fixture
+def published(tmp_path, monkeypatch):
+    """A candidate set published for today, the way the scanner would.
+
+    select_candidate() now refuses to act on candidates that are not
+    today's and do not name the allow-listed symbol, so any test that
+    reaches it has to publish first."""
+    from market_data import candidate_store
+    from market_hours import us_trading_day
+
+    monkeypatch.setenv(candidate_store.CANDIDATE_DIR_ENV, str(tmp_path / "candidates"))
+
+    def _publish(symbol=SYMBOL, *, trading_day=None, generated_at=None):
+        csv_bytes = ("symbol,price,score\n%s,10.0,100\n" % symbol).encode()
+        return candidate_store.publish(
+            csv_bytes,
+            trading_day=trading_day or us_trading_day(NOW),
+            generated_at=generated_at or NOW)
+
+    _publish()
+    return _publish
+
+
 @pytest.fixture(autouse=True)
 def _no_state_outside_tmp(tmp_path, monkeypatch):
     """Nothing in this file may write to the repository.
@@ -332,7 +355,7 @@ class TestQuantityIsNotConfigurable:
         body = source.split("BOOTSTRAP_QUANTITY = 1", 1)[1]
         assert "BOOTSTRAP_QUANTITY =" not in body, "quantity is reassigned somewhere"
 
-    def test_cash_sizing_can_only_veto_never_enlarge(self, monkeypatch):
+    def test_cash_sizing_can_only_veto_never_enlarge(self, monkeypatch, published):
         """Affordability is a veto, not an input. Even with cash for
         hundreds of shares the order is one share."""
         seen = {}
@@ -400,7 +423,7 @@ class TestEachPreconditionBlocksOnItsOwn:
                     deployed_commit="abc123", now=NOW)
             assert bootstrap.LIVE_ALLOWLIST_NOT_EXACTLY_ONE in caught.value.reason_codes
 
-    def test_K_insufficient_cash_blocks_with_zero_transport(self, monkeypatch):
+    def test_K_insufficient_cash_blocks_with_zero_transport(self, monkeypatch, published):
         monkeypatch.setattr(bootstrap.pso, "analyze_stock",
                             lambda s: {"score": 99, "price": 500.0})
         monkeypatch.setattr(bootstrap, "build_kis_instrument",
@@ -475,7 +498,7 @@ class TestEachPreconditionBlocksOnItsOwn:
 
 
 class TestTheScannerThresholdIsNotLowered:
-    def test_M_a_below_threshold_candidate_is_refused(self, monkeypatch):
+    def test_M_a_below_threshold_candidate_is_refused(self, monkeypatch, published):
         monkeypatch.setattr(bootstrap.pso, "analyze_stock",
                             lambda s: {"score": bootstrap.SCORE_THRESHOLD - 1, "price": 10.0})
         with pytest.raises(bootstrap.BootstrapBlocked) as caught:

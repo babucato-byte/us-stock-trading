@@ -658,6 +658,33 @@ def save_candidate_files(buckets):
     buckets.strong_candidates.to_csv(STRONG_CANDIDATES_FILE, index=False)
     buckets.order_candidates.to_csv(ORDER_CANDIDATES_FILE, index=False)
     buckets.candidates[["symbol"]].to_csv(PREVIOUS_CANDIDATES_FILE, index=False)
+    _publish_to_shared_store(buckets.order_candidates)
+
+
+def _publish_to_shared_store(order_candidates):
+    """Also publish the order candidates to the release-independent
+    shared store, atomically and with a freshness manifest.
+
+    The local CSVs above stay exactly as they were -- the dashboard,
+    health check and Slack report all read them. This adds the one copy
+    that trading reads, so no release ever needs a file carried into it
+    by hand.
+
+    Never raises: the scanner's job is to scan. A publication failure is
+    logged and leaves the previous published set in place, which the
+    consumer will then correctly reject as stale rather than act on.
+    """
+    try:
+        from market_data import candidate_store
+        from market_hours import us_trading_day
+
+        manifest = candidate_store.publish_dataframe(
+            order_candidates, trading_day=us_trading_day())
+        print(f"[CANDIDATE STORE] published {len(order_candidates)} rows "
+              f"for {manifest['trading_day']} to {candidate_store.candidate_path()}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[CANDIDATE STORE] publication FAILED ({type(exc).__name__}: {exc}); "
+              f"local CSVs are written, but trading will treat the shared store as stale")
 
 
 def classify_candidate(row, smart_money_min):
