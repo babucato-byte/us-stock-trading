@@ -88,6 +88,16 @@ else
     fail SLACK_WEBHOOK_UNCONFIGURED
 fi
 
+# KIS live has its own two webhooks and never falls back to the Alpaca
+# pair above. Both must be set: without them a real order would be
+# placed with its entire lifecycle -- including an UNKNOWN -- going
+# nowhere. Only presence is checked; the URLs are never printed.
+if [ -n "${KIS_LIVE_SLACK_WEBHOOK_URL:-}" ] && [ -n "${KIS_LIVE_SLACK_ALERT_WEBHOOK_URL:-}" ]; then
+    pass "KIS live Slack webhooks configured (general + alert)"
+else
+    fail KIS_LIVE_NOTIFICATION_NOT_CONFIGURED
+fi
+
 # -- 3. everything that needs the code and the account ------------------
 # One Python process for the checks that need imports or a KIS read, so
 # the token is issued at most once.

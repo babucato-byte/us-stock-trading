@@ -385,19 +385,35 @@ class TestRedaction:
 # Routing and payload contracts (§7)
 # ---------------------------------------------------------------------
 class TestRouting:
-    def test_urgent_events_go_to_the_alert_webhook(self):
-        from operations import alerts
+    """KIS live traffic goes to KIS live webhooks. Both halves matter: the
+    urgent/routine split, and the fact that neither half can end up in the
+    Alpaca channels."""
+
+    def test_urgent_events_go_to_the_kis_live_alert_webhook(self):
+        import slack_utils
 
         for event in (live_notifications.ORDER_UNKNOWN, live_notifications.HALT_ACTIVATED,
                       live_notifications.RECONCILIATION_MISMATCH):
-            assert live_notifications._sender_for(event) is alerts.send_alert
+            assert live_notifications._sender_for(event) is slack_utils.send_kis_live_alert
 
-    def test_routine_events_go_to_the_general_webhook(self):
+    def test_routine_events_go_to_the_kis_live_general_webhook(self):
         import slack_utils
 
         for event in (live_notifications.ORDER_SUBMITTED, live_notifications.FILL_COMPLETED,
                       live_notifications.MARKET_START, live_notifications.DAILY_SUMMARY):
-            assert live_notifications._sender_for(event) is slack_utils.send_slack_message
+            assert live_notifications._sender_for(event) is slack_utils.send_kis_live_message
+
+    def test_no_event_can_reach_an_alpaca_webhook(self):
+        """The decisive property: exhaustive over EVERY event, because a
+        single routine event slipping into the paper channel is a real
+        order nobody sees."""
+        import slack_utils
+        from operations import alerts
+
+        forbidden = {slack_utils.send_slack_message, slack_utils.send_slack_alert,
+                     alerts.send_alert}
+        for event in sorted(live_notifications.EVENTS):
+            assert live_notifications._sender_for(event) not in forbidden, event
 
     def test_no_new_webhook_configuration_is_introduced(self):
         """It must not read a webhook URL of its own -- the two existing

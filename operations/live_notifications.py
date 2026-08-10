@@ -9,10 +9,26 @@ reconciliation formatters, and no KIS caller invoked them. A first real
 order would have submitted, filled, partially filled, gone UNKNOWN or
 been cancelled without a single message.
 
-This module is the one place those events are worded and sent. It adds no
-new webhook: `alerts.send_alert()` -> `slack_utils.send_slack_alert()` is
-the existing channel, and `notification_health.send_with_health_tracking`
-is the existing delivery-failure bookkeeping.
+This module is the one place those events are worded and sent.
+
+Channel
+-------
+KIS live traffic has its own two webhooks and shares nothing with Alpaca:
+
+    KIS_LIVE_SLACK_WEBHOOK_URL         routine lifecycle
+    KIS_LIVE_SLACK_ALERT_WEBHOOK_URL   urgent (see URGENT_EVENTS)
+
+There is no fallback to `SLACK_WEBHOOK_URL` / `SLACK_ALERT_WEBHOOK_URL`.
+Those carry Alpaca paper fills and scanner output; a real-money order in
+that stream is an order nobody notices, and a fallback would let an
+unconfigured deployment place one while looking correctly notified.
+Unset webhooks are a readiness blocker instead
+(KIS_LIVE_NOTIFICATION_NOT_CONFIGURED), and every message is prefixed
+`[KIS LIVE]` -- `[KIS LIVE][CRITICAL]` when urgent -- so the distinction
+survives even if the channels are later merged by someone else.
+
+`notification_health.send_with_health_tracking` remains the existing
+delivery-failure bookkeeping.
 
 The rule that matters
 ---------------------
@@ -47,7 +63,6 @@ redactor is the backstop, not the plan.
 import logging
 
 from execution.secret_redaction import mask_account_number, redact_value
-from operations import alerts
 
 logger = logging.getLogger(__name__)
 
@@ -115,16 +130,24 @@ UNKNOWN_RECONCILIATION_LINE = "RECONCILIATION_REQUIRED=true"
 
 _TEST_PREFIX = "[TEST]"
 
+# Every message this module produces is real money on a real account, and
+# it shares an operator's screen with Alpaca paper traffic. The prefix is
+# how that distinction survives a glance at a phone notification.
+KIS_LIVE_PREFIX = "[KIS LIVE]"
+KIS_LIVE_CRITICAL_PREFIX = "[KIS LIVE][CRITICAL]"
+
 
 def _format(event, fields, *, test=False):
-    """`[EVENT]` headline plus one `- key: value` line per field.
+    """`[KIS LIVE] [EVENT]` headline plus one `- key: value` line per field.
 
     Field ORDER is the caller's; dicts preserve insertion order, and the
     payload contracts put the operationally important values first.
     """
     prefix = f"{_TEST_PREFIX}" if test else ""
-    urgent = ":rotating_light: " if event in URGENT_EVENTS else ""
-    lines = [f"{prefix}{urgent}*[{event}]*"]
+    is_urgent = event in URGENT_EVENTS
+    tag = KIS_LIVE_CRITICAL_PREFIX if is_urgent else KIS_LIVE_PREFIX
+    urgent = ":rotating_light: " if is_urgent else ""
+    lines = [f"{prefix}{tag} {urgent}*[{event}]*"]
     for key, value in (fields or {}).items():
         lines.append(f"- {key}: {value}")
     if event == ORDER_UNKNOWN:
@@ -137,21 +160,32 @@ def _format(event, fields, *, test=False):
 
 
 def _sender_for(event):
-    """Urgent events go to the ALERT webhook, routine lifecycle events to
-    the general one.
+    """Urgent events go to the KIS live ALERT webhook, routine lifecycle
+    events to the KIS live general one.
 
-    Both already exist (`SLACK_ALERT_WEBHOOK_URL` / `SLACK_WEBHOOK_URL`);
-    this adds no new channel. The split matters because the alert webhook
-    is where an operator looks when something is wrong -- filling it with
-    a PREPARED/SUBMITTED/ACCEPTED message for every routine order is how
-    an UNKNOWN alert gets scrolled past.
+    Both are KIS-live-only channels (`KIS_LIVE_SLACK_ALERT_WEBHOOK_URL` /
+    `KIS_LIVE_SLACK_WEBHOOK_URL`) and neither falls back to the Alpaca
+    pair. Two independent reasons:
+
+    * Volume. The Alpaca webhooks carry paper fills and scanner output.
+      An UNKNOWN on a real order has to be the loudest thing in its
+      channel, not the fortieth message that minute.
+    * Honesty. A fallback would let an unconfigured deployment place a
+      real order and appear to have notified. Instead the missing
+      webhook is a readiness blocker
+      (KIS_LIVE_NOTIFICATION_NOT_CONFIGURED) and, if reached anyway,
+      `slack_utils` refuses to send rather than picking another channel.
+
+    The urgent/routine split matters for the same reason it always did:
+    an alert channel filled with PREPARED/SUBMITTED/ACCEPTED for every
+    routine order is an alert channel nobody reads.
     """
-    if event in URGENT_EVENTS:
-        return alerts.send_alert
-
     import slack_utils
 
-    return slack_utils.send_slack_message
+    if event in URGENT_EVENTS:
+        return slack_utils.send_kis_live_alert
+
+    return slack_utils.send_kis_live_message
 
 
 def notify(event, fields=None, *, test=False, send_fn=None, track_health=True):
