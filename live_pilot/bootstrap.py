@@ -134,6 +134,7 @@ BOOTSTRAP_CAPABILITY_UNAVAILABLE = "BOOTSTRAP_CAPABILITY_UNAVAILABLE"
 NO_CANDIDATE = "NO_CANDIDATE"
 STALE_CANDIDATE = "STALE_CANDIDATE"
 CANDIDATE_SYMBOL_NOT_PUBLISHED = "CANDIDATE_SYMBOL_NOT_PUBLISHED"
+CANDIDATE_STORE_UNRESOLVED = "CANDIDATE_STORE_UNRESOLVED"
 
 
 class BootstrapBlocked(Exception):
@@ -463,15 +464,23 @@ def select_candidate(*, broker, rollout, deployed_commit, now):
     # catch it, because a symbol can still score well on a day the
     # scanner never nominated it.
     try:
-        rows, manifest = candidate_store.load_verified(trading_day=us_trading_day(now))
+        # `now` is threaded through so the age check uses the same
+        # clock as every other decision in this function, rather
+        # than wall-clock time.
+        rows, manifest = candidate_store.load_verified(
+            trading_day=us_trading_day(now), now=now)
     except candidate_store.CandidatesStale as exc:
         raise BootstrapBlocked(
             f"published candidates are not usable: {exc}",
             reason_codes=(STALE_CANDIDATE,),
         ) from exc
     except candidate_store.CandidatesUnavailable as exc:
+        # CandidateStoreUnresolved subclasses this and carries its own
+        # code: "the store is misconfigured" needs a different operator
+        # response from "the scanner nominated nobody today".
         raise BootstrapBlocked(
-            f"no published candidates: {exc}", reason_codes=(NO_CANDIDATE,),
+            f"no published candidates: {exc}",
+            reason_codes=(getattr(exc, "reason_code", NO_CANDIDATE),),
         ) from exc
 
     if candidate_store.find(symbol, rows=rows) is None:

@@ -41,6 +41,7 @@ get published.
 
 import csv
 import json
+import logging
 import os
 import tempfile
 from datetime import datetime, timezone
@@ -57,6 +58,8 @@ DEFAULT_MAX_AGE_SECONDS = 6 * 60 * 60
 
 CANDIDATE_DIR_ENV = "KIS_CANDIDATE_DIR"
 
+logger = logging.getLogger(__name__)
+
 
 class CandidateStoreError(Exception):
     """Base class. Every failure here is fail-closed for the caller."""
@@ -70,25 +73,58 @@ class CandidatesStale(CandidateStoreError):
     reason_code = "STALE_CANDIDATE"
 
 
-def candidate_dir():
-    """The shared, release-independent directory.
+class CandidateStoreUnresolved(CandidatesUnavailable):
+    """No shared store could be located.
 
-    `KIS_CANDIDATE_DIR` overrides it -- that is how tests point at a
-    tmp_path and how an operator could relocate the store -- but the
-    default deliberately sits beside the other shared state
-    (RECONCILIATION.json, TRADING_STATE.db) rather than inventing a new
-    top-level location.
+    Subclasses CandidatesUnavailable so every existing fail-closed
+    handler already treats it as "no candidates" rather than needing a
+    new branch, but carries its own reason code because the operator
+    action is different: this is a misconfigured process, not a quiet
+    scanning day.
+    """
+
+    reason_code = "CANDIDATE_STORE_UNRESOLVED"
+
+
+def candidate_dir():
+    """The shared, release-independent directory, or a refusal.
+
+    Resolution order:
+
+      1. `KIS_CANDIDATE_DIR` -- how tests point at a tmp_path and how an
+         operator could relocate the store.
+      2. `TRADING_PROJECT_ROOT`'s sibling `shared/state`, beside the
+         other shared state (RECONCILIATION.json, TRADING_STATE.db).
+
+    There is deliberately NO third option. This used to fall back to the
+    release directory when neither resolved, and that fallback was a
+    silent reintroduction of the exact split brain this store exists to
+    remove: a process with an unset environment would publish into its
+    own release, where no other release could see it, while reporting
+    success. It happened in practice -- a publisher invoked without
+    TRADING_PROJECT_ROOT wrote a candidate CSV and manifest into a
+    deployed release and left its working tree dirty, which would in
+    turn have blocked the next bootstrap on WORKING_TREE_DIRTY.
+
+    Refusing is strictly better than guessing: a caller that cannot
+    locate the shared store has no business writing candidates anywhere,
+    and a reader that cannot locate it must not silently fall back to a
+    stale release-local file and treat it as live.
     """
     override = os.environ.get(CANDIDATE_DIR_ENV)
-    if override:
+    if override and str(override).strip():
         return Path(override)
     root = os.environ.get("TRADING_PROJECT_ROOT")
-    if root:
+    if root and str(root).strip():
         # <releases>/<sha>/ -> <releases>/shared/state
         shared = Path(root).parent / "shared" / "state"
-        if shared.exists():
+        if shared.is_dir():
             return shared
-    return Path(__file__).resolve().parents[1]
+        raise CandidateStoreUnresolved(
+            f"TRADING_PROJECT_ROOT={root!r} but no shared store at {shared}")
+    raise CandidateStoreUnresolved(
+        f"neither {CANDIDATE_DIR_ENV} nor TRADING_PROJECT_ROOT is set; "
+        "refusing to fall back to a release-local candidate path")
 
 
 def candidate_path():
@@ -174,11 +210,31 @@ def read_rows():
 
 
 def symbols():
-    """Every candidate symbol, in publication order. Never raises for an
-    absent store -- an empty list is a valid 'no candidates today', and
-    the ordinary watchlist path should not explode over it."""
+    """Every candidate symbol, in publication order. Never raises.
+
+    This is the WATCHLIST read, not the order authority, and the two are
+    deliberately different strengths:
+
+      symbols()        tolerant -- an absent or unresolved store yields
+                       [], so `paper_strategy_order.load_watchlist()`
+                       falls through to the legacy local CSVs and the
+                       dashboard, health check and paper paths keep
+                       working exactly as before.
+      load_verified()  strict -- raises. Everything that is about to
+                       risk real money goes through it, so an
+                       unresolved store blocks an order rather than
+                       quietly sourcing one from a release-local file.
+
+    Returning [] here is safe precisely because it cannot authorise an
+    order on its own: the bootstrap re-reads through load_verified()
+    before pricing anything.
+    """
     try:
         rows = read_rows()
+    except CandidateStoreUnresolved as exc:
+        logger.warning("shared candidate store unresolved (%s); "
+                       "falling back to legacy local candidate files", exc)
+        return []
     except CandidatesUnavailable:
         return []
     seen, out = set(), []

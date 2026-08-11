@@ -311,3 +311,207 @@ class TestStrategyConditionsAreUntouched:
         import kis_live_trading
         from live_pilot import bootstrap
         assert bootstrap.SCORE_THRESHOLD == kis_live_trading.SCORE_THRESHOLD == 70
+
+
+class TestAnUnresolvedStoreRefusesInsteadOfFallingBack:
+    """The resolver used to fall back to the release directory when
+    neither environment variable was set. That silently reintroduced the
+    split brain this store exists to remove: a process would publish
+    into its own release, where no other release could see it, and
+    report success.
+
+    It happened for real -- a publisher invoked without
+    TRADING_PROJECT_ROOT wrote a CSV and manifest into a deployed
+    release and left the working tree dirty, which would have blocked
+    the next bootstrap on WORKING_TREE_DIRTY.
+
+    The fix is the refusal, not a .gitignore entry: hiding the dirty
+    tree would have left the wrong-path write in place and merely
+    stopped anyone noticing.
+    """
+
+    @pytest.fixture
+    def unset(self, monkeypatch):
+        monkeypatch.delenv(store.CANDIDATE_DIR_ENV, raising=False)
+        monkeypatch.delenv("TRADING_PROJECT_ROOT", raising=False)
+
+    def test_resolution_refuses_when_nothing_is_set(self, unset):
+        with pytest.raises(store.CandidateStoreUnresolved):
+            store.candidate_dir()
+
+    def test_resolution_refuses_when_the_shared_dir_does_not_exist(
+            self, monkeypatch, tmp_path):
+        monkeypatch.delenv(store.CANDIDATE_DIR_ENV, raising=False)
+        monkeypatch.setenv("TRADING_PROJECT_ROOT", str(tmp_path / "releases" / "sha"))
+        with pytest.raises(store.CandidateStoreUnresolved):
+            store.candidate_dir()
+
+    def test_a_blank_env_value_does_not_count_as_set(self, monkeypatch):
+        monkeypatch.setenv(store.CANDIDATE_DIR_ENV, "   ")
+        monkeypatch.setenv("TRADING_PROJECT_ROOT", "  ")
+        with pytest.raises(store.CandidateStoreUnresolved):
+            store.candidate_dir()
+
+    def test_publish_refuses_and_writes_nothing(self, unset, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        before = set(REPO_ROOT.iterdir())
+        with pytest.raises(store.CandidateStoreUnresolved):
+            store.publish(CSV, trading_day=DAY, generated_at=NOW)
+        assert set(REPO_ROOT.iterdir()) == before, "the repository was written to"
+        assert list(tmp_path.iterdir()) == [], "the cwd was written to"
+
+    def test_no_candidate_artifact_lands_in_the_repository(self, unset):
+        """The concrete regression: these two files appeared in a
+        deployed release and dirtied its working tree."""
+        for name in (store.CANDIDATE_FILE, store.MANIFEST_FILE):
+            assert not (REPO_ROOT / name).exists(), name
+
+    def test_the_strict_read_refuses(self, unset):
+        with pytest.raises(store.CandidatesUnavailable):
+            store.load_verified(trading_day=DAY, now=NOW)
+
+    def test_it_carries_its_own_reason_code(self):
+        assert store.CandidateStoreUnresolved.reason_code == "CANDIDATE_STORE_UNRESOLVED"
+        assert issubclass(store.CandidateStoreUnresolved, store.CandidatesUnavailable)
+
+    def test_the_bootstrap_blocks_with_that_code(self, unset):
+        from live_pilot import bootstrap
+
+        class R:
+            allowed_symbols = frozenset({"OMDA"})
+
+        with pytest.raises(bootstrap.BootstrapBlocked) as caught:
+            bootstrap.select_candidate(broker=object(), rollout=R(),
+                                       deployed_commit="abc", now=NOW)
+        assert bootstrap.CANDIDATE_STORE_UNRESOLVED in caught.value.reason_codes
+
+    def test_there_is_no_release_local_fallback_left_in_the_resolver(self):
+        """Statements only -- the docstring describes the fallback it
+        removed, so a substring search over the whole function matches
+        the explanation."""
+        import ast
+
+        source = (REPO_ROOT / "market_data" / "candidate_store.py").read_text(encoding="utf-8")
+        fn = next(n for n in ast.walk(ast.parse(source))
+                  if isinstance(n, ast.FunctionDef) and n.name == "candidate_dir")
+        returns = [n for n in ast.walk(fn) if isinstance(n, ast.Return)]
+        # Every return must be an env-derived path; none may be __file__-derived.
+        for node in returns:
+            assert "__file__" not in ast.dump(node), "release-local fallback survives"
+        raises = [n for n in ast.walk(fn) if isinstance(n, ast.Raise)]
+        assert len(raises) >= 2, "both unresolved cases must refuse"
+
+    def test_the_fix_is_not_a_gitignore_entry(self):
+        """Explicitly forbidden: hiding the dirty tree instead of
+        stopping the wrong-path write."""
+        gitignore = REPO_ROOT / ".gitignore"
+        if gitignore.exists():
+            body = gitignore.read_text(encoding="utf-8")
+            assert store.MANIFEST_FILE not in body, \
+                "the manifest was gitignored instead of the bad write being blocked"
+
+
+class TestTheLegacyWatchlistPathStillWorks:
+    """Live/bootstrap fail closed; the dashboard, health check and paper
+    paths must not be collateral damage."""
+
+    def test_symbols_is_tolerant_of_an_unresolved_store(self, monkeypatch):
+        monkeypatch.delenv(store.CANDIDATE_DIR_ENV, raising=False)
+        monkeypatch.delenv("TRADING_PROJECT_ROOT", raising=False)
+        assert store.symbols() == []
+
+    def test_load_watchlist_falls_through_to_the_local_csv(self, monkeypatch, tmp_path):
+        import paper_strategy_order as pso
+
+        monkeypatch.delenv(store.CANDIDATE_DIR_ENV, raising=False)
+        monkeypatch.delenv("TRADING_PROJECT_ROOT", raising=False)
+        local = tmp_path / "order_candidates.csv"
+        local.write_text("symbol,price\nLEGACY,1.0\n", encoding="utf-8")
+        monkeypatch.setattr(pso, "ORDER_CANDIDATES_FILE", local)
+        assert pso.load_watchlist() == ["LEGACY"]
+
+    def test_the_two_reads_have_different_strengths_on_purpose(self):
+        """symbols() tolerant, load_verified() strict -- and only the
+        strict one can authorise an order."""
+        import inspect
+
+        tolerant = inspect.getsource(store.symbols)
+        assert "return []" in tolerant
+        strict = inspect.getsource(store.load_verified)
+        assert "raise" in strict or "read_manifest()" in strict
+
+    def test_the_bootstrap_uses_the_strict_read(self):
+        source = (REPO_ROOT / "live_pilot" / "bootstrap.py").read_text(encoding="utf-8")
+        body = source.split("def select_candidate", 1)[1].split("\ndef ", 1)[0]
+        assert "load_verified" in body
+        assert "candidate_store.symbols()" not in body
+
+
+class TestThePublisherRefusesAnUnresolvedDestination:
+    SCRIPT = REPO_ROOT / "scripts" / "publish_candidates.py"
+
+    def test_it_resolves_the_destination_before_reading_the_source(self):
+        source = self.SCRIPT.read_text(encoding="utf-8")
+        body = source.split("args = parser.parse_args()", 1)[1]
+        assert body.index("candidate_path()") < body.index("source.exists()")
+
+    def test_it_exits_non_zero_without_writing(self, tmp_path, monkeypatch):
+        import subprocess
+
+        env = dict(os.environ)
+        env.pop("KIS_CANDIDATE_DIR", None)
+        env.pop("TRADING_PROJECT_ROOT", None)
+        env["PYTHONPATH"] = str(REPO_ROOT)
+        src = tmp_path / "order_candidates.csv"
+        src.write_text("symbol,price\nOMDA,24.5\n", encoding="utf-8")
+
+        before = set(REPO_ROOT.iterdir())
+        result = subprocess.run(
+            [sys.executable, str(self.SCRIPT), "--source", str(src)],
+            capture_output=True, text=True, timeout=120, env=env, cwd=str(tmp_path))
+
+        assert result.returncode == 1, result.stdout
+        assert "REFUSED" in result.stdout
+        assert set(REPO_ROOT.iterdir()) == before, "the repository was written to"
+        assert [p.name for p in tmp_path.iterdir()] == ["order_candidates.csv"]
+
+    def test_a_resolved_destination_still_publishes(self, tmp_path):
+        import subprocess
+
+        env = dict(os.environ)
+        env.pop("TRADING_PROJECT_ROOT", None)
+        env["KIS_CANDIDATE_DIR"] = str(tmp_path / "shared")
+        env["PYTHONPATH"] = str(REPO_ROOT)
+        src = tmp_path / "order_candidates.csv"
+        src.write_text("symbol,price\nOMDA,24.5\n", encoding="utf-8")
+
+        result = subprocess.run(
+            [sys.executable, str(self.SCRIPT), "--source", str(src)],
+            capture_output=True, text=True, timeout=120, env=env, cwd=str(tmp_path))
+
+        assert result.returncode == 0, result.stdout
+        assert (tmp_path / "shared" / store.CANDIDATE_FILE).exists()
+        assert (tmp_path / "shared" / store.MANIFEST_FILE).exists()
+
+    def test_the_cron_style_invocation_resolves(self, tmp_path):
+        """What cron actually does: TRADING_PROJECT_ROOT exported, shared
+        dir present beside the release."""
+        import subprocess
+
+        release = tmp_path / "releases" / "deadbeef"
+        (tmp_path / "releases" / "shared" / "state").mkdir(parents=True)
+        release.mkdir(parents=True)
+        env = dict(os.environ)
+        env.pop("KIS_CANDIDATE_DIR", None)
+        env["TRADING_PROJECT_ROOT"] = str(release)
+        env["PYTHONPATH"] = str(REPO_ROOT)
+        src = tmp_path / "order_candidates.csv"
+        src.write_text("symbol,price\nOMDA,24.5\n", encoding="utf-8")
+
+        result = subprocess.run(
+            [sys.executable, str(self.SCRIPT), "--source", str(src)],
+            capture_output=True, text=True, timeout=120, env=env, cwd=str(tmp_path))
+
+        assert result.returncode == 0, result.stdout
+        assert (tmp_path / "releases" / "shared" / "state" / store.CANDIDATE_FILE).exists()
+        assert not (release / store.CANDIDATE_FILE).exists(), "wrote into the release"

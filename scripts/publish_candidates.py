@@ -46,6 +46,19 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
+    # Resolve the destination FIRST. An unresolved shared store must
+    # refuse before anything is read or written -- the old behaviour was
+    # to fall back to the release directory, which published where no
+    # other release could see it while reporting success.
+    try:
+        destination = candidate_store.candidate_path()
+    except candidate_store.CandidateStoreUnresolved as exc:
+        print(f"REFUSED: {exc}")
+        print("         set TRADING_PROJECT_ROOT (or KIS_CANDIDATE_DIR). "
+              "Nothing was written.")
+        return 1
+    print(f"  destination  : {destination}")
+
     source = Path(args.source)
     if not source.exists():
         print(f"REFUSED: no source candidate file at {source}")
@@ -76,13 +89,13 @@ def main():
         return 1
 
     if args.dry_run:
-        print(f"\nDRY RUN: would publish to {candidate_store.candidate_path()}")
+        print(f"\nDRY RUN: would publish to {destination}")
         return 0
 
     manifest = candidate_store.publish(
         payload, trading_day=trading_day, generated_at=generated_at,
         source=f"bridge:{source}")
-    print(f"\nPUBLISHED to {candidate_store.candidate_path()}")
+    print(f"\nPUBLISHED to {destination}")
     print(f"  manifest: {manifest}")
     return 0
 
