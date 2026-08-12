@@ -62,3 +62,25 @@ def _isolate_kis_rate_limiter(monkeypatch, tmp_path):
     yield
     kis_rate_limiter.reset_limiter()
     kis_token_cache.reset_cache()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_scanner_analytics_store(monkeypatch, tmp_path):
+    """Same reasoning as the fixtures above, for the scanner analytics
+    store and the per-scanner logs.
+
+    `scanners/base/result_store.py` and `scanners/base/scanner_logging.py`
+    resolve their paths at CALL time from the project root, so a test
+    that runs a scanner would otherwise append signal rows into the real
+    `logs/scanners/` tree and pollute the month-1 dataset the whole
+    exercise depends on being clean. Redirecting the env vars covers
+    every entry point, including the ones that resolve the directory
+    deep inside a call.
+
+    Note this is a DIFFERENT variable from `KIS_CANDIDATE_DIR` above.
+    The two stores are deliberately separate (spec section 10): the
+    candidate store authorises orders, the analytics store records
+    experiments, and nothing may point one at the other.
+    """
+    monkeypatch.setenv("SCANNER_ANALYTICS_DIR", str(tmp_path / "scanner_analytics"))
+    monkeypatch.setenv("SCANNER_LOG_DIR", str(tmp_path / "scanner_logs"))

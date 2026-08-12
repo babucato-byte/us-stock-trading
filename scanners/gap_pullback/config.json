@@ -1,0 +1,33 @@
+{
+  "scanner_name": "gap_pullback",
+  "version": "gap_pullback_v1.0",
+  "description": "S5 -- a gap up that is pulling back normally, not one being chased. Frozen for month 1 (spec section 11). Candidate-generation only in v1.0; nothing here reaches an order path.",
+  "parameter_meanings": {
+    "gap_min_pct": "Session open vs the PRIOR daily close, in percent. 2.0 means the open must be at least 2% above yesterday's close.",
+    "gap_max_pct": "Same measure, upper bound. 8.0 rejects a runaway gap.",
+    "min_pullback_from_high_pct": "(session_high - price) / session_high * 100. 1.0 means price must have come off the session high by at least 1% -- below that there is no pullback to buy.",
+    "max_pullback_from_high_pct": "Same measure, upper bound. A backstop against a total collapse being read as a pullback; in practice vwap_tolerance_pct binds long before this does. Deliberately loose in v1.0 rather than tuned, per spec sections 20 and 31.",
+    "max_pullback_to_impulse_volume_ratio": "mean per-bar volume of the PULLBACK leg divided by mean per-bar volume of the IMPULSE leg. Below 1.0 means the retreat is trading on less volume than the move that caused it, which is the core S5 tell. Numerator is the pullback.",
+    "vwap_tolerance_pct": "How far BELOW session VWAP price may sit and still qualify, in percent. 1.0 allows price to be up to 1% under VWAP; anything lower is unwinding the gap, not pulling back into support.",
+    "min_session_bars": "Regular-session bars required before this scanner will judge at all. Fewer is a data shortfall, not a rejection.",
+    "score_pullback_to_impulse_volume_ideal": "Volume ratio scoring full marks. Same numerator/denominator as max_pullback_to_impulse_volume_ratio."
+  },
+  "params": {
+    "gap_min_pct": 2.0,
+    "gap_max_pct": 8.0,
+    "require_price_above_hma200": true,
+    "vwap_tolerance_pct": 1.0,
+    "min_pullback_from_high_pct": 1.0,
+    "max_pullback_from_high_pct": 60.0,
+    "max_pullback_to_impulse_volume_ratio": 1.0,
+    "min_session_bars": 10,
+    "regular_session_only": true,
+    "score_ideal_pullback_pct": 3.0,
+    "score_pullback_zero_pct": 12.0,
+    "score_pullback_to_impulse_volume_ideal": 0.4,
+    "score_weight_pullback_depth": 30,
+    "score_weight_volume_dryup": 30,
+    "score_weight_vwap_hold": 25,
+    "score_weight_gap_quality": 15
+  }
+}

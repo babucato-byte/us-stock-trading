@@ -1,0 +1,23 @@
+{
+  "scanner_name": "breakout_ready",
+  "version": "breakout_ready_v1.0",
+  "description": "S3 -- approaching resistance, not through it. Frozen for month 1 (spec section 11). Names already above the 20d high are kept but scored down, per section S3's 'lower the priority' rather than 'exclude'.",
+  "params": {
+    "distance_20d_high_max_pct": 5.0,
+    "adx_min": 20,
+    "require_price_above_hma200": true,
+    "require_hma200_rising": true,
+    "require_hma89_above_hma200": true,
+    "hma200_slope_min_pct": 0.0,
+    "already_broken_out_penalty_pct": 3.0,
+    "score_adx_strong": 35,
+    "score_slope_strong_pct": 2.0,
+    "score_volume_multiple_strong": 2.5,
+    "score_distance_52w_full_pct": 15.0,
+    "score_weight_proximity": 40,
+    "score_weight_adx": 25,
+    "score_weight_trend": 15,
+    "score_weight_volume": 10,
+    "score_weight_52w_context": 10
+  }
+}

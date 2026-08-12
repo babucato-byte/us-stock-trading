@@ -1,0 +1,21 @@
+{
+  "scanner_name": "premarket_momentum",
+  "version": "premarket_momentum_v1.0",
+  "description": "S4 -- adapter over the EXISTING score_scanner/premarket_momentum_score.py. These params are passed straight into that module's own ScoreScannerConfig; they are its current defaults, restated here so section 19 holds (parameters in a file) without editing the existing scanner. Changing a value here changes what this adapter asks for, never what the standalone score scanner does when run on its own.",
+  "parameter_meanings": {
+    "min_score": "The wrapped scanner's own 0-100 score floor. Its scoring is 50 base, +20 for breaking the prior high, +10 for ADX over the threshold, +10 for being at or near the 52-week high.",
+    "min_premarket_gain_pct": "(latest intraday price / prior daily close - 1) * 100. 7.0 means the name must already be up at least 7%.",
+    "min_volume_multiple": "latest bar volume / rolling 20-bar average intraday volume. Strictly greater than 2.0.",
+    "adx_threshold": "Daily 14-period ADX. Strictly above 25.0 earns the bonus; it is a scoring input, not a hard filter, inside the wrapped scanner.",
+    "week52_high_proximity_ratio": "Fraction of the 52-week high that price must reach to count as at/near it: price >= week52_high * 0.98, i.e. within 2% of the 52-week high. Passed to the wrapped module's `near_52w_ratio` field, whose name this key deliberately does not copy -- a bare 0.98 in a report tells a reader nothing.",
+    "avg_volume_window": "Bars in the rolling intraday average-volume window."
+  },
+  "params": {
+    "min_score": 60,
+    "min_premarket_gain_pct": 7.0,
+    "min_volume_multiple": 2.0,
+    "adx_threshold": 25.0,
+    "week52_high_proximity_ratio": 0.98,
+    "avg_volume_window": 20
+  }
+}
