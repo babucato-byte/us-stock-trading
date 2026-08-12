@@ -1,0 +1,20 @@
+{
+  "scanner_name": "accumulation",
+  "version": "accumulation_v1.0",
+  "description": "S2 -- volume arrives before the price move. Frozen for month 1 (spec section 11). Note: no LOWER bound on price_change_pct is applied in v1.0, deliberately; whether one is needed is a month-1 question and a floor chosen now would remove the evidence.",
+  "params": {
+    "volume_multiple_min": 1.5,
+    "price_change_max_pct": 8.0,
+    "require_price_above_hma200": true,
+    "require_hma200_rising": true,
+    "hma200_slope_min_pct": 0.0,
+    "score_volume_multiple_strong": 4.0,
+    "score_quiet_change_pct": 2.0,
+    "score_efficiency_strong": 3.0,
+    "score_slope_strong_pct": 2.0,
+    "score_weight_volume": 40,
+    "score_weight_quietness": 30,
+    "score_weight_efficiency": 20,
+    "score_weight_trend": 10
+  }
+}

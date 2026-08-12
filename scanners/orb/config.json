@@ -1,0 +1,24 @@
+{
+  "scanner_name": "orb",
+  "version": "orb_v1.0",
+  "description": "S6 -- Opening Range Breakout. orb_minutes selects ORB5/ORB15/ORB30 (spec S6); 15 is the v1.0 default. Frozen for month 1 (spec section 11).",
+  "params": {
+    "orb_minutes": 15,
+    "supported_orb_minutes": [5, 15, 30],
+    "require_close_breakout": true,
+    "require_price_above_vwap": true,
+    "require_ema9_above_ema21": true,
+    "volume_expansion_min": 1.2,
+    "retest_tolerance_pct": 0.3,
+    "min_post_range_bars": 3,
+    "regular_session_only": true,
+    "max_extension_above_or_high_pct": 6.0,
+    "score_volume_expansion_strong": 3.0,
+    "score_ideal_extension_pct": 1.5,
+    "score_weight_breakout_quality": 25,
+    "score_weight_volume_expansion": 25,
+    "score_weight_entry_proximity": 20,
+    "score_weight_vwap": 15,
+    "score_weight_retest": 15
+  }
+}

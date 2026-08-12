@@ -1,0 +1,18 @@
+{
+  "scanner_name": "common_features",
+  "version": "common_features_v1.0",
+  "description": "Indicator lengths shared by all six scanners. Kept in one file so that 'HMA200' means the same 200 bars in every scanner and in every month-end comparison. Changing anything here changes what every scanner measured, so it needs a version bump here AND is recorded on every signal via the config fingerprint.",
+  "params": {
+    "hma_fast_length": 89,
+    "hma_slow_length": 200,
+    "hma_slope_lookback": 5,
+    "adx_period": 14,
+    "volume_window": 20,
+    "high_20d_window": 20,
+    "high_50d_window": 50,
+    "high_52w_window": 252,
+    "ema_fast_span": 9,
+    "ema_slow_span": 21,
+    "max_daily_bar_age_days": 5
+  }
+}
