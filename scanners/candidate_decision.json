@@ -1,0 +1,14 @@
+{
+  "scanner_name": "candidate_decision",
+  "version": "candidate_decision_v1.0",
+  "description": "The Candidate Decision Layer policy (spec section 10). SHIPPED DISABLED. Month 1 is data collection (section 11); no scanner has earned a place in the order path yet (section 30). Enabling this is a deliberate, separate decision that must follow the month-1 review, not a side effect of installing the scanners.",
+  "params": {
+    "enabled": false,
+    "eligible_scanners": [],
+    "min_scanner_score": 70,
+    "min_confirmation_count": 1,
+    "max_candidates": 10,
+    "max_extension_hma200_pct": 25.0,
+    "rank_by": "scanner_score"
+  }
+}
