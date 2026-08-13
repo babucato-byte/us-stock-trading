@@ -162,6 +162,98 @@ python scripts/run_scanner_report.py export --start 2026-08-01 --end 2026-08-31
 
 ---
 
+## 2.7 실행 구조 최적화 (전략 무변경)
+
+전략 조건·점수·임계값은 **하나도 바뀌지 않았습니다.** 실행 구조만 바꿨고,
+동일 입력에 대해 동일 판정이 나오는 것을 테스트로 고정했습니다.
+
+### 무엇을 바꿨나
+
+| | 이전 | 이후 |
+|---|---|---|
+| Provider fetch | 심볼당 1회 (이미 공유됨) | 그대로 |
+| **Feature 계산** | **스캐너마다 1회** (daily=3회) | **심볼당 1회** |
+| **HMA 구현** | `rolling().apply(lambda)` | **`np.convolve` 벡터화** |
+| 계산 불가 심볼 | 매 실행마다 재시도 | **Eligibility 캐시로 skip** |
+| 장중 유니버스 | 전체 13,362 | **Activity 상위 N (기본 300)** |
+
+측정 결과 (200종목, 동일 캐시 데이터 A/B):
+
+```
+BEFORE (reference HMA, 스캐너별 feature) : 146.73 s
+AFTER  (fast HMA, feature 공유)          :   1.73 s
+speedup (계산만)                          :  84.6x
+신호 동일 여부                            :  82 = 82, 완전 일치
+```
+
+### Fast HMA
+
+`indicators.hma`(실주문 technical filter가 쓰는 함수)는 **건드리지 않았습니다.**
+스캐너 전용으로 `scanners/base/fast_indicators.py`에 `fast_hma`를 두고,
+`scanners/base/indicators.hma_series`만 그쪽을 씁니다.
+
+가중이동평균은 합성곱(convolution)이므로 파이썬 람다를 봉마다 호출할 필요가
+없습니다. 같은 수식, 같은 결과, 파이썬 루프 없음.
+
+두 구현은 **비트 단위로 동일하지 않습니다.** 곱의 누산 순서가 달라 부동소수점
+마지막 비트가 다릅니다. 실측 상대오차는 **6.7e-16**(machine epsilon 수준)이고,
+테스트는 1e-12로 고정합니다. NaN **위치**까지 일치하는지도 검증합니다 —
+warm-up 길이가 한 봉이라도 어긋나면 이후 전 구간이 밀리면서도 그럴듯해 보이기
+때문입니다.
+
+### Eligibility (데이터 적격성)
+
+`scanners/base/eligibility.py`. **전략이 아니라 데이터 가용성만** 판단합니다
+(§6). 여기에 ADX·거래량·추세 조건이 들어가면 어떤 스캐너 config에도 기록되지
+않는 숨은 필터가 되므로, 테스트가 AST로 전략 식별자 유입을 막습니다.
+
+| reason | 재확인 시점 |
+|---|---|
+| `eligible` | 7일 |
+| `insufficient_history` | **부족한 봉 수에서 계산** (3봉 부족 → 며칠, 200봉 부족 → 최대 90일) |
+| `provider_unavailable` | **1일** (일시 장애를 오래 믿으면 안 됨) |
+| `empty_history` / `stale_history` | 3일 |
+| `non_numeric_ohlcv` | 7일 |
+| `unsupported_symbol` | 30일 |
+
+**영구 제외는 없습니다.** 신규 상장 종목이 잠기지 않도록 모든 사유에
+`next_check`가 있고 상한은 90일입니다.
+
+`--symbols` 로 **명시한 종목은 절대 필터되지 않습니다.** 특정 종목을 디버깅할
+때 캐시가 조용히 빼버리면 그 플래그를 신뢰할 수 없게 됩니다.
+
+### Activity Funnel (장중 유니버스)
+
+`scanners/base/activity.py`. §13대로 **장중 프로파일은 13,362종목을 보지
+않습니다.**
+
+```
+daily (장 마감 후, 전체 유니버스)
+   └→ 거래대금 순위 기록 (price × 20일 평균 거래량)
+        └→ premarket / open 이 상위 N(기본 300)만 스캔
+```
+
+거래대금은 "이 종목이 **거래되는가**"이지 "**오를 것인가**"가 아닙니다.
+방향·모멘텀·갭 조건은 들어가지 않습니다 (§14의 3계층 분리:
+DATA ELIGIBILITY / ACTIVITY / STRATEGY).
+
+daily가 아직 순위를 만들지 않았으면 open 실행은 `FAILED_NO_UNIVERSE`로
+**거부**합니다 — 빈 풀을 "활발한 종목이 없는 시장"으로 보고하면 안 됩니다 (§14).
+순위가 오래되면(기본 5일) 쓰지 않습니다.
+
+장중 실행은 순위를 **다시 쓰지 않습니다.** 쓰게 두면 풀이 자기 자신으로 계속
+줄어들어 바깥 종목이 영원히 못 들어옵니다.
+
+### 새 CLI 옵션
+
+```bash
+python scripts/run_scanners.py --profile open --active-pool-size 300
+python scripts/run_scanners.py --profile daily --universe full
+python scripts/run_scanners.py --profile daily --no-eligibility   # 캐시 무시
+```
+
+---
+
 ## 3. 저장 위치
 
 | 내용 | 경로 | 환경변수 |
@@ -172,6 +264,8 @@ python scripts/run_scanner_report.py export --start 2026-08-01 --end 2026-08-31
 | 리포트 | `logs/scanners/reports/` | 〃 |
 | CSV/JSON export | `logs/scanners/exports/` | 〃 |
 | 스캐너별 로그 | `logs/scanners/<스캐너>.log` | `SCANNER_LOG_DIR` |
+| Eligibility 캐시 | `logs/scanners/eligibility/<provider>.json` | `SCANNER_ANALYTICS_DIR` |
+| Activity 순위 | `logs/scanners/activity/<provider>.json` | 〃 |
 
 `SCANNER_ANALYTICS_DIR` 는 주문 후보 저장 위치와 **의도적으로 별개**입니다 (§10).
 주문 후보는 저장소 루트의 `order_candidates.csv`(`daily_candidate_scanner.py` 가

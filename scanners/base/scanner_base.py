@@ -234,12 +234,48 @@ class BaseScanner(ABC):
         return {}
 
     def minimum_daily_bars(self) -> int:
+        """Daily bars this scanner needs before it can judge anything.
+
+        Derived from the shared feature configuration, never a literal.
+        Today every scanner needs the same thing (the HMA200 pass
+        dominates), but a scanner that later wants a longer lookback
+        should be able to say so by overriding this, and the eligibility
+        manager takes the MAXIMUM across the scanners in a run -- so
+        adding such a scanner widens the requirement automatically
+        rather than silently under-fetching for it.
+        """
         return minimum_daily_bars()
+
+    #: Alias so callers can read the requirement without constructing a
+    #: call, matching how `required_history` reads at the call site.
+    @property
+    def required_history(self) -> int:
+        return self.minimum_daily_bars()
 
     # ---- framework ------------------------------------------------------
 
-    def build_features(self, data: SymbolData) -> SymbolFeatures:
-        return build_features(data, require_intraday=self.requires_intraday)
+    def build_features(self, data: SymbolData,
+                       shared: Optional[SymbolFeatures] = None) -> SymbolFeatures:
+        """This scanner's feature view of a symbol.
+
+        `shared` is a feature pass the runner already computed for this
+        symbol. Every scanner in a run wants byte-identical features --
+        that is what makes section 17's intersection analysis meaningful
+        -- so recomputing them per scanner produced the same numbers
+        three times over. On the server that was 0.90 s of HMA per
+        scanner per symbol, and the daily profile has three scanners.
+
+        The one thing that genuinely differs per scanner is
+        `requires_intraday`, which is a REFUSAL, not a computation. It is
+        re-applied here against the shared pass so an intraday scanner
+        still fails a symbol with no minute bars, with the same message
+        and at the same point in the flow as before.
+        """
+        if shared is None:
+            return build_features(data, require_intraday=self.requires_intraday)
+        if self.requires_intraday and (data.intraday is None or len(data.intraday) == 0):
+            raise ScannerDataError(f"{data.symbol}: intraday bars required but unavailable")
+        return shared
 
     def evaluate(
         self,
@@ -248,6 +284,7 @@ class BaseScanner(ABC):
         trading_day: str,
         timestamp: Optional[str] = None,
         run_id: Optional[str] = None,
+        shared_features: Optional[SymbolFeatures] = None,
     ) -> Optional[ScannerSignal]:
         """One symbol. A signal, or None if it did not qualify.
 
@@ -258,7 +295,7 @@ class BaseScanner(ABC):
         statistics meaningless.
         """
         stamp = timestamp or datetime.now(timezone.utc).isoformat()
-        features = self.build_features(data)
+        features = self.build_features(data, shared_features)
         context: Dict[str, Any] = {}
         try:
             reasons = self.check(features, data, context)
@@ -356,6 +393,7 @@ class BaseScanner(ABC):
         trading_day: str,
         timestamp: Optional[str] = None,
         run_id: Optional[str] = None,
+        shared_features: Optional[SymbolFeatures] = None,
     ) -> Optional[ScannerSignal]:
         """One isolated evaluation, accumulated into `outcome`.
 
@@ -370,10 +408,10 @@ class BaseScanner(ABC):
         outcome.symbols_seen += 1
         try:
             signal = self.evaluate(data, trading_day=trading_day, timestamp=timestamp,
-                                   run_id=run_id)
+                                   run_id=run_id, shared_features=shared_features)
         except ScannerDataError as exc:
             outcome.data_errors += 1
-            _count_reason(outcome.reject_reasons, "insufficient_or_stale_data")
+            count_reject_reason(outcome.reject_reasons, "insufficient_or_stale_data")
             log_decision(self.log, scanner=self.scanner_name, version=self.version,
                          symbol=data.symbol, result="FAIL", reason=str(exc))
             return None
@@ -391,8 +429,19 @@ class BaseScanner(ABC):
         return signal
 
 
-def _count_reason(counter: Dict[str, int], reason: str) -> None:
+def count_reject_reason(counter: Dict[str, int], reason: str) -> None:
+    """Tally one reject reason.
+
+    Public because the runner records the same reasons when the shared
+    feature pass fails for a symbol -- both paths must bucket a data
+    shortfall identically or the run summary would depend on which layer
+    happened to notice it.
+    """
     counter[reason] = counter.get(reason, 0) + 1
+
+
+#: Retained for callers that used the private name.
+_count_reason = count_reject_reason
 
 
 def require(condition: bool, message: str) -> None:
