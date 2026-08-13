@@ -90,14 +90,54 @@ python scripts/run_scanner_performance.py --days 30
 ### 리포트
 
 ```bash
-python scripts/run_scanner_report.py weekly
+python scripts/run_scanner_report.py weekly                    # 이번 주
 python scripts/run_scanner_report.py weekly --week-of 2026-08-10
+python scripts/run_scanner_report.py monthly                   # 이번 달
 python scripts/run_scanner_report.py monthly --month 2026-08
+python scripts/run_scanner_report.py intersections             # 최근 30일
+python scripts/run_scanner_report.py intersections --days 7
 python scripts/run_scanner_report.py intersections --start 2026-08-01 --end 2026-08-31
 python scripts/run_scanner_report.py export --start 2026-08-01 --end 2026-08-31
 ```
 
 `export` 는 §22용 CSV/JSON을 `logs/scanners/exports/` 에 생성합니다.
+
+### 기간 지정 규칙
+
+`weekly` / `monthly` / `intersections` 는 인자 없이 실행할 수 있습니다.
+`intersections` 의 기본값은 **최근 30일**이며 `--days` 로 조정합니다.
+`--start` / `--end` 를 하나만 줘도 됩니다 — 나머지 한쪽은 같은 창(window)으로
+채워집니다.
+
+| 지정 | 결과 |
+|---|---|
+| 둘 다 | 그대로 사용 |
+| 둘 다 생략 | `[오늘 - 30일, 오늘]` |
+| `--start` 만 | `[start, 오늘]` |
+| `--end` 만 | `[end - 30일, end]` |
+
+`export` 는 예외적으로 **양쪽 모두 필수**입니다. 파일명에 기간이 들어가는
+산출물이라, 호출자가 지정하지 않은 기간의 데이터셋을 그럴듯한 이름으로
+만들어내면 안 되기 때문입니다.
+
+**"오늘"의 기준**: 로컬 시스템 날짜(`date.today()`)가 아니라 신호에 찍히는 것과
+같은 **미 동부 거래일**(`us_trading_day()`)입니다. 서버가 UTC이므로 ET 19~20시
+이후에는 로컬 날짜가 하루 앞서갑니다. 일요일 저녁 cron이 `date.today()` 기준으로
+돌면 다음 주를 조회해 빈 리포트를 내놓고, 출력만 봐서는 이유를 알 수 없습니다.
+
+### 종료 코드
+
+| 코드 | 의미 |
+|---|---|
+| `0` | 리포트 정상 출력 (데이터가 없는 기간도 정상) |
+| `1` | 리포트를 만들지 못함 |
+| `2` | **호출이 잘못됨** — 날짜 형식 오류, 역순 기간, 필수 인자 누락 |
+
+`2`를 `1`과 분리한 이유는 crontab 오타를 실제 장애와 구분하기 위해서입니다.
+
+날짜는 `YYYY-MM-DD` 로 정규화됩니다. 저장소가 날짜 키를 **문자열로 비교**하므로
+`2026-8-1` 같은 미패딩 날짜는 정렬이 어긋납니다(`"2026-8-1" > "2026-08-05"`).
+CLI가 정규화하지만, 직접 API를 호출할 때는 주의하세요.
 
 ### cron 예시
 
