@@ -328,6 +328,39 @@ def _swing_high(daily: pd.DataFrame, window: int) -> Optional[float]:
     return ind.rolling_high(daily, window, exclude_current=True)
 
 
+#: pandas exceptions that mean "this frame's data is unusable", not
+#: "this code is broken" (spec section 21).
+#:
+#: `DataError: No numeric types to aggregate` is raised by `.rolling()`
+#: when a column that should hold prices holds none -- an all-null or
+#: object-dtype OHLCV frame, which the provider does return for some
+#: thinly-traded symbols. Three of 193 symbols hit it in the 200-symbol
+#: benchmark.
+#:
+#: Left unclassified these surfaced as ERROR with a full traceback, which
+#: is wrong twice over: it counts a data problem as a scanner fault in
+#: the run summary, and at 13,362 symbols a 1.6% rate is ~200 tracebacks
+#: per run burying anything real (section 22).
+#:
+#: Deliberately a NARROW list. A blanket `except Exception ->
+#: ScannerDataError` would hide genuine bugs as data problems, which is
+#: the failure this classification is meant to prevent, inverted.
+_DATA_SHAPED_ERRORS = (pd.errors.DataError,)
+
+
+def _classify_data_error(symbol: str, exc: Exception) -> Optional[ScannerDataError]:
+    """Convert an expected data-shape failure, or return None.
+
+    Returning None means "not recognised" and the caller re-raises, so
+    an unexpected exception keeps its traceback and its ERROR status.
+    """
+    if isinstance(exc, _DATA_SHAPED_ERRORS):
+        return ScannerDataError(
+            f"{symbol}: OHLCV columns are not numeric "
+            f"(reason=non_numeric_ohlcv): {exc}")
+    return None
+
+
 def build_features(
     data: SymbolData,
     *,
@@ -342,6 +375,26 @@ def build_features(
     scanner must not be stopped by an absent minute feed.
     """
     config = config or common_config()
+    symbol = data.symbol
+    try:
+        return _build_features(data, config=config, require_intraday=require_intraday)
+    except ScannerDataError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - narrowed immediately below
+        classified = _classify_data_error(symbol, exc)
+        if classified is None:
+            # Not a recognised data shape problem. Re-raise untouched so
+            # it keeps its traceback and is counted as a scanner fault.
+            raise
+        raise classified from exc
+
+
+def _build_features(
+    data: SymbolData,
+    *,
+    config: ScannerConfig,
+    require_intraday: bool,
+) -> SymbolFeatures:
     symbol = data.symbol
 
     minimum = minimum_daily_bars(config)

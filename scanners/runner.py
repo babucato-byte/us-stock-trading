@@ -51,24 +51,25 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
+from scanners.base import activity as act
+from scanners.base import eligibility as elig
 from scanners.base import result_store, run_context
 from scanners.base.trading_calendar import us_trading_day
+from scanners.base.features import build_features
 from scanners.base.market_data_provider import (
     BarMarketDataProvider,
     MarketDataUnavailable,
     SymbolData,
     default_provider,
 )
-from scanners.base.scanner_base import ScanOutcome
-from scanners.base.scanner_logging import get_scanner_logger
+from scanners.base.models import ScannerDataError
+from scanners.base.scanner_base import ScanOutcome, count_reject_reason
+from scanners.base.scanner_logging import get_scanner_logger, log_decision
 from scanners.registry import ALL_SCANNERS, DAILY_SCANNERS, INTRADAY_SCANNERS, build_scanners
 from scanners.universe import UniverseUnavailable, load_symbols
 
 logger = logging.getLogger(__name__)
 
-#: Named symbol groups for the scheduler, matching how the six are meant
-#: to be run through the trading day (see the runbook in
-#: docs/SCANNERS.md).
 #: Consecutive per-symbol exceptions before a scanner is declared broken
 #: and dropped for the rest of the run.
 #:
@@ -99,6 +100,8 @@ MAX_CONSECUTIVE_SCANNER_ERRORS = 25
 #: activity for that day without leaving a trace.
 PROVIDER_DEGRADED_FRACTION = 0.5
 
+#: Named scanner groups for the scheduler, matching how the six are meant
+#: to be run through the trading day (see the runbook in docs/SCANNERS.md).
 PROFILES = {
     "all": list(ALL_SCANNERS),
     "daily": list(DAILY_SCANNERS),
@@ -106,6 +109,25 @@ PROFILES = {
     "premarket": ["premarket_momentum"],
     "open": ["orb", "gap_pullback"],
 }
+
+#: Which universe each profile draws from by default (section 13).
+#:
+#: `daily` walks the full universe after the close -- it has the time,
+#: and it is what populates the activity ranking the others depend on.
+#: The intraday profiles draw from that ranking instead, because the
+#: ORB window is minutes wide and a full-universe pass takes hours: the
+#: answer would arrive after the setup it describes had already
+#: resolved.
+PROFILE_UNIVERSE = {
+    "all": "full",
+    "daily": "full",
+    "intraday": "active",
+    "premarket": "active",
+    "open": "active",
+}
+
+UNIVERSE_FULL = "full"
+UNIVERSE_ACTIVE = "active"
 
 
 @dataclass
@@ -122,6 +144,10 @@ class RunReport:
     outcomes: List[ScanOutcome] = field(default_factory=list)
     fetch_failures: int = 0
     fetch_failure_samples: List[str] = field(default_factory=list)
+    #: Symbols the provider would not serve. Tracked in full (not just
+    #: the sampled messages) because eligibility needs every one of them
+    #: to record a recheck date.
+    fetch_failed_symbols: List[str] = field(default_factory=list)
     construction_failures: Dict[str, str] = field(default_factory=dict)
     stored_signals: int = 0
     duration_seconds: float = 0.0
@@ -129,6 +155,15 @@ class RunReport:
     #: Set only when the run could not proceed at all. A run that
     #: completed derives its status from the outcomes instead.
     terminal_status: Optional[str] = None
+    #: Which universe this run drew from: "full" or "active".
+    universe_type: Optional[str] = None
+    activity_summary: Dict[str, Any] = field(default_factory=dict)
+    #: Symbols never fetched because a current eligibility record ruled
+    #: them out. Reported so a shrinking universe is visible rather than
+    #: looking like a quiet market.
+    skipped_ineligible: int = 0
+    eligibility_summary: Dict[str, Any] = field(default_factory=dict)
+    required_history_bars: int = 0
 
     @property
     def signal_count(self) -> int:
@@ -204,6 +239,11 @@ class RunReport:
             "market_data_provider": self.provider,
             "market_data_feed": self.provider_feed,
             "universe_size": self.universe_size,
+            "universe_type": self.universe_type,
+            "activity": dict(self.activity_summary),
+            "skipped_ineligible": self.skipped_ineligible,
+            "eligibility": dict(self.eligibility_summary),
+            "required_history_bars": self.required_history_bars,
             "provider_error_count": self.fetch_failures,
             "fetch_failures": self.fetch_failures,
             "fetch_failure_samples": self.fetch_failure_samples[:5],
@@ -247,11 +287,16 @@ def _symbol_bundles(
             )
         except MarketDataUnavailable as exc:
             report.fetch_failures += 1
+            report.fetch_failed_symbols.append(symbol)
             if len(report.fetch_failure_samples) < 20:
                 report.fetch_failure_samples.append(str(exc))
+            # Expected outcome for a delisted or unlisted ticker: logged
+            # as a line, not a traceback. At 13k symbols the traceback
+            # form buries anything real (section 22).
             logger.debug("skipping %s: %s", symbol, exc)
         except Exception as exc:  # noqa: BLE001 - a bad symbol must not end the run
             report.fetch_failures += 1
+            report.fetch_failed_symbols.append(symbol)
             if len(report.fetch_failure_samples) < 20:
                 report.fetch_failure_samples.append(f"{symbol}: {type(exc).__name__}: {exc}")
             logger.exception("unexpected fetch failure for %s", symbol)
@@ -270,6 +315,9 @@ def run_scanners(
     intraday_lookback_days: int = 5,
     profile: Optional[str] = None,
     run_id: Optional[str] = None,
+    use_eligibility: bool = True,
+    universe_type: Optional[str] = None,
+    active_pool_size: int = act.DEFAULT_POOL_SIZE,
 ) -> RunReport:
     """Run the requested scanners over the requested symbols.
 
@@ -310,19 +358,68 @@ def run_scanners(
         _record_manifest(report, day)
         return report
 
+    explicit_symbols = symbols
+    activity_store = (act.ActivityStore.load(report.provider) if use_eligibility
+                      else act.NullActivityStore(report.provider))
+    selected_universe = universe_type or PROFILE_UNIVERSE.get(profile or "", UNIVERSE_FULL)
+    report.universe_type = selected_universe if symbols is None else "explicit"
+
     if symbols is None:
-        try:
-            symbols = load_symbols(limit=limit)
-        except UniverseUnavailable as exc:
-            report.skipped_reason = f"universe unavailable: {exc}"
-            report.terminal_status = run_context.FAILED_NO_UNIVERSE
-            report.duration_seconds = time.monotonic() - started
-            logger.error("universe unavailable: %s", exc)
-            _record_manifest(report, day)
-            return report
+        if selected_universe == UNIVERSE_ACTIVE:
+            symbols = activity_store.active_symbols(limit=limit or active_pool_size)
+            if not symbols:
+                # An empty pool means the daily run has not populated the
+                # ranking yet -- an operational fact, not a market with
+                # no active names. Reported as a failure so it cannot be
+                # mistaken for a quiet session (section 14).
+                report.skipped_reason = (
+                    "no active universe available; run the daily profile first "
+                    "to populate the activity ranking")
+                report.terminal_status = run_context.FAILED_NO_UNIVERSE
+                report.duration_seconds = time.monotonic() - started
+                logger.error("%s", report.skipped_reason)
+                _record_manifest(report, day)
+                return report
+            logger.info("active universe: %s symbols (pool limit %s)",
+                        len(symbols), limit or active_pool_size)
+        else:
+            try:
+                symbols = load_symbols(limit=limit)
+            except UniverseUnavailable as exc:
+                report.skipped_reason = f"universe unavailable: {exc}"
+                report.terminal_status = run_context.FAILED_NO_UNIVERSE
+                report.duration_seconds = time.monotonic() - started
+                logger.error("universe unavailable: %s", exc)
+                _record_manifest(report, day)
+                return report
     elif limit:
         symbols = symbols[:limit]
     report.universe_size = len(symbols)
+    report.required_history_bars = max(
+        (scanner.required_history for scanner in built), default=0)
+
+    # Eligibility: drop symbols a CURRENT record says cannot be judged,
+    # before any of them costs a network round trip. Section 6 -- this is
+    # a data-availability filter only; nothing strategy-shaped reaches
+    # it, so it cannot change which symbols pass a scanner condition,
+    # only which ones were worth asking about.
+    eligibility_store = (elig.EligibilityStore.load(report.provider)
+                         if use_eligibility
+                         else elig.NullEligibilityStore(report.provider))
+    # Explicitly named symbols are NEVER filtered. `--symbols AAPL,MSFT`
+    # is an instruction to scan those two, and silently dropping one
+    # because a cache from last week says it had short history would
+    # make the flag untrustworthy exactly when it is used -- debugging a
+    # specific name. The cache still LEARNS from such a run; it just
+    # does not gate it.
+    if use_eligibility and explicit_symbols is None:
+        keep = eligibility_store.eligible_symbols(symbols)
+        report.skipped_ineligible = len(symbols) - len(keep)
+        if report.skipped_ineligible:
+            logger.info("eligibility: skipping %s of %s symbols with a current "
+                        "ineligible record", report.skipped_ineligible, len(symbols))
+        symbols = keep
+        report.universe_size = len(symbols)
 
     want_intraday = any(getattr(scanner, "requires_intraday", False) for scanner in built)
     # One timestamp for the whole run. Every forward return in section
@@ -340,6 +437,53 @@ def run_scanners(
         intraday_lookback_days=intraday_lookback_days,
         want_intraday=want_intraday,
     ):
+        # ONE feature pass per symbol, shared by every scanner in the run.
+        #
+        # Each scanner used to call `build_features` itself, so the daily
+        # profile computed the same HMA89, HMA200 and ADX three times
+        # over -- identical inputs, identical outputs, 0.90 s of HMA per
+        # repetition on the server. Sharing is not only cheaper: section
+        # 17's intersection analysis rests on every scanner having judged
+        # a symbol from the same numbers, and one pass makes that true by
+        # construction rather than by coincidence.
+        #
+        # A failure here belongs to the SYMBOL, not to any one scanner,
+        # so it is recorded against all of them exactly as the per-scanner
+        # path used to record it.
+        shared_features = None
+        feature_error = None
+        try:
+            shared_features = build_features(bundle)
+        except ScannerDataError as exc:
+            feature_error = exc
+        except Exception as exc:  # noqa: BLE001 - unexpected: keep it per-scanner
+            feature_error = exc
+
+        # Remember what this symbol turned out to be, so the next run
+        # does not pay to rediscover it.
+        if isinstance(feature_error, ScannerDataError):
+            reason = elig.classify_data_error(str(feature_error))
+            eligibility_store.note_ineligible(
+                bundle.symbol, reason,
+                history_bars=(0 if bundle.daily is None else len(bundle.daily)),
+                required_bars=report.required_history_bars,
+                detail=str(feature_error)[:200])
+        elif feature_error is None:
+            eligibility_store.note_eligible(
+                bundle.symbol,
+                history_bars=(0 if bundle.daily is None else len(bundle.daily)),
+                required_bars=report.required_history_bars)
+            # Liquidity for the intraday pool, taken from the feature
+            # pass that already computed it. Only the full-universe
+            # profile updates the ranking -- an intraday run sees only
+            # the pool it was given, so letting it write would shrink
+            # the ranking to itself, run after run, until nothing else
+            # could ever re-enter.
+            if selected_universe == UNIVERSE_FULL and shared_features is not None:
+                activity_store.note(bundle.symbol, trading_day=day,
+                                    price=shared_features.price,
+                                    avg_volume=shared_features.avg_volume)
+
         for scanner in built:
             name = scanner.scanner_name
             outcome = outcomes[name]
@@ -347,8 +491,23 @@ def run_scanners(
                 continue
             errors_before = outcome.exceptions
             try:
+                if feature_error is not None:
+                    raise feature_error
                 scanner.evaluate_into(outcome, bundle, trading_day=day, timestamp=stamp,
-                                      run_id=identifier)
+                                      run_id=identifier,
+                                      shared_features=shared_features)
+            except ScannerDataError as exc:
+                # The shared pass could not build features for this
+                # symbol. Counted and logged exactly as the per-scanner
+                # path did, so the run summary is unchanged by the
+                # sharing (section 28: a data shortfall is not a
+                # rejection and not a scanner fault).
+                outcome.data_errors += 1
+                count_reject_reason(outcome.reject_reasons, "insufficient_or_stale_data")
+                outcome.symbols_seen += 1
+                log_decision(scanner.log, scanner=name, version=scanner.version,
+                             symbol=bundle.symbol, result="FAIL", reason=str(exc))
+                continue
             except Exception as exc:  # noqa: BLE001 - section 5: isolate the scanner
                 # `evaluate_into` already absorbs per-symbol failures, so
                 # reaching here means the scanner instance itself is
@@ -377,6 +536,17 @@ def run_scanners(
                 consecutive_errors[name] = 0
 
     report.outcomes = [outcomes[scanner.scanner_name] for scanner in built]
+
+    for symbol in report.fetch_failed_symbols:
+        # A provider refusal is treated as TRANSIENT (short recheck).
+        # Believing it durably would let one bad afternoon at the vendor
+        # evict a large slice of the universe for a month.
+        eligibility_store.note_ineligible(symbol, elig.PROVIDER_UNAVAILABLE,
+                              required_bars=report.required_history_bars)
+    report.eligibility_summary = eligibility_store.summary()
+    report.activity_summary = activity_store.summary()
+    eligibility_store.save()
+    activity_store.save()
 
     if store:
         for outcome in report.outcomes:
@@ -433,7 +603,11 @@ def print_report(report: RunReport) -> None:
           f"{'null (run did not complete)' if report.candidate_count is None else report.candidate_count}")
     print(f"provider        : {report.provider}"
           + (f" feed={report.provider_feed}" if report.provider_feed else " feed=null"))
-    print(f"universe        : {report.universe_size} symbols")
+    print(f"universe        : {report.universe_size} symbols"
+          + (f" ({report.universe_type})" if report.universe_type else ""))
+    if report.skipped_ineligible:
+        print(f"skipped (inelig): {report.skipped_ineligible} symbols with a current "
+              f"ineligible record")
     if report.skipped_reason:
         print(f"SKIPPED         : {report.skipped_reason}")
     for name, reason in report.construction_failures.items():
@@ -477,6 +651,14 @@ def parse_args(argv=None):
                         help="evaluate and print without writing to the analytics store")
     parser.add_argument("--ignore-market-calendar", action="store_true",
                         help="run even when the US market is closed (backfill/testing)")
+    parser.add_argument("--universe", choices=[UNIVERSE_FULL, UNIVERSE_ACTIVE], default=None,
+                        help="which universe to draw from; defaults to the profile's "
+                             "own (daily=full, premarket/open=active)")
+    parser.add_argument("--active-pool-size", type=int, default=act.DEFAULT_POOL_SIZE,
+                        help=f"symbols in the intraday active pool (default "
+                             f"{act.DEFAULT_POOL_SIZE})")
+    parser.add_argument("--no-eligibility", action="store_true",
+                        help="ignore the eligibility and activity caches for this run")
     parser.add_argument("--intraday-interval", default="1m")
     parser.add_argument("--intraday-lookback-days", type=int, default=5)
     parser.add_argument("--daily-lookback-days", type=int, default=400)
@@ -530,6 +712,9 @@ def main(argv=None) -> int:
         intraday_interval=args.intraday_interval,
         intraday_lookback_days=args.intraday_lookback_days,
         profile=args.profile,
+        universe_type=args.universe,
+        active_pool_size=args.active_pool_size,
+        use_eligibility=not args.no_eligibility,
     )
     print_report(report)
     # A scanner that failed is an operational problem worth a non-zero
