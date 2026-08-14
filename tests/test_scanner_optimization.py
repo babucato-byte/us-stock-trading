@@ -32,7 +32,7 @@ from scanners.base import eligibility as elig  # noqa: E402
 from scanners.base import features as feat_mod  # noqa: E402
 from scanners.base import indicators as sind  # noqa: E402
 from scanners.base.market_data_provider import StaticMarketDataProvider  # noqa: E402
-from scanners.base.models import ScannerDataError  # noqa: E402
+from scanners.base.models import ScannerDataError, ScannerSignal  # noqa: E402
 from scanners.registry import ALL_SCANNERS, build_scanner  # noqa: E402
 from tests import scanner_fixtures as fx  # noqa: E402
 
@@ -165,6 +165,98 @@ class TestFetchReuse:
                             provider=counting, trading_day=DAY, store=False)
         assert calls["daily"] == 1
         assert calls["intraday"] == 1
+
+
+class TestProviderCacheLifecycle:
+    """The run-wide provider cache belongs to the tracker, not the runner.
+
+    `CachingMarketDataProvider` never evicts. In the tracker that is a
+    real saving -- one symbol carries several signals, so the same bars
+    are asked for repeatedly. In the runner it is pure cost: the loop is
+    symbol-major and fetches each symbol exactly once, so the cache
+    records every frame it will never be asked for again.
+
+    Measured cache-on vs cache-off over an identical symbol set
+    (200/500/1000/3000): zero hits at every size, identical provider
+    call counts, and RSS growing 107.7 KB/symbol with the cache against
+    2.9 KB/symbol without it. At 13,362 symbols that is ~1.5 GB on a
+    956 MB box -- the daily scan would have been OOM-killed part way
+    through.
+    """
+
+    def test_the_runner_default_provider_is_not_cached(self, monkeypatch):
+        from scanners.base.market_data_provider import CachingMarketDataProvider
+
+        captured = {}
+        original = runner.default_provider
+
+        def spy(**kwargs):
+            captured.update(kwargs)
+            return original(**kwargs)
+
+        monkeypatch.setattr(runner, "default_provider", spy)
+        monkeypatch.setenv("SCANNER_UNIVERSE_FILE", "/nonexistent/universe.csv")
+        runner.run_scanners(scanners=["hma_early_trend"], trading_day=DAY, store=False)
+
+        assert captured.get("cached") is False, (
+            "the runner must not take the caching provider: it fetches each "
+            "symbol once, so the cache only accumulates memory")
+        assert not isinstance(original(cached=False), CachingMarketDataProvider)
+
+    def test_the_tracker_still_uses_the_cache(self):
+        """It genuinely benefits -- one symbol, several scanners' signals."""
+        import inspect
+
+        from scanners.analytics import performance_tracker
+
+        source = inspect.getsource(performance_tracker.track_signals)
+        assert "default_provider()" in source, (
+            "the tracker's cache saves real fetches and must stay")
+
+    def test_the_cache_saves_fetches_where_it_is_used(self):
+        """Pins the asymmetry: useless in the runner, useful in the tracker."""
+        from scanners.analytics import performance_tracker
+        from scanners.base.market_data_provider import CachingMarketDataProvider
+
+        class Counting(StaticMarketDataProvider):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.calls = 0
+
+            def get_daily_bars(self, symbol, lookback_days=400):
+                self.calls += 1
+                return super().get_daily_bars(symbol, lookback_days=lookback_days)
+
+        daily = fx.forward_daily("2026-08-12", sessions=5, start_price=100.0,
+                                 highs=[105] * 5, lows=[98] * 5, closes=[103] * 5)
+        inner = Counting(daily={"TEST": daily})
+        signals = [
+            ScannerSignal(timestamp="2026-08-12T14:00:00+00:00",
+                          trading_day="2026-08-12", symbol="TEST",
+                          scanner_name=name, scanner_version=f"{name}_v1.0",
+                          scanner_score=80.0, signal_price=100.0)
+            for name in ("hma_early_trend", "accumulation", "breakout_ready", "orb")
+        ]
+        performance_tracker.track_signals(
+            signals, provider=CachingMarketDataProvider(inner))
+        assert inner.calls == 1, (
+            f"four signals for one symbol cost {inner.calls} fetches; the "
+            "tracker cache is not working")
+
+    def test_a_runner_scan_fetches_each_symbol_exactly_once(self, provider):
+        """The property that makes the cache pointless here."""
+        calls = []
+
+        class Counting(StaticMarketDataProvider):
+            def get_daily_bars(self, symbol, lookback_days=400):
+                calls.append(symbol)
+                return super().get_daily_bars(symbol, lookback_days=lookback_days)
+
+        counting = Counting(daily=provider._daily, intraday=provider._intraday)
+        runner.run_scanners(scanners=runner.PROFILES["all"], symbols=["TEST"],
+                            provider=counting, trading_day=DAY, store=False,
+                            use_eligibility=False)
+        assert calls == ["TEST"], calls
 
 
 class TestVerdictEquivalence:
