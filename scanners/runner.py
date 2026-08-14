@@ -327,7 +327,28 @@ def run_scanners(
     failure -- not lose the day.
     """
     day = trading_day or us_trading_day()
-    provider = provider or default_provider()
+    # UNCACHED, deliberately.
+    #
+    # `CachingMarketDataProvider` memoises every fetch for the lifetime of
+    # the provider and never evicts. That is right for the performance
+    # tracker, where one symbol carries several signals and the cache
+    # measurably saves fetches -- but this loop is symbol-major and
+    # fetches each symbol exactly once, so there is nothing to hit.
+    #
+    # Measured over 200/500/1000/3000 symbols, cache-on vs cache-off with
+    # an identical symbol set:
+    #
+    #     cache hits            0 at every size
+    #     entries == misses     == provider calls (397/987/1950/5900)
+    #     provider calls        identical with and without the cache
+    #     RSS growth      on    107.7 KB/symbol   116.8 -> 411.3 MB
+    #                     off     2.9 KB/symbol    89.7 ->  97.6 MB
+    #
+    # So the cache bought nothing here and charged ~108 KB per symbol.
+    # Extrapolated to the 13,362-symbol universe that is ~1.5 GB against
+    # a 956 MB server -- the full daily scan would have been killed part
+    # way through, which is the failure this line prevents.
+    provider = provider or default_provider(cached=False)
     started = time.monotonic()
     # Minted here, before anything can fail, so a run that dies during
     # startup still has an identity in the run log. Section 5: never
