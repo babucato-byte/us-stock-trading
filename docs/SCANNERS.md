@@ -244,6 +244,35 @@ daily가 아직 순위를 만들지 않았으면 open 실행은 `FAILED_NO_UNIVE
 장중 실행은 순위를 **다시 쓰지 않습니다.** 쓰게 두면 풀이 자기 자신으로 계속
 줄어들어 바깥 종목이 영원히 못 들어옵니다.
 
+### Provider 캐시는 runner에서 쓰지 않습니다
+
+`CachingMarketDataProvider`는 fetch를 전부 메모리에 보관하고 **eviction이
+없습니다.** 이는 성과 추적기(한 종목이 여러 스캐너의 신호를 갖고 있어 같은 봉을
+반복 요청)에서는 실제 이득이지만, **runner에서는 이득이 0입니다** — 심볼 단위
+루프라 각 심볼을 정확히 한 번만 조회하기 때문입니다.
+
+동일 심볼 집합으로 cache on/off를 측정한 결과:
+
+| n | cache | hits | entries | provider calls | max RSS |
+|---:|---|---:|---:|---:|---:|
+| 200 | on | **0** | 397 | 397 | 116.8 MB |
+| 500 | on | **0** | 987 | 987 | 156.7 MB |
+| 1000 | on | **0** | 1950 | 1950 | 225.3 MB |
+| 3000 | on | **0** | 5900 | 5900 | 411.3 MB |
+| 200 | off | — | — | 397 | 89.7 MB |
+| 3000 | off | — | — | 5900 | **97.6 MB** |
+
+```
+RSS 증가  cache on : 107.7 KB/symbol
+          cache off:   2.9 KB/symbol   ← 사실상 평탄
+provider call 수   : 양쪽 완전 동일
+```
+
+13,362종목 기준 추정: **cache on 약 1,501 MB vs off 약 127 MB.** 서버 RAM이
+956 MB(가용 571 MB)이므로 캐시를 켠 채로는 전체 스캔이 도중에 OOM으로
+죽었을 것입니다. 그래서 `runner`는 `default_provider(cached=False)`를 쓰고,
+성과 추적기는 캐시를 그대로 유지합니다.
+
 ### 새 CLI 옵션
 
 ```bash
