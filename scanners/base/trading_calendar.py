@@ -30,9 +30,42 @@ exactly the class of bug that only shows up around a session boundary
 and only in production.
 """
 
+from datetime import date, timedelta
 from typing import Optional
 
 import market_hours
+
+
+class TradingCalendarError(Exception):
+    """The calendar could not answer. Callers must not guess a day."""
+
+
+def next_trading_day(day) -> str:
+    """The next US session strictly after `day`, as `YYYY-MM-DD`.
+
+    Delegates to `market_hours.is_market_day`, which takes a date and
+    therefore works for a FUTURE day -- unlike `market_guard.
+    is_us_trading_day()`, which takes no argument and can only answer
+    for right now. That distinction matters here: the evening watchlist
+    pass has to file its output under tomorrow's session, which is by
+    definition not today.
+
+    Raises rather than falling back to "day + 1" if no session is found
+    within a fortnight. A watchlist filed under the wrong date is read
+    on the wrong morning, and nothing in the file would say so.
+    """
+    if isinstance(day, str):
+        try:
+            day = date.fromisoformat(day)
+        except ValueError as exc:
+            raise TradingCalendarError(f"not a date: {day!r}") from exc
+    cursor = day
+    for _ in range(14):
+        cursor = cursor + timedelta(days=1)
+        if market_hours.is_market_day(cursor):
+            return cursor.isoformat()
+    raise TradingCalendarError(
+        f"no US trading day within two weeks after {day.isoformat()}")
 
 
 def us_trading_day(now: Optional[object] = None) -> str:
