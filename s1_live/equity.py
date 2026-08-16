@@ -21,24 +21,38 @@ rate. No FX rate is read, stored or assumed, because none is needed --
 and a fixed one would be a fabricated number in the denominator of every
 risk figure.
 
-Why this currently answers UNKNOWN
-----------------------------------
-The cash half of the sum is not obtainable from this broker. That is not
-an inference: `brokers/kis_broker.py`'s verification matrix records
-`balance_cash_fields_absent` as LIVE_RESPONSE_CONFIRMED from a real
-read-only probe on the Oracle host -- TTTS3012R's `output2` returned nine
-purchase/valuation/P&L fields on every venue leg and neither
-`frcr_dncl_amt1` nor `frcr_use_psbl_amt`. The only cash figure the
-wrapper can obtain is `get_orderable_usd(symbol, price)`, which is
-answered per symbol and per limit price and is therefore not an
-account-level cash balance.
+Where the cash half comes from (PHASE 4C)
+-----------------------------------------
+`inquire-balance` (TTTS3012R) does not carry cash -- that is recorded as
+`balance_cash_fields_absent` in the broker's verification matrix, from a
+real probe. `inquire-present-balance` (CTRP6504R) does, in an `output2`
+row tagged with its own `crcy_cd`, and `KISBroker.get_account_cash_usd()`
+reads the USD row's `frcr_dncl_amt_2`. A live probe cross-validated it
+against `get_orderable_usd()` -- already independently confirmed -- and
+the two matched EXACTLY.
 
-The position half IS computable, from the balance response's own rows.
-It is exposed separately as `position_value_usd` so the missing half is
-visible rather than implied -- but it is never returned AS equity,
-because equity minus its cash term is a different number with the same
-name, and substituting one for the other is exactly how ORACLE-CASH-01
-turned "this endpoint reports nothing" into a confident zero.
+Equity is CALCULATED, not reported
+-----------------------------------
+KIS publishes no USD account equity. Its only "total assets" field,
+`output3.tot_asst_amt`, came back at 5,844x the USD orderable amount and
+IDENTICAL whether the request asked for the KRW or the foreign-currency
+division: a won-denominated total spanning every currency the account
+holds. It is the one field whose name suggests exactly what this module
+needs, and it is the wrong number -- using it would put KRW cash and an
+implicit FX rate into the denominator of every risk figure.
+
+So the sum is done here, from a verified USD cash figure and USD
+position value, and `source` records which half came from where.
+
+The position half is exposed separately as `position_value_usd` and is
+never returned AS equity: equity minus its cash term is a different
+number with the same name, and substituting one for the other is exactly
+how ORACLE-CASH-01 turned "this endpoint reports nothing" into a
+confident zero.
+
+Still unverified: the position-value formula has not been checked against
+a broker-reported valuation, because the account held no positions when
+the probe ran.
 """
 
 import logging
@@ -118,6 +132,20 @@ def _finite(value) -> Optional[float]:
     return number if math.isfinite(number) else None
 
 
+def _usable_cash(value) -> Optional[float]:
+    """A cash figure must also be NON-NEGATIVE.
+
+    `KISBroker.get_account_cash_usd()` already refuses a negative, but
+    this is the layer that turns cash into equity and it does not get to
+    assume its caller checked. A negative balance is not a small balance:
+    this codebase forbids negative cash outright, so the honest response
+    is "unknown", not an equity figure below zero that every downstream
+    percentage would then divide by.
+    """
+    number = _finite(value)
+    return number if number is not None and number >= 0 else None
+
+
 def assert_single_currency(*currencies) -> str:
     """Every supplied currency must be USD. Raises otherwise.
 
@@ -164,8 +192,16 @@ def position_value(positions) -> Optional[float]:
 
 
 def from_account(account_snapshot, positions, *, now=None,
-                 source="kis_balance") -> EquitySnapshot:
-    """Build the snapshot, or refuse with the reason. Never raises."""
+                 source="kis_balance", cash_override=None) -> EquitySnapshot:
+    """Build the snapshot, or refuse with the reason. Never raises.
+
+    `cash_override` is the account-level USD cash from
+    `get_account_cash_usd()`. It is preferred over the balance
+    snapshot's own `usd_cash` because that field is absent on this
+    broker -- see `brokers/kis_broker.py`'s matrix. It is an OVERRIDE and
+    not a fallback: when it is present it is the figure used, because it
+    is the one that was verified against a second endpoint.
+    """
     stamp = now or datetime.now(timezone.utc)
     count = len(list(positions)) if positions is not None else 0
 
@@ -179,7 +215,9 @@ def from_account(account_snapshot, positions, *, now=None,
                               detail=str(exc))
 
     value = position_value(positions)
-    cash = _finite(getattr(account_snapshot, "usd_cash", None))
+    cash = _usable_cash(cash_override)
+    if cash is None:
+        cash = _usable_cash(getattr(account_snapshot, "usd_cash", None))
 
     if value is None:
         return EquitySnapshot(
@@ -223,7 +261,23 @@ def from_amount(equity_usd, *, source="caller", now=None,
 
 
 def read(broker, *, now=None) -> EquitySnapshot:
-    """One equity read through the broker. Any failure is UNAVAILABLE."""
+    """One equity read through the broker. Any failure is UNAVAILABLE.
+
+    PHASE 4C: cash comes from `get_account_cash_usd()` --
+    `inquire-present-balance`'s currency-tagged USD row -- because
+    `inquire-balance` genuinely does not carry it. When the broker
+    predates that method the read still works and still refuses, which is
+    what keeps this function honest on an older wrapper rather than
+    silently substituting a zero.
+
+    KIS reports no USD-denominated account equity. Its only "total
+    assets" figure (`output3.tot_asst_amt`) is won-denominated and spans
+    every currency the account holds -- a live probe measured it at
+    5,844x the USD orderable amount and identical under both the KRW and
+    foreign-currency request divisions. So equity is CALCULATED here,
+    from a verified USD cash figure plus USD position value, and the
+    provenance of both halves is recorded on the snapshot.
+    """
     stamp = now or datetime.now(timezone.utc)
     try:
         snapshot = broker.get_account_snapshot()
@@ -233,4 +287,22 @@ def read(broker, *, now=None) -> EquitySnapshot:
         return EquitySnapshot(UNAVAILABLE, None, USD, stamp, "kis_balance",
                               reason_code=REASON_READ_FAILED,
                               detail=f"the account read failed: {type(exc).__name__}")
-    return from_account(snapshot, positions, now=stamp)
+
+    cash = None
+    cash_source = "kis_balance"
+    reader = getattr(broker, "get_account_cash_usd", None)
+    if callable(reader):
+        try:
+            cash = _usable_cash(reader())
+            cash_source = "kis_present_balance:output2[USD].frcr_dncl_amt_2"
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("account cash read failed: %s", type(exc).__name__)
+            return EquitySnapshot(
+                UNAVAILABLE, None, USD, stamp, "kis_present_balance",
+                position_value_usd=position_value(positions),
+                position_count=len(list(positions)) if positions is not None else 0,
+                reason_code=REASON_READ_FAILED,
+                detail=f"the account cash read failed: {type(exc).__name__}")
+
+    return from_account(snapshot, positions, now=stamp, source=cash_source,
+                        cash_override=cash)

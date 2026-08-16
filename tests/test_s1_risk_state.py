@@ -57,6 +57,115 @@ class FakeAccount:
         self.cash_source = cash_source
 
 
+class FakeBroker:
+    """Stands in for KISBroker. `cash` raising models a failed read."""
+
+    def __init__(self, cash=None, positions=(), snapshot=None, cash_error=None):
+        self._cash = cash
+        self._positions = list(positions)
+        self._snapshot = snapshot if snapshot is not None else FakeAccount()
+        self._cash_error = cash_error
+
+    def get_account_snapshot(self):
+        return self._snapshot
+
+    def get_positions(self):
+        return self._positions
+
+    def get_account_cash_usd(self):
+        if self._cash_error is not None:
+            raise self._cash_error
+        return self._cash
+
+
+class LegacyBroker:
+    """A wrapper predating get_account_cash_usd()."""
+
+    def __init__(self, snapshot=None, positions=()):
+        self._snapshot = snapshot if snapshot is not None else FakeAccount()
+        self._positions = list(positions)
+
+    def get_account_snapshot(self):
+        return self._snapshot
+
+    def get_positions(self):
+        return self._positions
+
+
+# --------------------------------------------------- PHASE 4C cash source
+
+class TestAccountCashSource:
+    def test_cash_from_the_present_balance_endpoint_establishes_equity(self):
+        """The PHASE 4C finding: CTRP6504R output2[crcy_cd=USD]."""
+        snap = equity.read(FakeBroker(cash=500.0, positions=[FakePosition(10, 30.0, 20.0)]))
+        assert snap.available is True
+        assert snap.cash_usd == 500.0
+        assert snap.position_value_usd == pytest.approx(320.0)
+        assert snap.require() == pytest.approx(820.0)
+        assert "frcr_dncl_amt_2" in snap.source
+
+    def test_equity_is_cash_plus_position_value_exactly(self):
+        snap = equity.read(FakeBroker(cash=500.0, positions=[FakePosition(10, 30.0, 20.0)]))
+        assert snap.equity_usd == pytest.approx(snap.cash_usd + snap.position_value_usd)
+
+    def test_a_failed_cash_read_blocks_rather_than_zeroes(self):
+        snap = equity.read(FakeBroker(cash_error=RuntimeError("KIS refused")))
+        assert snap.available is False
+        assert snap.reason_code == equity.REASON_READ_FAILED
+
+    @pytest.mark.parametrize("bad", [None, -1.0, float("nan"), True, "500"])
+    def test_an_unusable_cash_figure_blocks(self, bad):
+        snap = equity.read(FakeBroker(cash=bad))
+        assert snap.available is False
+
+    def test_a_real_zero_cash_is_accepted(self):
+        """Zero is a legitimate balance; only absence is unknown."""
+        snap = equity.read(FakeBroker(cash=0.0))
+        assert snap.available is True and snap.require() == 0.0
+
+    def test_a_wrapper_without_the_method_still_refuses(self):
+        """An older broker must not silently produce a zero-cash equity."""
+        snap = equity.read(LegacyBroker())
+        assert snap.available is False
+        assert snap.reason_code == equity.REASON_NO_ACCOUNT_CASH
+
+    def test_the_cash_override_beats_the_snapshot_field(self):
+        snap = equity.from_account(FakeAccount(usd_cash=1.0), [], cash_override=999.0)
+        assert snap.require() == 999.0
+
+    def test_the_broker_exposes_the_verified_field_names(self):
+        from brokers import kis_broker
+
+        assert kis_broker.ACCOUNT_CASH_FIELD == "frcr_dncl_amt_2"
+        assert kis_broker.ACCOUNT_CASH_CURRENCY_FIELD == "crcy_cd"
+        assert kis_broker.TR_ID_PRESENT_BALANCE["live"] == "CTRP6504R"
+        assert kis_broker.PRESENT_BALANCE_PATH.endswith("inquire-present-balance")
+
+    def test_tot_asst_amt_is_recorded_as_disproved(self):
+        """It is the only field whose NAME suggests total assets, which is
+        why it needed disproving rather than ignoring."""
+        from brokers.kis_broker import VERIFICATION_MATRIX
+
+        names = {entry.name: entry for entry in VERIFICATION_MATRIX}
+        assert "account_equity_not_in_tot_asst_amt" in names
+        assert names["account_equity_not_in_tot_asst_amt"].live_status == "LIVE_RESPONSE_CONFIRMED"
+        assert "account_cash_field" in names
+
+    def test_the_read_only_method_cannot_submit_an_order(self):
+        import ast
+
+        source = (REPO_ROOT / "brokers" / "kis_broker.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "get_account_cash_usd":
+                body = ast.dump(node)
+                for forbidden in ("submit_order", "_post", '"POST"', "'POST'"):
+                    assert forbidden not in body, forbidden
+                assert "validate_read_allowed" in body
+                return
+        raise AssertionError("get_account_cash_usd not found")
+
+
 # ------------------------------------------------------------------ equity
 
 class TestEquityDefinition:

@@ -90,6 +90,7 @@ from execution.secret_redaction import redact_text, safe_repr
 TOKEN_PATH = "/oauth2/tokenP"
 PRICE_PATH = "/uapi/overseas-price/v1/quotations/price"
 BALANCE_PATH = "/uapi/overseas-stock/v1/trading/inquire-balance"
+PRESENT_BALANCE_PATH = "/uapi/overseas-stock/v1/trading/inquire-present-balance"
 PSAMOUNT_PATH = "/uapi/overseas-stock/v1/trading/inquire-psamount"
 ORDER_PATH = "/uapi/overseas-stock/v1/trading/order"
 # CODEX-052: REFERENCE_VERIFIED, LIVE_RESPONSE_PENDING. The path and the
@@ -103,6 +104,13 @@ NCCS_PATH = "/uapi/overseas-stock/v1/trading/inquire-nccs"
 CCNL_PATH = "/uapi/overseas-stock/v1/trading/inquire-ccnl"
 
 TR_ID_BALANCE = {"live": "TTTS3012R", "paper": "VTTS3012R"}
+TR_ID_PRESENT_BALANCE = {"live": "CTRP6504R", "paper": "VTRP6504R"}
+#: The currency-tagged USD deposit in CTRP6504R's output2. Confirmed
+#: against a live account: it matched get_orderable_usd() EXACTLY, while
+#: output3's totals came back ~1,415x and ~4,429x larger (KRW, and
+#: mixing currencies). See ACCOUNT_CASH_FIELD below.
+ACCOUNT_CASH_FIELD = "frcr_dncl_amt_2"
+ACCOUNT_CASH_CURRENCY_FIELD = "crcy_cd"
 TR_ID_PSAMOUNT = {"live": "TTTS3007R", "paper": "VTTS3007R"}
 # The single field the orderable amount is read from, named once so the
 # parser, the verification matrix and the read-only probe cannot disagree.
@@ -299,6 +307,51 @@ VERIFICATION_MATRIX = (
     # one was never in the matrix, which is exactly why a wrong field name
     # survived: the matrix only covered price and order values, so nothing
     # ever compared the balance response's cash fields against a real one.
+    # PHASE 4C. The answer to balance_cash_fields_absent: the cash IS
+    # reported, by a DIFFERENT endpoint the wrapper did not implement.
+    # Confirmed by a live read-only probe on the Oracle host (2026-08-16),
+    # cross-validated against get_orderable_usd() -- which is itself
+    # already LIVE_RESPONSE_CONFIRMED, so the two agree on a value neither
+    # was told by the other.
+    WireValueVerification(
+        "account_cash_path", PRESENT_BALANCE_PATH, REFERENCE_VERIFIED,
+        LIVE_RESPONSE_CONFIRMED,
+        "live read-only probe: inquire-present-balance answered rt_cd=0 on the "
+        "live account (Oracle, 2026-08-16); endpoint and TR id are from the "
+        "official koreainvestment/open-trading-api repository",
+    ),
+    WireValueVerification(
+        "account_cash_tr_id_live", TR_ID_PRESENT_BALANCE["live"], REFERENCE_VERIFIED,
+        LIVE_RESPONSE_CONFIRMED,
+        "live read-only probe: CTRP6504R accepted on the LIVE account -- the "
+        "paper TR_ID (VTRP6504R) is a separate value and is NOT confirmed by "
+        "this (Oracle, 2026-08-16)",
+    ),
+    WireValueVerification(
+        "account_cash_field", f"output2[crcy_cd=USD].{ACCOUNT_CASH_FIELD}",
+        REFERENCE_VERIFIED, LIVE_RESPONSE_CONFIRMED,
+        "live read-only probe: matched get_orderable_usd() EXACTLY, while "
+        "frcr_evlu_amt2 and output3.frcr_use_psbl_amt came back x1,414.88 "
+        "(FX scale) and output3.tot_asst_amt x5,844.18 (Oracle, 2026-08-16)",
+    ),
+    # The DISPROVED equity candidate, recorded so it cannot quietly come
+    # back. It is the only field whose name suggests "total assets", which
+    # is exactly why it needed disproving rather than ignoring.
+    WireValueVerification(
+        "account_equity_not_in_tot_asst_amt", f"{TR_ID_PRESENT_BALANCE['live']}:output3-is-KRW",
+        REFERENCE_VERIFIED, LIVE_RESPONSE_CONFIRMED,
+        "live read-only probe: output3 returned IDENTICAL values for "
+        "WCRC_FRCR_DVSN_CD=01 and =02, and tot_asst_amt was x5,844.18 the USD "
+        "orderable amount -- a won-denominated total across every currency the "
+        "account holds, not USD equity (Oracle, 2026-08-16)",
+    ),
+    WireValueVerification(
+        "orderable_amount_is_account_level", f"{TR_ID_PSAMOUNT['live']}:symbol-and-price-invariant",
+        REFERENCE_VERIFIED, LIVE_RESPONSE_CONFIRMED,
+        "live read-only probe: AAPL and MSFT at current, +1% and half price gave "
+        "a 0.0000% spread across all six reads, and the value equalled the "
+        "account USD deposit exactly (Oracle, 2026-08-16)",
+    ),
     WireValueVerification(
         "balance_cash_fields_absent", f"{TR_ID_BALANCE['live']}:no-cash-fields",
         REFERENCE_VERIFIED, LIVE_RESPONSE_CONFIRMED,
@@ -457,6 +510,20 @@ class KISAmbiguousResponseError(KISBrokerError):
     responses to a state-mutating call (order/cancel) -- the caller
     (execution/order_state_machine.py) must treat this as UNKNOWN, never
     as a definite failure eligible for retry (spec §9)."""
+
+
+class KISAccountCashUnavailableError(KISBrokerError):
+    """The account-level USD cash figure could not be established.
+    Deliberately NOT a zero-cash outcome -- see get_account_cash_usd."""
+
+    def __init__(self, message, *, detail=None):
+        super().__init__(message)
+        self.reason_code = "ACCOUNT_CASH_UNAVAILABLE"
+        self.detail = detail
+
+    def diagnostic(self):
+        return {"reason_code": self.reason_code, "detail": self.detail,
+                "field": ACCOUNT_CASH_FIELD}
 
 
 class KISOrderableCashUnavailableError(KISBrokerError):
@@ -845,6 +912,91 @@ class KISBroker:
             return value
 
         return _parse("frcr_dncl_amt1"), _parse("frcr_use_psbl_amt")
+
+    def get_account_cash_usd(self) -> float:
+        """The account's USD cash, account-level. PHASE 4C.
+
+        `inquire-balance` (TTTS3012R) does not carry cash -- that is
+        recorded as `balance_cash_fields_absent` in the matrix above, from
+        a live probe. `inquire-present-balance` (CTRP6504R) does, in an
+        `output2` row TAGGED with its own currency code, and this reads
+        the row whose `crcy_cd` is USD.
+
+        Why this field and not the bigger-looking ones. A live probe
+        compared every candidate against `get_orderable_usd()`, which is
+        already known to answer in USD:
+
+            output2[USD].frcr_dncl_amt_2      EXACT MATCH
+            output2[USD].frcr_drwg_psbl_amt_1 EXACT MATCH
+            output2[USD].frcr_evlu_amt2       x1,414.88  (FX scale -> KRW)
+            output3.frcr_use_psbl_amt         x1,414.88  (FX scale -> KRW)
+            output3.tot_dncl_amt              x4,429.30  (KRW, all currencies)
+            output3.tot_asst_amt              x5,844.18  (KRW, all currencies)
+
+        `output3`'s totals came back IDENTICAL whether the request asked
+        for the KRW or the foreign-currency division, which is the other
+        half of the same finding: they are a won-denominated view across
+        every currency the account holds. `tot_asst_amt` is therefore
+        emphatically NOT a USD equity figure, despite being the only field
+        whose name suggests "total assets" -- using it would put KRW cash
+        and an implicit FX rate into the denominator of every risk figure.
+
+        Fail-closed, on the same principle as `get_orderable_usd`: a read
+        that cannot produce a well-formed, finite, non-negative number
+        raises. It never degrades to 0.0, because "the read failed" and
+        "the account has no money" must not produce the same record --
+        which is exactly what ORACLE-CASH-01 was.
+        """
+        self.config.validate_read_allowed()
+        tr_id = TR_ID_PRESENT_BALANCE[self._env_key()]
+        body = self._get(PRESENT_BALANCE_PATH, tr_id, {
+            "CANO": self.config.account_no,
+            "ACNT_PRDT_CD": self.config.account_product_cd,
+            # 02 = foreign currency. output2 is currency-tagged either
+            # way; asking for the foreign-currency division keeps the
+            # request honest about what is wanted.
+            "WCRC_FRCR_DVSN_CD": "02", "NATN_CD": "840",
+            "TR_MKET_CD": "00", "INQR_DVSN_CD": "00",
+            "CTX_AREA_FK200": "", "CTX_AREA_NK200": "",
+        })
+        if not isinstance(body, dict):
+            raise KISAccountCashUnavailableError(
+                f"{tr_id} returned a non-object body")
+        if str(body.get("rt_cd")) != "0":
+            raise KISAccountCashUnavailableError(
+                f"{tr_id} refused the request (rt_cd={body.get('rt_cd')!r}, "
+                f"msg_cd={body.get('msg_cd')!r})")
+
+        rows = body.get("output2") or []
+        if isinstance(rows, dict):
+            rows = [rows]
+        usd_rows = [row for row in rows
+                    if isinstance(row, dict)
+                    and str(row.get(ACCOUNT_CASH_CURRENCY_FIELD, "")).strip().upper() == "USD"]
+        if not usd_rows:
+            raise KISAccountCashUnavailableError(
+                f"{tr_id} output2 carried no row tagged {ACCOUNT_CASH_CURRENCY_FIELD}=USD; "
+                f"refusing to read a cash figure whose currency is not stated")
+        if len(usd_rows) > 1:
+            raise KISAccountCashUnavailableError(
+                f"{tr_id} output2 carried {len(usd_rows)} USD rows; ambiguous")
+
+        raw = usd_rows[0].get(ACCOUNT_CASH_FIELD)
+        if ACCOUNT_CASH_FIELD not in usd_rows[0]:
+            raise KISAccountCashUnavailableError(
+                f"{tr_id} USD row has no {ACCOUNT_CASH_FIELD} field")
+        if raw is None or (isinstance(raw, str) and not raw.strip()) or isinstance(raw, bool):
+            raise KISAccountCashUnavailableError(
+                f"{tr_id} {ACCOUNT_CASH_FIELD} is empty")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            raise KISAccountCashUnavailableError(
+                f"{tr_id} {ACCOUNT_CASH_FIELD} is not numeric") from None
+        if not math.isfinite(value) or value < 0:
+            raise KISAccountCashUnavailableError(
+                f"{tr_id} {ACCOUNT_CASH_FIELD} is not a usable amount")
+        return value
 
     def get_orderable_usd(self, instrument, limit_price_usd: float) -> float:
         """The account's orderable USD FOR THIS SYMBOL AT THIS PRICE.
