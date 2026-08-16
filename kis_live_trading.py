@@ -324,12 +324,22 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                            symbol=symbol, reason_code="SYMBOL_NOT_ALLOWED", now=current)
                     continue
 
-                analysis = pso.analyze_stock(symbol)
-                if analysis is None or analysis["score"] < SCORE_THRESHOLD:
-                    results["skipped"].append((symbol, "did not meet score threshold"))
+                # PHASE 4A: qualification is the ONLY source-specific step.
+                # The legacy source still applies analyze_stock +
+                # SCORE_THRESHOLD, byte for byte. The S1 source uses its
+                # own validated candidate row instead, because requiring
+                # an S1 candidate to also clear an unrelated older scoring
+                # model would mean the thing that actually trades is "S1
+                # AND legacy score" -- not the strategy month 1 measured.
+                # Everything below this point is shared by both.
+                qualified = source.qualify(
+                    symbol, analyze=pso.analyze_stock, score_threshold=SCORE_THRESHOLD)
+                if not qualified.qualified:
+                    results["skipped"].append((symbol, qualified.detail or "not qualified"))
                     outcome["result"] = shadow_audit.RESULT_INFO
-                    outcome["reason_code"] = "BELOW_SCORE_THRESHOLD"
+                    outcome["reason_code"] = qualified.reason_code or "NOT_QUALIFIED"
                     continue
+                analysis = {"price": qualified.price, "score": qualified.score}
 
                 _audit(run_id, shadow_audit.SIGNAL_RECEIVED, shadow_audit.RESULT_INFO, symbol=symbol,
                        reason_code="SCORE_THRESHOLD_MET", now=current)
@@ -337,10 +347,16 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                 try:
                     instrument = _build_instrument(symbol, allowed_symbols)
                     signal = build_signal(
-                        strategy_id="PAPER_STRATEGY_ORDER_SCORE_V1", strategy_version="v1",
+                        # The strategy identity comes from whoever
+                        # qualified the candidate. A trade recorded under
+                        # the legacy id when an S1 candidate produced it
+                        # would be untraceable back to the scanner and to
+                        # the month of discovery data behind it. The
+                        # legacy source still yields the legacy id.
+                        strategy_id=qualified.strategy_id, strategy_version="v1",
                         config_version="live_rollout_v1", code_commit=deployed_commit,
                         symbol=symbol, exchange=instrument.exchange, signal_price=analysis["price"],
-                        score=analysis["score"], entry_reason="score_threshold_breakout",
+                        score=analysis["score"], entry_reason=qualified.entry_reason,
                         valid_for_seconds=SIGNAL_VALID_SECONDS, now=current,
                     )
                 except (InstrumentError, SignalError) as exc:

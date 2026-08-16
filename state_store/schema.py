@@ -426,11 +426,100 @@ MIGRATION_10_STATEMENTS = [
     SHADOW_AUDIT_TERMINAL_ONCE_INDEX,
 ]
 
+# ---------------------------------------------------------------------------
+# PHASE 4A: S1 Limited Live trade accounting.
+#
+# Separate from `orders`/`fills`, which record what the ORDER SYSTEM did.
+# This records what the S1 EXPERIMENT earned, and the two answer
+# different questions: an order is filled or not, a trade is profitable
+# or not, and only the second needs a scanner run id next to a fee.
+#
+# Every money column is NULLABLE on purpose. "Unknown" and "zero" are
+# different facts and this table refuses to conflate them -- see
+# `fees_status`. A fee this project has not yet verified against KIS's
+# published schedule must not be stored as 0 and then summed into a
+# net P&L that reads as authoritative. Overseas trading has real
+# commission, regulatory fees and FX cost; a net figure computed with
+# fee=0 is a gross figure wearing the wrong label.
+#
+# `broker_order_id` and the fill timestamps come from the broker. Where
+# this table and the broker disagree, the broker is right: KIS publishes
+# order/execution/balance/period-P&L endpoints, and a locally computed
+# number must never outrank a reported fill.
+# ---------------------------------------------------------------------------
+
+S1_LIVE_TRADES_TABLE = """
+CREATE TABLE s1_live_trades (
+    trade_id TEXT PRIMARY KEY,
+
+    -- provenance: which scanner observation produced this trade
+    source_signal_id TEXT NOT NULL,
+    scanner_run_id TEXT NOT NULL,
+    scanner_score REAL,
+    candidate_rank INTEGER,
+    allocation_version TEXT NOT NULL,
+    trading_day TEXT NOT NULL,
+
+    -- order identity
+    internal_order_id TEXT,
+    broker_order_id TEXT,
+
+    -- entry
+    entry_submitted_at TEXT,
+    entry_filled_at TEXT,
+    entry_price REAL,
+    qty INTEGER,
+    allocated_cash REAL,
+    account_cash_before REAL,
+
+    -- exit
+    exit_submitted_at TEXT,
+    exit_filled_at TEXT,
+    exit_price REAL,
+    exit_reason TEXT,
+
+    -- accounting. NULL means not established; see fees_status.
+    gross_pnl REAL,
+    commission REAL,
+    regulatory_fees REAL,
+    fx_cost REAL,
+    fees_total REAL,
+    estimated_slippage REAL,
+    net_pnl REAL,
+    account_cash_after REAL,
+
+    -- 'UNKNOWN'  no fee figure has been established -- net_pnl must stay NULL
+    -- 'REPORTED' every component came from the broker
+    -- 'PARTIAL'  some components reported, others still unknown
+    fees_status TEXT NOT NULL DEFAULT 'UNKNOWN',
+    fees_source TEXT,
+
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+"""
+
+S1_LIVE_TRADES_SIGNAL_INDEX = """
+CREATE UNIQUE INDEX idx_s1_live_trades_source_signal
+    ON s1_live_trades (source_signal_id)
+"""
+
+S1_LIVE_TRADES_DAY_INDEX = """
+CREATE INDEX idx_s1_live_trades_trading_day
+    ON s1_live_trades (trading_day)
+"""
+
+MIGRATION_11_STATEMENTS = [
+    S1_LIVE_TRADES_TABLE,
+    S1_LIVE_TRADES_SIGNAL_INDEX,
+    S1_LIVE_TRADES_DAY_INDEX,
+]
+
 # Every table this schema version creates -- used by export.py's
 # export_all() and by tests asserting the full table set exists.
 ALL_TABLES = [
     "orders", "fills", "positions", "position_events",
     "strategy_runs", "risk_events", "kill_switch_events",
     "exit_intents", "live_entry_reservations", "kis_order_idempotency",
-    "order_state_events", "shadow_audit_events",
+    "order_state_events", "shadow_audit_events", "s1_live_trades",
 ]

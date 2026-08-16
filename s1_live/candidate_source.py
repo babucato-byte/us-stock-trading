@@ -82,6 +82,16 @@ class CandidateSource:
     def allowed_symbols(self) -> FrozenSet[str]:
         raise NotImplementedError
 
+    def qualify(self, symbol, *, analyze=None, score_threshold=None):
+        """Is this setup worth an order? SOURCE-SPECIFIC (PHASE 4A §2).
+
+        Only the strategy judgement is per-source. Instrument validation,
+        the live price re-check, the Order Gate, entry limits, the kill
+        switch, reconciliation and the Execution Engine are shared and
+        run identically whatever answered this.
+        """
+        raise NotImplementedError
+
     def describe(self) -> dict:
         return {"candidate_source": self.name}
 
@@ -131,6 +141,13 @@ class LegacyWatchlistSource(CandidateSource):
 
     def allowed_symbols(self) -> FrozenSet[str]:
         return self._rollout.allowed_symbols
+
+    def qualify(self, symbol, *, analyze, score_threshold):
+        """Unchanged legacy qualification: analyze_stock + SCORE_THRESHOLD."""
+        from s1_live import qualification
+
+        return qualification.qualify_legacy(
+            symbol, analyze=analyze, score_threshold=score_threshold)
 
     def describe(self) -> dict:
         return {"candidate_source": self.name,
@@ -206,6 +223,30 @@ class S1CandidateSource(CandidateSource):
 
     def allowed_symbols(self) -> FrozenSet[str]:
         return self._validated_symbols()
+
+    def candidate_row(self, symbol):
+        """The validated row for `symbol`, or None."""
+        result = self._load()
+        if result is None:
+            return None
+        wanted = str(symbol or "").upper()
+        for row in result.rows:
+            if row["symbol"] == wanted:
+                return row
+        return None
+
+    def qualify(self, symbol, *, analyze=None, score_threshold=None):
+        """S1 qualification: the validated candidate row, and nothing else.
+
+        `analyze`/`score_threshold` are accepted so the cycle can call
+        every source the same way, and are deliberately IGNORED. Applying
+        the legacy score to an S1 candidate would mean the thing that
+        actually trades is "S1 AND legacy score" -- which is not the
+        strategy month 1 measured, and not what any report describes.
+        """
+        from s1_live import qualification
+
+        return qualification.qualify_s1(symbol, candidate_row=self.candidate_row(symbol))
 
     def describe(self) -> dict:
         result = self._load()

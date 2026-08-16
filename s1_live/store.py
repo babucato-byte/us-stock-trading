@@ -56,12 +56,20 @@ MANIFEST_FILE = "s1_live_candidates.manifest.json"
 #: not be possible by setting a single variable.
 S1_CANDIDATE_DIR_ENV = "S1_LIVE_CANDIDATE_DIR"
 
-SCHEMA_VERSION = "s1_live_candidates_v1"
+SCHEMA_VERSION = "s1_live_candidates_v2"
 
 #: The CSV's columns, in order. A file whose header differs is rejected
 #: rather than coerced -- a column that moved is a different file.
+#:
+#: v2 added `signal_timestamp`. The downstream re-entry and freshness
+#: guards both need the moment the signal was generated -- one to refuse
+#: a signal older than the position's last exit, the other to measure
+#: age at order time -- and v1 simply did not carry it, so every
+#: candidate was rejected for having no usable timestamp. Bumping
+#: SCHEMA_VERSION rather than tolerating both shapes means a v1 file left
+#: on disk is refused outright instead of silently losing the field.
 COLUMNS = ("rank", "symbol", "scanner_score", "signal_price", "signal_id",
-           "scanner_run_id", "trading_day")
+           "signal_timestamp", "scanner_run_id", "trading_day")
 
 #: Manifest keys that must all be present and non-empty.
 REQUIRED_MANIFEST_KEYS = (
@@ -299,17 +307,30 @@ def _parse_rows(payload: bytes, manifest: Dict[str, Any], expected_trading_day: 
         if not str(raw.get("signal_id") or "").strip():
             return _refuse(f"row {number}: empty signal_id")
 
+        stamp = str(raw.get("signal_timestamp") or "").strip()
+        if not stamp or _as_utc(stamp) is None:
+            return _refuse(f"row {number}: signal_timestamp "
+                           f"{raw.get('signal_timestamp')!r} is not a usable timestamp")
+
         rows.append({
             "rank": number - 1,
             "symbol": symbol,
             "scanner_score": score,
             "signal_price": price,
             "signal_id": str(raw["signal_id"]).strip(),
+            "signal_timestamp": stamp,
             "scanner_run_id": str(raw["scanner_run_id"]),
             "trading_day": str(raw["trading_day"]),
             "source_scanner": expected_scanner,
         })
     return rows
+
+
+def _as_utc(value):
+    """Shared with `s1_live/freshness.py` -- one definition of a timestamp."""
+    from s1_live.freshness import as_utc
+
+    return as_utc(value)
 
 
 def _finite(value) -> Optional[float]:

@@ -131,6 +131,9 @@ def build(trading_day: str, *, limit: int = MAX_S1_LIVE_CANDIDATES,
         "scanner_score": row.get("scanner_score"),
         "signal_price": row.get("signal_price"),
         "signal_id": row.get("signal_id"),
+        # The signal's own generation time, needed downstream by the
+        # freshness and re-entry guards.
+        "signal_timestamp": row.get("timestamp"),
         "scanner_run_id": run_id,
         "trading_day": trading_day,
     } for position, row in enumerate(ranked, start=1)]
