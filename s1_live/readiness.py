@@ -191,7 +191,7 @@ def compare_position_valuation(internal_usd, broker_usd) -> Dict[str, Any]:
 def build_matrix(*, conn=None, risk_state=None, equity_snapshot=None,
                  candidate_source_ok=None, candidate_decision_enabled=None,
                  kill_switch_healthy=None, reconciliation_healthy=None,
-                 minimum_order_verified=False, exit_policy_defined=False,
+                 minimum_order_verified=None, exit_policy_defined=False,
                  fees_reported=False, now=None) -> Matrix:
     """Every requirement, evaluated. Missing evidence is never READY."""
     stamp = (now or datetime.now(timezone.utc)).isoformat()
@@ -254,11 +254,18 @@ def build_matrix(*, conn=None, risk_state=None, equity_snapshot=None,
         UNKNOWN, "reconciliation is stale, failing or unreadable")
 
     # -- open decisions -----------------------------------------------------
+    # PHASE 4E: the caller may pass an override, but the default answer
+    # comes from config/s1_order_rules.py so one place decides.
+    if minimum_order_verified is None:
+        from config import s1_order_rules
+
+        minimum_order_verified = s1_order_rules.minimum_order_verified()
     add(stages.REQ_MINIMUM_ORDER, bool(minimum_order_verified),
         "the broker's real minimum order value is established",
         UNKNOWN,
-        "DEFAULT_MIN_ORDER_AMOUNT_USD is a placeholder and must not be used "
-        "as live grounds")
+        "no official minimum order amount is documented and ORD_QTY defers to "
+        "unpublished exchange minimums; DEFAULT_MIN_ORDER_AMOUNT_USD stays a "
+        "placeholder and must not be used as live grounds")
     add(stages.REQ_EXIT_POLICY, bool(exit_policy_defined),
         "an S1 exit policy is defined",
         BLOCKED,

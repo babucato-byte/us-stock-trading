@@ -523,3 +523,114 @@ class TestOrderStateDatabaseIsolation:
             assert target.exists()
         finally:
             conn.close()
+
+
+class TestOrderRulesAndFeeSource:
+    """PHASE 4E: what the official sources did and did not establish."""
+
+    def test_the_minimum_order_rule_is_unknown_not_assumed(self):
+        from config import s1_order_rules
+
+        assert s1_order_rules.MINIMUM_ORDER_RULE == s1_order_rules.UNKNOWN
+        assert s1_order_rules.minimum_order_verified() is False
+
+    def test_the_whole_share_rule_exists_but_is_not_in_force(self):
+        """'No minimum is documented' and 'no minimum exists' are
+        different statements; only the first is established."""
+        from config import s1_order_rules
+
+        assert s1_order_rules.RULE_WHOLE_SHARE_ONLY == "WHOLE_SHARE_ONLY"
+        assert s1_order_rules.MINIMUM_ORDER_RULE != s1_order_rules.RULE_WHOLE_SHARE_ONLY
+
+    def test_the_minimum_order_gate_stays_unmet_by_default(self, conn):
+        matrix = full_ready(conn, minimum_order_verified=None)
+        unmet = {check.key for check in matrix.unmet_for(stages.STAGE_FIRST_LIVE)}
+        assert stages.REQ_MINIMUM_ORDER in unmet
+
+    def test_the_placeholder_is_never_treated_as_verified(self):
+        from config import s1_order_rules
+        from live_readiness.sizing import DEFAULT_MIN_ORDER_AMOUNT_USD
+
+        assert DEFAULT_MIN_ORDER_AMOUNT_USD == 1.0
+        assert s1_order_rules.minimum_order_verified() is False
+
+    def test_no_tick_size_constant_is_invented(self):
+        """§4: no rounding rule is created. The policy is named, not
+        implemented."""
+        from config import s1_order_rules
+
+        assert s1_order_rules.TICK_SIZE_POLICY == s1_order_rules.TICK_POLICY_BROKER_ENFORCED
+        assert s1_order_rules.TICK_POLICY_VERIFIED == s1_order_rules.UNKNOWN
+        # Checked on the syntax tree. The module docstring NAMES the
+        # common US increments precisely to explain why they are not
+        # constants here -- a text search would fail on the explanation
+        # instead of on an actual rule.
+        import ast
+
+        source = (REPO_ROOT / "config" / "s1_order_rules.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        numeric_assignments = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant) \
+                    and isinstance(node.value.value, (int, float)) \
+                    and not isinstance(node.value.value, bool):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        numeric_assignments[target.id] = node.value.value
+        assert numeric_assignments == {}, (
+            f"a numeric tick/price rule was bound: {numeric_assignments}")
+        called = {n.func.id for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        assert "round" not in called, "a rounding rule was implemented"
+
+    def test_fee_fields_are_confirmed_but_not_usable(self):
+        from s1_live import fee_source
+
+        assert "ovrs_fee_smtl" in fee_source.CONFIRMED_FEE_FIELDS
+        assert "smtl_fee1" in fee_source.CONFIRMED_FEE_FIELDS
+        status = fee_source.accounting_status()
+        assert status["fees_status"] == "UNKNOWN"
+        assert status["net_pnl"] is None
+        assert status["usable"] is False
+
+    def test_an_empty_detail_block_is_reported_as_unverified(self):
+        from s1_live import fee_source
+
+        body = {"rt_cd": "0", "output1": [],
+                "output2": [{"dmst_fee_smtl": "0", "ovrs_fee_smtl": "0"}]}
+        observation = fee_source.observe(body, fee_source.PERIOD_TRANS)
+        assert observation.status == fee_source.FIELDS_CONFIRMED
+        assert observation.usable_for_accounting is False
+        assert "no trade has settled" in observation.detail
+
+    @pytest.mark.parametrize("body", [
+        None, "nope", {}, {"rt_cd": "7"}, {"rt_cd": "0"},
+        {"rt_cd": "0", "output2": []},
+        {"rt_cd": "0", "output2": [{"dmst_fee_smtl": "0"}]}])
+    def test_a_malformed_official_response_never_yields_a_fee(self, body):
+        from s1_live import fee_source
+
+        observation = fee_source.observe(body, fee_source.PERIOD_TRANS)
+        assert observation.usable_for_accounting is False
+
+    def test_a_populated_detail_block_is_still_not_usable_yet(self):
+        """Rows existing does not tell us the currency."""
+        from s1_live import fee_source
+
+        body = {"rt_cd": "0", "output1": [{"x": 1}],
+                "output2": [{"dmst_fee_smtl": "1.5", "ovrs_fee_smtl": "2.5"}]}
+        observation = fee_source.observe(body, fee_source.PERIOD_TRANS)
+        assert observation.status == fee_source.SEMANTICS_UNVERIFIED
+        assert observation.usable_for_accounting is False
+
+    def test_the_module_computes_no_fee_amount(self):
+        """It reads and records; it must not produce a number to subtract."""
+        import ast
+
+        source = (REPO_ROOT / "s1_live" / "fee_source.py").read_text(encoding="utf-8")
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.FunctionDef) and node.name in ("observe",):
+                dumped = ast.dump(node)
+                assert "net_pnl" not in dumped
+        for rate in ("0.0025", "0.25", "0.007", "COMMISSION_RATE"):
+            assert rate not in source
