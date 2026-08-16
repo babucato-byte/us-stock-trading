@@ -335,6 +335,13 @@ python scripts/run_scanners.py --profile daily --no-eligibility   # 캐시 무�
 | 스캐너별 로그 | `logs/scanners/<스캐너>.log` | `SCANNER_LOG_DIR` |
 | Eligibility 캐시 | `logs/scanners/eligibility/<provider>.json` | `SCANNER_ANALYTICS_DIR` |
 | Activity 순위 | `logs/scanners/activity/<provider>.json` | 〃 |
+| Slack 중복 억제 상태 | `logs/scanners/notify/<날짜>.json` | 〃 |
+| Manual Watchlist | `logs/watchlist/<날짜>.{tomorrow,today}.{json,md}` | `MANUAL_WATCHLIST_DIR` |
+
+Manual Watchlist 는 `logs/scanners` **안이 아니라 옆에** 둡니다. 분석 저장소는
+append-only 연구 데이터라는 규칙이 그대로 성립해야 하는데, 워치리스트는
+append-only 도 아니고 연구 데이터도 아니어서 같은 루트에 넣으면 그 구분이
+흐려집니다. 자세한 내용은 [MANUAL_WATCHLIST.md](MANUAL_WATCHLIST.md).
 
 `SCANNER_ANALYTICS_DIR` 는 주문 후보 저장 위치와 **의도적으로 별개**입니다 (§10).
 주문 후보는 저장소 루트의 `order_candidates.csv`(`daily_candidate_scanner.py` 가
@@ -347,6 +354,41 @@ python scripts/run_scanners.py --profile daily --no-eligibility   # 캐시 무�
 신호 파일은 append-only이며 하루가 끝나면 불변입니다. 성과는 별도 파일에
 쌓이고, `signal_price` 는 절대 수정되지 않습니다. 모든 수익률·MFE·MAE가
 그 값을 기준으로 계산되기 때문입니다.
+
+---
+
+## 3.5 Slack
+
+새 webhook 을 만들지 않고 기존 두 개를 재사용합니다.
+
+| 무엇 | 채널 | 빈도 |
+|---|---|---|
+| 실행 실패 알림 | `SLACK_ALERT_WEBHOOK_URL` (`send_slack_alert`) | 실패했을 때만 |
+| 주간 요약 | `SLACK_WEBHOOK_URL` (`send_slack_message`) | 주 1회 (토) |
+| Manual Watchlist | `SLACK_WEBHOOK_URL` | 하루 1회 (아침) |
+
+**발송하는 경우**: `FAILED` / `FAILED_PROVIDER` / `FAILED_NO_UNIVERSE` /
+`FAILED_NO_SCANNER`, circuit breaker 가 실제로 발동한 `PARTIAL`, 리포트
+CLI 의 exit 1·2.
+
+**발송하지 않는 경우**: `SUCCESS`, 후보 0건인 `SUCCESS`, `SKIPPED_MARKET_CLOSED`,
+일반 `PARTIAL`. 조용한 장세는 스캔하는 날의 가장 흔한 결과이고, 거기에 알림을
+보내면 그 채널을 안 읽게 훈련시킵니다 — 그러면 나머지 알림 전부가 무의미해집니다.
+
+**실패 알림에는 종목명과 score 가 들어가지 않습니다.** 건수·상태·사유 코드만
+들어갑니다. 가끔 티커를 찍는 채널은 사람들이 그걸 보고 매매하는 채널이 되고,
+Month 1 은 관측 기간입니다.
+
+**Slack 장애는 스캔 결과를 바꾸지 않습니다.** 알림은 exit code 가 이미 결정되고
+manifest 가 기록된 뒤에 호출되며, 예외를 스스로 삼킵니다. Slack 이 폭발한
+실행과 정상 실행의 저장 데이터(runs·signals)가 동일한지 테스트가 비교합니다.
+
+중복 억제는 `(profile, trading_day, status)` 기준 1회이고, 상태 파일을 읽거나
+쓰지 못하면 **억제를 포기하고 발송합니다** — 중복은 성가신 정도지만, 상태
+파일 때문에 알림 자체를 잃는 것이 이 모듈이 막으려는 실패입니다.
+
+`SCANNER_SLACK_ENABLED=false` 로 Scanner 계열 발송만 전부 끌 수 있습니다
+(기존 Trading 알림 경로에는 영향 없음).
 
 ---
 

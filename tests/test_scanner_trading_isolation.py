@@ -57,6 +57,14 @@ def python_files():
 
 
 def imported_modules(path):
+    """Every imported module name, including the dotted `from X import Y`.
+
+    Recording only `node.module` loses the imported name, which made
+    `test_no_scanner_module_imports_the_trading_candidate_store` unable
+    to see `from market_data import candidate_store` -- it recorded that
+    import as plain `market_data`, and the substring check for
+    "candidate_store" never matched. Emitting both forms closes it.
+    """
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     names = set()
     for node in ast.walk(tree):
@@ -66,6 +74,8 @@ def imported_modules(path):
         elif isinstance(node, ast.ImportFrom):
             if node.module and node.level == 0:
                 names.add(node.module)
+                for alias in node.names:
+                    names.add(f"{node.module}.{alias.name}")
     return names
 
 

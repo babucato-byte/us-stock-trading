@@ -716,6 +716,8 @@ def main(argv=None) -> int:
             )
             _record_manifest(skipped, day)
             print("[MARKET GUARD] NYSE closed. Scanner run skipped.")
+            # Deliberately no notification: a closed market is a correct
+            # no-op, and alerting on it would fire on every holiday.
             return 0
 
     names = [item.strip() for item in args.scanners.split(",") if item.strip()]
@@ -741,7 +743,18 @@ def main(argv=None) -> int:
     # A scanner that failed is an operational problem worth a non-zero
     # exit so cron/systemd surfaces it -- but only after the other
     # scanners' results have been stored.
-    return 0 if report.status == run_context.SUCCESS else 1
+    exit_code = 0 if report.status == run_context.SUCCESS else 1
+    # Notification LAST, and after the exit code is already decided, so
+    # that a Slack outage cannot influence what this process reports.
+    # `notify_run` swallows its own exceptions; the guard here is for
+    # the import itself, which must not be able to fail a scan either.
+    try:
+        from scanners.notify import slack as notify
+
+        notify.notify_run(report)
+    except Exception:  # noqa: BLE001 - see scanners/notify/slack.py
+        logger.warning("scanner notification could not be attempted", exc_info=True)
+    return exit_code
 
 
 if __name__ == "__main__":

@@ -28,7 +28,7 @@ from scanners.analytics.common import (
     split_experiments,
     summarise,
 )
-from scanners.base import result_store
+from scanners.base import result_store, run_context
 
 logger = logging.getLogger(__name__)
 
@@ -170,3 +170,147 @@ def write(report: Dict[str, Any]) -> str:
     path = result_store.reports_dir() / f"weekly_{report['start_day']}_{report['end_day']}.json"
     path.write_text(json.dumps(report, indent=2, sort_keys=True, default=str), encoding="utf-8")
     return str(path)
+
+
+def collect_run_health(start_day: str, end_day: str) -> Dict[str, Any]:
+    """How the week's RUNS went, from the manifests rather than the signals.
+
+    A week with no failed run and a week whose runs all failed both
+    produce a report full of zeroes if you only read the signal files.
+    The manifests are the only place the difference is recorded, so the
+    Slack summary reads them: "0 signals" next to "4 failed runs" is a
+    different message from "0 signals" next to "12 clean runs".
+    """
+    days, statuses, failed, partial, skipped, breakers = [], {}, [], [], 0, 0
+    for day in result_store.available_trading_days():
+        if not (start_day <= day <= end_day):
+            continue
+        days.append(day)
+    # Manifests exist for days with no signals too, so walk the range by
+    # date rather than by which days happen to have a signal file.
+    for day in _days_in_range(start_day, end_day):
+        for manifest in result_store.read_run_manifests(day):
+            status = str(manifest.get("run_status") or "UNKNOWN")
+            statuses[status] = statuses.get(status, 0) + 1
+            label = f"{day} {manifest.get('profile') or 'adhoc'}"
+            if status in run_context.FAILURE_STATUSES:
+                failed.append(f"{label}: {status}")
+            elif status == run_context.PARTIAL:
+                partial.append(label)
+            elif status == run_context.SKIPPED_MARKET_CLOSED:
+                skipped += 1
+            if manifest.get("circuit_breaker_triggered"):
+                breakers += 1
+    return {
+        "runs": sum(statuses.values()),
+        "statuses": statuses,
+        "failed": failed,
+        "partial": partial,
+        "skipped_market_closed": skipped,
+        "circuit_breaker_runs": breakers,
+    }
+
+
+def _days_in_range(start_day: str, end_day: str) -> List[str]:
+    try:
+        start = date.fromisoformat(start_day)
+        end = date.fromisoformat(end_day)
+    except (TypeError, ValueError):
+        return []
+    out, cursor = [], start
+    while cursor <= end:
+        out.append(cursor.isoformat())
+        cursor += timedelta(days=1)
+    return out
+
+
+def format_slack(report: Dict[str, Any], *, run_health: Optional[Dict[str, Any]] = None) -> str:
+    """The weekly summary as a Slack message.
+
+    Deliberately NOT `format_report()` with a wrapper. Two differences
+    are requirements, not styling:
+
+    * No `best_candidate`/`worst_candidate`. Those name a symbol, and
+      track B-2 keeps symbols out of Slack -- a weekly message that
+      printed the week's best ticker is a message people trade from,
+      which is exactly what month 1 is not for.
+    * Run health is included. The file report is read by someone who
+      already knows why they opened it; the Slack message is read by
+      someone who was not looking, so "4 runs failed" has to be in the
+      message rather than one directory away.
+
+    The file report keeps everything, including the candidates. This is
+    an additional rendering, not a replacement.
+    """
+    start, end = report.get("start_day"), report.get("end_day")
+    lines = [
+        "*📡 Scanner 주간 요약* (Month 1 · 관측 전용)",
+        f"기간: {start} ~ {end}",
+        f"신호 총계: {report.get('total_signals', 0)}   "
+        f"신호 발생 거래일: {len(report.get('trading_days') or [])}   "
+        f"hit horizon: {report.get('hit_horizon')}",
+    ]
+
+    health = run_health or {}
+    if health:
+        bits = [f"실행 {health.get('runs', 0)}회"]
+        if health.get("failed"):
+            bits.append(f"실패 {len(health['failed'])}")
+        if health.get("partial"):
+            bits.append(f"부분성공 {len(health['partial'])}")
+        if health.get("circuit_breaker_runs"):
+            bits.append(f"circuit breaker {health['circuit_breaker_runs']}")
+        if health.get("skipped_market_closed"):
+            bits.append(f"휴장 {health['skipped_market_closed']}")
+        lines.append("실행 상태: " + " · ".join(bits))
+        for entry in (health.get("failed") or [])[:5]:
+            lines.append(f"  ⚠️ {entry}")
+
+    scanners = report.get("scanners") or []
+    if not scanners:
+        lines.append("")
+        lines.append("이번 주 기록된 신호가 없습니다.")
+    else:
+        lines.append("")
+        lines.append("```")
+        header = (f"{'scanner':20}{'ver':>6} {'prov':>9} {'n':>5} {'hit%':>7} "
+                  f"{'1d':>7} {'3d':>7} {'5d':>7} {'MFE':>7} {'MAE':>7} "
+                  f"{'M/M':>6} {'5d성숙':>7}")
+        lines.append(header)
+        lines.append("-" * len(header))
+        for item in scanners:
+            maturity = (item.get("maturity") or {}).get("return_5d") or {}
+            lines.append(
+                f"{str(item.get('scanner_name'))[:20]:20}"
+                f"{_short_version(item.get('scanner_version')):>6} "
+                f"{str(item.get('market_data_provider') or '-')[:9]:>9} "
+                f"{item.get('signal_count', 0):5} {_num(item.get('hit_rate')):>7} "
+                f"{_num(item.get('avg_return_1d')):>7} {_num(item.get('avg_return_3d')):>7} "
+                f"{_num(item.get('avg_return_5d')):>7} {_num(item.get('avg_mfe')):>7} "
+                f"{_num(item.get('avg_mae')):>7} {_num(item.get('mfe_mae_ratio')):>6} "
+                f"{_maturity_pct(maturity):>7}")
+        lines.append("```")
+
+    for finding in report.get("experiment_splits") or []:
+        lines.append(f"⚠️ {format_split_warning(finding)}")
+
+    lines.append("")
+    lines.append("종목명 미포함 · 주문 경로 영향 없음 · Candidate Decision: disabled")
+    return "\n".join(lines)
+
+
+def _short_version(version) -> str:
+    """`hma_early_trend_v1.0` -> `v1.0`. The scanner name is already in
+    the row; repeating it inside the version column wastes the width a
+    phone-sized Slack view has."""
+    text = str(version or "-")
+    marker = text.rfind("_v")
+    return text[marker + 1:] if marker != -1 else text[-6:]
+
+
+def _maturity_pct(maturity: Dict[str, Any]) -> str:
+    count = maturity.get("n")
+    pct = maturity.get("pct_of_signals")
+    if count is None:
+        return "-"
+    return f"{count}/{_num(pct, 0)}%" if pct is not None else str(count)

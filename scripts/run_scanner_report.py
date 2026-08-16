@@ -70,7 +70,24 @@ def parse_args(argv=None):
                              "('run'), anywhere in the trading day ('day'), or both")
     parser.add_argument("--no-write", action="store_true",
                         help="print the report without saving it")
+    parser.add_argument("--slack", action="store_true",
+                        help="weekly only: also post a symbol-free summary to "
+                             "the existing report webhook (SLACK_WEBHOOK_URL)")
     return parser.parse_args(argv)
+
+
+def _post_weekly_to_slack(report, start: str, end: str) -> None:
+    """Best-effort. A failed post is logged and the report still exits 0 --
+    the report itself succeeded, and its file is already on disk."""
+    try:
+        from scanners.notify import slack as notify
+
+        health = weekly_report.collect_run_health(start, end)
+        sent = notify.send_report(weekly_report.format_slack(report, run_health=health))
+        print(f"slack: {'sent' if sent else 'not sent'}")
+    except Exception:  # noqa: BLE001
+        logging.getLogger(__name__).warning("weekly Slack post failed", exc_info=True)
+        print("slack: not sent (see log)")
 
 
 def _parse_month(value) -> tuple:
@@ -112,13 +129,34 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    command = f"run_scanner_report.py {getattr(args, 'report', '?')}"
     try:
-        return _run(args)
+        code, detail = _run(args), None
     except date_range.DateRangeError as exc:
         # Usage error, not a failed report. Exiting 2 keeps a typo in a
         # cron entry distinguishable from a genuine operational failure.
         print(f"error: {exc}")
-        return USAGE_ERROR
+        code, detail = USAGE_ERROR, str(exc)
+    _alert_on_failure(command, code, detail)
+    return code
+
+
+def _alert_on_failure(command: str, exit_code: int, detail=None) -> None:
+    """Non-zero exit -> the alert channel. Best-effort, always.
+
+    Wrapped here rather than inside `_run` so that the exit code is
+    fully decided before any network call, and so a Slack problem can
+    never turn a successful report into a failed one.
+    """
+    if not exit_code:
+        return
+    try:
+        from scanners.notify import slack as notify
+
+        notify.notify_cli_failure(command, exit_code, detail=detail)
+    except Exception:  # noqa: BLE001 - a report is not failed by its alert
+        logging.getLogger(__name__).warning(
+            "could not attempt the CLI failure notification", exc_info=True)
 
 
 def _run(args) -> int:
@@ -135,6 +173,8 @@ def _run(args) -> int:
         print(weekly_report.format_report(report))
         if not args.no_write:
             print(f"\nsaved: {weekly_report.write(report)}")
+        if args.slack:
+            _post_weekly_to_slack(report, start, end)
         return 0
 
     if args.report == "monthly":

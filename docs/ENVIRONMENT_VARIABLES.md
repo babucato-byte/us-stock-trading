@@ -32,8 +32,12 @@
 
 | 변수 | 필수 여부 | 채널 | 사용처 |
 |---|---|---|---|
-| `SLACK_WEBHOOK_URL` | 필수 | `#value-report` | `slack_report.py`, `backtest_report_slack.py` |
-| `SLACK_ALERT_WEBHOOK_URL` | 필수 | `#realtime-alerts` | `slack_scanner.py`, `order_monitor.py`, `trading_health_check.py` |
+| `SLACK_WEBHOOK_URL` | 필수 | `#value-report` | `slack_report.py`, `backtest_report_slack.py`, Scanner 주간 요약 (`scripts/run_scanner_report.py weekly --slack`), Manual Watchlist (`scripts/run_manual_watchlist.py --slack`) |
+| `SLACK_ALERT_WEBHOOK_URL` | 필수 | `#realtime-alerts` | `order_monitor.py`, `trading_health_check.py`, Scanner 실패 알림 (`scanners/notify/slack.py`) |
+
+Scanner 계열은 새 webhook을 만들지 않고 위 두 개를 재사용한다. 실패는
+alert 채널, 예정된 요약은 report 채널로 간다. `SCANNER_SLACK_ENABLED=false`
+로 Scanner 계열 발송만 전부 끌 수 있다 (기존 Trading 알림에는 영향 없음).
 
 ## AI 분석
 
