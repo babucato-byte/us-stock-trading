@@ -45,6 +45,8 @@ class DryRunResult:
     rejected: List[Dict[str, Any]] = field(default_factory=list)
     plan: Optional[Dict[str, Any]] = None
     observations: List[Dict[str, Any]] = field(default_factory=list)
+    #: The durable PHASE 4B state, when one was supplied.
+    risk_state: Optional[Dict[str, Any]] = None
 
     @property
     def would_submit(self) -> int:
@@ -64,6 +66,7 @@ class DryRunResult:
             "cash_pool": self.cash_pool,
             "account_allowed": self.account_allowed,
             "account_guards": self.account_guards,
+            "risk_state": self.risk_state,
             "eligible": self.eligible,
             "rejected": self.rejected,
             "plan": self.plan,
@@ -79,7 +82,8 @@ def simulate(*, trading_day, candidates, cash_pool_usd=None, pool=None,
              pnl_today_usd=None, basis_equity_usd=None,
              equity_usd=None, peak_equity_usd=None,
              consecutive_losses=0, consecutive_loss_limit=None,
-             cooldown_seconds=None, max_signal_age_seconds=None) -> DryRunResult:
+             cooldown_seconds=None, max_signal_age_seconds=None,
+             risk_state=None) -> DryRunResult:
     """Simulate one S1 entry cycle. Places nothing.
 
     `candidates` are validated S1 candidate rows in rank order.
@@ -94,11 +98,29 @@ def simulate(*, trading_day, candidates, cash_pool_usd=None, pool=None,
         cash_pool=resolved.as_dict(),
     )
 
-    allowed, guards = risk_guards.evaluate_all(
-        pnl_today_usd=pnl_today_usd, basis_equity_usd=basis_equity_usd,
-        equity_usd=equity_usd, peak_equity_usd=peak_equity_usd,
-        consecutive_losses=consecutive_losses,
-        consecutive_loss_limit=consecutive_loss_limit)
+    if risk_state is not None:
+        # PHASE 4B: the durable state is authoritative when supplied. Its
+        # start equity is the one captured at the open and never
+        # recomputed, so a mid-day restart cannot widen the loss budget.
+        result.risk_state = risk_state.as_dict()
+        allowed = risk_state.entries_allowed
+        guards = [
+            risk_guards.check_daily_loss(
+                pnl_today_usd=(None if risk_state.current_equity is None
+                               or risk_state.start_equity is None
+                               else risk_state.current_equity - risk_state.start_equity),
+                basis_equity_usd=risk_state.start_equity),
+            risk_guards.check_drawdown(equity_usd=risk_state.current_equity,
+                                       peak_equity_usd=risk_state.peak_equity),
+            risk_guards.check_consecutive_losses(
+                consecutive_losses=consecutive_losses, limit=consecutive_loss_limit),
+        ]
+    else:
+        allowed, guards = risk_guards.evaluate_all(
+            pnl_today_usd=pnl_today_usd, basis_equity_usd=basis_equity_usd,
+            equity_usd=equity_usd, peak_equity_usd=peak_equity_usd,
+            consecutive_losses=consecutive_losses,
+            consecutive_loss_limit=consecutive_loss_limit)
     result.account_guards = [item.as_dict() for item in guards]
     result.account_allowed = allowed
 

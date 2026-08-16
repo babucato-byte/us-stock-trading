@@ -515,6 +515,81 @@ MIGRATION_11_STATEMENTS = [
     S1_LIVE_TRADES_DAY_INDEX,
 ]
 
+# ---------------------------------------------------------------------------
+# PHASE 4B: durable account risk state.
+#
+# Two tables because the two facts have different lifetimes. The daily
+# row is scoped to one ET trading day and is immutable in its start
+# figure once captured; the peak is a single account-level high-water
+# mark that outlives every day.
+#
+# Why `start_equity` must be durable rather than recomputed: the daily
+# loss limit is measured against the equity the day STARTED from. A
+# process that restarts at 14:00 and re-reads equity would treat the
+# post-loss figure as the day's starting point, which resets the loss
+# budget to zero used -- turning a -2% day into a fresh -2% of room, and
+# doing so silently at exactly the moment a restart is most likely
+# (something went wrong). The row is therefore written once per day and
+# read thereafter; `start_equity_source` records how it was obtained so
+# a late or reconstructed capture is never indistinguishable from a
+# clean one at the open.
+#
+# Every equity column is NULLABLE and the status columns carry UNKNOWN,
+# because on this broker they currently ARE unknown -- see
+# `s1_live/equity.py`. A schema that made them NOT NULL would force a
+# caller to invent a number to satisfy it.
+# ---------------------------------------------------------------------------
+
+S1_RISK_STATE_TABLE = """
+CREATE TABLE s1_risk_state (
+    trading_day TEXT PRIMARY KEY,
+
+    start_equity REAL,
+    start_equity_source TEXT,
+    start_equity_captured_at TEXT,
+
+    current_equity REAL,
+    current_equity_source TEXT,
+    current_equity_as_of TEXT,
+
+    equity_currency TEXT,
+
+    daily_return_pct REAL,
+    drawdown_pct REAL,
+
+    -- ALLOW / BLOCK / UNKNOWN
+    daily_loss_status TEXT NOT NULL DEFAULT 'UNKNOWN',
+    drawdown_status TEXT NOT NULL DEFAULT 'UNKNOWN',
+    status_detail TEXT,
+
+    last_successful_refresh TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+"""
+
+# Single row, id = 1. Account-level and cross-day: a drawdown is not a
+# daily measure and its baseline must not reset with the calendar.
+S1_RISK_PEAK_TABLE = """
+CREATE TABLE s1_risk_peak (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    peak_equity REAL NOT NULL,
+    equity_currency TEXT NOT NULL,
+    peak_updated_at TEXT NOT NULL,
+    peak_source TEXT,
+    -- Set whenever the peak was raised by something this system cannot
+    -- prove was trading profit. See s1_live/risk_state.py on deposits.
+    external_flow_suspected INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+"""
+
+MIGRATION_12_STATEMENTS = [
+    S1_RISK_STATE_TABLE,
+    S1_RISK_PEAK_TABLE,
+]
+
 # Every table this schema version creates -- used by export.py's
 # export_all() and by tests asserting the full table set exists.
 ALL_TABLES = [
@@ -522,4 +597,5 @@ ALL_TABLES = [
     "strategy_runs", "risk_events", "kill_switch_events",
     "exit_intents", "live_entry_reservations", "kis_order_idempotency",
     "order_state_events", "shadow_audit_events", "s1_live_trades",
+    "s1_risk_state", "s1_risk_peak",
 ]

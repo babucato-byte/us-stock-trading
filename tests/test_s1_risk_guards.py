@@ -358,7 +358,9 @@ class TestTradeAccounting:
         from state_store.migrations import CURRENT_SCHEMA_VERSION
         from state_store.schema import ALL_TABLES
 
-        assert CURRENT_SCHEMA_VERSION == 11
+        # >= rather than ==: the trade table arrived at migration 11 and
+        # later migrations must not be able to break this assertion.
+        assert CURRENT_SCHEMA_VERSION >= 11
         assert "s1_live_trades" in ALL_TABLES
         names = {row[0] for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
