@@ -36,6 +36,7 @@ curating that list to exclude such instruments, not on independent
 code-level detection. See docs/live_review/TBD_REVIEW_RECOMMENDATIONS.md.
 """
 
+import logging
 import os
 import uuid
 from datetime import datetime, timezone
@@ -72,8 +73,12 @@ from market_data.kis_validation_provider import (
     compute_price_deviation_percent,
 )
 from market_data.base import MarketDataProviderError
+from market_hours import us_trading_day
 from operations import kill_switch as ops_kill_switch
+from s1_live import candidate_source as s1_candidate_source
 from state_store import db as state_db
+
+logger = logging.getLogger(__name__)
 
 SCORE_THRESHOLD = 70  # matches paper_strategy_order.py's existing threshold
 SIGNAL_VALID_SECONDS = 120
@@ -194,11 +199,27 @@ def _get_allowed_account_no():
     return os.environ.get("KIS_ALLOWED_ACCOUNT_NO", "")
 
 
-def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None):
+def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
+                             candidate_source=None):
     """Returns a results dict: {"submitted": [...], "blocked": [(symbol, reason)], "skipped": [...]}.
     Never raises for a per-symbol failure -- only for a structural
     precondition failure that makes the WHOLE cycle unsafe to run at all
-    (config invalid, halted, commit mismatch)."""
+    (config invalid, halted, commit mismatch).
+
+    `candidate_source` supplies the two things this cycle used to answer
+    inline: which symbols to evaluate, and which symbols the Order Gate
+    is told are allowed. Omitting it resolves the source from the
+    environment, which yields the legacy watchlist source unless
+    `S1_LIVE_SOURCE_ENABLED` is explicitly set -- so the default path is
+    the one that shipped, symbol for symbol.
+
+    Only the SOURCE is pluggable. Every gate below -- allow-list check,
+    price re-validation, orderable cash, duplicate order, entry limits,
+    kill switch, reconciliation, the Execution Engine -- is shared by
+    every source and exists exactly once. A second candidate source must
+    never mean a second pipeline: two pipelines are two ideas of what is
+    safe, and they diverge silently.
+    """
     current = now or datetime.now(timezone.utc)
     results = {"submitted": [], "blocked": [], "skipped": []}
     cycle_run_id = shadow_audit.new_run_id()
@@ -261,8 +282,23 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None):
 
     is_regular_session = pso.get_us_market_session() == "regular" if rollout.regular_session_only else True
 
-    watchlist = pso.load_watchlist()
-    kis_validation = KISValidationProvider(broker, instrument_lookup=lambda s: _build_instrument(s, rollout.allowed_symbols))
+    # Resolved AFTER every structural precondition above, so a cycle that
+    # was going to refuse anyway never reads a candidate file.
+    # `watchlist_module=pso` hands over THIS module's own reference. It
+    # must not be re-imported inside the source: test_ai_analysis.py
+    # pops "paper_strategy_order" from sys.modules and leaves it popped,
+    # so a fresh import would build a different module object than the
+    # one `klt.pso` -- and therefore every existing monkeypatch -- uses.
+    source = candidate_source or s1_candidate_source.resolve(
+        rollout, trading_day=us_trading_day(current), watchlist_module=pso)
+    # One evaluation of the allow-list per cycle. Re-reading it per symbol
+    # would let the set change underneath a cycle that had already made
+    # decisions against the earlier value.
+    allowed_symbols = source.allowed_symbols()
+    logger.info("candidate source: %s", source.describe())
+
+    watchlist = source.symbols()
+    kis_validation = KISValidationProvider(broker, instrument_lookup=lambda s: _build_instrument(s, allowed_symbols))
 
     conn = state_db.open_db()
     try:
@@ -277,7 +313,7 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None):
                        "detail": None, "internal_order_id": None}
             terminal_recorded = False
             try:
-                if symbol not in rollout.allowed_symbols:
+                if symbol not in allowed_symbols:
                     results["skipped"].append((symbol, "not in live_rollout.allowed_symbols"))
                     _persist_blocked_record(
                         symbol=symbol, risk_gate_result="BLOCKED",
@@ -299,7 +335,7 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None):
                        reason_code="SCORE_THRESHOLD_MET", now=current)
 
                 try:
-                    instrument = _build_instrument(symbol, rollout.allowed_symbols)
+                    instrument = _build_instrument(symbol, allowed_symbols)
                     signal = build_signal(
                         strategy_id="PAPER_STRATEGY_ORDER_SCORE_V1", strategy_version="v1",
                         config_version="live_rollout_v1", code_commit=deployed_commit,
@@ -466,7 +502,7 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None):
                         is_regular_session=is_regular_session, kis_price_usd=kis_price,
                         max_price_deviation_percent=rollout.max_price_deviation_percent,
                         usd_orderable_cash=available_usd, has_open_order_for_symbol=has_open_order_for_symbol,
-                        has_order_for_signal_id=False, allowed_symbols=rollout.allowed_symbols,
+                        has_order_for_signal_id=False, allowed_symbols=allowed_symbols,
                         # CODEX-044: supplied BY the Execution Engine from its
                         # own live KIS reads -- this pipeline cannot assert
                         # reconciliation status, only pass through what the
