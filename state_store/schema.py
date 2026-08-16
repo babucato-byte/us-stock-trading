@@ -590,6 +590,40 @@ MIGRATION_12_STATEMENTS = [
     S1_RISK_PEAK_TABLE,
 ]
 
+# ---------------------------------------------------------------------------
+# PHASE 4D: facts only a real order can establish.
+#
+# Two of the rollout requirements cannot be verified by any amount of
+# testing, because they are claims about what the BROKER does:
+#
+#   position_valuation  does qty*avg_price + unrealized equal the
+#                       broker's own valuation of the same position?
+#   reserved_order_cash does an open order's cash leave the orderable
+#                       figure while it is resting?
+#
+# Both default to UNVERIFIED and both block promotion. They are durable
+# rather than computed because the observation happens once, during a
+# real trade, and must survive every restart afterwards -- and because a
+# MISMATCH must latch: a valuation disagreement is not something a later
+# clean read should silently clear.
+# ---------------------------------------------------------------------------
+
+S1_VERIFICATION_STATE_TABLE = """
+CREATE TABLE s1_verification_state (
+    key TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    detail TEXT,
+    observed_at TEXT,
+    evidence TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+"""
+
+MIGRATION_13_STATEMENTS = [
+    S1_VERIFICATION_STATE_TABLE,
+]
+
 # Every table this schema version creates -- used by export.py's
 # export_all() and by tests asserting the full table set exists.
 ALL_TABLES = [
@@ -597,5 +631,5 @@ ALL_TABLES = [
     "strategy_runs", "risk_events", "kill_switch_events",
     "exit_intents", "live_entry_reservations", "kis_order_idempotency",
     "order_state_events", "shadow_audit_events", "s1_live_trades",
-    "s1_risk_state", "s1_risk_peak",
+    "s1_risk_state", "s1_risk_peak", "s1_verification_state",
 ]

@@ -14,6 +14,7 @@ from state_store.schema import (
     MIGRATION_5_STATEMENTS, MIGRATION_6_STATEMENTS, MIGRATION_7_STATEMENTS,
     MIGRATION_8_STATEMENTS, MIGRATION_9_STATEMENTS, MIGRATION_10_STATEMENTS,
     MIGRATION_11_STATEMENTS, MIGRATION_12_STATEMENTS,
+    MIGRATION_13_STATEMENTS,
 )
 
 MIGRATIONS = [
@@ -39,6 +40,8 @@ MIGRATIONS = [
      MIGRATION_11_STATEMENTS),
     (12, "PHASE 4B: durable account risk state -- per-day start equity and a cross-day peak",
      MIGRATION_12_STATEMENTS),
+    (13, "PHASE 4D: s1_verification_state for facts only a real order can establish",
+     MIGRATION_13_STATEMENTS),
 ]
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1][0]

@@ -469,7 +469,9 @@ class TestSchema:
         from state_store.migrations import CURRENT_SCHEMA_VERSION
         from state_store.schema import ALL_TABLES
 
-        assert CURRENT_SCHEMA_VERSION == 12
+        # >= : the risk tables arrived at 12 and a later migration must
+        # not be able to break this assertion, only add to it.
+        assert CURRENT_SCHEMA_VERSION >= 12
         assert "s1_risk_state" in ALL_TABLES and "s1_risk_peak" in ALL_TABLES
         names = {row[0] for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}

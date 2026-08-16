@@ -64,6 +64,30 @@ def _isolate_scanner_analytics_store(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_order_state_database(monkeypatch, tmp_path):
+    """Point `state_store.db` at tmp_path by default.
+
+    Every test file that uses `open_db()` already sets
+    `STATE_STORE_DB_FILE` itself -- 45 of them do, and a sweep found none
+    that forgot. So this changes no current behaviour. What it changes is
+    what happens when the NEXT file forgets.
+
+    That is not hypothetical. A test added in PHASE 4A called
+    `run_live_buy_entry_cycle()`, which persists a Shadow Mode row through
+    `state_store.db.open_db()` BEFORE it raises on a structural refusal.
+    Without the environment variable that write landed in the real
+    `TRADING_STATE.db` at the repository root, and twenty tests failed --
+    none of them in the new file, and all of them passing in isolation.
+
+    The convention was sound; relying on every future author remembering
+    it was the weak part. Same reasoning, and the same "point it at
+    tmp_path by default, a test that wants otherwise overrides it"
+    pattern, as the health/kill-switch fixture below.
+    """
+    monkeypatch.setenv("STATE_STORE_DB_FILE", str(tmp_path / "AUTOUSE_STATE.db"))
+
+
+@pytest.fixture(autouse=True)
 def _isolate_health_and_kill_switch_state_files(monkeypatch, tmp_path):
     """CODEX-017: paper_strategy_order._safe_send_slack_alert() now always
     routes through notification_health.send_with_health_tracking(), which can
