@@ -1,0 +1,1119 @@
+# Oracle KIS Migration Runbook
+
+**이 문서는 절차서다. Claude Code는 이 저장소가 실행되는 로컬/개발 환경에서 Oracle Cloud
+서버로 SSH 접속할 수 있는 도구를 갖고 있지 않으므로, 아래 모든 단계는 실제 서버 접근 권한이
+있는 운영자(또는 그런 도구를 가진 별도 세션)가 직접 수행해야 한다. Claude Code는 이 문서를
+작성했을 뿐, 어떤 단계도 실행하지 않았다.**
+
+## 0. 사전 조건
+
+- 이 저장소의 `feature/kis-live-broker` 브랜치가 Codex 독립 검증을 통과했고(`PASS` 또는
+  승인 가능한 `PASS_WITH_CONDITIONS`), `main`에 병합되어 origin에 push된 상태여야 한다.
+  검증 전 커밋을 배포하지 않는다.
+- `KIS_APP_KEY`/`KIS_APP_SECRET`/`KIS_ACCOUNT_NO` 등 KIS 실계좌 자격증명을 Git 저장소에
+  절대 넣지 않는다. Oracle 서버의 별도 환경파일(`~/trading-release/.env` 또는 systemd
+  `EnvironmentFile=`) 또는 비밀정보 관리 도구를 사용한다.
+- 현재 운영 중인 `~/trading`은 이 배포 절차 도중 변경하지 않는다.
+
+## 1. 서버 현재 상태 점검 (읽기 전용, 변경 없음)
+
+```bash
+ssh <oracle-server>
+cd ~/trading
+git log --oneline -5
+git status --short
+git diff --stat
+systemctl status order-monitor dashboard 2>&1 | head -40
+crontab -l
+cat /etc/os-release
+python3 --version
+df -h
+free -h
+```
+
+기록할 것: 서버 현재 커밋, 서버 로컬 변경사항(있다면), Git에 없는 운영 파일(`order_history.csv`,
+`universe.csv`, `TRADING_STATE.db`, `KILL_SWITCH_STATE.json` 등), 현재 환경변수, 가상환경
+경로, 설치된 패키지 버전(`pip freeze`), systemd 유닛 파일 내용, cron 항목, 로그 경로.
+
+**운영 데이터를 삭제하거나 덮어쓰지 않는다.**
+
+## 2. Swap 확인/추가 (메모리 약 1GB, 필요 시)
+
+```bash
+free -h  # Swap 없음 확인
+sudo fallocate -l 2G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+free -h  # 2GB Swap 반영 확인
+```
+
+## 3. 신규 매수 차단 (배포 전 안전 확인)
+
+현재 운영 중인 `~/trading`이 아직 Alpaca 기반이라면, 이 프로젝트의 기존 Kill Switch로
+신규 매수를 차단한다(기존 절차, `docs/live_review/KILL_SWITCH_RUNBOOK.md` 참고). 미체결
+주문이 있는지 확인한다.
+
+```bash
+cd ~/trading
+source venv/bin/activate
+python3 -c "import kill_switch_state as ks; print(ks.get_state())"
+```
+
+## 4. 백업
+
+```bash
+cp -r ~/trading ~/trading-backup-$(date +%Y%m%d-%H%M%S)
+```
+
+CSV/DB/주문 원장(`order_history.csv`, `universe.csv`, `strategy_performance.csv`,
+`TRADING_STATE.db*`, `KILL_SWITCH_STATE.json`, `LIVE_ENTRY_RESERVATION.lock` 등)이 백업에
+포함됐는지 확인한다.
+
+## 5. 신규 릴리스 디렉터리 배포
+
+```bash
+cd ~
+git clone https://github.com/babucato-byte/us-stock-trading.git trading-release
+cd trading-release
+git checkout main   # Codex 검증 통과 후 병합된 커밋이어야 함
+git log --oneline -1  # 검증된 커밋 해시와 반드시 일치해야 함
+```
+
+**서버에서 직접 코드를 수정하지 않는다.** `~/trading-release`가 서버 로컬에서 수정된 코드를
+포함하고 있다면 그 배포는 무효로 간주한다 — origin에 push되고 검증된 버전만 배포한다.
+
+## 6. 별도 가상환경 준비
+
+```bash
+cd ~/trading-release
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+## 7. 환경변수 설정 (Oracle 서버 전용 secrets 경로)
+
+`~/trading-release/.env` (Git에 커밋되지 않음, `.gitignore` 확인):
+
+```env
+MARKET_DATA_PROVIDER=alpaca
+EXECUTION_BROKER=kis
+
+ALPACA_DATA_ENABLED=true
+ALPACA_ORDER_ENABLED=false
+ALPACA_PAPER_ORDER_ENABLED=false
+ALPACA_API_KEY=<alpaca data-only key, if still needed for data>
+ALPACA_SECRET_KEY=<...>
+
+KIS_ENV=live
+KIS_APP_KEY=<실제 KIS App Key>
+KIS_APP_SECRET=<실제 KIS App Secret>
+KIS_ACCOUNT_NO=<실제 KIS 계좌번호>
+KIS_ACCOUNT_PRODUCT_CD=01
+KIS_ALLOWED_ACCOUNT_NO=<위와 동일한 계좌번호 -- order_gate의 계좌 일치 검증용>
+KIS_ACCOUNT_READ_ENABLED=true
+KIS_LIVE_ORDER_ENABLED=false
+
+ENTRY_DISABLED=true
+
+LIVE_ROLLOUT_ENABLED=false
+LIVE_ROLLOUT_ALLOWED_SYMBOLS=
+LIVE_ROLLOUT_MAX_QUANTITY=1
+LIVE_ROLLOUT_MAX_POSITIONS=1
+LIVE_ROLLOUT_MAX_DAILY_ENTRIES=1
+REGULAR_SESSION_ONLY=true
+MARKET_ORDER_ENABLED=false
+EXTENDED_HOURS_ENABLED=false
+MAX_PRICE_DEVIATION_PERCENT=0.30
+
+# CODEX-046: independent kill-switches for the KIS position-management
+# tick's "extra" exit behaviors. All four MUST stay false at initial
+# rollout -- only stop-loss and full take-profit (target_2) are active
+# with all four off, which is the intended narrowest starting posture.
+# Enabling any of these later is itself a deliberate, reviewed config
+# change, not a code deploy.
+LIVE_ENABLE_PARTIAL_PROFIT=false
+LIVE_ENABLE_TRAILING_STOP=false
+LIVE_ENABLE_TIME_STOP=false
+LIVE_ENABLE_EOD_EXIT=false
+
+VALIDATED_COMMIT=<Codex가 검증한 정확한 커밋 해시>
+DEPLOYED_COMMIT=<위와 동일해야 함 -- order_gate.py가 이 둘의 일치를 강제로 검증한다>
+```
+
+**`KIS_LIVE_ORDER_ENABLED=false`와 `ENTRY_DISABLED=true`, `LIVE_ROLLOUT_ENABLED=false`, 그리고
+네 개의 `LIVE_ENABLE_*` 플래그는 이 단계 이후에도 계속 `false`로 유지한다.** 이 중 하나라도
+켜는 것은 spec §29의 "최초 KIS 실주문 기능 활성화"(또는 그에 준하는 실거래 동작 확장)에
+해당하며 운영자의 별도 명시적 승인이 필요하다.
+
+**주의(실제 배포에서 발견된 문제)**: 과거 배포된 Oracle `.env`에는 위 이름과 다른
+`KIS_LIVE_APP_KEY`/`KIS_LIVE_APP_SECRET`/`KIS_LIVE_ACCOUNT_NO`/`KIS_LIVE_ACCOUNT_PRODUCT_CODE`
+같은 변수명이 남아 있을 수 있다. `brokers/kis_config.py`가 실제로 읽는 이름은 위 코드
+블록에 적힌 것(`KIS_APP_KEY`/`KIS_APP_SECRET`/`KIS_ACCOUNT_NO`/`KIS_ACCOUNT_PRODUCT_CD`)뿐이다
+-- 8단계(전체 테스트)와 9단계(설정 검증)를 실행하기 전에, 실제 `.env` 파일의 변수명이
+이 코드 블록과 정확히 일치하는지 `grep -oE '^[A-Z_][A-Z0-9_]*=' .env`로 반드시 재확인한다.
+이름이 다르면 `KISConfig.from_env()`가 `app_key=None` 등으로 조용히 읽어 이후 모든 KIS
+호출이 인증 오류로 실패한다 (비밀값 자체는 여전히 출력/로그에 남기지 않는다 -- 이름만
+확인한다).
+
+## 8. 스키마 마이그레이션 적용 (읽기 전용이 아님 -- 상태 DB 스키마 변경)
+
+```bash
+source venv/bin/activate
+python3 -c "
+from state_store import db
+conn = db.open_db()
+from state_store.migrations import CURRENT_SCHEMA_VERSION
+print('applied schema version:', db.get_schema_version(conn))
+assert db.get_schema_version(conn) == CURRENT_SCHEMA_VERSION
+"
+```
+
+`db.open_db()`가 `kis_order_idempotency` 테이블(마이그레이션 6)과 그 `requested_quantity`
+컬럼(마이그레이션 7, CODEX-045 -- 부분체결 오분류 수정에 필요)까지 자동으로 적용한다.
+이 명령이 실패하거나 버전이 `CURRENT_SCHEMA_VERSION`과 다르면 다음 단계로 진행하지 않는다.
+
+## 9. 전체 테스트
+
+```bash
+pytest -q
+```
+
+`docs/autonomous/FINAL_VALIDATION_PACKAGE.md`(또는 이 사이클의 등가 문서)에 기록된 테스트
+수·결과와 정확히 일치해야 한다. 하나라도 실패하면 배포를 중단한다.
+
+## 10. 설정 검증
+
+```bash
+python3 -c "
+from config.live_rollout_config import LiveRolloutConfig
+from config.live_exit_flags import LiveExitFlags
+from brokers.kis_config import KISConfig
+cfg = LiveRolloutConfig.from_env()
+cfg.validate()
+print('live_rollout OK:', cfg)
+kis = KISConfig.from_env()
+print('kis_env:', kis.kis_env, 'account_read_enabled:', kis.account_read_enabled, 'live_order_enabled:', kis.live_order_enabled)
+flags = LiveExitFlags.from_env()
+print('exit flags (all must be False at initial rollout):', flags)
+"
+```
+
+`live_order_enabled`가 `False`인지, `LiveRolloutConfig.validate()`가 예외 없이 통과하는지,
+`LiveExitFlags`의 네 필드가 모두 `False`인지 확인한다.
+
+## 11. Alpaca 데이터 조회 확인 (읽기 전용)
+
+```bash
+python3 -c "
+from market_data.alpaca_provider import AlpacaMarketDataProvider
+p = AlpacaMarketDataProvider()
+q = p.get_price_quote('AAPL')
+print(q)
+"
+```
+
+## 12. KIS 실계좌 조회 (읽기 전용, 이 단계에서 최초로 실제 KIS API 호출 발생)
+
+```bash
+python3 -c "
+from brokers.kis_broker import KISBroker
+b = KISBroker()
+snap = b.get_account_snapshot()
+print(snap)
+positions = b.get_positions()
+print('positions:', positions)
+open_orders = b.get_open_orders()
+print('open_orders:', open_orders)
+"
+```
+
+**이 단계가 이 프로젝트 전체에서 처음으로 실제 KIS API에 연결하는 지점이다.** 실패하면
+(인증 오류, 네트워크 오류, 계좌번호 불일치 등) 원인을 해결할 때까지 다음 단계로 진행하지
+않는다.
+
+### 12.1 wire-format 값 실응답 확인 (CODEX-052)
+
+`brokers/kis_broker.py`의 모든 TR_ID·endpoint·응답 field는 KIS 공식 예제/reference
+repository 기준으로는 확인됐지만(`REFERENCE_VERIFIED`), **실제 KIS 응답으로는 아직
+확인되지 않았다**(`LIVE_RESPONSE_PENDING`). 두 상태는 서로 다른 축이며, 코드의
+`VERIFICATION_MATRIX`가 그 유일한 기준이다.
+
+**요구 수준은 posture별로 다르다.** 각 항목에는 `required_for`가 붙어 있고, 이 값은
+이름이 아니라 **실제 참조 위치**에서 도출된다.
+
+```text
+OBSERVE_REQUIRED (7)  price_path, price_field_last, order_exchange_code_space,
+                      orderable_amount_path, orderable_amount_tr_id_live,
+                      orderable_amount_field, balance_cash_fields_absent
+ARMED_REQUIRED  (13)  위 7개 + order_path, order_tr_id_live_buy, cancel_path,
+                      cancel_tr_id_live, cancel_tr_id_paper, cancel_price_field_rule
+```
+
+`order_exchange_code_space`가 OBSERVE에 포함되는 이유가 이 분류를 이름으로 하면 안 되는
+이유다 — 이름은 주문 전용처럼 보이지만 `OVRS_EXCG_CD`는 `_sweep_exchanges()`가 잔고·미체결·
+체결 **조회**에 붙이는 값이라 OBSERVE가 전적으로 의존한다.
+
+`orderable_amount_*` 3개와 `balance_cash_fields_absent`는 **ORACLE-CASH-01** 때문에
+추가됐다. 잔고 조회(`TTTS3012R`)의 `output2`에는 현금 필드가 **없다** — Oracle 실계좌
+응답은 매입·평가·손익 계열 9개만 반환한다. 그런데 코드는 `frcr_dncl_amt1` /
+`frcr_use_psbl_amt`를 `.get(field, 0) or 0`으로 읽고 있어서, **자금이 있는 계좌가 $0으로
+보고**됐고 모든 후보가 다른 게이트에 닿기 전에 `INSUFFICIENT_CASH`로 막혔다. 현금 필드는
+애초에 matrix에 없었기 때문에 실제 응답과 대조된 적이 없었다 — 그게 이 결함이 살아남은
+이유이고, 이 4개 항목이 OBSERVE 요구에 들어간 이유다.
+
+주문가능금액의 권위는 **후보별** `inquire-psamount`(`TTTS3007R`,
+`output.ord_psbl_frcr_amt`)다. KIS는 이 값을 (종목, 거래소, 지정가)별로 답하므로
+계좌 단위 상수가 아니며, **주문에 사용할 제한가격과 같은 가격으로** 조회해야 한다.
+
+이 단계에서 확인해야 할 항목을 코드에서 직접 뽑아 쓴다.
+
+```bash
+python3 -c "
+from brokers.kis_broker import (
+    REQUIRED_FOR_OBSERVE, REQUIRED_FOR_ARMED, matrix_entries_for, pending_items_for)
+for posture in (REQUIRED_FOR_OBSERVE, REQUIRED_FOR_ARMED):
+    pending = pending_items_for(posture)
+    total = len(matrix_entries_for(posture))
+    print(f'{posture}: {total - len(pending)}/{total} confirmed; pending={list(pending)}')
+"
+```
+
+**OBSERVE 7개는 읽기 전용으로 확인할 수 있다.**
+
+```bash
+python3 scripts/verify_kis_observe_responses.py --symbols AAPL,MSFT
+```
+
+이 스크립트는 주문·취소 메서드에 도달할 수 없는 read-only proxy를 사용하며, 시세·잔고·
+포지션·미체결·체결·주문가능금액 **조회만** 수행한다. 응답의 **필드 존재와 타입만**
+기록하고 토큰·전체 계좌번호·원본 응답은 출력하지 않는다.
+
+`get_orderable_usd`는 allow-list에 있지만 **조회**다(`TTTS3007R`). 종목과 지정가를
+파라미터로 넘기는 이유는 endpoint가 그 두 값을 입력으로 받기 때문이며, 주문 body도
+hashkey도 전송하지 않는다.
+
+### ORACLE-CASH-01 재배포 후 read-only 확인 절차
+
+현금 수정이 들어간 커밋을 배포한 뒤 Oracle에서 **조회만** 수행한다. 실주문·실취소·
+systemd/timer 변경·환경파일 변경·안전 플래그 변경은 하지 않는다.
+
+```bash
+cd "$TRADING_PROJECT_ROOT"
+KIS_ENV=live LIVE_PILOT_ACK_LIVE_ENV=true \
+  venv/bin/python scripts/verify_kis_observe_responses.py --symbols AAPL,MSFT
+```
+
+기대 결과:
+
+```text
+exit 0
+observe_requirements  7/7 confirmed
+orderable:<SYMBOL>    TTTS3007R output.ord_psbl_frcr_amt -> float, finite, >= 0
+balance_cash_fields_absent  cash_status=UNAVAILABLE
+                            cash_source=TTTS3012R_DOES_NOT_PROVIDE
+matrix_split          OBSERVE requires [7개 항목]
+broker methods used   조회 메서드만
+order transport 0 / cancel transport 0 / secrets exposed 0
+```
+
+`balance_cash_fields_absent`가 FAIL이면 잔고 응답이 실제로 현금 필드를 실어 왔다는 뜻이므로
+**matrix 항목을 다시 판단해야 한다** — 조용히 fallback으로 되돌리지 않는다.
+
+이어서 preflight와 OBSERVE `--once`를 실행하고 다음을 확인한다.
+
+```text
+preflight  [PASS] account  account=****XXXX orderable_usd=UNAVAILABLE
+                           (TTTS3012R_DOES_NOT_PROVIDE); sized per candidate at entry time
+           exit 0, OBSERVE_ALLOWED, ARMED_BLOCKED, ARMED 6개 pending 경고
+
+OBSERVE --once
+  후보별 get_orderable_usd 1회 (같은 지정가로)
+  주문가능금액 >= 1주 → cash gate 통과 → 후속 gate 평가 → hypothetical 기록
+  주문가능금액 = 0     → INSUFFICIENT_CASH
+  조회 실패·필드 이상  → ORDERABLE_CASH_UNAVAILABLE (INSUFFICIENT_CASH 아님)
+  order transport 0 / cancel transport 0
+  orders·fills·kis_order_idempotency·live_entry_reservations delta 0
+  run당 terminal 이벤트 정확히 1
+```
+
+**ARMED 6개는 읽기 전용으로 확인할 수 없다.**
+
+```text
+order_path, order_tr_id_live_buy, cancel_path,
+cancel_tr_id_live, cancel_tr_id_paper, cancel_price_field_rule
+```
+
+`cancel_tr_id_live`와 `order_tr_id_live_buy`는 live 전용 값이라 **모의투자 응답으로 확인
+처리하면 안 된다.** 나머지는 **모의투자(paper) 환경에서 주문 후 취소**로 확인한다. 실계좌
+주문으로 확인하지 않는다.
+
+확인된 항목은 `VERIFICATION_MATRIX`의 `live_status`를 `LIVE_RESPONSE_CONFIRMED`로 갱신하고
+`source`에 그 근거(어떤 probe가 언제 무엇을 봤는지)를 남긴다. 값이 실제와 다르면 코드를
+수정한 뒤 다시 Codex 검증을 받는다. 문서만 보고 CONFIRMED로 바꾸지 않는다.
+
+**preflight 동작**: OBSERVE 세션은 OBSERVE 요구 항목만 강제한다. ARMED 전용 미확인 항목은
+`[WARN] armed_response_requirements [BLOCKED_FOR_ARMED_ONLY]`로 보고되며 OBSERVE 기동을
+막지 않는다. ARMED posture(세 플래그 전부 on)에서는 전부를 강제한다. 우회 환경변수는
+없다.
+
+### 진입 한도 두 가지 (ORACLE-LIMIT-01)
+
+`LIVE_ROLLOUT_MAX_POSITIONS`와 `LIVE_ROLLOUT_MAX_DAILY_ENTRIES`는 **설정만 있고 강제되지
+않았다.** 두 값은 `config/live_rollout_config.py`가 읽고 타입 검증까지 했지만 진입 경로
+어디에서도 소비되지 않았다 — `evaluate_buy_gate`에도, `kis_live_trading`에도,
+shadow 평가에도 없었다. `LIVE_ROLLOUT_MAX_POSITIONS=1`로 설정한 운영자는 아무것도
+제한하지 않는 숫자를 읽고 있었다.
+
+지금은 Order Gate가 **RECONCILIATION 다음에, 모든 후보별 검사 뒤에** 강제한다.
+
+```text
+... → SYMBOL → INSTRUMENT → RECONCILIATION → MAX_OPEN_POSITIONS → MAX_DAILY_ENTRIES
+```
+
+계정 단위 용량 제한이므로 마지막이다. 후보 자체가 부적격이면 그 이유가 먼저 보고되고,
+`MAX_OPEN_POSITIONS`가 나왔다면 후보는 멀쩡한데 계좌가 찼다는 뜻이다.
+
+권위 있는 수치는 두 곳에서만 온다.
+
+```text
+보유 포지션  KIS get_positions()에서 quantity > 0
+진입 시도    kis_order_idempotency — execution_engine이 네트워크 호출 전에,
+             single_run_lock() 안에서 쓰는 원장. 그 순서가 이걸 예약으로 만든다:
+             행을 쓴 뒤 crash해도 slot은 소비된 채로 남는다
+```
+
+포지션 한도는 **보유 + 진행 중**을 심볼 합집합으로 센다. 합집합인 이유는 체결되어
+포지션이 된 주문을 두 번 세지 않기 위해서고, 진행 중을 포함하는 이유는 한 슬롯을 두
+후보가 동시에 통과하는 race를 막기 위해서다.
+
+일일 슬롯은 그날의 모든 매수 시도가 소비한다 — **UNKNOWN 포함, 재조정될 때까지 영구히.**
+유일한 예외는 브로커가 본 적 없는 시도(`REJECTED` + `broker_order_id` 없음)다.
+
+거래일은 **미국 동부 달력 날짜**(`market_hours.us_trading_day`)다. 기록하는 원장과
+세는 게이트가 같은 함수를 쓰므로 둘이 어긋날 수 없다. UTC 날짜를 쓰면 20:00 ET 이후
+평가에서 거래일은 그대로인데 UTC 날짜만 넘어간다.
+
+읽을 수 없으면 진입을 막는다: `POSITION_LIMIT_STATE_UNKNOWN` /
+`DAILY_ENTRY_STATE_UNKNOWN`. 카운트를 0으로 가정하는 경로는 없다 — 한도 검사기가 낼 수
+있는 가장 위험한 오답이 "아직 아무것도 없다"이기 때문이다.
+
+**매도는 어느 한도에도 걸리지 않는다.** 포지션 한도에 찬 계좌도 보유분은 항상 정리할 수
+있어야 한다(`evaluate_sell_gate`는 이 검사를 호출하지 않는다).
+
+### allow-list 두 개는 서로 다른 것을 결정한다 (ORACLE-SCOPE-01)
+
+```text
+SHADOW_ALLOWED_SYMBOLS        OBSERVE가 무엇을 평가할지 (evaluation scope)
+                              unset/빈 값 → 모든 scanner 후보 평가 (기본)
+                              "A,B"       → 그 둘만 평가
+                              실주문 승인에는 어떤 경로로도 쓰이지 않는다
+
+LIVE_ROLLOUT_ALLOWED_SYMBOLS  실제 주문이 허용된 종목 (execution authorization)
+                              ARMED에서 hard block. 비어 있으면 신규 BUY 전부 차단
+```
+
+문제는 allow-list가 게이트 순서상 `SYMBOL`에 있고, 그 뒤에 `INSTRUMENT`,
+`RECONCILIATION`, `MAX_OPEN_POSITIONS`, `MAX_DAILY_ENTRIES`가 온다는 점이었다. 읽기 전용
+자세에서는 목록이 비어 있는 것이 정상이므로 **모든 OBSERVE 평가가 SYMBOL에서 멈추고 뒤의
+네 게이트는 한 번도 관찰되지 않았다.** Oracle 세션 두 번이 정확히 그 모습이었다 —
+`furthest_gate=DUPLICATE_SIGNAL, stopped_at=SYMBOL`.
+
+OBSERVE는 이제 두 축을 따로 보고한다.
+
+```text
+live_authorization  "이 주문을 실제로 낼 수 있는가?"
+                    allow-list 포함, 그대로 차단한다
+                    → WOULD_APPROVE 또는 LIVE_BLOCKED:SYMBOL
+
+diagnostic          "allow-list 뒤의 안전 게이트들은 정상인가?"
+                    allow-list만 지나쳐 계속 평가한다
+                    → DIAGNOSTIC_PASS 또는 DIAGNOSTIC_BLOCKED:<gate>
+                    furthest_gate로 어디까지 갔는지 기록
+```
+
+`DIAGNOSTIC_PASS`는 **승인이 아니다.** live 목록에 없는 종목이 downstream을 전부 통과해도
+`APPROVED`라는 문자열은 어디에도 기록되지 않는다.
+
+이것은 게이트 우회가 아니다. `evaluate_buy_gate()`에는 "계속 진행" 파라미터가 없고 앞으로도
+없어야 한다. diagnostic은 같은 게이트를 **컨텍스트 사본에 다른 allow-list를 넣어** 한 번 더
+호출할 뿐이다 — 설정은 건드리지 않으며, 실제 호출자에게 게이트는 여전히 첫 위반에서 멈춘다.
+`execution/authorization.py`와 `execution_engine.py`는 diagnostic에 도달할 수 없다(테스트로 고정).
+
+audit에는 `DIAGNOSTIC_COMPLETED` 이벤트가 두 축과 용량 수치를 함께 남긴다. terminal 이벤트
+계약(run당 정확히 1)은 그대로다 — 이 이벤트는 terminal이 아니다.
+
+**권장 운영 상태**
+
+```text
+LIVE_ROLLOUT_ALLOWED_SYMBOLS=     (비움 — 실주문 승인 범위 0)
+SHADOW_ALLOWED_SYMBOLS            unset 유지 (scanner 후보 전체 평가)
+```
+
+이 조합에서 후보가 나오면 live 축은 `LIVE_BLOCKED:SYMBOL`로 정확히 기록되고, diagnostic 축이
+INSTRUMENT / RECONCILIATION / 두 용량 게이트까지 계속 관찰한다. 주문 transport는 0이다.
+
+## 13. KIS 잔고·미체결 대조 (계정 전체 reconciliation, CODEX-044)
+
+reconciliation은 두 층으로 동작한다.
+
+1. **주문 경로 내부 (CODEX-044, 강제)**: `execution/execution_engine.py`가 매 주문 직전에
+   `reconciliation/snapshot.py::build_snapshot()`으로 KIS 실제 잔고·미체결·체결과 내부
+   포지션·내부 열린 주문·UNKNOWN 주문을 직접 조회해 불변 스냅샷을 만들고,
+   `verify_snapshot()`으로 검증한다. 조회 실패, 계좌/종목 불일치, TTL 초과
+   (`RECONCILIATION_MAX_AGE_SECONDS`, 기본 30초), 포지션·미체결·체결 불일치, UNKNOWN 주문
+   존재 중 하나라도 있으면 주문은 transport 호출 0회로 차단된다. 매수와 매도에 동일하게
+   적용된다.
+2. **주기 서비스 (§15의 `us-stock-trading-reconcile`)**: 같은 대조를 주기적으로 수행하고
+   그 결과를 `RECONCILIATION_STATE.json`에 기록하며, UNKNOWN 주문을 KIS 체결 이력과 대조해
+   해소하고, Shadow 감사 보관 정책을 적용한다. KIS 조회가 실패하면 **아무것도 기록하지
+   않는다** -- 실패한 조회가 clean timestamp를 갱신할 수 없다.
+
+수동 확인(읽기 전용, 저장소의 실제 진입점을 그대로 사용한다):
+
+```bash
+cd ~/trading-release
+source venv/bin/activate
+python3 scripts/run_reconciliation.py --log-level INFO
+echo "exit=$?"   # 0=대조 완료, 2=KIS 조회 불가(아무것도 기록 안 함), 1=오류
+cat RECONCILIATION_STATE.json
+```
+
+`mismatch`가 보고되면(즉 KIS에 내부가 모르는 포지션/주문이 있으면) 원인을 파악하기 전까지
+중단한다. `RECONCILIATION_STATE_FILE` 환경변수로 상태 파일 경로를 지정할 수 있다(미지정 시
+저장소 루트의 `RECONCILIATION_STATE.json`).
+
+## 14. Shadow Mode 실행 (spec §26)
+
+Shadow Mode 진입점은 `scripts/run_shadow_mode.py`다. 이 스크립트는
+`execution.execution_engine`을 **import조차 하지 않으며** `submit_order()`를 호출할 수 있는
+경로가 없다 -- 주문 불가가 플래그가 아니라 구조로 보장된다.
+
+한 후보당 두 번의 게이트 평가를 기록한다.
+
+- **실제 평가**: 현재 배포 플래그 그대로. 초기 자세에서는 `live order flag is not enabled` /
+  `ENTRY_DISABLED`에서 차단되며, 그것이 지금 시스템이 실제로 할 행동의 정직한 기록이다.
+- **가정 평가**: 위 두 config 플래그만 뒤집은 경우. 가격 편차·잔고·중복 주문·allow-list·
+  종목 적격성·reconciliation·UNKNOWN 등 **나머지 모든 안전 검사는 실제 KIS 조회 결과로**
+  평가된다. 운영자가 활성화 전에 실제로 알아야 하는 질문("다른 검사는 통과했겠는가")에
+  답하는 것이 이 기록이다.
+
+기록 대상은 두 곳이지만 **둘의 커버리지가 다르다. 권위 있는 기록은 DB다.**
+
+- 감사 이벤트(**항상 기록됨 — 이쪽을 먼저 본다**): `shadow_audit.py` SQLite
+  `shadow_audit_events` 테이블. 매수 경로와 **매도 경로 모두** 기록하며, 모든 run은
+  `SHADOW_COMPLETED` 또는 `SHADOW_ERROR`로 반드시 종료된다. 계좌번호·비밀정보는
+  `execution/secret_redaction.py`가 기록 직전에 마스킹한다.
+- 구조화 레코드(**조건부 기록됨**): `shadow_mode.py` JSONL. 경로는 **반드시 설정해야 하며
+  기본값이 없다.**
+
+```env
+# 권장: 일자 회전이 필요한 운영 배포
+SHADOW_MODE_LOG_DIR=/home/ubuntu/releases/us-stock-trading/shared/logs
+# 또는 단일 파일 고정
+SHADOW_MODE_LOG_FILE=/home/ubuntu/releases/us-stock-trading/shared/logs/shadow-mode.jsonl
+```
+
+```text
+SHADOW_MODE_LOG_DIR  설정 -> <dir>/shadow-YYYY-MM-DD.jsonl 일자 회전
+                             + SHADOW_AUDIT_MAX_FILE_MB 크기 회전
+                             + SHADOW_AUDIT_RETENTION_DAYS 보관, append마다 fsync
+SHADOW_MODE_LOG_FILE 설정 -> 정확히 그 파일 하나 (회전 없음)
+둘 다 미설정          -> JSONL 비활성. DB만 사용하며 시작 로그에
+                             shadow_audit_backend=database jsonl_enabled=false 를 남긴다
+```
+
+**release root fallback은 제거되었다.** 예전에는 두 변수가 모두 없으면 `shadow_mode.py`가
+자기 디렉터리(= release 루트)에 `shadow-YYYY-MM-DD.jsonl`을 만들었고, 2026-08-04 검증에서
+실제로 저장소 루트에 파일이 생성되는 것이 확인됐다. 이제 미설정 시에는 어디에도 쓰지 않는다
+— release 루트에도, 현재 작업 디렉터리에도 쓰지 않는다.
+
+> **JSONL 파일이 아예 없을 수 있다 — 그것이 정상 동작인 경우가 있다.**
+> JSONL 레코드는 후보가 **Order Gate 평가까지 도달한 경우에만** 기록된다. 게이트 이전에
+> 차단되면(거래소 미지원, 가격 조회 실패, 계좌 조회 실패, 잔고 부족, 주문 의도 무효,
+> reconciliation 불가) JSONL은 생성되지 않고 **DB에만** 남는다.
+> 실제로 2026-08-03 Oracle read-only 검증에서 `SHADOW_MODE_LOG_FILE`은 생성되지 않았고
+> (후보 IXN=ARCA 미지원, AAPL=잔고 0), 모든 기록은 `shadow_audit_events`에 있었다.
+> **JSONL이 비었다는 이유로 "후보 없음"으로 판단하면 안 된다.** 반드시 DB를 조회한다.
+
+게이트 이전 차단 시 DB에는 다음 두 종류의 이벤트가 남는다.
+
+- `KIS_PIPELINE_EXCLUDED` — 거래소가 KIS 주문 코드공간(NASD/NYSE/AMEX) 밖이라 KIS
+  파이프라인에 아예 전달되지 않은 후보. 분석 산출물에는 그대로 남는다. payload에
+  `kis_pipeline=false`와 지원 거래소 목록이 들어간다.
+- `HYPOTHETICAL_INCOMPLETE` — 게이트 이전에 멈춘 후보. payload의
+  `pre_gate_stages_passed` / `blocked_at` / `blocked_reason` /
+  `pre_gate_stages_not_evaluated`로 "어디까지 통과했는지"를 알 수 있다.
+  **`order_gate_evaluated=false`가 항상 함께 기록된다** — 게이트는 실행되지 않았고,
+  게이트 판정을 추정해 기록하지 않는다.
+
+```bash
+cd ~/trading-release
+source venv/bin/activate
+python3 scripts/run_shadow_mode.py --log-level INFO
+
+# 감사 이벤트(권위 기록) 확인 -- JSONL이 0건이어도 여기가 비어 있으면 안 된다
+python3 -c "
+import shadow_audit, shadow_mode
+records, corruption = shadow_mode.read_all_with_integrity()
+print('shadow JSONL records:', len(records), '(0 may be correct -- see above)')
+print('corrupt JSONL lines:', corruption)
+print('audit events:', len(shadow_audit.read_events()))
+print('runs without a terminal event:', shadow_audit.runs_without_terminal_event())
+"
+
+# 게이트 이전 차단 후보가 어디까지 갔는지 (DB에만 있는 정보)
+sqlite3 "$STATE_STORE_DB_FILE" \
+  "select symbol, event_type, reason_code, payload from shadow_audit_events
+   where event_type in ('KIS_PIPELINE_EXCLUDED','HYPOTHETICAL_INCOMPLETE')
+   order by rowid desc limit 20;"
+```
+
+`corrupt lines`가 비어 있지 않거나 `runs without a terminal event`가 비어 있지 않으면 감사
+기록 경로 자체가 깨진 것이므로 원인을 파악하기 전까지 다음 단계로 진행하지 않는다.
+반면 `shadow JSONL records: 0`은 그 자체로는 이상이 아니다 — 위 설명대로 게이트 도달
+여부에 달려 있으며, `audit events`가 0인 경우에만 문제다.
+
+## 15. 서비스 설치 및 경로 전환
+
+### 15.1 유닛 설치
+
+저장소에 실제 systemd 유닛과 설치 스크립트가 포함되어 있다.
+
+```text
+deploy/systemd/us-stock-trading-migrate.service        # 스키마 마이그레이션
+deploy/systemd/us-stock-trading-reconcile.service      # 읽기 전용 대조
+deploy/systemd/us-stock-trading-reconcile.timer        # 2분 주기
+deploy/systemd/us-stock-trading-shadow.service         # 매수 평가, 주문 없음
+deploy/systemd/us-stock-trading-shadow.timer           # 5분 주기
+deploy/systemd/us-stock-trading-shadow-exit.service    # 매도/청산 조건 평가, 주문 없음
+deploy/systemd/us-stock-trading-shadow-exit.timer      # 2분 주기
+deploy/systemd/us-stock-trading-health.service         # 상태 점검
+deploy/systemd/us-stock-trading-health.timer           # 15분 주기
+deploy/systemd/us-stock-trading-live.service           # 설치만, enable 하지 않음
+
+scripts/preflight_kis_live.py
+scripts/run_migrations.py
+scripts/run_reconciliation.py
+scripts/run_shadow_mode.py
+scripts/run_shadow_exit_evaluation.py
+scripts/run_health_report.py
+scripts/run_live_buy_entry.py
+scripts/install_oracle_services.sh
+```
+
+서비스 기동 순서는 유닛의 `After=`/`Requires=`로 강제된다.
+
+```text
+migrate  →  (각 유닛의 ExecStartPre) preflight  →  reconcile  →  shadow / shadow-exit
+```
+
+`shadow`와 `shadow-exit`는 `Requires=us-stock-trading-reconcile.service`이므로
+reconciliation이 실패하면 시작되지 않는다.
+
+환경파일을 먼저 만든다(§7의 내용을 그대로 사용, **root:trading 0640**).
+
+```bash
+sudo install -d -m 0750 -o root -g trading /etc/us-stock-trading
+sudo cp ~/trading-release/.env /etc/us-stock-trading/live-readonly.env
+sudo chown root:trading /etc/us-stock-trading/live-readonly.env
+sudo chmod 0640 /etc/us-stock-trading/live-readonly.env
+```
+
+설치:
+
+```bash
+cd ~/trading-release
+sudo RELEASE_DIR=/home/ubuntu/trading-release scripts/install_oracle_services.sh
+```
+
+이 스크립트는 순서대로 다음을 수행한다.
+
+**설치와 활성화는 별개의 두 단계다.**
+
+```text
+단계 A  scripts/install_oracle_services.sh
+        -> unit 설치만. timer는 전부 disabled + inactive로 남는다.
+
+단계 B  scripts/enable_oracle_shadow_timer.sh   (별도 승인 필요)
+        -> Shadow timer 하나만 활성화한다.
+```
+
+예전에는 설치 스크립트가 네 timer를 `enable --now`로 함께 켰다. Shadow timer 기동은
+검토를 거쳐 내리는 결정이지 파일 복사의 부수효과가 아니며, 더 나쁘게는 마지막 안전
+검증이 그 enable 뒤에 있어서 스크립트가 exit 1로 끝나도 timer 네 개는 이미 켜진 채
+남았다. 이제 설치 스크립트는 **아무것도 enable/start 하지 않는다.**
+
+단계 A가 수행하는 일 (호스트를 건드리기 전에 끝나는 검증이 먼저다):
+
+```text
+ 1. 경로·사용자·권한 검증  (shared/state는 0700 ubuntu:ubuntu로 교정 후 실측 검증)
+ 2. unit 렌더링
+ 3. placeholder 잔존 검사
+ 4. systemd-analyze verify
+ 5. live unit에 [Install] 섹션이 없는지 검사
+ 6. 격리 sandbox에서 live unit is-enabled=static 확인
+ 7. 격리 sandbox에서 enable 시 symlink 0개 확인
+ 8. 환경파일의 실주문 플래그 검사
+ 9. run_migrations.py + preflight_kis_live.py
+10. unit 파일 설치
+11. daemon-reload
+12. live unit disable + stop
+13. 모든 trading timer disable + stop
+14. 최종 상태 검증 (하나라도 다르면 exit 1)
+```
+
+검증이 전부 끝나기 전에는 어떤 timer도 enable/start되지 않는다. 따라서 단계 A가
+실패해도 호스트는 안전 상태로 남는다.
+
+`us-stock-trading-live.service`는 **절대 enable/start 하지 않는다**. `[Install]` 섹션이
+없으므로 `systemctl enable`로 부팅 symlink를 만들 수 없다.
+
+### 15.2 사전 검증 (수동 실행 가능)
+
+```bash
+cd ~/trading-release
+source venv/bin/activate
+python3 scripts/run_migrations.py
+python3 scripts/preflight_kis_live.py
+echo "exit=$?"    # 0이 아니면 서비스가 시작되지 않는다
+```
+
+preflight는 필수 환경변수, 계좌 alias, Alpaca/KIS 주문 비활성, `LIVE_ROLLOUT_ENABLED`
+비활성, `ENTRY_DISABLED=true`, 플래그 상호 정합성, DB 스키마 버전, reconciliation 실행 가능
+여부, 로그 디렉터리 쓰기 권한, 모든 entrypoint/unit 파일 존재, 단일 실행 lock, 그리고
+**검증 커밋·배포 커밋·실제 체크아웃 커밋이 모두 동일한 40자리 소문자 hex SHA인지**를
+확인한다(CODEX-051 — 짧은 prefix, 대문자, `HEAD` 같은 ref, 존재하지 않는 SHA는 모두 거부).
+비밀값은 출력하지 않으며 계좌번호는 마스킹된 형태로만 나타난다.
+
+### 15.3 단독 실행 확인 (서비스 등록 전에 손으로 한 번씩)
+
+```bash
+python3 scripts/run_reconciliation.py --log-level INFO          # exit 0 / 2(KIS 조회 불가)
+python3 scripts/run_shadow_mode.py --log-level INFO             # 매수 평가, 주문 0회
+python3 scripts/run_shadow_exit_evaluation.py --log-level INFO  # 매도 조건 평가, 주문 0회
+python3 scripts/run_health_report.py --json                     # exit 0 / 2(문제 있음)
+```
+
+`run_shadow_exit_evaluation.py`는 보유 포지션마다 손절·익절·분할익절·시간청산·EOD 청산
+조건을 `positions.lifecycle.decide_exit()`(실주문 경로가 사용하는 것과 **동일한** 순수
+함수)로 평가하고 결과만 기록한다. `check_and_manage()`를 호출하지 않으므로 청산 주문을
+낼 수 없다.
+
+### 15.4 시작·확인
+
+단계 A 직후에는 timer가 모두 꺼져 있으므로, 각 서비스는 손으로 한 번씩 실행해 동작을
+확인한다(아래 `start`는 oneshot service 1회 실행이며 timer를 켜지 않는다).
+
+```bash
+sudo systemctl start us-stock-trading-reconcile.service
+sudo systemctl start us-stock-trading-shadow.service
+sudo systemctl start us-stock-trading-shadow-exit.service
+sudo systemctl start us-stock-trading-health.service
+
+systemctl list-timers | grep us-stock-trading   # 단계 B 이전에는 비어 있다
+journalctl -u us-stock-trading-reconcile.service -n 50 --no-pager
+journalctl -u us-stock-trading-shadow.service -n 50 --no-pager
+journalctl -u us-stock-trading-shadow-exit.service -n 50 --no-pager
+journalctl -u us-stock-trading-health.service -n 50 --no-pager
+```
+
+감사 기록 확인:
+
+```bash
+python3 -c "
+import shadow_audit, shadow_mode
+print('audit events:', len(shadow_audit.read_events()))
+print('integrity:', shadow_audit.audit_integrity_report())
+records, corruption = shadow_mode.read_all_with_integrity()
+print('shadow records:', len(records), 'corrupt lines:', corruption)
+"
+```
+
+`runs_without_terminal_event` 또는 `runs_with_multiple_terminal_events`가 비어 있지 않거나
+`corrupt lines`가 비어 있지 않으면 감사 기록 경로가 깨진 것이므로 다음 단계로 진행하지
+않는다.
+
+### 15.5 live 서비스가 enable 불가 상태인지 확인 (필수)
+
+```bash
+systemctl is-enabled us-stock-trading-live.service   # static 이어야 한다
+systemctl is-active  us-stock-trading-live.service   # inactive 이어야 한다
+```
+
+기대값은 **`static`**이다. `disabled`가 아니다.
+
+`us-stock-trading-live.service`에는 `[Install]` 섹션이 없다. systemd는 그런 unit을
+`static`으로 보고하며, `systemctl enable`을 해도 `multi-user.target.wants/` 아래
+symlink를 만들지 못한다 — 즉 **부팅 자동기동 경로 자체가 존재하지 않는다.**
+
+```text
+static    정상. [Install] 섹션이 없어 enable 대상이 아님
+disabled  이상. [Install] 섹션이 되살아났다는 뜻 -> unit 파일을 확인한다
+enabled   이상. 즉시 sudo systemctl disable --now 후 원인 조사
+```
+
+`disabled`를 정상으로 보면 안 된다. 목표는 "지금 꺼져 있다"가 아니라
+"구조적으로 켤 수 없다"이다. `run_health_report.py`도 매 15분 이 조건을 확인한다.
+
+의도한 대로인지 직접 확인하려면(호스트를 건드리지 않는다):
+
+```bash
+SANDBOX=$(mktemp -d); mkdir -p "$SANDBOX/etc/systemd/system"
+cp /etc/systemd/system/us-stock-trading-live.service "$SANDBOX/etc/systemd/system/"
+systemctl --root="$SANDBOX" is-enabled us-stock-trading-live.service   # static
+systemctl --root="$SANDBOX" enable     us-stock-trading-live.service   # 경고, symlink 미생성
+find "$SANDBOX" -type l | wc -l                                       # 0 이어야 한다
+rm -rf "$SANDBOX"
+```
+
+### 15.5b Shadow timer 활성화 (단계 B — 별도 승인)
+
+단계 A는 timer를 켜지 않는다. Shadow timer는 이 스크립트로만 켠다.
+
+```bash
+sudo ALLOW_SHADOW_TIMER_ENABLE=true \
+     TRADING_RELEASE_ROOT=~/releases/us-stock-trading/<commit> \
+     TRADING_SHARED_ROOT=~/releases/us-stock-trading/shared \
+     scripts/enable_oracle_shadow_timer.sh
+```
+
+`ALLOW_SHADOW_TIMER_ENABLE`이 정확히 `true`가 아니면 exit 1이다. 스크립트는 다음을 모두
+확인한 뒤에만 enable + start를 수행한다.
+
+```text
+DEPLOYED_COMMIT == VALIDATED_COMMIT == release HEAD
+KIS_LIVE_ORDER_ENABLED=false / LIVE_ROLLOUT_ENABLED=false / ENTRY_DISABLED=true
+live unit: static + inactive
+shared/state: 0700 ubuntu:ubuntu
+preflight PASS
+reconciliation snapshot이 FRESH (아래 참조)
+UNKNOWN 주문 0건
+HALT false
+```
+
+#### reconciliation snapshot freshness (필수)
+
+snapshot이 **존재하고 clean한 것만으로는 부족하다.** 30일 된 clean snapshot으로 timer가
+활성화된 사례, 그리고 `"clean": "false"`(문자열)가 truthy로 승인된 사례가 검증에서
+재현됐다. 이제 다음을 모두 만족해야 한다.
+
+```text
+regular file (symlink·디렉터리·world-writable 거부)
+JSON object로 완전히 파싱됨 (부분 write는 거부)
+strict schema (아래) — 타입 강제 변환·암묵적 기본값 없음
+checked_at에 timezone 명시 (Z 또는 offset) — timezone 없으면 거부
+checked_at <= now + clock skew
+now - checked_at <= TTL
+clean = true, mismatch_count = 0, unknown_count = 0, halt = false
+```
+
+#### snapshot strict schema (schema_version 1)
+
+```json
+{
+  "schema_version": 1,
+  "checked_at": "2026-08-05T00:00:00+00:00",
+  "clean": true,
+  "mismatch_count": 0,
+  "unknown_count": 0,
+  "halt": false
+}
+```
+
+여섯 필드 모두 **필수**이며 타입이 정확히 일치해야 한다.
+
+```text
+schema_version  integer, 정확히 1
+checked_at      string, timezone 포함 ISO-8601
+clean           boolean
+mismatch_count  integer >= 0
+unknown_count   integer >= 0
+halt            boolean
+```
+
+**강제 변환하지 않는다.** `"clean": "false"`는 문자열이므로 거부한다 — Python에서
+`bool("false")`는 `True`라 예전 reader가 이를 승인했다. `"mismatch_count": "0"`도
+거부하며, 필드가 없으면 0/false로 추정하지 않고 `RECONCILIATION_REQUIRED_FIELD_MISSING`으로
+차단한다. `mismatch_count: true`처럼 boolean을 정수 자리에 넣는 것도 거부한다
+(`isinstance(True, int)`가 참이므로 `type(x) is int`로 검사한다).
+
+**배포 후 reconciliation을 한 번 수동 실행해 새 schema snapshot을 생성해야 한다.**
+이전 schema의 snapshot은 `RECONCILIATION_REQUIRED_FIELD_MISSING`으로 거부된다 — 구버전을
+추정해서 읽지 않는다. `reconciliation_state.is_current_and_clean()`(주문 gate가 사용)도
+동일 schema를 적용하므로, 스키마 갱신 전에는 주문 gate도 fail-closed로 막힌다.
+
+```env
+SHADOW_RECONCILIATION_MAX_AGE_SECONDS=900         # 기본 900초(15분), 상한 3600
+SHADOW_RECONCILIATION_MAX_FUTURE_SKEW_SECONDS=30  # 기본 30초, 상한 300
+```
+
+경계는 `age <= TTL` 허용, `age > TTL` 거부다. 미래 timestamp는 skew 이내만 허용하며
+그 밖은 `RECONCILIATION_SNAPSHOT_FROM_FUTURE`로 차단한다 — 서버 시계가 뒤로 이동해
+과거 snapshot이 미래로 보이는 상황을 fresh로 오인하지 않기 위한 것이다. TTL/skew에
+잘못된 값(0, 음수, 소수, 문자열, 상한 초과)을 넣으면 설정 오류로 exit 1이며, 미설정 시에만
+기본값을 쓰고 실제 적용값을 로그에 남긴다.
+
+**cadence와 TTL 정합성**: reconcile timer는 `OnUnitActiveSec=2min`, Shadow timer는 5분
+주기다. TTL 15분은 reconciliation을 여러 번 연속으로 놓쳐도 정상 운영을 막지 않으면서,
+reconciler가 멈추면 Shadow도 함께 멈추게 한다. TTL을 reconcile 주기보다 짧게 설정하면
+정상 운영 중에도 반복 차단되므로 금지한다.
+
+**timer를 켠 뒤에도 매 실행 직전 다시 검증한다.** `us-stock-trading-shadow.service`의
+`ExecStartPre`가 같은 프로그램(`scripts/check_reconciliation_freshness.py`)을 실행하므로,
+timer 활성화 이후 reconciliation이 멈추면 Shadow 본체는 실행되지 않는다. 손으로
+`run_shadow_mode.py`를 실행할 때도 entrypoint가 같은 검사를 수행하고 exit 5로 종료한다.
+
+운영 중 상태 확인:
+
+```bash
+jq '.checked_at, .clean, .mismatch_count' "$RECONCILIATION_STATE_FILE"
+date -u
+venv/bin/python scripts/check_reconciliation_freshness.py --purpose manual-check
+echo "exit=$?"    # 0이 아니면 Shadow timer를 켜지 않는다
+```
+
+차단 사유는 다음 reason code로 구분된다.
+
+```text
+RECONCILIATION_SNAPSHOT_MISSING            snapshot 파일 없음
+RECONCILIATION_SNAPSHOT_INVALID            symlink/비정규 파일/world-writable/JSON 파손
+RECONCILIATION_TIMESTAMP_INVALID           checked_at 없음 또는 파싱 불가
+RECONCILIATION_TIMESTAMP_TIMEZONE_MISSING  timezone 미표기
+RECONCILIATION_SNAPSHOT_STALE              TTL 초과
+RECONCILIATION_SNAPSHOT_FROM_FUTURE        허용 skew를 넘는 미래 timestamp
+RECONCILIATION_NOT_CLEAN                   clean=false 또는 mismatch_count>0
+RECONCILIATION_UNKNOWN_PRESENT             UNKNOWN 주문 존재
+RECONCILIATION_HALT_ACTIVE                 HALT 설정됨
+RECONCILIATION_FRESHNESS_CONFIG_INVALID    TTL/skew 환경변수 값 오류
+RECONCILIATION_SNAPSHOT_SCHEMA_INVALID     JSON object가 아님
+RECONCILIATION_REQUIRED_FIELD_MISSING      필수 필드 누락 (detail=field=<이름>)
+RECONCILIATION_FIELD_TYPE_INVALID          타입 불일치 (detail=field/expected/actual)
+RECONCILIATION_FIELD_VALUE_INVALID         값 범위 위반 (음수 count)
+RECONCILIATION_SCHEMA_VERSION_UNSUPPORTED  지원하지 않는 schema_version
+```
+
+타입 오류(`*_FIELD_TYPE_INVALID`)와 안전 상태 차단(`RECONCILIATION_NOT_CLEAN` /
+`_UNKNOWN_PRESENT` / `_HALT_ACTIVE`)은 서로 다른 reason으로 구분된다 — 전자는 snapshot이
+잘못 쓰인 것이고 후자는 계좌 상태가 안전하지 않은 것이다.
+
+#### snapshot writer lifecycle과 commit-uncertain
+
+writer는 하나의 flock 안에서 다음 순서를 수행한다.
+
+```text
+lock -> stale temp scan/검증/정리 -> temp write -> file fsync -> chmod 0600
+     -> os.replace -> directory fsync -> unlock
+```
+
+`now`는 **timezone-aware만 허용**한다. naive datetime은
+`RECONCILIATION_TIMESTAMP_TIMEZONE_MISSING`으로 거부되며 기존 snapshot은 그대로 남는다
+(naive를 쓰면 reader가 반드시 거부할 snapshot이 만들어지므로 쓰기 자체를 막는다).
+`checked_at`은 UTC(`+00:00`)로 정규화해 기록한다.
+
+**commit-uncertain marker는 replace보다 먼저 durable하게 만들어진다.**
+
+```text
+lock -> stale temp 정리
+     -> marker 생성 (O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW, 0600) + file fsync + dir fsync
+     -> temp write -> file fsync -> chmod
+     -> os.replace
+     -> snapshot dir fsync
+     -> marker unlink -> dir fsync
+```
+
+marker를 replace 이후에 만들면 `os.replace`와 directory fsync 사이의 SIGKILL 창을 막을 수
+없다 — 그 사이에 죽으면 새 snapshot은 보이는데 durability를 의심할 근거가 아무것도 남지
+않아 fresh로 승인된다. 실제 SIGKILL을 6개 지점(marker dir fsync 전/후, temp fsync 후
+replace 전, replace 직후, snapshot dir fsync 후 marker unlink 전, marker unlink 후 dir
+fsync 전)에서 넣어 확인했고, marker가 남는 5개 지점은 모두 gate가 차단하며 마지막
+지점은 snapshot이 durable한 상태다. 모든 지점이 다음 정상 reconciliation으로 복구된다.
+
+**marker가 있으면 snapshot 내용이 fresh하고 clean이어도 차단한다.** marker만 지우고
+승인하면 안 되며, 반드시 새 reconciliation을 완주시켜야 한다.
+
+**replace 전 실패와 후 실패는 다르게 보고된다.**
+
+```text
+replace 전 (temp write / file fsync / replace 실패)
+  -> 기존 snapshot byte 동일, temp 제거, 일반 write 실패
+
+replace 후 (directory fsync 실패)
+  -> RECONCILIATION_SNAPSHOT_COMMIT_UNCERTAIN
+  -> 새 snapshot이 이미 보일 수 있으므로 "write 실패"라고 하지 않는다
+  -> 롤백하지 않는다 (커밋됐을 수도 있는 snapshot을 지우면 불확실이 손실로 바뀐다)
+  -> commit-uncertain marker 기록 + 운영 alert
+  -> freshness gate가 RECONCILIATION_SNAPSHOT_COMMIT_UNCERTAIN으로 차단
+  -> 다음 reconciliation이 전체 lifecycle을 완주하면 자동 해제
+```
+
+즉 **directory fsync가 실패한 뒤에는 reconciliation을 한 번 더 정상 완주시키기 전까지
+Shadow timer를 켤 수 없다.**
+
+marker(`.{snapshot}.commit-uncertain`)와 writer lock(`.{snapshot}.writer.lock`)은 모두
+**symlink를 따라가지 않고, 특정 inode에 binding된다.** 열기 전에 `lstat()`으로 검사하고
+`dir_fd` + `O_NOFOLLOW`로 연다.
+
+```text
+mode        정확히 0600만 허용 (0640·0644·0660·0666·0400 전부 거부)
+            자동 chmod 교정 없음 — 예상 밖 mode는 다른 주체가 만든 파일이라는 뜻이다
+owner       현재 사용자
+st_nlink    1
+type        regular file (symlink·broken symlink·디렉터리·FIFO·socket 거부)
+```
+
+**pathname은 신뢰하지 않는다.** `lstat → open → fstat`만으로는 그 사이에 regular file이
+*다른* regular file로 교체되는 것을 잡을 수 없다(fstat은 "regular인가"만 확인한다). 그래서
+lock은 open 전 lstat, fd의 fstat, open 후 lstat의 `(st_dev, st_ino)`가 모두 같아야 하고,
+flock 직후와 commit 직전에 다시 확인한다. 불일치는
+`RECONCILIATION_WRITER_LOCK_CHANGED`로 차단한다.
+
+marker 역시 생성 시점의 inode를 기억해 unlink 직전에 대조한다. 다르면
+`RECONCILIATION_MARKER_CHANGED`로 **삭제하지 않고** 차단한다 — 교체된 파일을 지우고 성공을
+반환하면 남의 파일을 지운 뒤 gate까지 열어주는 셈이다. unlink 후에는 이름이 실제로
+비었는지 확인하며, 즉시 재생성돼 있으면 `RECONCILIATION_MARKER_REAPPEARED`다.
+
+**상호 배제는 lock 파일이 아니라 state 디렉터리 inode에 건다.** pathname이 교체되면 두 번째
+writer는 자기 나름대로 일관된 inode를 보게 되므로 lock 파일만으로는 동시 쓰기를 막을 수
+없다. 디렉터리 inode는 그 안에서 무슨 일이 일어나도 바뀌지 않으므로 두 writer가 항상 같은
+객체를 두고 경합한다(실제 2-process probe로 확인: lock pathname을 교체해도 두 번째 writer가
+6초간 대기 후 직렬 실행). lock 파일 검증은 변조 탐지 수단으로 유지한다.
+
+다른 snapshot의 marker·lock(`.OTHER.json.*`)은 건드리지 않는다.
+
+**남아 있는 창구(운영자가 알아야 할 것).** inode를 지정해 unlink하는 syscall이 POSIX에 없으므로,
+marker의 마지막 검증 `lstat`과 `unlink` 사이 수 마이크로초에 이름이 교체되면 그 교체된 파일이
+지워진다. 이름 기반 unlink 앞의 어떤 검사도 이 간격을 없앨 수 없고, rename 기반 프로토콜은 같은
+간격을 다른 이름으로 옮길 뿐이다. 두 가지 이유로 gate 안전성에는 영향이 없다:
+
+- 이 간격에 도달하려면 state 디렉터리에 **서비스 계정과 같은 uid로 쓰기 권한**이 이미 있어야 한다
+  (`shared/state`는 0700 owner-only). 그 권한이면 snapshot을 직접 조작하는 쪽이 더 쉽다.
+- unlink는 snapshot의 directory fsync가 **성공한 뒤에만** 도달하므로, 이 race에서 져도
+  "durable하지 않은 snapshot이 fresh로 승인되는" 결과는 만들어지지 않는다.
+
+검증 `lstat` **이전**의 모든 교체는 `RECONCILIATION_MARKER_CHANGED`로 잡힌다
+(`tests/test_shadow_exit_halt_and_writer_recovery.py::TestTheUnlinkGapThatCannotBeClosed`가
+이 경계를 고정한다).
+
+stale temp는 `.{snapshot}.{pid}.{uuid}.tmp` 형식이며, 다음 정상 write가 lock을 쥔 채
+정리한다. dead PID의 정상 temp는 삭제하고, live PID temp·malformed 이름·symlink·디렉터리·
+FIFO는 **삭제하지 않고 write를 차단**한다(`RECONCILIATION_TEMP_ARTIFACT_INVALID`).
+정리 실패 시에도 write를 진행하지 않는다(`RECONCILIATION_STALE_TEMP_CLEANUP_FAILED`).
+
+### Shadow exit와 HALT
+
+`us-stock-trading-shadow-exit.service`는 **stale reconciliation snapshot으로는 차단하지
+않는다**(매도·청산 경로를 막으면 포지션이 갇힐 수 있다). 대신 실행 시점의 HALT를
+`kill_switch.is_halted()`로 **직접 조회**한다 — snapshot의 `halt` 필드는 reconciliation
+시점의 값이라 사용하지 않는다.
+
+```text
+kill_switch.is_halted()  <- 첫 broker 호출보다 먼저
+-> 포지션 조회 -> 가격/계좌 조회 -> 미체결·UNKNOWN 조회 -> exit 판단
+```
+
+HALT 조회가 실패하면 `HALT_STATUS_UNAVAILABLE`, 결과가 boolean이 아니면
+`HALT_STATUS_INVALID`로 각각 exit code 6, broker 호출 0, 주문·취소 transport 0이다.
+
+**결과를 `bool()`로 변환하지 않는다.** Python에서 `bool(None)`·`bool(0)`·`bool([])`·
+`bool({})`가 모두 False라, 변환하면 "모르겠다"가 "halt 아님"으로 읽힌다 — 여기서 가능한
+가장 위험한 오독이다. `type(value) is bool`로 검사하며(`isinstance`는 bool이 int의
+subclass라 0/1을 통과시킨다), 로그에는 값이 아니라 `actual_type`만 남긴다.
+
+HALT=true일 때의 정책은 exit 종류로 나뉜다.
+
+```text
+RISK_REDUCTION (STOP_LOSS, EOD_FORCED_CLOSE)
+  -> 계속 평가한다. HALT는 자동 실행을 멈추라는 것이지
+     보호 손절이 걸린 포지션을 방치하라는 뜻이 아니다.
+
+STRATEGY (TARGET_1, TARGET_2, TIME_STOP, TRAILING_BREAKEVEN, 그 밖의 모든 신규 사유)
+  -> BLOCKED / HALT_ACTIVE
+```
+
+분류는 whitelist다 — 나중에 추가되는 exit 사유는 자동으로 STRATEGY가 되므로, 새 규칙이
+조용히 halt 중 동작 권한을 얻지 못한다. 모든 실행은 `HALT_CHECKED` 이벤트를 남기고,
+차단 시 `EXIT_BLOCKED_HALT`를 남기며, 두 이벤트 모두 terminal이 아니므로 run당 terminal은
+정확히 1건을 유지한다. Shadow이므로 어느 경로에서도 실제 주문·취소 transport는 0이다.
+
+중간에 실패하면 `stop` + `disable`로 되돌린다. 종료 시 상태는 둘 중 하나뿐이다.
+
+```text
+성공  enabled + active
+실패  disabled + inactive
+```
+
+`enabled + inactive`나 `enabled + failed`는 남지 않는다. 이 스크립트는 Shadow timer
+하나만 대상으로 하며 live service나 다른 timer를 켜는 기능이 없다.
+
+### 15.6 기존 서비스 경로 전환
+
+기존 `order-monitor`/`dashboard` 유닛을 새 `~/trading-release` 경로로 갱신하되,
+**`ENTRY_DISABLED=true`/`KIS_LIVE_ORDER_ENABLED=false`/`LIVE_ROLLOUT_ENABLED=false`/네
+`LIVE_ENABLE_*` 플래그를 유지한 채** 전환한다.
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart order-monitor dashboard
+systemctl status order-monitor dashboard
+```
+
+### 15.7 정지
+
+```bash
+sudo systemctl stop us-stock-trading-shadow.timer us-stock-trading-shadow-exit.timer \
+    us-stock-trading-reconcile.timer us-stock-trading-health.timer
+sudo systemctl stop us-stock-trading-shadow.service us-stock-trading-shadow-exit.service \
+    us-stock-trading-reconcile.service us-stock-trading-health.service
+```
+
+**주의(범위)**: 실제 청산 주문을 내는
+`kis_position_manager.sync_kis_fills_and_manage_exits()` tick은 실주문 경로이므로 초기
+배포에 서비스로 포함하지 않는다. 그 조건 평가는 위 `shadow-exit` 서비스가 주문 없이
+수행하므로 Oracle에서 매도 로직을 검증하는 것 자체는 가능하다. 실제 실행 활성화는 spec §29의
+실주문 활성화 승인 절차에 속한다.
+
+## 16. 실주문 비활성 상태 최종 확인
+
+```bash
+sudo grep -E "ENTRY_DISABLED|KIS_LIVE_ORDER_ENABLED|LIVE_ROLLOUT_ENABLED|ALPACA_ORDER_ENABLED|ALPACA_PAPER_ORDER_ENABLED|LIVE_ENABLE_PARTIAL_PROFIT|LIVE_ENABLE_TRAILING_STOP|LIVE_ENABLE_TIME_STOP|LIVE_ENABLE_EOD_EXIT" /etc/us-stock-trading/live-readonly.env
+systemctl is-enabled us-stock-trading-live.service
+```
+
+아홉 값 모두 `false`(또는 `ENTRY_DISABLED=true`)이고 live 서비스가 `disabled`인지 육안으로
+재확인한다.
+
+## 롤백 절차
+
+1. 새 유닛을 먼저 중지·비활성화한다.
+
+   ```bash
+   sudo systemctl disable --now us-stock-trading-shadow.timer
+   sudo systemctl disable --now us-stock-trading-shadow-exit.timer
+   sudo systemctl disable --now us-stock-trading-reconcile.timer
+   sudo systemctl disable --now us-stock-trading-health.timer
+   sudo systemctl stop us-stock-trading-shadow.service us-stock-trading-shadow-exit.service \
+       us-stock-trading-reconcile.service us-stock-trading-health.service
+   systemctl is-enabled us-stock-trading-live.service   # disabled 확인
+   ```
+
+2. `sudo systemctl stop order-monitor dashboard`
+3. systemd 유닛의 `WorkingDirectory`/`ExecStart`를 `~/trading`(기존 운영본)으로 되돌린다.
+4. `sudo systemctl daemon-reload && sudo systemctl start order-monitor dashboard`
+5. `~/trading-release`와 `/etc/us-stock-trading/live-readonly.env`는 삭제하지 않고
+   보존한다(원인 분석용).
+6. 문제가 KIS API 자체(인증/네트워크)라면 `KIS_ACCOUNT_READ_ENABLED=false`로 즉시 KIS
+   API 호출을 전면 차단할 수 있다 — 코드 변경 없이 환경변수만으로 가능.
+
+## 긴급 대응 절차
+
+- **의심되는 이중 주문/미확인 주문**: `KIS_LIVE_ORDER_ENABLED=false`로 즉시 전환(신규
+  주문 전면 차단) 후 `reconciliation/order_reconciler.reconcile_unknown_order()`로 KIS
+  주문 이력과 대조. 자동 반대매매/자동 취소를 수행하지 않는다.
+- **계좌 불일치 발견**: `operations/commands.halt()`를 호출해 전량 자동 주문 실행을 중지한다
+  (기존 포지션 감시는 계속되나 신규 주문/매도 자동 실행도 함께 중단됨 — spec §20의 HALT).
+- **긴급 전량 청산 필요**: `operations/commands.request_emergency_liquidation()`으로 승인
+  기록을 남기되, 실제 청산 주문은 이 승인만으로 자동 실행되지 않는다 — 사람이 KIS HTS/MTS
+  또는 별도 명시적 조작으로 직접 수행한다(spec §29).

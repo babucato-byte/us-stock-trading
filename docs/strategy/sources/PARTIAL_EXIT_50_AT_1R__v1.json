@@ -1,0 +1,28 @@
+{
+  "source_id": "PARTIAL_EXIT_50_AT_1R",
+  "source_type": "USER_CHART_ANALYSIS",
+  "title": "1R 도달 시 50% 분할 익절",
+  "reference": "docs/autonomous/PROJECT_CONSTITUTION.md",
+  "collected_at": "2026-07-25T00:00:00+00:00",
+  "version": 1,
+  "validation_status": "REVIEWED",
+  "claims": [
+    {
+      "category": "EXIT",
+      "statement": "1R 도달 시 보유 수량의 50%를 분할 익절한다",
+      "origin": "SOURCE",
+      "source_excerpt": "자동 손절 → 50% 분할 익절 → 잔여 포지션 관리",
+      "confidence": 1.0
+    },
+    {
+      "category": "STOP",
+      "statement": "분할 익절 이후 잔여 포지션의 손절가는 손익분기(진입가)로 이동한다",
+      "origin": "ASSUMPTION",
+      "source_excerpt": null,
+      "confidence": 0.5
+    }
+  ],
+  "derived_strategy_id": "VWAP_MICRO_PULLBACK_MOMENTUM_V1",
+  "similar_to": [],
+  "notes": "50% 분할 자체는 constitution에 명시(REVIEWED). 분할 이후 손절가를 손익분기로 이동하는 정책은 Stage 4에서 결정한 ASSUMPTION (positions/lifecycle.py, DECISION_LOG.md Stage 4 참고)."
+}

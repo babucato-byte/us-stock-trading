@@ -1,0 +1,45 @@
+# CODEX-049: US Stock Trading -- KIS Shadow entry evaluation (places no orders)
+#
+# LOW: paths are TEMPLATED, not hardcoded. scripts/install_oracle_
+# services.sh substitutes @TRADING_RELEASE_ROOT@, @TRADING_SHARED_ROOT@,
+# @TRADING_ENV_FILE@ and @TRADING_LOG_DIR@ at install time, so one unit
+# file fits any release layout. A unit installed with an unsubstituted
+# placeholder fails its ConditionPathExists rather than running against
+# a wrong path.
+# Places NO orders: scripts/run_shadow_mode.py never imports
+# execution.execution_engine. Requires= reconcile, so a failed
+# reconciliation blocks this unit from starting at all.
+[Unit]
+Description=US Stock Trading -- KIS Shadow entry evaluation (places no orders)
+After=network-online.target us-stock-trading-migrate.service us-stock-trading-reconcile.service
+Wants=network-online.target
+Requires=us-stock-trading-migrate.service us-stock-trading-reconcile.service
+ConditionPathExists=@TRADING_RELEASE_ROOT@/venv/bin/python
+ConditionPathExists=@TRADING_ENV_FILE@
+ConditionPathExists=@TRADING_RELEASE_ROOT@/scripts/run_shadow_mode.py
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=trading
+WorkingDirectory=@TRADING_RELEASE_ROOT@
+EnvironmentFile=@TRADING_ENV_FILE@
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=300
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+ReadWritePaths=@TRADING_RELEASE_ROOT@ @TRADING_SHARED_ROOT@ @TRADING_LOG_DIR@
+ExecStartPre=@TRADING_RELEASE_ROOT@/venv/bin/python @TRADING_RELEASE_ROOT@/scripts/preflight_kis_live.py
+# Arming the timer once against a fresh reconciliation says nothing
+# about the state an hour later. Checked again before EVERY run, with
+# the same program and therefore the same TTL the approval used, so a
+# reconciler that stops after the timer is armed stops Shadow too.
+ExecStartPre=@TRADING_RELEASE_ROOT@/venv/bin/python @TRADING_RELEASE_ROOT@/scripts/check_reconciliation_freshness.py --purpose shadow-run
+ExecStart=@TRADING_RELEASE_ROOT@/venv/bin/python @TRADING_RELEASE_ROOT@/scripts/run_shadow_mode.py
+
+[Install]
+WantedBy=multi-user.target

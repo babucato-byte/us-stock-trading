@@ -282,8 +282,18 @@ def test_candidate_file_generation(tmp_path, monkeypatch):
     monkeypatch.setattr(scanner, "STRONG_CANDIDATES_FILE", tmp_path / STRONG_CANDIDATES_FILE.name)
     monkeypatch.setattr(scanner, "ORDER_CANDIDATES_FILE", tmp_path / ORDER_CANDIDATES_FILE.name)
     monkeypatch.setattr(scanner, "PREVIOUS_CANDIDATES_FILE", tmp_path / PREVIOUS_CANDIDATES_FILE.name)
+    # save_candidate_files() now ALSO publishes to the shared candidate
+    # store, which resolves its own path at call time and so is not
+    # covered by the four setattr redirections above. Without this the
+    # test publishes into the repository.
+    from market_data import candidate_store
+    monkeypatch.setenv(candidate_store.CANDIDATE_DIR_ENV, str(tmp_path / "shared"))
 
     save_candidate_files(buckets)
+
+    # the shared publication happened, and it went to tmp_path
+    assert (tmp_path / "shared" / "order_candidates.csv").exists()
+    assert (tmp_path / "shared" / "order_candidates.manifest.json").exists()
 
     assert (tmp_path / "candidates.csv").exists()
     assert (tmp_path / "strong_candidates.csv").exists()

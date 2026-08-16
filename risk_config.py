@@ -10,6 +10,10 @@ MAX_SINGLE_TRADE_LOSS_RATE = -0.01
 MAX_TRADES_PER_DAY = 3
 MAX_OPEN_POSITIONS = 5
 
+# Account-wide exposure controls
+# Total market value of all open positions, as a fraction of account equity.
+MAX_TOTAL_EXPOSURE_RATE = 0.5
+
 # Exit rules
 TAKE_PROFIT_RATE = 0.15
 STOP_LOSS_RATE = -0.08

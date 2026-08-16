@@ -1,0 +1,28 @@
+{
+  "source_id": "RISK_REWARD_1_TO_2",
+  "source_type": "USER_CHART_ANALYSIS",
+  "title": "1:2 손익비(Risk:Reward) 목표 구조",
+  "reference": "docs/autonomous/PROJECT_CONSTITUTION.md",
+  "collected_at": "2026-07-25T00:00:00+00:00",
+  "version": 1,
+  "validation_status": "COLLECTED",
+  "claims": [
+    {
+      "category": "TARGET",
+      "statement": "1R에서 1차 목표(target_1)를 설정한다",
+      "origin": "SOURCE",
+      "source_excerpt": "자동 손절 → 50% 분할 익절 → 잔여 포지션 관리",
+      "confidence": 1.0
+    },
+    {
+      "category": "TARGET",
+      "statement": "잔여 포지션의 2차 목표(target_2)는 진입 리스크의 2배(2R)로 설정한다",
+      "origin": "ASSUMPTION",
+      "source_excerpt": null,
+      "confidence": 0.6
+    }
+  ],
+  "derived_strategy_id": "VWAP_MICRO_PULLBACK_MOMENTUM_V1",
+  "similar_to": [],
+  "notes": "target_2=2R은 지시서 원문에 명시되지 않은 ASSUMPTION이며 DECISION_LOG.md Stage 3 결정 근거로 기록되어 있음 (config.scalping_strategy_v1_config.TARGET_2_R_MULTIPLE=2.0)."
+}

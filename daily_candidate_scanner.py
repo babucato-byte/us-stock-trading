@@ -658,6 +658,33 @@ def save_candidate_files(buckets):
     buckets.strong_candidates.to_csv(STRONG_CANDIDATES_FILE, index=False)
     buckets.order_candidates.to_csv(ORDER_CANDIDATES_FILE, index=False)
     buckets.candidates[["symbol"]].to_csv(PREVIOUS_CANDIDATES_FILE, index=False)
+    _publish_to_shared_store(buckets.order_candidates)
+
+
+def _publish_to_shared_store(order_candidates):
+    """Also publish the order candidates to the release-independent
+    shared store, atomically and with a freshness manifest.
+
+    The local CSVs above stay exactly as they were -- the dashboard,
+    health check and Slack report all read them. This adds the one copy
+    that trading reads, so no release ever needs a file carried into it
+    by hand.
+
+    Never raises: the scanner's job is to scan. A publication failure is
+    logged and leaves the previous published set in place, which the
+    consumer will then correctly reject as stale rather than act on.
+    """
+    try:
+        from market_data import candidate_store
+        from market_hours import us_trading_day
+
+        manifest = candidate_store.publish_dataframe(
+            order_candidates, trading_day=us_trading_day())
+        print(f"[CANDIDATE STORE] published {len(order_candidates)} rows "
+              f"for {manifest['trading_day']} to {candidate_store.candidate_path()}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[CANDIDATE STORE] publication FAILED ({type(exc).__name__}: {exc}); "
+              f"local CSVs are written, but trading will treat the shared store as stale")
 
 
 def classify_candidate(row, smart_money_min):
@@ -750,10 +777,39 @@ def format_yes_no(value):
     return "YES" if value is True or str(value).lower() in {"true", "1", "yes"} else "NO"
 
 
+def load_scan_universe(base_dir=None):
+    """Returns (frame, source_path).
+
+    Prefers `universe_tradable.csv` -- the account-budget/liquidity
+    filtered pool built by universe_builder.build_tradable_universe() --
+    because scanning a symbol the account cannot buy one whole share of
+    spends the scan budget on a candidate that can never become an order.
+
+    A filtered file with ZERO rows is honoured as-is: "nothing is
+    affordable right now" is a real answer, and falling back to the full
+    listing there would re-admit exactly the symbols the filter excluded.
+    The fallback applies only when the file is absent or unparseable,
+    which restores the pre-T8 behaviour rather than loosening any gate
+    (the order path's own affordability checks are unaffected either way).
+    """
+    root = Path(base_dir) if base_dir is not None else BASE_DIR
+    tradable_path = root / "universe_tradable.csv"
+    if tradable_path.exists():
+        try:
+            frame = pd.read_csv(tradable_path)
+            if "symbol" in frame.columns:
+                return frame, tradable_path
+            print(f"[SCAN UNIVERSE] {tradable_path} has no symbol column; falling back to universe.csv")
+        except Exception as exc:
+            print(f"[SCAN UNIVERSE] {tradable_path} unreadable ({exc}); falling back to universe.csv")
+    return pd.read_csv(root / "universe.csv"), root / "universe.csv"
+
+
 def scan(preset_name=None, send_slack=True, scan_limit=None):
     rules = load_scanner_rules(preset_name)
     scan_id = create_scan_id()
-    universe = pd.read_csv(BASE_DIR / "universe.csv")
+    universe, universe_source = load_scan_universe()
+    print(f"[SCAN UNIVERSE] source={universe_source} rows={len(universe)}")
 
     if "exchange" in universe.columns:
         universe = universe[universe["exchange"].astype(str).str.upper() != "OTC"]

@@ -1,0 +1,35 @@
+{
+  "source_id": "TURTLE_TREND_FOLLOWING",
+  "source_type": "YOUTUBE",
+  "title": "터틀 트레이딩(Turtle Trading) 추세추종 규칙",
+  "reference": "TBD_OPERATOR: 실제 사용자 차트 분석 자료 또는 YouTube 영상 링크/타임스탬프 미지정. 아래 claims는 해당 개념에 대한 공개적으로 알려진 일반 서술이며, 특정 소스를 인용한 것이 아님.",
+  "collected_at": "2026-07-25T00:00:00+00:00",
+  "version": 1,
+  "validation_status": "COLLECTED",
+  "claims": [
+    {
+      "category": "ENTRY",
+      "statement": "N일 신고가/신저가 돌파 시 진입한다 (Donchian 채널 브레이크아웃)",
+      "origin": "ASSUMPTION",
+      "source_excerpt": null,
+      "confidence": 0.5
+    },
+    {
+      "category": "RISK",
+      "statement": "포지션 크기는 ATR 기반 변동성 단위(N)로 결정한다",
+      "origin": "ASSUMPTION",
+      "source_excerpt": null,
+      "confidence": 0.5
+    },
+    {
+      "category": "STOP",
+      "statement": "손절은 진입가로부터 2N(ATR 2배) 거리에 설정한다",
+      "origin": "ASSUMPTION",
+      "source_excerpt": null,
+      "confidence": 0.4
+    }
+  ],
+  "derived_strategy_id": null,
+  "similar_to": [],
+  "notes": "장기·스윙 트레이딩 규칙으로, 이 프로젝트의 초단타(수분~당일) 범위와 시간 프레임이 다름 — 그대로 적용 불가, 참고용."
+}

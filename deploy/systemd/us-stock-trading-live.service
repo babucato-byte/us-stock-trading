@@ -1,0 +1,60 @@
+# CODEX-049: US Stock Trading -- KIS live buy-entry cycle (DISABLED by default)
+#
+# LOW: paths are TEMPLATED, not hardcoded. scripts/install_oracle_
+# services.sh substitutes @TRADING_RELEASE_ROOT@, @TRADING_SHARED_ROOT@,
+# @TRADING_ENV_FILE@ and @TRADING_LOG_DIR@ at install time, so one unit
+# file fits any release layout. A unit installed with an unsubstituted
+# placeholder fails its ConditionPathExists rather than running against
+# a wrong path.
+# INSTALLED BUT DELIBERATELY NOT ENABLEABLE.
+#
+# This unit has NO [Install] section, on purpose. Without one there is
+# no WantedBy target to link, so `systemctl enable` fails outright:
+#
+#   Failed to enable unit: Unit .../us-stock-trading-live.service is
+#   not enableable, only a generator or transient unit could have
+#   enabled it
+#
+# It therefore cannot be started at boot, cannot be pulled in as a
+# dependency of multi-user.target, and cannot be enabled by an install
+# script or by a slip of the hand. It previously carried
+# `[Install] WantedBy=multi-user.target`, which meant one stray
+# `systemctl enable` would have armed real order placement on every
+# reboot -- relying on the installer to disable it again was a weaker
+# guarantee than not being enableable at all.
+#
+# A deliberate `systemctl start us-stock-trading-live.service` still
+# works, which is the intended path: a first real order needs an
+# explicit operator start AND a reviewed change to @TRADING_ENV_FILE@,
+# because the ExecStartPre preflight below refuses to run while the
+# read-only posture is in force.
+[Unit]
+Description=US Stock Trading -- KIS live buy-entry cycle (DISABLED by default)
+After=network-online.target us-stock-trading-migrate.service us-stock-trading-reconcile.service
+Wants=network-online.target
+Requires=us-stock-trading-migrate.service us-stock-trading-reconcile.service
+ConditionPathExists=@TRADING_RELEASE_ROOT@/venv/bin/python
+ConditionPathExists=@TRADING_ENV_FILE@
+ConditionPathExists=@TRADING_RELEASE_ROOT@/scripts/run_live_buy_entry.py
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=trading
+WorkingDirectory=@TRADING_RELEASE_ROOT@
+EnvironmentFile=@TRADING_ENV_FILE@
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=300
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+ReadWritePaths=@TRADING_RELEASE_ROOT@ @TRADING_SHARED_ROOT@ @TRADING_LOG_DIR@
+ExecStartPre=@TRADING_RELEASE_ROOT@/venv/bin/python @TRADING_RELEASE_ROOT@/scripts/preflight_kis_live.py
+ExecStart=@TRADING_RELEASE_ROOT@/venv/bin/python @TRADING_RELEASE_ROOT@/scripts/run_live_buy_entry.py
+
+# No [Install] section -- see the header. This unit is intentionally not
+# enableable; do not add one without a reviewed decision to allow live
+# order placement to survive a reboot.

@@ -1,0 +1,28 @@
+{
+  "source_id": "ROSS_CAMERON_MICRO_PULLBACK",
+  "source_type": "YOUTUBE",
+  "title": "Ross Cameron 스타일 마이크로 눌림목(micro pullback) 진입",
+  "reference": "TBD_OPERATOR: 사용자가 참고한 실제 Ross Cameron 영상 링크 미지정. VWAP_MICRO_PULLBACK_MOMENTUM_V1의 설계 근거로 이미 채택되어 구현됨 (strategy/plugins/vwap_micro_pullback_v1.py, DECISION_LOG.md Stage 3).",
+  "collected_at": "2026-07-25T00:00:00+00:00",
+  "version": 1,
+  "validation_status": "COLLECTED",
+  "claims": [
+    {
+      "category": "ENTRY",
+      "statement": "초기 rally 이후 얕은 pullback(거래량 감소)에서 재돌파(거래량 재확대) 시 진입한다",
+      "origin": "ASSUMPTION",
+      "source_excerpt": null,
+      "confidence": 0.7
+    },
+    {
+      "category": "STOP",
+      "statement": "손절은 micro-pullback 저점 또는 ATR 기반 최소 버퍼 중 더 보수적인 값으로 설정한다",
+      "origin": "ASSUMPTION",
+      "source_excerpt": null,
+      "confidence": 0.6
+    }
+  ],
+  "derived_strategy_id": "VWAP_MICRO_PULLBACK_MOMENTUM_V1",
+  "similar_to": [],
+  "notes": "실제 영상 링크가 지정되지 않았으므로 origin=SOURCE를 사용하지 않았다. 구현은 이미 존재하지만(derived_strategy_id), 원 소스 자료 자체는 미검증 상태로 validation_status=COLLECTED를 유지한다."
+}

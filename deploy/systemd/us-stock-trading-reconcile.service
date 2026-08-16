@@ -1,0 +1,39 @@
+# CODEX-049: US Stock Trading -- KIS reconciliation (read-only)
+#
+# LOW: paths are TEMPLATED, not hardcoded. scripts/install_oracle_
+# services.sh substitutes @TRADING_RELEASE_ROOT@, @TRADING_SHARED_ROOT@,
+# @TRADING_ENV_FILE@ and @TRADING_LOG_DIR@ at install time, so one unit
+# file fits any release layout. A unit installed with an unsubstituted
+# placeholder fails its ConditionPathExists rather than running against
+# a wrong path.
+# Read-only against KIS: get_positions/get_open_orders/get_fills only.
+# Never submit_order()/cancel_order().
+[Unit]
+Description=US Stock Trading -- KIS reconciliation (read-only)
+After=network-online.target us-stock-trading-migrate.service
+Wants=network-online.target
+Requires=us-stock-trading-migrate.service
+ConditionPathExists=@TRADING_RELEASE_ROOT@/venv/bin/python
+ConditionPathExists=@TRADING_ENV_FILE@
+ConditionPathExists=@TRADING_RELEASE_ROOT@/scripts/run_reconciliation.py
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=trading
+WorkingDirectory=@TRADING_RELEASE_ROOT@
+EnvironmentFile=@TRADING_ENV_FILE@
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=300
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+ReadWritePaths=@TRADING_RELEASE_ROOT@ @TRADING_SHARED_ROOT@ @TRADING_LOG_DIR@
+ExecStartPre=@TRADING_RELEASE_ROOT@/venv/bin/python @TRADING_RELEASE_ROOT@/scripts/preflight_kis_live.py
+ExecStart=@TRADING_RELEASE_ROOT@/venv/bin/python @TRADING_RELEASE_ROOT@/scripts/run_reconciliation.py
+
+[Install]
+WantedBy=multi-user.target

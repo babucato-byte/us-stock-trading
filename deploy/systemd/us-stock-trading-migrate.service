@@ -1,0 +1,37 @@
+# CODEX-049: US Stock Trading -- state-store schema migration
+#
+# LOW: paths are TEMPLATED, not hardcoded. scripts/install_oracle_
+# services.sh substitutes @TRADING_RELEASE_ROOT@, @TRADING_SHARED_ROOT@,
+# @TRADING_ENV_FILE@ and @TRADING_LOG_DIR@ at install time, so one unit
+# file fits any release layout. A unit installed with an unsubstituted
+# placeholder fails its ConditionPathExists rather than running against
+# a wrong path.
+# Every other unit Requires= this one, so no service can ever run
+# against a database that is behind the deployed code.
+[Unit]
+Description=US Stock Trading -- state-store schema migration
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=@TRADING_RELEASE_ROOT@/venv/bin/python
+ConditionPathExists=@TRADING_ENV_FILE@
+ConditionPathExists=@TRADING_RELEASE_ROOT@/scripts/run_migrations.py
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=trading
+WorkingDirectory=@TRADING_RELEASE_ROOT@
+EnvironmentFile=@TRADING_ENV_FILE@
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=300
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+ReadWritePaths=@TRADING_RELEASE_ROOT@ @TRADING_SHARED_ROOT@ @TRADING_LOG_DIR@
+ExecStart=@TRADING_RELEASE_ROOT@/venv/bin/python @TRADING_RELEASE_ROOT@/scripts/run_migrations.py
+
+[Install]
+WantedBy=multi-user.target

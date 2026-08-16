@@ -1,0 +1,13 @@
+# CODEX-049: periodic trigger for us-stock-trading-shadow.service.
+[Unit]
+Description=Run US Stock Trading KIS Shadow entry evaluation every 5 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+Unit=us-stock-trading-shadow.service
+
+[Install]
+WantedBy=timers.target

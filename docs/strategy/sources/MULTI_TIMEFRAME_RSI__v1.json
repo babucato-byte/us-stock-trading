@@ -1,0 +1,28 @@
+{
+  "source_id": "MULTI_TIMEFRAME_RSI",
+  "source_type": "YOUTUBE",
+  "title": "멀티 타임프레임 RSI 확인 진입",
+  "reference": "TBD_OPERATOR: 실제 사용자 차트 분석 자료 또는 YouTube 영상 링크/타임스탬프 미지정. 아래 claims는 해당 개념에 대한 공개적으로 알려진 일반 서술이며, 특정 소스를 인용한 것이 아님.",
+  "collected_at": "2026-07-25T00:00:00+00:00",
+  "version": 1,
+  "validation_status": "COLLECTED",
+  "claims": [
+    {
+      "category": "FILTER",
+      "statement": "상위 타임프레임(예: 5분봉) RSI가 추세 방향과 일치할 때만 하위 타임프레임(1분봉) 신호를 채택한다",
+      "origin": "ASSUMPTION",
+      "source_excerpt": null,
+      "confidence": 0.5
+    },
+    {
+      "category": "ENTRY",
+      "statement": "하위 타임프레임 RSI가 과매도(30 이하)에서 반등할 때 진입한다",
+      "origin": "ASSUMPTION",
+      "source_excerpt": null,
+      "confidence": 0.5
+    }
+  ],
+  "derived_strategy_id": null,
+  "similar_to": [],
+  "notes": "PROJECT_CONSTITUTION.md는 RSI를 '명확한 검증 근거 없이 추가하지 않는다'고 명시 — 채택 전 백테스트(Phase 6/Stage 7) 필요."
+}
