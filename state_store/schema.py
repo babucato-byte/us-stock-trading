@@ -624,6 +624,76 @@ MIGRATION_13_STATEMENTS = [
     S1_VERIFICATION_STATE_TABLE,
 ]
 
+# --- migration 14: the S1 position state the exit policy runs on ----------
+#
+# `s1_live/exit_policy.py` is a pure function over S1PositionState. This
+# table is where that state lives between ticks, and it exists because
+# three of its fields CANNOT be recomputed from the market:
+#
+#   protective_floor_r  ratchets. A position that touched +2R and fell
+#                       back keeps the floor that move earned it.
+#                       Recomputing from the current price hands the
+#                       floor back on every restart -- the exact loss the
+#                       profit-protection axis exists to prevent.
+#   peak_r              the same, one level down: it is what the floor is
+#                       derived FROM, so losing it loses the floor next tick.
+#   sessions_held       the time exit counts sessions since entry. A
+#                       restart that reset it to 0 would hold a dead
+#                       position indefinitely.
+#
+# `exit_submitted` is the policy-layer half of duplicate-SELL prevention
+# (exit_intents is the ledger half). Both must survive a restart or the
+# position gets sold twice.
+#
+# `pending_exit_reason` implements spec §9: an exit that triggered in a
+# session the broker will not accept an order in is NOT discarded and NOT
+# re-evaluated from scratch -- it is latched here and submitted first
+# thing in the next orderable session. A trigger is never reset.
+S1_POSITIONS_TABLE = """
+CREATE TABLE IF NOT EXISTS s1_positions (
+    position_id         TEXT PRIMARY KEY,
+    symbol              TEXT NOT NULL,
+    strategy_id         TEXT NOT NULL,
+    signal_id           TEXT NOT NULL,
+    -- The KIS ACTUAL AVERAGE FILL PRICE, never the intended limit price.
+    -- Every R level is measured from this, so an intended-price entry
+    -- would put the stop in the wrong place by the slippage amount.
+    entry_price         REAL NOT NULL,
+    quantity            INTEGER NOT NULL,
+    entry_order_id      TEXT,
+    sessions_held       INTEGER NOT NULL DEFAULT 0,
+    last_session_date   TEXT,
+    protective_floor_r  REAL,
+    peak_r              REAL NOT NULL DEFAULT 0.0,
+    exit_submitted      INTEGER NOT NULL DEFAULT 0,
+    status              TEXT NOT NULL DEFAULT 'OPEN',
+    pending_exit_reason TEXT,
+    pending_exit_since  TEXT,
+    exit_reason         TEXT,
+    opened_at           TEXT NOT NULL,
+    updated_at          TEXT NOT NULL,
+    closed_at           TEXT,
+    CHECK (status IN ('OPEN', 'EXIT_PENDING', 'EXIT_SUBMITTED', 'CLOSED')),
+    CHECK (entry_price > 0),
+    CHECK (quantity >= 1),
+    CHECK (exit_submitted IN (0, 1))
+)
+"""
+
+# One OPEN position per symbol. Stage 1 allows max_positions=1 overall,
+# but the constraint that matters for correctness is per-symbol: it makes
+# a second entry into a name we already hold impossible at the storage
+# layer, not merely unlikely at the gate layer.
+S1_POSITIONS_OPEN_SYMBOL_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_s1_positions_open_symbol
+    ON s1_positions (symbol) WHERE status != 'CLOSED'
+"""
+
+MIGRATION_14_STATEMENTS = [
+    S1_POSITIONS_TABLE,
+    S1_POSITIONS_OPEN_SYMBOL_INDEX,
+]
+
 # Every table this schema version creates -- used by export.py's
 # export_all() and by tests asserting the full table set exists.
 ALL_TABLES = [
@@ -632,4 +702,5 @@ ALL_TABLES = [
     "exit_intents", "live_entry_reservations", "kis_order_idempotency",
     "order_state_events", "shadow_audit_events", "s1_live_trades",
     "s1_risk_state", "s1_risk_peak", "s1_verification_state",
+    "s1_positions",
 ]
