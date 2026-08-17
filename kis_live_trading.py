@@ -27,13 +27,22 @@ tested (tests/test_execution_engine_kis.py, tests/test_order_gate.py)
 -- only the strategy-side "when should we sell" decision logic and its
 wiring into this pipeline remain.
 
-RESIDUAL RISK (documented): `_build_instrument()` below defaults
-leveraged/inverse/otc to False for any symbol on the operator-curated
-`live_rollout.allowed_symbols` list -- there is no automated leveraged/
-inverse/OTC classifier in this codebase (universe.csv carries no such
-field), so this pipeline currently relies entirely on the operator
-curating that list to exclude such instruments, not on independent
-code-level detection. See docs/live_review/TBD_REVIEW_RECOMMENDATIONS.md.
+SECURITY TYPE (was a residual risk, now enforced): `_build_instrument()`
+below still defaults leveraged/inverse/otc to False, so on its own it
+cannot tell a common stock from an ETF -- universe.csv carries no such
+field. That used to mean the pipeline relied ENTIRELY on the operator
+curating `live_rollout.allowed_symbols`, which a full-universe S1 scan
+showed to be a real exposure: it returned IUSV, KBE, MILN, BLCV, LEMB,
+IVOV, HYGV, JPIE and JPLD alongside the equities.
+
+`s1_live/security_type.py` now classifies from KIS's own published
+overseas master (field 9: 1=Index 2=Stock 3=ETP 4=Warrant), and the
+per-symbol loop below calls `require_live_eligible()` before an order is
+built. Only COMMON_STOCK on NASDAQ/NYSE/AMEX passes; ETP is refused
+whole, and a symbol absent from the master is UNKNOWN and refused. The
+operator list remains available as an additional restriction, but is no
+longer the only thing preventing an ETF purchase.
+See docs/live_review/TBD_REVIEW_RECOMMENDATIONS.md.
 """
 
 import logging
@@ -76,6 +85,7 @@ from market_data.base import MarketDataProviderError
 from market_hours import us_trading_day
 from operations import kill_switch as ops_kill_switch
 from s1_live import candidate_source as s1_candidate_source
+from s1_live import security_type as s1_security_type
 from state_store import db as state_db
 
 logger = logging.getLogger(__name__)
@@ -371,6 +381,47 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                     _audit(run_id, shadow_audit.INSTRUMENT_BLOCKED, shadow_audit.RESULT_BLOCKED,
                            symbol=symbol, reason_code="SYMBOL_NOT_ALLOWED", now=current)
                     continue
+
+                # Security type, re-checked here even though the publisher
+                # already filtered on it. The candidate file is an artifact
+                # on disk: it can be stale, hand-edited, or left over from a
+                # run against a different master. This is the last point
+                # before an order where "is this actually a common stock"
+                # can still be asked, and the answer comes from KIS's own
+                # master rather than a name rule.
+                #
+                # ETP is refused whole. Distinguishing an ETF from a
+                # leveraged or inverse one is unnecessary when none may be
+                # bought, and attempting it would only create a way to get
+                # the answer wrong. UNKNOWN is refused too: a symbol the
+                # master does not list is not a symbol we know is safe.
+                # Scoped to the S1 source. In the live configuration that is
+                # the only source there is (`S1_LIVE_SOURCE_ENABLED=true`),
+                # so the gate always applies to anything that can actually
+                # trade. The legacy watchlist source keeps the mechanism it
+                # shipped with -- operator-curated `allowed_symbols` -- rather
+                # than acquiring a new refusal it was never written against.
+                try:
+                    classification = (
+                        s1_security_type.require_live_eligible(symbol)
+                        if getattr(source, "name", None) == s1_candidate_source.SOURCE_S1
+                        else None)
+                except s1_security_type.SecurityTypeUnavailable as exc:
+                    reason = str(exc)
+                    results["skipped"].append((symbol, reason))
+                    _persist_blocked_record(
+                        symbol=symbol, risk_gate_result="BLOCKED",
+                        rejection_reason=reason, now=current,
+                    )
+                    outcome["reason_code"] = reason.split(":")[0]
+                    _audit(run_id, shadow_audit.INSTRUMENT_BLOCKED, shadow_audit.RESULT_BLOCKED,
+                           symbol=symbol, reason_code=outcome["reason_code"],
+                           detail=reason, now=current)
+                    continue
+                if classification is not None:
+                    logger.info("S1 entry candidate %s verified as %s on %s "
+                                "(KIS master %s)", symbol, classification.security_type,
+                                classification.exchange, classification.asof)
 
                 # PHASE 4A: qualification is the ONLY source-specific step.
                 # The legacy source still applies analyze_stock +
