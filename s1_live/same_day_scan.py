@@ -269,8 +269,8 @@ def s1_score_threshold(scanner=None) -> Optional[float]:
 
 def scan(symbols, *, bundles=None, provider=None, trading_day=None,
          session: Optional[str] = None, scanner=None,
-         score_threshold: Optional[float] = None, limit: Optional[int] = None
-         ) -> S1SameDayScan:
+         score_threshold: Optional[float] = None, limit: Optional[int] = None,
+         daily_lookback_days: Optional[int] = None) -> S1SameDayScan:
     """Compute S1 candidates for `symbols`, highest score first.
 
     Stateless on purpose: §2 requires every session to be able to ask
@@ -287,6 +287,13 @@ def scan(symbols, *, bundles=None, provider=None, trading_day=None,
     if score_threshold is None:
         score_threshold = s1_score_threshold(scanner)
 
+    if daily_lookback_days is None:
+        # Enough completed bars for HMA200 plus the slope window, taken
+        # from the shared config rather than guessed, and widened for
+        # weekends/holidays since the provider counts CALENDAR days.
+        from scanners.base.features import minimum_daily_bars
+        daily_lookback_days = int(minimum_daily_bars() * 1.6) + 30
+
     result = S1SameDayScan(trading_day=day, signal_day=signal_day, session=session)
     for symbol in symbols:
         data = None
@@ -294,9 +301,17 @@ def scan(symbols, *, bundles=None, provider=None, trading_day=None,
             data = bundles.get(symbol)
         elif provider is not None:
             try:
-                data = provider.fetch(symbol)
-            except Exception:
-                logger.warning("S1 same-day: could not fetch %s", symbol, exc_info=True)
+                # `get_symbol_data`, the same call scanners/runner.py makes.
+                # No intraday and no premarket: S1 declares
+                # `requires_intraday = False`, and asking for bars we must
+                # not feed into a daily indicator only invites them being
+                # used by accident.
+                data = provider.get_symbol_data(
+                    symbol, daily_lookback_days=daily_lookback_days,
+                    intraday_interval="5m", intraday_lookback_days=0,
+                    want_premarket=False)
+            except Exception as exc:
+                logger.debug("S1 same-day: could not fetch %s: %s", symbol, exc)
                 data = None
         if data is None or getattr(data, "daily", None) is None:
             result.unavailable += 1
