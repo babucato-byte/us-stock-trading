@@ -258,6 +258,54 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
         _audit_cycle_block(cycle_run_id, shadow_audit.HALT_BLOCKED, "ENTRY_OFF", reason, now=current)
         raise KISLiveTradingError(reason)
 
+    # Two INDEPENDENT entry permissions, both fail-closed, deliberately not
+    # merged into one:
+    #
+    #   kill_switch_state == ENTRY_DISABLED  (checked immediately above)
+    #       the runtime emergency stop. Persisted, so it survives a restart
+    #       and takes effect without touching a file the operator may not
+    #       be able to reach mid-incident.
+    #
+    #   ENTRY_DISABLED in the environment      (checked here)
+    #       the deployment/operator posture. It is what `resolve_posture()`
+    #       reads, and it is what an operator editing shared env expects to
+    #       be obeyed.
+    #
+    # Before this gate existed the second one was read ONLY by
+    # live_pilot/posture.py, which `live_pilot/armed.py:entry_cycle()` does
+    # not call -- so setting ENTRY_DISABLED=true in shared env produced an
+    # OBSERVE posture in every report while this cycle went on placing
+    # orders. An operator following the documented incident procedure would
+    # have believed new entries were stopped when they were not.
+    #
+    # Neither switch is synchronised into the other: they answer different
+    # questions and either one alone must be able to stop new entries.
+    # Neither applies to the SELL path -- an entry block that also blocked
+    # liquidation would trap the account in the position the block exists
+    # to escape.
+    # Imported here, not at module scope: live_pilot/armed.py imports THIS
+    # module, so a top-level import would close the cycle.
+    from live_pilot import posture as live_posture
+
+    # Scoped deliberately to ENTRY_DISABLED alone rather than to the full
+    # ARMED posture. "Are live entries active at all" is already answered
+    # above by `rollout.enabled`, which callers inject -- re-deriving it
+    # from os.environ here would mean a caller could hold an enabled
+    # rollout config and still be refused because the process environment
+    # disagreed with it. The gap this closes is narrower and specific:
+    # ENTRY_DISABLED was read ONLY by live_pilot/posture.py.
+    if live_posture.env_bool(os.environ, live_posture.FLAG_ENTRY_DISABLED, False):
+        reason = (
+            f"{live_posture.FLAG_ENTRY_DISABLED} is set in the environment "
+            "-- new entries blocked by operator posture"
+        )
+        _persist_blocked_record(
+            symbol=_CYCLE_LEVEL_SYMBOL, risk_gate_result="BLOCKED", rejection_reason=reason, now=current,
+        )
+        _audit_cycle_block(cycle_run_id, shadow_audit.CONFIG_BLOCKED,
+                           "ENTRY_DISABLED_ENV", reason, now=current)
+        raise KISLiveTradingError(reason)
+
     validated_commit = _get_validated_commit()
     deployed_commit = _get_deployed_commit()
     if not validated_commit or validated_commit != deployed_commit:
