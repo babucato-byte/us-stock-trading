@@ -143,19 +143,32 @@ SESSION_POLICIES: Dict[str, SessionPolicy] = {
         order_type=ORDER_TYPE_LIMIT, verified=True,
         reason="KIS daytime-order route, limit orders only"),
 
-    # No published KIS order route has been found for the 04:00-09:30 ET
-    # session. The standard route is NOT assumed to accept it: "extended
-    # hours" is a name, not evidence. Scanning is still allowed, because
-    # collecting candidates costs nothing and orders nothing.
+    # No KIS order route executes in 04:00-09:30 ET. Every US order
+    # endpoint the official reference repo publishes was checked:
+    #
+    #   order.py           TTTT1002U/TTTT1006U -- the regular session
+    #   daytime_order.py   TTTS6036U/TTTS6037U -- 20:00-04:00 ET
+    #   order_resv.py      TTTT3014U/TTTT3016U -- 예약주문. NOT a session:
+    #                      its own docstring says "23:30 정규장으로 주문 전송",
+    #                      so it QUEUES an order for the next regular
+    #                      session rather than executing in the one it was
+    #                      accepted in.
+    #
+    # So premarket has no execution route, and the standard endpoint is
+    # not assumed to accept it: "extended hours" is a name, not evidence.
+    # Scanning stays on, because collecting candidates costs nothing and
+    # orders nothing.
     PREMARKET: _policy(
         PREMARKET, scan=True, entry=False, exit_=False, route=ROUTE_NONE,
         order_type=None, verified=False,
-        reason="no official KIS order route identified for this session"),
+        reason="no official KIS order route identified for this session "
+               "(order_resv queues for the regular session, it does not execute here)"),
 
     AFTER_HOURS: _policy(
         AFTER_HOURS, scan=True, entry=False, exit_=False, route=ROUTE_NONE,
         order_type=None, verified=False,
-        reason="no official KIS order route identified for this session"),
+        reason="no official KIS order route identified for this session "
+               "(order_resv queues for the regular session, it does not execute here)"),
 
     CLOSED: _policy(
         CLOSED, scan=True, entry=False, exit_=False, route=ROUTE_NONE,
