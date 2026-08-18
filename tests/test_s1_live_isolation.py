@@ -76,14 +76,44 @@ class TestPublisherNeverTouchesTheTradingCandidateStore:
             assert "candidate_store" not in module, f"{path.name} imports {module}"
             assert "candidate_decision" not in module, f"{path.name} imports {module}"
 
+    #: The ONE file in s1_live/ that is allowed to reach the order path,
+    #: named here rather than excluded silently. `executor.py` is the
+    #: orchestrator the server runs unattended: it calls
+    #: `kis_live_trading.run_live_buy_entry_cycle()` for entries and hands
+    #: a broker adapter to the exit runtime. Every other module in this
+    #: package produces or evaluates data and must stay unable to trade,
+    #: which is what the sweep below still enforces.
+    MAY_REACH_THE_ORDER_PATH = {"executor.py"}
+
     @pytest.mark.parametrize("path", python_files(S1_DIR), ids=lambda p: p.name)
     def test_the_publisher_cannot_submit_an_order(self, path):
         """It may not import the engine, the broker or the gate. The
         publisher's job ends at two files on disk."""
+        if path.name in self.MAY_REACH_THE_ORDER_PATH:
+            pytest.skip(f"{path.name} is the declared order-path orchestrator")
         forbidden = {"execution", "brokers", "broker", "kis_live_trading",
                      "execution.execution_engine", "live_pilot"}
         for module in imported_modules(path):
             assert module.split(".")[0] not in forbidden, f"{path.name} imports {module}"
+
+    def test_the_order_path_exception_list_stays_exactly_one_file(self):
+        """The exemption is a door, so it is worth counting. A second name
+        appearing here should have to be argued for in review rather than
+        added quietly alongside the first."""
+        assert self.MAY_REACH_THE_ORDER_PATH == {"executor.py"}
+        present = {p.name for p in python_files(S1_DIR)}
+        assert self.MAY_REACH_THE_ORDER_PATH <= present, "exemption names a missing file"
+
+    def test_the_exempt_orchestrator_still_owns_no_policy(self):
+        """It may place orders; it may not decide what to place. Entry
+        gating stays in kis_live_trading, exit policy in exit_policy."""
+        from s1_live import executor
+
+        source = (S1_DIR / "executor.py").read_text()
+        for owned_elsewhere in ("HARD_STOP_PCT", "SCORE_THRESHOLD", "adx_min",
+                                "PROFIT_PROTECTION_STEPS"):
+            assert owned_elsewhere not in source, owned_elsewhere
+        assert executor.STRATEGY_ID == "hma_early_trend"
 
     def test_the_two_stores_use_different_filenames_and_variables(self):
         from market_data import candidate_store
