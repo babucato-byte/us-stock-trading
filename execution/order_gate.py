@@ -78,6 +78,19 @@ class BuyGateContext:
     # a safety limit, which is the defect this field exists to close.
     entry_limits: EntryLimitState
     now: datetime
+    #: S1's execution-price verdict, or None for the legacy path.
+    #:
+    #: The previous-close deviation check below is right for a signal that
+    #: is seconds old and wrong for one that is a day old: S1's signal
+    #: price IS yesterday's close, so an overnight gap reads as an anomaly
+    #: when it is the strategy. When a verdict is supplied the gate
+    #: requires it to have PASSED and uses it INSTEAD of the deviation
+    #: check; when it is absent the deviation check applies unchanged.
+    #:
+    #: Fail-closed by construction: an S1 order that forgot to compute a
+    #: verdict falls through to the 0.30% check, which blocks it. A wiring
+    #: mistake cannot open the gate, only shut it.
+    execution_price_check: Optional[object] = None
 
 
 @dataclass(frozen=True)
@@ -150,13 +163,32 @@ def evaluate_buy_gate(ctx: BuyGateContext) -> bool:
         raise OrderGateBlockedError(f"signal {ctx.signal.signal_id!r} has expired", code="SIGNAL_EXPIRED")
     if not _is_finite_number(ctx.kis_price_usd) or ctx.kis_price_usd <= 0:
         raise OrderGateBlockedError(f"KIS price is invalid: {ctx.kis_price_usd!r}", code="PRICE_INVALID")
-    deviation_percent = abs(ctx.kis_price_usd - ctx.signal.signal_price) / ctx.signal.signal_price * 100.0
-    if deviation_percent > ctx.max_price_deviation_percent:
-        raise OrderGateBlockedError(
-            f"KIS price {ctx.kis_price_usd!r} deviates {deviation_percent:.4f}% from signal price "
-            f"{ctx.signal.signal_price!r}, exceeding the {ctx.max_price_deviation_percent!r}% limit "
-            "-- order cancelled, no chase-buy", code="PRICE_DEVIATION",
-        )
+    verdict = getattr(ctx, "execution_price_check", None)
+    if verdict is None:
+        # Legacy/scalping: unchanged, still 0.30% against the signal price.
+        deviation_percent = abs(ctx.kis_price_usd - ctx.signal.signal_price) / ctx.signal.signal_price * 100.0
+        if deviation_percent > ctx.max_price_deviation_percent:
+            raise OrderGateBlockedError(
+                f"KIS price {ctx.kis_price_usd!r} deviates {deviation_percent:.4f}% from signal price "
+                f"{ctx.signal.signal_price!r}, exceeding the {ctx.max_price_deviation_percent!r}% limit "
+                "-- order cancelled, no chase-buy", code="PRICE_DEVIATION",
+            )
+    else:
+        # S1: the price must sit inside the instrument's OWN trading-day
+        # range. Not a looser tolerance -- a different question, and one a
+        # stale or wrong-exchange quote still fails.
+        if not getattr(verdict, "passed", False):
+            raise OrderGateBlockedError(
+                f"execution-price check failed for {ctx.order_intent.symbol}: "
+                f"{getattr(verdict, 'reason_code', 'UNKNOWN')} "
+                f"({getattr(verdict, 'detail', '')})", code="EXECUTION_PRICE",
+            )
+        if getattr(verdict, "symbol", None) != ctx.order_intent.symbol:
+            # A verdict for another symbol is not evidence about this one.
+            raise OrderGateBlockedError(
+                f"execution-price check is for {getattr(verdict, 'symbol', None)!r}, "
+                f"not {ctx.order_intent.symbol!r}", code="EXECUTION_PRICE",
+            )
     order_notional_usd = quantity * ctx.order_intent.limit_price
     if not _is_finite_number(ctx.usd_orderable_cash) or ctx.usd_orderable_cash < order_notional_usd:
         raise OrderGateBlockedError(
@@ -232,6 +264,10 @@ def _check_entry_limits(ctx):
 BUY_GATE_SEQUENCE = (
     "BROKER", "LIVE_FLAG", "ENTRY_DISABLED", "COMMIT", "ACCOUNT", "QUANTITY",
     "ORDER_TYPE", "SESSION", "SIGNAL_EXPIRED", "PRICE_INVALID", "PRICE_DEVIATION",
+    # Same position in the sequence as PRICE_DEVIATION, because exactly one
+    # of the two runs: the legacy path takes the deviation branch, S1 takes
+    # this one. Both are listed so a report can name whichever refused.
+    "EXECUTION_PRICE",
     "CASH", "OPEN_ORDER", "DUPLICATE_SIGNAL", "SYMBOL", "INSTRUMENT", "RECONCILIATION",
     entry_limits.MAX_OPEN_POSITIONS, entry_limits.MAX_DAILY_ENTRIES,
 )

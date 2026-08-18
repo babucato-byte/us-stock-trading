@@ -307,3 +307,48 @@ class TestStrategyIsolation:
         assert "_truncated_bundle" in body
         assert "signal_day" in body
         assert "want_premarket" in body
+
+
+class TestPriceFnReachesKISCorrectly:
+    """A regression that only a held position would otherwise reveal.
+
+    `build_kis_instrument()` returns (instrument, exchange_record). The
+    executor passed the tuple straight to `get_current_price`, which fails
+    with "'tuple' object has no attribute 'exchange'" -- but only on an
+    exit tick, which needs a position, which no test had. It reached
+    production undetected for exactly that reason.
+    """
+
+    def test_the_instrument_is_unpacked_before_the_broker_sees_it(self):
+        seen = {}
+
+        class RecordingBroker:
+            def get_current_price(self, instrument):
+                seen["instrument"] = instrument
+                return 28.37
+
+        price = executor.make_price_fn(RecordingBroker())("AAPL")
+        assert price == 28.37
+        assert not isinstance(seen["instrument"], tuple), "tuple passed to broker"
+        assert hasattr(seen["instrument"], "exchange"), "no .exchange on instrument"
+        assert seen["instrument"].symbol == "AAPL"
+
+    def test_every_call_site_unpacks_the_pair(self):
+        """The other eight call sites already did; this keeps them aligned."""
+        import re
+
+        for path in (REPO_ROOT / "s1_live").rglob("*.py"):
+            for line in path.read_text().splitlines():
+                if "build_kis_instrument(" in line and "def " not in line:
+                    assert re.search(r",\s*_?\w*\s*=\s*build_kis_instrument\(|"
+                                     r"build_kis_instrument\([^)]*\)\[0\]", line), \
+                        f"{path.name}: {line.strip()}"
+
+    def test_an_unusable_price_raises_rather_than_being_used(self):
+        for bad in (None, 0, -1.0):
+            class Bad:
+                def get_current_price(self, instrument):
+                    return bad
+
+            with pytest.raises(ValueError):
+                executor.make_price_fn(Bad())("AAPL")

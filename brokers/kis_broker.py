@@ -118,6 +118,27 @@ ORDERABLE_AMOUNT_FIELD = "ord_psbl_frcr_amt"
 TR_ID_NCCS = {"live": "TTTS3018R", "paper": "TTTS3018R"}
 TR_ID_CCNL = {"live": "TTTS3035R", "paper": "VTTS3035R"}
 TR_ID_PRICE = "HHDFS00000300"
+# --- today's own range, for execution-time sanity ------------------------
+#
+# The quote endpoint above returns 11 fields and none of them is a high, a
+# low or a timestamp. `price-detail` returns 41, including today's open/
+# high/low, the tick size and an orderable flag. Verified against a live
+# response (AMBA, NASDAQ, 2026-08-18): open 76.2150 high 77.0400 low
+# 74.5100 last 75.5400 base 78.5400 e_hogau 0.0100 e_ordyn "매매 가능".
+#
+# Used ONLY to sanity-check an execution price. It is never fed to a
+# scanner: S1's signal is computed on completed daily bars, and letting a
+# forming high/low into that calculation is the exact drift the same-day
+# design exists to prevent.
+PRICE_DETAIL_PATH = "/uapi/overseas-price/v1/quotations/price-detail"
+TR_ID_PRICE_DETAIL = "HHDFS76200200"
+#: Field names read from that response, named once so the parser, the
+#: matrix and any probe cannot disagree.
+PRICE_DETAIL_FIELDS = {
+    "last": "last", "high": "high", "low": "low", "open": "open",
+    "prev_close": "base", "currency": "curr", "tick_size": "e_hogau",
+    "orderable": "e_ordyn", "today_volume": "tvol",
+}
 # US-market order TR_IDs, verified from examples_user/overseas_stock/
 # overseas_stock_functions.py's order() function.
 TR_ID_ORDER_US = {
@@ -844,6 +865,51 @@ class KISBroker:
                     pass
             tagged.append(row)
         return tagged
+
+    def get_price_detail(self, instrument) -> dict:
+        """Today's own range for `instrument`, plus tick size and
+        tradability. Read-only.
+
+        Returns raw-but-parsed values; interpreting them is the caller's
+        job (see s1_live/execution_price.py). Every numeric field is
+        returned as a float or None -- never as the empty string KIS sends
+        for a wrong-exchange query, because "" compares as less than any
+        number and would silently pass a range check.
+        """
+        self.config.validate_read_allowed()
+        excd = _excd_for(instrument.exchange)
+        body = self._get(PRICE_DETAIL_PATH, TR_ID_PRICE_DETAIL, {
+            "AUTH": "", "EXCD": excd, "SYMB": instrument.kis_symbol,
+        })
+        output = body.get("output")
+        if not isinstance(output, dict):
+            raise KISPriceUnavailableError(
+                f"KIS price-detail response has no usable 'output': {safe_repr(output)}",
+                reason_code=REASON_PRICE_RESPONSE_MALFORMED,
+                symbol=instrument.kis_symbol, exchange=instrument.exchange,
+                kis_exchange_code=excd, success_code=body.get("rt_cd"),
+                price_field="output",
+            )
+
+        def number(field):
+            raw = output.get(field)
+            if raw is None or (isinstance(raw, str) and not raw.strip()):
+                return None
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return None
+
+        parsed = {name: number(field) for name, field in PRICE_DETAIL_FIELDS.items()
+                  if name not in ("currency", "orderable")}
+        parsed["currency"] = (output.get(PRICE_DETAIL_FIELDS["currency"]) or "").strip()
+        parsed["orderable_text"] = (output.get(PRICE_DETAIL_FIELDS["orderable"]) or "").strip()
+        parsed["symbol"] = instrument.kis_symbol
+        parsed["exchange"] = instrument.exchange
+        parsed["kis_exchange_code"] = excd
+        parsed["success_code"] = body.get("rt_cd")
+        parsed["fetched_at"] = self._now().isoformat()
+        return parsed
 
     def get_account_snapshot(self, *, source_label="kis_balance") -> AccountSnapshot:
         self.config.validate_read_allowed()

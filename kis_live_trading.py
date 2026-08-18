@@ -85,6 +85,7 @@ from market_data.base import MarketDataProviderError
 from market_hours import us_trading_day
 from operations import kill_switch as ops_kill_switch
 from s1_live import candidate_source as s1_candidate_source
+from s1_live import execution_price as s1_execution_price
 from s1_live import security_type as s1_security_type
 from state_store import db as state_db
 
@@ -594,11 +595,45 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                 planned_target_price = buffered_price + planned_risk_per_share * strat_cfg.TARGET_1_R_MULTIPLE
                 price_diff_percent = compute_price_deviation_percent(signal.signal_price, kis_quote.price_usd)
 
+                # S1 only. The previous-close deviation check is the right
+                # question for a seconds-old scalping signal and the wrong
+                # one for S1, whose signal price IS yesterday's close --
+                # on 2026-08-18 it refused all nine ranked candidates, the
+                # tightest by 0.46%. The verdict below asks instead whether
+                # the price sits inside the instrument's own trading-day
+                # range, which a stale or wrong-exchange quote still fails.
+                #
+                # Left as None for the legacy source, which keeps the 0.30%
+                # check exactly as it was.
+                execution_price_verdict = None
+                if getattr(source, "name", None) == s1_candidate_source.SOURCE_S1:
+                    execution_price_verdict = s1_execution_price.evaluate_symbol(
+                        symbol, broker=broker, instrument=instrument)
+                    if not execution_price_verdict.passed:
+                        reason = (f"execution-price check failed: "
+                                  f"{execution_price_verdict.reason_code} "
+                                  f"({execution_price_verdict.detail})")
+                        results["blocked"].append((symbol, reason))
+                        _persist_blocked_record(
+                            symbol=symbol, risk_gate_result="BLOCKED",
+                            rejection_reason=reason, signal_price=signal.signal_price,
+                            kis_price=kis_quote.price_usd, now=current,
+                        )
+                        outcome["reason_code"] = execution_price_verdict.reason_code
+                        _audit(run_id, shadow_audit.INSTRUMENT_BLOCKED,
+                               shadow_audit.RESULT_BLOCKED, symbol=symbol,
+                               reason_code=execution_price_verdict.reason_code,
+                               detail=execution_price_verdict.detail, now=current)
+                        continue
+                    logger.info("S1 execution price OK for %s: %s",
+                                symbol, execution_price_verdict.detail)
+
                 def _buy_ctx_builder(
                     reconciliation,
                     signal=signal, instrument=instrument, order_intent=order_intent,
                     kis_price=kis_quote.price_usd, available_usd=available_usd,
                     has_open_order_for_symbol=has_open_order_for_symbol,
+                    execution_price_verdict=execution_price_verdict,
                 ):
                     # Collected inside the builder, so it is read at gate
                     # time rather than at candidate-selection time -- the
@@ -625,6 +660,7 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                         reconciliation=reconciliation,
                         entry_limits=limits,
                         now=current,
+                        execution_price_check=execution_price_verdict,
                     )
 
                 def _shadow_record(risk_gate_result, rejection_reason=None):

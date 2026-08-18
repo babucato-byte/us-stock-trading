@@ -189,8 +189,12 @@ class TestGateSequenceMatchesTheGate:
                 continue
             for keyword in node.keywords:
                 if keyword.arg == "code" and isinstance(keyword.value, ast.Constant):
-                    codes.append(keyword.value.value)
-        return codes
+                    codes.append((keyword.value.lineno, keyword.value.value))
+        # ast.walk() is BREADTH-first, so it yields a raise nested inside an
+        # if/else AFTER shallower ones regardless of where it appears in the
+        # file. Sorting by line number is what "in source order" actually
+        # means, and it keeps this check independent of nesting depth.
+        return [code for _lineno, code in sorted(codes)]
 
     def _helper_codes_in_source_order(self, function_name):
         """The codes raised by a helper the gate calls. These are
@@ -208,8 +212,9 @@ class TestGateSequenceMatchesTheGate:
                 continue
             for keyword in node.keywords:
                 if keyword.arg == "code" and isinstance(keyword.value, ast.Attribute):
-                    codes.append(getattr(entry_limits_module, keyword.value.attr))
-        return codes
+                    codes.append((keyword.value.lineno,
+                                  getattr(entry_limits_module, keyword.value.attr)))
+        return [code for _lineno, code in sorted(codes)]
 
     def test_the_probe_sequence_matches_the_gate_source(self):
         probe = _probe()

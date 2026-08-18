@@ -110,7 +110,12 @@ def make_price_fn(broker):
     from market_data.exchange_registry import build_kis_instrument
 
     def price_fn(symbol):
-        instrument = build_kis_instrument(symbol)
+        # `build_kis_instrument` returns (instrument, exchange_record).
+        # Passing the tuple through reaches KIS as an object with no
+        # `.exchange`, which fails only once a position exists -- so it
+        # would have surfaced on the first exit tick rather than in any
+        # test that ran without one.
+        instrument, _record = build_kis_instrument(symbol)
         price = broker.get_current_price(instrument)
         if price is None or not isinstance(price, (int, float)) or price <= 0:
             raise ValueError(f"no usable realtime price for {symbol}: {price!r}")
