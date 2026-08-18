@@ -50,10 +50,9 @@ STATUS_ENTRY_BLOCKED = "ENTRY_BLOCKED"
 STATUS_SUBMITTED = "FIRST_S1_LIVE_ORDER_SUBMITTED"
 STATUS_HELD = "ENTRY_LIMIT_REACHED"
 
-#: Sessions in which the pilot may place an order. The rollout config
-#: refuses `allow_extended_hours=True`, so this list is what that refusal
-#: means in practice -- not a second, looser opinion about sessions.
-ORDERABLE_MARKET_STATES = ("REGULAR", "OPEN")
+#: Which sessions permit which side now lives in
+#: `config/s1_session_policy.py`, so there is one table rather than a
+#: second opinion here that could drift from it.
 
 
 @dataclass
@@ -79,26 +78,25 @@ class CycleReport:
 
 
 def resolve_session(now=None):
-    """The current session, and whether an order may be placed in it.
+    """The current session policy.
 
-    An unrecognised or non-regular state is NOT orderable. That is the
-    fail-closed direction: a session we cannot name is not one we know
-    the broker accepts.
+    Delegates to `config/s1_session_policy.py`, which states one thing per
+    session instead of collapsing every non-regular session into a single
+    "extended hours" bucket. The returned object carries `.name`,
+    `.orders_allowed` and `.verification`, so `exit_runtime` -- which only
+    ever asks "may I sell here" -- needs no change.
+
+    REGULAR resolves to entry and exit both permitted on the standard
+    route, which is byte-for-byte the behaviour production already has.
+    Anything unrecognised resolves to UNKNOWN, which permits nothing.
     """
-    import market_hours
-
-    from s1_live.exit_runtime import SessionPolicy
+    from config import s1_session_policy as sp
 
     try:
-        state = market_hours.get_market_state(now) if now else market_hours.get_market_state()
+        return sp.current_policy(now)
     except Exception as exc:
-        logger.warning("market state unavailable -- treating session as closed: %s", exc)
-        return SessionPolicy("UNKNOWN", orders_allowed=False,
-                             verification="MARKET_STATE_UNAVAILABLE")
-    orderable = str(state).upper() in ORDERABLE_MARKET_STATES
-    return SessionPolicy(
-        str(state), orders_allowed=orderable,
-        verification="VERIFIED" if orderable else "SESSION_NOT_ORDERABLE")
+        logger.warning("session could not be determined -- failing closed: %s", exc)
+        return sp.policy_for(sp.UNKNOWN)
 
 
 def make_price_fn(broker):
@@ -217,8 +215,13 @@ def run_entry_half(conn, *, broker, session, now=None):
     """Entry. Refuses outright when the session cannot take an order."""
     import kis_live_trading as klt
 
-    if not session.orders_allowed:
-        return STATUS_SESSION_CLOSED, f"session {session.name} is not orderable", {}
+    # Entry asks specifically about ENTRY. A session may permit exits and
+    # not entries, and collapsing the two would let an exit-only session
+    # place a buy.
+    if not getattr(session, "entry_allowed", session.orders_allowed):
+        return (STATUS_SESSION_CLOSED,
+                f"session {session.name} does not permit entry "
+                f"({getattr(session, 'reason', '')})", {})
     try:
         results = klt.run_live_buy_entry_cycle(broker=broker, now=now)
     except klt.KISLiveTradingError as exc:

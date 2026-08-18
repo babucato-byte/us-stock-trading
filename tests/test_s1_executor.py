@@ -77,36 +77,76 @@ def open_position(conn, symbol="TESTX", entry=ENTRY):
                             signal_id="sig", entry_price=entry, quantity=1)
 
 
+def at_et(year, month, day, hour, minute=0):
+    """A timezone-aware Eastern instant, so session detection is tested
+    against the real clock rather than a patched state function."""
+    import pytz
+
+    return pytz.timezone("America/New_York").localize(
+        datetime(year, month, day, hour, minute))
+
+
 class TestSessionGating:
-    def test_only_the_regular_session_is_orderable(self, monkeypatch):
-        import market_hours
+    """Tuesday 2026-08-18 is an ordinary trading day; Saturday the 22nd
+    is not."""
 
-        for state, expected in (("REGULAR", True), ("PREMARKET", False),
-                                ("AFTERMARKET", False), ("CLOSED", False)):
-            monkeypatch.setattr(market_hours, "get_market_state", lambda s=state: s)
-            session = executor.resolve_session()
-            assert session.orders_allowed is expected, state
-            assert session.name == state
+    @pytest.mark.parametrize("hour,minute,expected", [
+        (3, 0, "OVERNIGHT_DAYTIME"), (4, 0, "PREMARKET"), (9, 0, "PREMARKET"),
+        (9, 30, "REGULAR"), (12, 0, "REGULAR"), (16, 0, "AFTER_HOURS"),
+        (19, 0, "AFTER_HOURS"), (20, 0, "OVERNIGHT_DAYTIME"), (23, 0, "OVERNIGHT_DAYTIME"),
+    ])
+    def test_the_session_is_detected_from_eastern_time(self, hour, minute, expected):
+        assert executor.resolve_session(at_et(2026, 8, 18, hour, minute)).name == expected
 
-    def test_an_unreadable_market_state_is_not_orderable(self, monkeypatch):
+    def test_a_weekend_is_closed(self):
+        assert executor.resolve_session(at_et(2026, 8, 22, 12, 0)).name == "CLOSED"
+
+    def test_regular_still_permits_both_sides(self):
+        """The behaviour production already has must not change."""
+        session = executor.resolve_session(at_et(2026, 8, 18, 12, 0))
+        assert session.entry_allowed is True
+        assert session.exit_allowed is True
+        assert session.route == "STANDARD_OVERSEAS_ORDER"
+        assert session.verified is True
+
+    @pytest.mark.parametrize("hour,name", [(6, "PREMARKET"), (17, "AFTER_HOURS")])
+    def test_unverified_sessions_scan_but_never_order(self, hour, name):
+        session = executor.resolve_session(at_et(2026, 8, 18, hour, 0))
+        assert session.name == name
+        assert session.scan_allowed is True
+        assert session.entry_allowed is False
+        assert session.exit_allowed is False
+        assert session.verified is False
+
+    def test_an_unreadable_clock_fails_closed(self, monkeypatch):
         import market_hours
 
         def boom(*a, **k): raise RuntimeError("clock unavailable")
-        monkeypatch.setattr(market_hours, "get_market_state", boom)
+        monkeypatch.setattr(market_hours, "eastern_now", boom)
         session = executor.resolve_session()
-        assert session.orders_allowed is False
-        assert session.verification == "MARKET_STATE_UNAVAILABLE"
-
-    def test_an_unknown_state_name_is_not_orderable(self, monkeypatch):
-        import market_hours
-
-        monkeypatch.setattr(market_hours, "get_market_state", lambda *a, **k: "SOMETHING_NEW")
-        assert executor.resolve_session().orders_allowed is False
+        assert session.name == "UNKNOWN"
+        assert session.entry_allowed is False
+        assert session.exit_allowed is False
+        assert session.scan_allowed is False
 
     def test_entry_refuses_outright_in_a_closed_session(self, conn):
-        closed = er.SessionPolicy("CLOSED", orders_allowed=False)
+        from config import s1_session_policy as sp
+
         status, detail, results = executor.run_entry_half(
-            conn, broker=FakeBroker(), session=closed)
+            conn, broker=FakeBroker(), session=sp.policy_for(sp.CLOSED))
+        assert status == executor.STATUS_SESSION_CLOSED
+        assert results == {}
+
+    def test_entry_asks_about_entry_not_about_orders_generally(self, conn):
+        """A session that allowed exits but not entries must not buy."""
+        from config import s1_session_policy as sp
+
+        exit_only = sp.SessionPolicy(
+            session="EXIT_ONLY", scan_allowed=True, entry_allowed=False,
+            exit_allowed=True, route=sp.ROUTE_STANDARD,
+            order_type=sp.ORDER_TYPE_LIMIT, verified=True)
+        status, _, results = executor.run_entry_half(
+            conn, broker=FakeBroker(), session=exit_only)
         assert status == executor.STATUS_SESSION_CLOSED
         assert results == {}
 
@@ -246,9 +286,9 @@ class TestRestartRecovery:
 class TestCycleReporting:
     def test_a_cycle_reports_the_session_and_never_touches_the_real_broker(
             self, conn, monkeypatch):
-        import market_hours
+        from config import s1_session_policy as sp
 
-        monkeypatch.setattr(market_hours, "get_market_state", lambda *a, **k: "CLOSED")
+        monkeypatch.setattr(sp, "current_policy", lambda *a, **k: sp.policy_for(sp.CLOSED))
         broker = FakeBroker()
         report = executor.run_cycle(broker=broker, broker_adapter=FakeAdapter(),
                                     conn=conn, now=NOW)
@@ -259,9 +299,9 @@ class TestCycleReporting:
         assert broker.submits == [], "the real submit surface was entered"
 
     def test_the_report_serialises_every_field_the_spec_asks_for(self, conn, monkeypatch):
-        import market_hours
+        from config import s1_session_policy as sp
 
-        monkeypatch.setattr(market_hours, "get_market_state", lambda *a, **k: "CLOSED")
+        monkeypatch.setattr(sp, "current_policy", lambda *a, **k: sp.policy_for(sp.CLOSED))
         report = executor.run_cycle(broker=FakeBroker(), broker_adapter=FakeAdapter(),
                                     conn=conn, now=NOW)
         payload = report.as_dict()

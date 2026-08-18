@@ -131,6 +131,36 @@ TR_ID_ORDER_US = {
 # previously (incorrectly) reused for both.
 TR_ID_CANCEL = {"live": "TTTT1004U", "paper": "VTTT1004U"}
 
+# --- the US daytime (overnight) session route ----------------------------
+#
+# KIS's 미국주간주문 is a SEPARATE endpoint, not the standard one with a
+# flag. Verified against examples_llm/overseas_stock/daytime_order/
+# daytime_order.py in the official reference repo: same account/exchange/
+# quantity/price fields as ORDER_PATH, same 4-letter OVRS_EXCG_CD space
+# (NASD/NYSE/AMEX), ORD_SVR_DVSN_CD="0", and ORD_DVSN="00" -- limit only,
+# per that file's own note, "주간거래는 지정가만 가능".
+#
+# The session it serves is 20:00-04:00 ET (Korean daytime), which is
+# neither premarket nor after-hours; see config/s1_session_policy.py.
+# TTTS6038U, already named in this module as the daytime-specific CANCEL
+# TR, belongs to this same family -- which is corroborating evidence that
+# the 6036/6037/6038 block is the daytime one.
+#
+# REFERENCE_VERIFIED, LIVE_RESPONSE_PENDING: no real KIS daytime order
+# response has been observed yet.
+DAYTIME_ORDER_PATH = "/uapi/overseas-stock/v1/trading/daytime-order"
+TR_ID_DAYTIME_ORDER_US = {
+    ("live", "buy"): "TTTS6036U", ("live", "sell"): "TTTS6037U",
+}
+
+#: Route name -> (endpoint path, TR-id table). The strategy never names a
+#: TR id; it names a route, and this is where a route becomes an endpoint.
+ORDER_ROUTES = {
+    "STANDARD_OVERSEAS_ORDER": (ORDER_PATH, TR_ID_ORDER_US),
+    "KIS_DAYTIME_ORDER": (DAYTIME_ORDER_PATH, TR_ID_DAYTIME_ORDER_US),
+}
+DEFAULT_ORDER_ROUTE = "STANDARD_OVERSEAS_ORDER"
+
 # EXCD (3-letter) is the quotations-API exchange code (price/quote
 # endpoint); OVRS_EXCG_CD (4-letter, order/balance endpoints) is a
 # DIFFERENT code space -- verified against the reference repo's order.py
@@ -1093,7 +1123,7 @@ class KISBroker:
     # -- order submission ---------------------------------------------
 
     def submit_order(self, order_intent: OrderIntent, instrument, *, authorization=None,
-                     bootstrap_capability=None) -> ExecutionRecord:
+                     bootstrap_capability=None, route=None) -> ExecutionRecord:
         """The ONLY method in this codebase that places a real KIS order.
         CODEX-043: `authorization` MUST be a currently-valid
         `execution.authorization.AuthorizedExecution` for this exact
@@ -1121,9 +1151,22 @@ class KISBroker:
             bootstrap_capability=bootstrap_capability, order_intent=order_intent)
         if order_intent.order_type != "limit":
             raise KISBrokerError("only limit orders are permitted in this pilot")
-        tr_id = TR_ID_ORDER_US.get((self._env_key(), order_intent.side))
+        # Route selection. Defaults to the standard endpoint, so a caller
+        # that says nothing behaves exactly as before this existed.
+        route_name = str(route or DEFAULT_ORDER_ROUTE)
+        selected = ORDER_ROUTES.get(route_name)
+        if selected is None:
+            raise KISBrokerError(f"unknown order route {route_name!r}")
+        order_path, tr_table = selected
+        tr_id = tr_table.get((self._env_key(), order_intent.side))
         if tr_id is None:
-            raise KISBrokerError(f"no order TR_ID for env={self._env_key()!r} side={order_intent.side!r}")
+            # A route that has no TR id for this env/side is refused rather
+            # than quietly falling back to the standard one: silently
+            # sending a daytime order down the regular endpoint would place
+            # a real order in a session nobody authorised.
+            raise KISBrokerError(
+                f"no order TR_ID for route={route_name!r} env={self._env_key()!r} "
+                f"side={order_intent.side!r}")
         excg = _order_excg_for(order_intent.exchange)
         payload = {
             "CANO": self.config.account_no, "ACNT_PRDT_CD": self.config.account_product_cd,
@@ -1138,7 +1181,7 @@ class KISBroker:
             category=kis_rate_limiter.CATEGORY_ORDER)
         try:
             response = self.session.request(
-                "POST", f"{self.config.base_url}{ORDER_PATH}", headers=self._auth_headers(tr_id),
+                "POST", f"{self.config.base_url}{order_path}", headers=self._auth_headers(tr_id),
                 json=payload, timeout=10,
             )
         except requests.exceptions.RequestException as exc:

@@ -137,9 +137,40 @@ class TestClassificationMatchesTheSource:
 
     @pytest.mark.parametrize("name", ["order_path", "order_tr_id_live_buy"])
     def test_order_values_are_referenced_only_by_submission(self, name):
-        methods = self._methods_referencing(self._assigned_constant(name))
-        assert methods, name
-        assert methods <= {"submit_order"}, f"{name} referenced by {methods}"
+        """The order endpoint and its TR ids must not leak into a
+        read-only path.
+
+        They are now reached through the module-level ORDER_ROUTES table
+        rather than named directly inside submit_order -- KIS has two
+        order endpoints (standard and daytime) and the route is chosen per
+        session. The invariant is unchanged: no function other than
+        submit_order may touch them, whether directly or via the table.
+        """
+        constant = self._assigned_constant(name)
+        direct = self._methods_referencing(constant)
+        via_table = self._methods_referencing("ORDER_ROUTES")
+        assert direct or via_table, f"{name} is referenced by nothing"
+        assert direct <= {"submit_order"}, f"{name} referenced by {direct}"
+        assert via_table <= {"submit_order"}, f"ORDER_ROUTES referenced by {via_table}"
+
+    def test_the_route_table_contains_only_order_endpoints(self):
+        """A read path must not be reachable by asking for a route."""
+        import re
+
+        table = re.search(r"ORDER_ROUTES = \{(.+?)\n\}", BROKER_SOURCE, re.S)
+        assert table, "ORDER_ROUTES table not found"
+        body = table.group(1)
+        for read_only in ("BALANCE_PATH", "PRICE_PATH", "PSAMOUNT_PATH",
+                          "NCCS_PATH", "CCNL_PATH", "CANCEL_PATH"):
+            assert read_only not in body, f"{read_only} is reachable as an order route"
+
+    def test_the_daytime_route_is_distinct_from_the_standard_one(self):
+        """Sending a daytime order to the standard endpoint would place a
+        real order in a session that endpoint does not serve."""
+        assert "DAYTIME_ORDER_PATH" in BROKER_SOURCE
+        assert "TTTS6036U" in BROKER_SOURCE and "TTTS6037U" in BROKER_SOURCE
+        daytime = self._methods_referencing("TR_ID_DAYTIME_ORDER_US")
+        assert daytime <= {"submit_order"}, daytime
 
     @pytest.mark.parametrize("name", ["cancel_path", "cancel_tr_id_live",
                                       "cancel_tr_id_paper"])
