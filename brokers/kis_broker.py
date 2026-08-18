@@ -857,7 +857,12 @@ class KISBroker:
         for row in rows or []:
             if isinstance(row, dict):
                 row = dict(row)
-                row.setdefault("kis_exchange_code", code)
+                # KIS's own venue field wins when it is present: the
+                # requested code is what we ASKED for, and balance reads
+                # have been observed answering with a different venue.
+                native = str(row.get("ovrs_excg_cd") or "").strip()
+                row.setdefault("kis_exchange_code", native or code)
+                row.setdefault("kis_requested_exchange_code", code)
                 try:
                     row.setdefault(
                         "canonical_exchange", exchange_for_kis_order_code(code).value)
@@ -1106,11 +1111,25 @@ class KISBroker:
         seen_symbols = set()
         for code, body in legs:
             for row in self._tag_rows(body.get("output1") or [], code):
-                # A symbol lists on exactly one venue; if two legs report
-                # the same one, keep the first rather than double-count.
-                # Scoped by venue so an identical ticker on two venues is
-                # not silently collapsed.
-                key = (code, (row or {}).get("ovrs_pdno", ""))
+                # Keyed on the venue the ROW reports, not the one the leg
+                # asked for.
+                #
+                # inquire-balance does not strictly filter by
+                # OVRS_EXCG_CD. Measured against the live account
+                # (2026-08-18, one TX holding): requesting NASD returned
+                # the row with ovrs_excg_cd="NYSE", requesting NYSE
+                # returned the same row again, and AMEX returned none. A
+                # (requested_code, symbol) key therefore produced TWO
+                # entries for ONE position -- which the max-open-positions
+                # cap counts and reconciliation compares against local
+                # state.
+                #
+                # The row's own ovrs_excg_cd is authoritative, so this
+                # still keeps the distinction the old comment wanted: the
+                # same ticker genuinely held on two venues carries two
+                # different ovrs_excg_cd values and stays two rows.
+                venue = str((row or {}).get("ovrs_excg_cd") or "").strip() or code
+                key = (venue, (row or {}).get("ovrs_pdno", ""))
                 if key[1] and key in seen_symbols:
                     continue
                 if key[1]:

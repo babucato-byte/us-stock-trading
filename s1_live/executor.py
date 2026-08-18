@@ -289,8 +289,21 @@ def run_cycle(*, broker, broker_adapter=None, conn=None, now=None) -> CycleRepor
 
         try:
             from s1_live import position_store as ps
+            # `deposit_usd` is KIS's settled foreign-currency DEPOSIT
+            # (frcr_dncl_amt_2). It is settlement-lagged: after buying TX
+            # for $53.68 it still read 127.82, because an unsettled buy has
+            # not left the deposit yet. Reported under a name that says so,
+            # because "cash_usd" reads as "money available to spend" and
+            # was misread that way once already.
+            #
+            # Order feasibility does NOT come from this number. Sizing uses
+            # `get_orderable_usd(instrument, limit_price)` per symbol and
+            # price (kis_live_trading.py), which is the figure KIS itself
+            # will honour for an order.
             report.account = {
-                "cash_usd": broker.get_account_cash_usd(),
+                "deposit_usd": broker.get_account_cash_usd(),
+                "deposit_semantics": "SETTLED_DEPOSIT_NOT_SPENDABLE_BALANCE",
+                "sizing_source": "get_orderable_usd_per_symbol_and_price",
                 "broker_positions": len(broker.get_positions()),
                 "open_orders": len(broker.get_open_orders()),
                 "local_s1_positions": ps.live_count(conn),
