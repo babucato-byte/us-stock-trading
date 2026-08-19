@@ -46,7 +46,7 @@ exit reasons (STOP_LOSS, TARGET_2 full exit, TARGET_1 partial exit,
 TIME_STOP, EOD_FORCED_CLOSE) are all reused, unmodified.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import risk_config
 from config import scalping_strategy_v1_config as strat_cfg
@@ -144,18 +144,53 @@ EXIT_MANAGED_ELSEWHERE_STRATEGY_IDS = frozenset({"S1_HMA_EARLY_TREND_V1"})
 _FILL_PENDING_STATES = (states.ENTRY_SUBMITTED, states.PARTIALLY_FILLED)
 
 
-def _find_kis_fill_for_order(kis_broker, broker_order_id, *, now):
+def _as_datetime(value):
+    """A stored ISO timestamp as an aware datetime, or None."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _find_kis_fill_for_order(kis_broker, broker_order_id, *, now, since=None):
     """CODEX-045: `ft_ccld_qty` fill rows are per-execution-event, not
     cumulative -- a buy order filled across two separate KIS fill rows
     (1 share then 1 share) must sum to 2, not report the first row's
     qty alone. positions.lifecycle.record_fill() explicitly requires
     the *cumulative* filled quantity (CODEX-027), so this returns the
     sum across every matching fill row and the resulting weighted
-    average price, never a single event's price."""
+    average price, never a single event's price.
+
+    `since` is the moment the ORDER was placed. Without it the lookup
+    spans only today, so a fill from a previous session can never be
+    found: an order submitted yesterday and not synchronised that day
+    stays at ENTRY_SUBMITTED permanently, and reconciliation keeps
+    reporting a real holding as internal=0. That is not hypothetical --
+    it is what happened to the first live S1 fill.
+
+    The window is the order's own age, not an arbitrary lookback, and it
+    starts a day EARLIER than the order timestamp because that timestamp
+    is UTC while KIS dates rows by its own trading day; an order placed
+    late in the ET session already belongs to the previous UTC date. Over-
+    fetching is harmless because rows are matched on the exact order
+    number.
+    """
     if not broker_order_id:
         return None
+    start = now
+    if since is not None:
+        try:
+            start = min(since, now)
+        except TypeError:
+            start = now
+    start_date = (start - timedelta(days=1)).strftime("%Y%m%d")
     try:
-        fills = kis_broker.get_fills(start_date=now.strftime("%Y%m%d"), end_date=now.strftime("%Y%m%d"))
+        fills = kis_broker.get_fills(start_date=start_date, end_date=now.strftime("%Y%m%d"))
     except Exception:
         return None
     cumulative_qty = 0.0
@@ -320,7 +355,9 @@ def sync_kis_fills_and_manage_exits(*, kis_broker, broker_adapter, now=None, con
                 continue
 
         if record["state"] in _FILL_PENDING_STATES:
-            fill = _find_kis_fill_for_order(kis_broker, record.get("broker_order_id"), now=current)
+            fill = _find_kis_fill_for_order(
+                kis_broker, record.get("broker_order_id"), now=current,
+                since=_as_datetime(record.get("entry_time")))
             if fill is not None:
                 # Captured BEFORE the call so the notification below can
                 # tell a genuine new fill from the same cumulative fill

@@ -196,3 +196,89 @@ class TestFillAndOrderIdentityUseTheRowsVenue:
         """Otherwise the requested code would leak back in and defeat it."""
         assert "kis_requested_exchange_code" in kb._TAG_KEYS
         assert "kis_exchange_code" in kb._TAG_KEYS
+
+
+class TestFillLookupSpansTheOrdersOwnAge:
+    """A fill from a previous session must still be findable.
+
+    The lookup used to span only `now`'s date, so an order submitted
+    yesterday and not synchronised that day could never be matched again:
+    its position stayed at ENTRY_SUBMITTED and reconciliation kept
+    reporting a real holding as internal=0. That is what happened to the
+    first live S1 fill (submitted 2026-08-18, still unsynced on 08-19).
+    """
+
+    def setup_method(self):
+        import kis_position_manager as kpm
+        self.kpm = kpm
+        self.calls = []
+
+    def broker(self, rows):
+        calls = self.calls
+
+        class FakeBroker:
+            def get_fills(self, *, start_date, end_date):
+                calls.append((start_date, end_date))
+                return rows
+
+        return FakeBroker()
+
+    def fill(self, odno="0030469882", qty="1", price="53.68000000"):
+        return {"odno": odno, "ft_ccld_qty": qty, "ft_ccld_unpr3": price}
+
+    def test_yesterdays_fill_is_found_when_the_order_is_from_yesterday(self):
+        from datetime import datetime, timezone
+
+        now = datetime(2026, 8, 19, 15, 30, tzinfo=timezone.utc)
+        entry = datetime(2026, 8, 18, 15, 45, tzinfo=timezone.utc)
+        found = self.kpm._find_kis_fill_for_order(
+            self.broker([self.fill()]), "0030469882", now=now, since=entry)
+        assert found == {"filled_qty": 1.0, "average_fill_price": 53.68}
+        start, end = self.calls[0]
+        assert start <= "20260817", f"window began at {start}"
+        assert end == "20260819"
+
+    def test_without_since_the_window_is_still_at_least_today(self):
+        from datetime import datetime, timezone
+
+        now = datetime(2026, 8, 19, 15, 30, tzinfo=timezone.utc)
+        self.kpm._find_kis_fill_for_order(self.broker([]), "X", now=now)
+        start, end = self.calls[0]
+        assert end == "20260819"
+        assert start <= "20260819"
+
+    def test_the_window_starts_a_day_before_the_order(self):
+        """The order timestamp is UTC; KIS dates rows by its trading day,
+        so an order late in the ET session is already the previous UTC
+        date."""
+        from datetime import datetime, timezone
+
+        now = datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc)
+        entry = datetime(2026, 8, 19, 0, 30, tzinfo=timezone.utc)
+        self.kpm._find_kis_fill_for_order(self.broker([]), "X", now=now, since=entry)
+        assert self.calls[0][0] == "20260818"
+
+    def test_a_future_since_never_pushes_the_window_past_now(self):
+        from datetime import datetime, timezone
+
+        now = datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc)
+        later = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        self.kpm._find_kis_fill_for_order(self.broker([]), "X", now=now, since=later)
+        start, end = self.calls[0]
+        assert start == "20260818" and end == "20260819"
+
+    def test_partial_fills_across_the_window_still_sum(self):
+        from datetime import datetime, timezone
+
+        now = datetime(2026, 8, 19, 15, 30, tzinfo=timezone.utc)
+        rows = [self.fill(qty="2", price="10.0"), self.fill(qty="3", price="20.0")]
+        found = self.kpm._find_kis_fill_for_order(
+            self.broker(rows), "0030469882", now=now,
+            since=datetime(2026, 8, 18, tzinfo=timezone.utc))
+        assert found["filled_qty"] == 5.0
+        assert found["average_fill_price"] == pytest.approx((2 * 10 + 3 * 20) / 5)
+
+    def test_an_unparseable_entry_time_falls_back_to_today(self):
+        assert self.kpm._as_datetime("not-a-time") is None
+        assert self.kpm._as_datetime(None) is None
+        assert self.kpm._as_datetime("2026-08-18T15:45:12+00:00") is not None
