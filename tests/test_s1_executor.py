@@ -277,16 +277,51 @@ class TestCycleReporting:
 
 
 class TestStrategyIsolation:
-    def test_the_executor_never_calls_the_scalping_manager(self):
-        import ast
+    def test_s1_positions_never_receive_scalping_exit_management(self):
+        """The executor DOES call kis_position_manager -- for fill
+        synchronisation, which is bookkeeping every strategy needs and
+        whose absence left the first live fill stuck at ENTRY_SUBMITTED.
 
+        What must never reach an S1 position is the EXIT half: the -8%
+        stop, the 60-minute time stop, the R-multiple targets. That is
+        refused at the source, by strategy id, so it holds no matter who
+        calls the function.
+        """
+        import kis_position_manager
+        from s1_live import qualification
+
+        assert (qualification.S1_STRATEGY_ID
+                in kis_position_manager.EXIT_MANAGED_ELSEWHERE_STRATEGY_IDS)
+
+        source = (REPO_ROOT / "kis_position_manager.py").read_text()
+        guard = source.index("EXIT_MANAGED_ELSEWHERE_STRATEGY_IDS")
+        applied = source.index("record.get(\"strategy_id\") in EXIT_MANAGED_ELSEWHERE")
+        exit_branch = source.index("_EXIT_ELIGIBLE_STATES:")
+        assert guard < applied < exit_branch, (
+            "the strategy guard must be applied BEFORE the exit-eligible branch")
+
+    def test_the_fill_sync_runs_before_the_entry_half(self):
+        """Reconciliation is what the entry gate reads, and the fill sync
+        is what makes it true."""
+        # The CALL, not the docstring that explains it -- a bare index()
+        # lands in the module docstring and passes for the wrong reason.
         source = (REPO_ROOT / "s1_live" / "executor.py").read_text()
-        for node in ast.walk(ast.parse(source)):
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                names = [getattr(node, "module", "") or ""] + [a.name for a in node.names]
-                for name in names:
-                    assert "kis_position_manager" not in str(name)
-                    assert "lifecycle" not in str(name).split(".")[-1]
+        sync = source.index("kis_position_manager.sync_kis_fills_and_manage_exits(")
+        entry = source.index("status, detail, results = run_entry_half(")
+        assert sync < entry
+
+    def test_the_executor_still_owns_no_exit_policy(self):
+        source = (REPO_ROOT / "s1_live" / "executor.py").read_text()
+        for owned_elsewhere in ("STOP_LOSS_RATE", "TARGET_1_R_MULTIPLE",
+                                "MAX_POSITION_HOLD_MINUTES", "HARD_STOP_PCT"):
+            assert owned_elsewhere not in source, owned_elsewhere
+
+    def test_a_ledger_sync_failure_does_not_abort_the_tick(self):
+        source = (REPO_ROOT / "s1_live" / "executor.py").read_text()
+        block = source[source.index(
+            "kis_position_manager.sync_kis_fills_and_manage_exits("):][:700]
+        assert "except Exception" in block
+        assert "ledger_sync" in block
 
     def test_only_s1_is_named(self):
         assert executor.STRATEGY_ID == "hma_early_trend"

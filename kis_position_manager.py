@@ -129,6 +129,18 @@ def finalize_stop_and_targets_from_fill(position_id, average_fill_price):
 
 
 _EXIT_ELIGIBLE_STATES = (states.STOP_ACTIVE, states.TARGET_1_ACTIVE, states.PARTIAL_EXITED, states.TRAILING)
+
+#: Strategies whose exits are owned elsewhere. Their fills are still
+#: SYNCHRONISED here -- recording what the broker did is bookkeeping every
+#: strategy needs, and skipping it is what left the first S1 position
+#: stuck at ENTRY_SUBMITTED with reconciliation reporting internal=0
+#: against a real KIS holding.
+#:
+#: What is skipped is the EXIT half below: the scalping stop/target/EOD
+#: policy. An S1 position sized against a -6% stop must not acquire the
+#: -8% one, and must not be liquidated 60 minutes after entry. S1 exits
+#: live in s1_positions and are decided by s1_live/exit_policy.py.
+EXIT_MANAGED_ELSEWHERE_STRATEGY_IDS = frozenset({"S1_HMA_EARLY_TREND_V1"})
 _FILL_PENDING_STATES = (states.ENTRY_SUBMITTED, states.PARTIALLY_FILLED)
 
 
@@ -333,6 +345,14 @@ def sync_kis_fills_and_manage_exits(*, kis_broker, broker_adapter, now=None, con
             else:
                 summary["skipped"].append((symbol, "no KIS fill yet"))
                 continue
+
+        if record.get("strategy_id") in EXIT_MANAGED_ELSEWHERE_STRATEGY_IDS:
+            # Its fill has just been recorded above, which is the point of
+            # letting it through this loop at all. The exit policy below
+            # belongs to another owner.
+            summary["skipped"].append(
+                (symbol, f"exit managed elsewhere ({record.get('strategy_id')})"))
+            continue
 
         if record["state"] not in _EXIT_ELIGIBLE_STATES:
             continue

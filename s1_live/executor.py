@@ -16,15 +16,23 @@ supplies the three things neither of them can obtain for itself -- the
 current session, a realtime price, and the daily trend structure -- and
 records what happened.
 
-Why S1 positions do not go through kis_position_manager
---------------------------------------------------------
-`live_pilot/armed.py:exit_cycle()` calls
-`kis_position_manager.sync_kis_fills_and_manage_exits()`, which applies
-the scalping policy: an -8% stop, a 60-minute time stop and R-multiple
-targets. Those were chosen for a holding period of minutes. Routing an S1
-position through them would give it a stop 33% wider than the one its
-size was derived from and liquidate it an hour after entry regardless of
-trend. S1 positions live in `s1_positions` and are evaluated here.
+What S1 takes from kis_position_manager, and what it does not
+--------------------------------------------------------------
+It takes FILL SYNCHRONISATION. It does not take the exit policy.
+
+Those were conflated once, and it cost. `sync_kis_fills_and_manage_exits()`
+does two separable things: it records what the broker actually filled
+(bookkeeping every strategy needs) and it applies the scalping stop/target
+/EOD policy (which S1 must never acquire -- a -8% stop on a position sized
+against -6%, liquidated 60 minutes after entry regardless of trend).
+Skipping the whole function skipped the bookkeeping too, so the first live
+S1 fill left its ledger record stuck at ENTRY_SUBMITTED: `orders` and
+`fills` stayed empty, reconciliation compared a real KIS holding against
+internal=0, and every subsequent entry was blocked as a lost order.
+
+So the fill half is called here, and the exit half refuses S1 positions at
+the source (`EXIT_MANAGED_ELSEWHERE_STRATEGY_IDS`). S1 exits stay in
+`s1_positions`, decided by `s1_live/exit_policy.py`.
 
 ORDER_ACCEPTED is not FILLED
 ----------------------------
@@ -71,6 +79,7 @@ class CycleReport:
     blocked: List[Any] = field(default_factory=list)
     skipped: List[Any] = field(default_factory=list)
     positions_synced: List[Dict[str, Any]] = field(default_factory=list)
+    ledger_sync: Dict[str, Any] = field(default_factory=dict)
     account: Dict[str, Any] = field(default_factory=dict)
     error: Optional[str] = None
 
@@ -270,7 +279,27 @@ def run_cycle(*, broker, broker_adapter=None, conn=None, now=None) -> CycleRepor
             logger.error("S1 exit half failed this tick: %s", exc, exc_info=True)
             report.error = f"EXIT_HALF_FAILED: {exc}"
 
-        # 2. Confirmed fills become positions.
+        # 2a. Record what the broker filled into the ORDER ledger, so the
+        # position lifecycle advances past ENTRY_SUBMITTED and
+        # reconciliation compares like with like. The exit half of that
+        # function refuses S1 positions; only the bookkeeping applies.
+        try:
+            import kis_position_manager
+
+            ledger = kis_position_manager.sync_kis_fills_and_manage_exits(
+                kis_broker=broker, broker_adapter=broker_adapter, now=now, conn=conn)
+            report.ledger_sync = {
+                "synced_fills": list(ledger.get("synced_fills") or []),
+                "reconciliation_blocked": list(ledger.get("reconciliation_blocked") or [])[:5],
+                "skipped": list(ledger.get("skipped") or [])[:5],
+            }
+        except Exception as exc:
+            # A ledger sync failure must not stop the exit half that has
+            # already run, nor silently pass as success.
+            logger.error("ledger fill sync failed this tick: %s", exc, exc_info=True)
+            report.ledger_sync = {"error": str(exc)[:200]}
+
+        # 2b. Confirmed broker positions become S1 position state.
         report.positions_synced = sync_fills(
             conn, broker, trading_day=report.trading_day, now=now)
 

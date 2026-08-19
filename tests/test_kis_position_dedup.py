@@ -132,3 +132,67 @@ class TestUnchangedBehaviour:
         legs = [("NYSE", {"output1": [row(qty="not-a-number")]})]
         with pytest.raises(kb.KISBrokerError):
             broker_with(legs).get_positions()
+
+
+class TestFillAndOrderIdentityUseTheRowsVenue:
+    """The same hazard as positions, with a worse consequence.
+
+    `_find_kis_fill_for_order` SUMS ft_ccld_qty across matching rows, so a
+    one-share fill echoed by two legs would be recorded as two filled --
+    corrupting position size, remaining quantity and every reconciliation
+    decision downstream. Measured on the live account: the TX fill came
+    back from both the NASD and the NYSE leg with ovrs_excg_cd="NYSE".
+    """
+
+    def fill_row(self, venue="NYSE", odno="0030469882", qty="1"):
+        return {"odno": odno, "pdno": "TX", "ovrs_excg_cd": venue,
+                "ft_ccld_qty": qty, "ft_ccld_unpr3": "53.68000000",
+                "ord_dt": "20260818", "sll_buy_dvsn_cd_name": "매수"}
+
+    def test_one_execution_echoed_by_two_legs_is_one_row(self):
+        legs = [("NASD", {"output": [self.fill_row()]}),
+                ("NYSE", {"output": [self.fill_row()]})]
+        merged = kb._merge_rows(legs, kb.KISBroker._tag_rows,
+                                identity=kb._execution_identity)
+        assert len(merged) == 1, merged
+
+    def test_the_summed_quantity_is_one_not_two(self):
+        """The number that would have been written to the position."""
+        legs = [("NASD", {"output": [self.fill_row()]}),
+                ("NYSE", {"output": [self.fill_row()]})]
+        merged = kb._merge_rows(legs, kb.KISBroker._tag_rows,
+                                identity=kb._execution_identity)
+        total = sum(float(r["ft_ccld_qty"]) for r in merged
+                    if r.get("odno") == "0030469882")
+        assert total == 1.0, f"a 1-share fill summed to {total}"
+
+    def test_two_genuine_partial_fills_still_sum(self):
+        """CODEX-045: distinct executions on one order must NOT collapse."""
+        legs = [("NYSE", {"output": [self.fill_row(qty="2"), self.fill_row(qty="3")]})]
+        merged = kb._merge_rows(legs, kb.KISBroker._tag_rows,
+                                identity=kb._execution_identity)
+        assert sum(float(r["ft_ccld_qty"]) for r in merged) == 5.0
+
+    def test_the_same_odno_on_two_real_venues_stays_two(self):
+        legs = [("NASD", {"output": [self.fill_row(venue="NASD")]}),
+                ("NYSE", {"output": [self.fill_row(venue="NYSE")]})]
+        merged = kb._merge_rows(legs, kb.KISBroker._tag_rows,
+                                identity=kb._execution_identity)
+        assert len(merged) == 2
+
+    def test_orders_echoed_by_two_legs_are_one_order(self):
+        row = {"odno": "0030469882", "ovrs_excg_cd": "NYSE", "pdno": "TX"}
+        legs = [("NASD", {"output": [dict(row)]}), ("NYSE", {"output": [dict(row)]})]
+        merged = kb._merge_rows(legs, kb.KISBroker._tag_rows,
+                                identity=kb._order_identity)
+        assert len(merged) == 1
+
+    def test_a_row_without_a_venue_falls_back_to_the_requested_code(self):
+        assert kb._row_venue({}, "NASD") == "NASD"
+        assert kb._row_venue({"ovrs_excg_cd": ""}, "NASD") == "NASD"
+        assert kb._row_venue({"ovrs_excg_cd": "NYSE"}, "NASD") == "NYSE"
+
+    def test_the_tag_fields_never_enter_the_identity(self):
+        """Otherwise the requested code would leak back in and defeat it."""
+        assert "kis_requested_exchange_code" in kb._TAG_KEYS
+        assert "kis_exchange_code" in kb._TAG_KEYS

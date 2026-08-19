@@ -429,16 +429,37 @@ class KISAccountSweepError(KISBrokerError):
 
 # Keys this module adds to a row; excluded from identity so tagging can
 # never change what counts as the same record.
-_TAG_KEYS = ("kis_exchange_code", "canonical_exchange")
+_TAG_KEYS = ("kis_exchange_code", "canonical_exchange",
+             "kis_requested_exchange_code")
+
+
+def _row_venue(row, code):
+    """The venue a row belongs to, per the row itself.
+
+    KIS account reads do not strictly filter by the OVRS_EXCG_CD they are
+    given -- measured on the live account, a balance request for NASD
+    returned a row whose own ovrs_excg_cd was NYSE, and a fill request did
+    the same. Keying identity on the REQUESTED code therefore makes one
+    record look like several, once per leg that echoed it.
+
+    The row's own field is authoritative; the requested code is only the
+    fallback when the row does not say.
+    """
+    native = str((row or {}).get("ovrs_excg_cd") or "").strip()
+    return native or code
 
 
 def _order_identity(row, code):
     """An ORDER is identified by its number, scoped to its venue -- two
-    venues could in principle issue the same odno."""
+    venues could in principle issue the same odno.
+
+    The venue comes from the row (see `_row_venue`): a leg that echoes
+    another venue's order must not make it look like a second order.
+    """
     for field in ("odno", "ODNO"):
         value = row.get(field)
         if value:
-            return (code, str(value))
+            return (_row_venue(row, code), str(value))
     return None
 
 
@@ -468,7 +489,11 @@ def _execution_identity(row, code):
     payload = tuple(sorted(
         (key, str(value)) for key, value in row.items() if key not in _TAG_KEYS
     ))
-    return (code, payload)
+    # Venue from the ROW, not from the leg that asked. Otherwise the same
+    # execution echoed by two legs yields two identities, and
+    # _find_kis_fill_for_order SUMS per-execution quantities -- a 1-share
+    # fill returned twice would be recorded as 2 filled.
+    return (_row_venue(row, code), payload)
 
 
 def _merge_rows(legs, tag, *, identity):
