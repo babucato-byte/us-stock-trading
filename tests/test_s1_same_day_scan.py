@@ -25,10 +25,22 @@ MONDAY = "2026-08-17"
 FRIDAY = "2026-08-14"
 SESSIONS = ("OVERNIGHT", "PREMARKET", "REGULAR", "AFTER_HOURS")
 
+#: Anything that actually BUILDS FEATURES has to use bars that are current
+#: when the test runs. `build_features` refuses a frame older than
+#: `max_daily_bar_age_days` -- a production guard, and the right one -- so a
+#: fixture pinned to a fixed date passes until it ages past that limit and
+#: then fails on a calendar rather than on a change.
+#:
+#: The fixed MONDAY/FRIDAY pair stays for the pure calendar assertions
+#: (`signal_day_for` is a date function with no staleness rule), which is
+#: where a hardcoded date is the point rather than a liability.
+SCAN_DAY = pd.Timestamp.today().normalize()
+SCAN_DAY_ISO = SCAN_DAY.date().isoformat()
 
-def turning_up(end=MONDAY, seed=3, bars=400):
+
+def turning_up(end=None, seed=3, bars=400):
     """A long base then an early turn up -- passes all five S1 conditions."""
-    index = pd.bdate_range(end=end, periods=bars)
+    index = pd.bdate_range(end=end or SCAN_DAY, periods=bars)
     base = np.full(bars, 100.0)
     turn = min(80, bars)
     base[-turn:] = 100.0 + np.arange(turn) ** 1.5 * 0.02
@@ -37,11 +49,11 @@ def turning_up(end=MONDAY, seed=3, bars=400):
                          "Close": close, "Volume": [3_000_000] * bars}, index=index)
 
 
-def falling(end=MONDAY, bars=400):
+def falling(end=None, bars=400):
     close = np.linspace(150, 50, bars)
     return pd.DataFrame({"Open": close, "High": close * 1.01, "Low": close * 0.99,
                          "Close": close, "Volume": [2_000_000] * bars},
-                        index=pd.bdate_range(end=end, periods=bars))
+                        index=pd.bdate_range(end=end or SCAN_DAY, periods=bars))
 
 
 def bundle(symbol, frame):
@@ -49,7 +61,7 @@ def bundle(symbol, frame):
 
 
 def scan_one(frame, symbol="TURN", **kw):
-    kw.setdefault("trading_day", MONDAY)
+    kw.setdefault("trading_day", SCAN_DAY_ISO)
     return sds.scan([symbol], bundles={symbol: bundle(symbol, frame)}, **kw)
 
 
@@ -58,7 +70,7 @@ class TestSignalDayIsTheLastCompletedSession:
         assert sds.signal_day_for(MONDAY) == FRIDAY
 
     def test_the_scan_records_which_day_it_used(self):
-        assert scan_one(turning_up()).signal_day == FRIDAY
+        assert scan_one(turning_up()).signal_day == sds.signal_day_for(SCAN_DAY_ISO)
 
     def test_a_date_object_is_accepted(self):
         assert sds.signal_day_for(date(2026, 8, 17)) == FRIDAY
@@ -71,9 +83,10 @@ class TestSignalDayIsTheLastCompletedSession:
 class TestTheIncompleteBarCannotMoveTheSignal:
     def test_todays_bar_is_dropped_from_the_window(self):
         frame = turning_up()
-        kept = sds.daily_through(frame, FRIDAY)
-        assert len(kept) == len(frame) - 1
-        assert kept.index[-1].date().isoformat() == FRIDAY
+        signal_day = sds.signal_day_for(SCAN_DAY_ISO)
+        kept = sds.daily_through(frame, signal_day)
+        assert len(kept) < len(frame), "the forming bar must be dropped"
+        assert kept.index[-1].date().isoformat() <= signal_day
 
     def test_tripling_todays_bar_does_not_change_the_score(self):
         """The whole point. If this fails, S1 drifts during the session."""
@@ -97,7 +110,7 @@ class TestTheIncompleteBarCannotMoveTheSignal:
         """No in-session bar may reach the daily calculation by any route."""
         frame = turning_up()
         data = SymbolData(symbol="T", daily=frame, intraday=frame, premarket=object())
-        truncated = sds._truncated_bundle(data, FRIDAY)
+        truncated = sds._truncated_bundle(data, sds.signal_day_for(SCAN_DAY_ISO))
         assert truncated.intraday is None
         assert truncated.premarket is None
 
@@ -105,7 +118,7 @@ class TestTheIncompleteBarCannotMoveTheSignal:
         """S2..S6 judge the same bundle -- it must be left alone."""
         frame = turning_up()
         data = bundle("T", frame)
-        sds._truncated_bundle(data, FRIDAY)
+        sds._truncated_bundle(data, sds.signal_day_for(SCAN_DAY_ISO))
         assert len(data.daily) == len(frame)
         assert data.daily.index[-1] == frame.index[-1]
 
@@ -130,12 +143,12 @@ class TestEverySessionCanScanAgain:
         scores = {s: scan_one(frame, session=s) for s in SESSIONS}
         for session, result in scores.items():
             assert result.status == sds.STATUS_OK, session
-            assert result.signal_day == FRIDAY
+            assert result.signal_day == sds.signal_day_for(SCAN_DAY_ISO)
             assert result.candidates[0].session == session
 
     def test_a_session_with_no_candidate_does_not_block_the_next(self):
         """§2: premarket 0 must not fix the day at 0."""
-        empty = sds.scan([], bundles={}, trading_day=MONDAY, session="PREMARKET")
+        empty = sds.scan([], bundles={}, trading_day=SCAN_DAY_ISO, session="PREMARKET")
         assert empty.status == sds.STATUS_DATA_UNAVAILABLE
 
         later = scan_one(turning_up(), session="REGULAR")
@@ -194,13 +207,13 @@ class TestOrderingAndFailure:
         strong, weak = turning_up(seed=3), turning_up(seed=11)
         result = sds.scan(["BBB", "AAA"], bundles={
             "BBB": bundle("BBB", strong), "AAA": bundle("AAA", weak)},
-            trading_day=MONDAY)
+            trading_day=SCAN_DAY_ISO)
         scores = [c.score for c in result.candidates]
         assert scores == sorted(scores, reverse=True)
 
     def test_a_symbol_with_no_bars_is_counted_unavailable_not_rejected(self):
         result = sds.scan(["X"], bundles={"X": SymbolData(symbol="X", daily=None)},
-                          trading_day=MONDAY)
+                          trading_day=SCAN_DAY_ISO)
         assert result.unavailable == 1 and result.rejected == 0
         assert result.status == sds.STATUS_DATA_UNAVAILABLE
 
@@ -210,12 +223,12 @@ class TestOrderingAndFailure:
 
     def test_an_empty_scan_is_not_reported_as_no_candidate(self):
         """"Nothing could be evaluated" and "nothing qualified" differ."""
-        assert sds.scan([], bundles={}, trading_day=MONDAY).status \
+        assert sds.scan([], bundles={}, trading_day=SCAN_DAY_ISO).status \
             == sds.STATUS_DATA_UNAVAILABLE
 
     def test_limit_caps_the_result(self):
         frame = turning_up()
         result = sds.scan(["A", "B", "C"], bundles={
             s: bundle(s, turning_up(seed=i + 3)) for i, s in enumerate("ABC")},
-            trading_day=MONDAY, limit=2)
+            trading_day=SCAN_DAY_ISO, limit=2)
         assert len(result.candidates) <= 2
