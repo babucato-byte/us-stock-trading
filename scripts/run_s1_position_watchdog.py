@@ -171,6 +171,36 @@ def escalate(result) -> bool:
     return True
 
 
+def notify_monitor(result, *, escalated: bool) -> bool:
+    """Announce a stale watchdog on #scanner-monitor.
+
+    Only the STALE case. A watchdog that reports HEALTHY every ten minutes
+    into a channel is how a channel stops being read, and the escalation
+    it performs -- ENTRY_DISABLED -- is precisely the thing an operator
+    needs to learn about without going to look for it.
+
+    Whether the kill switch actually CHANGED is stated rather than
+    implied: "already ENTRY_DISABLED" and "just disabled entries now" are
+    different situations, and a message that reads the same for both
+    would hide a watchdog firing repeatedly.
+    """
+    try:
+        from scanners.notify import monitor
+
+        body = "\n".join([
+            f"Status: {result.get('status')}",
+            f"Detail: {result.get('detail', '-')}",
+            f"Symbol: {result.get('symbol', '-')}",
+            f"Silent for: {result.get('silent_minutes', '-')} min",
+            f"Kill switch: {'ENTRY_DISABLED (escalated now)' if escalated else 'unchanged'}",
+            "Exits remain permitted.",
+        ])
+        return monitor.notify_tagged(monitor.TAG_WATCHDOG, body)
+    except Exception:  # noqa: BLE001 - the watchdog's job is the kill switch
+        logger.warning("watchdog could not send its monitor message", exc_info=True)
+        return False
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--max-silence-minutes", type=int,
@@ -194,8 +224,10 @@ def main(argv=None) -> int:
         return 0
 
     logger.error("%s: %s", result["status"], result.get("detail"))
+    escalated = False
     if not args.no_escalate:
-        escalate(result)
+        escalated = escalate(result)
+    notify_monitor(result, escalated=escalated)
     return 1
 
 

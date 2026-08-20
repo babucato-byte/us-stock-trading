@@ -46,6 +46,20 @@ SCANNER_TAGS = {
     "orb": "S6 ORB",
 }
 
+#: The five sessions an all-session scanner covers, in clock order. Only
+#: S2 is all-session today; S1 is frozen at its measured sessions and
+#: S3..S6 are DISCOVERY_ONLY, so neither advertises coverage it does not
+#: have. Membership is a fact about the scanner, not about this channel.
+ALL_SESSIONS = ("OVERNIGHT", "DAYTIME", "PREMARKET", "REGULAR", "AFTER_HOURS")
+ALL_SESSION_SCANNERS = frozenset({"accumulation"})
+
+#: Printed for S3..S6 so a reader never has to infer whether a candidate
+#: could have been ordered. DISCOVERY_ONLY means the scanner is
+#: structurally unable to reach the order path -- it is the default in
+#: `notify_run` precisely so an unmapped scanner is described as inert
+#: rather than as live.
+MODE_DISCOVERY_ONLY = "DISCOVERY_ONLY"
+
 TAG_LIVE_BUY = "LIVE BUY"
 TAG_LIVE_FILL = "LIVE FILL"
 TAG_LIVE_SELL = "LIVE SELL"
@@ -66,23 +80,32 @@ def scanner_tag(scanner_name: str) -> str:
     return SCANNER_TAGS.get(str(scanner_name), str(scanner_name).upper())
 
 
+def is_all_session(scanner_name: str) -> bool:
+    return str(scanner_name) in ALL_SESSION_SCANNERS
+
+
 def webhook_configured(env=None) -> bool:
     mapping = os.environ if env is None else env
     return bool(str(mapping.get(WEBHOOK_ENV) or "").strip())
 
 
 def _send(message: str, *, env=None) -> bool:
-    """The only outbound call. Never raises, never blocks a caller."""
+    """The only outbound call. Never raises, never blocks a caller.
+
+    The webhook is resolved here (from a caller-supplied mapping, so tests
+    never need the real one) and the transport is `slack_utils`, which is
+    where every other Slack path in this codebase already goes. Imported
+    lazily so a missing `requests` cannot break `import scanners.runner`.
+    """
     mapping = os.environ if env is None else env
     url = str(mapping.get(WEBHOOK_ENV) or "").strip()
     if not url:
         logger.debug("scanner monitor: %s unset, message not sent", WEBHOOK_ENV)
         return False
     try:
-        import requests
+        from slack_utils import send_to_webhook
 
-        response = requests.post(url, json={"text": message}, timeout=10)
-        return 200 <= response.status_code < 300
+        return bool(send_to_webhook(url, message))
     except Exception:  # noqa: BLE001 - a Slack outage is not a trading failure
         logger.warning("scanner monitor: send failed", exc_info=True)
         return False
@@ -106,15 +129,18 @@ def format_scan(*, scanner_name, session, trading_day, scanned, candidates,
     """A scan result, including the zero-candidate case.
 
     Zero candidates and a failed scanner are different facts and are
-    printed differently: the first is a market observation, the second is
-    an operational one, and collapsing them is how a broken scanner hides
-    behind a quiet day.
+    printed differently: the first is a market observation reported as
+    `Candidates: 0` with `Scanner: SUCCESS`, the second carries the
+    failure in the `Scanner:` line itself. Collapsing them is how a broken
+    scanner hides behind a quiet day, so the count never doubles as the
+    health signal.
     """
     tag = scanner_tag(scanner_name)
-    lines = [f"[SCANNER {tag} · {session}]", ""]
+    lines = [f"[{tag}]", ""]
     if generated_at:
         lines.append(f"Time: {generated_at}")
     lines += [
+        f"Session: {session}",
         f"Trading day: {trading_day}",
         f"Scanned: {scanned if scanned is not None else '-'}",
         f"Candidates: {candidates if candidates is not None else '-'}",
@@ -126,9 +152,11 @@ def format_scan(*, scanner_name, session, trading_day, scanned, candidates,
             lines.append(f"#{index} {item.get('symbol', '?'):<6} "
                          f"score {_fmt(item.get('score'))}")
         lines.append("")
-    lines.append(f"Status: {status}")
+    lines.append(f"Scanner: {status}")
     if live_status:
-        lines.append(f"Live: {live_status}")
+        lines.append(f"Mode: {live_status}")
+    if is_all_session(scanner_name):
+        lines.append(f"All-session coverage: {' · '.join(ALL_SESSIONS)}")
 
     if ranked:
         best = ranked[0]
@@ -143,14 +171,69 @@ def format_scan(*, scanner_name, session, trading_day, scanned, candidates,
     return "\n".join(lines)
 
 
+#: Scan messages are de-duplicated on their own CONTENT, not on
+#: (scanner, session, day). The duplicate this prevents is the real one:
+#: cronie has no CRON_TZ, so every ET-guarded entry fires twice from two
+#: UTC hours, and a retried or manually re-run scan repeats the same
+#: finding. Keying on content means an unchanged result is sent once
+#: while a genuinely different result in the same session still gets
+#: through -- a day/session key would swallow the second one, which is
+#: the message an operator most wants.
+#:
+#: Lifecycle messages (BUY/FILL/SELL) are deliberately NOT de-duplicated.
+#: Two identical-looking fills can be two real fills, and suppressing an
+#: order event to save a line is the wrong trade.
+_SCAN_SENT: Dict[str, set] = {}
+
+
+def _scan_is_duplicate(digest: str, trading_day) -> bool:
+    """In-process suppression. Best-effort and deliberately not persisted.
+
+    A scan run is a single process, so an in-memory set covers the dual
+    firing and the retry within it. Persisting across processes would
+    mean a crashed run's state could silence the re-run that replaces
+    it, which is worse than an occasional repeat.
+    """
+    return digest in _SCAN_SENT.get(str(trading_day or "unknown"), set())
+
+
+def _mark_scan_sent(digest: str, trading_day) -> None:
+    """Recorded only after the send SUCCEEDS.
+
+    Marking before would let one Slack outage suppress the retry, turning
+    a transient failure into a permanently missing message.
+
+    Only the current trading day is retained. A cron run is one process so
+    this is normally a handful of entries, but the watchdog and executor
+    are long-lived enough that an unbounded dict would be a slow leak, and
+    yesterday's digests can no longer suppress anything useful.
+    """
+    day = str(trading_day or "unknown")
+    if day not in _SCAN_SENT:
+        _SCAN_SENT.clear()
+    _SCAN_SENT.setdefault(day, set()).add(digest)
+
+
+def reset_scan_dedup() -> None:
+    """Forget what has been sent. For tests, and for a re-run that means it."""
+    _SCAN_SENT.clear()
+
+
 def notify_scan(*, scanner_name, session, trading_day, scanned, candidates,
                 status, top=None, live_status=None, generated_at=None,
                 env=None) -> bool:
     try:
-        return _send(format_scan(
+        message = format_scan(
             scanner_name=scanner_name, session=session, trading_day=trading_day,
             scanned=scanned, candidates=candidates, status=status, top=top,
-            live_status=live_status, generated_at=generated_at), env=env)
+            live_status=live_status, generated_at=generated_at)
+        if _scan_is_duplicate(message, trading_day):
+            logger.info("scanner monitor: identical scan message suppressed")
+            return False
+        if not _send(message, env=env):
+            return False
+        _mark_scan_sent(message, trading_day)
+        return True
     except Exception:  # noqa: BLE001
         logger.warning("scanner monitor: scan message failed", exc_info=True)
         return False
@@ -325,7 +408,8 @@ def notify_run(report, *, env=None) -> int:
                            trading_day=trading_day,
                            scanned=getattr(outcome, "symbols_seen", None),
                            candidates=len(signals), status=status, top=top,
-                           live_status=modes.get(name, "DISCOVERY_ONLY"), env=env):
+                           live_status=modes.get(name, MODE_DISCOVERY_ONLY),
+                           env=env):
                 sent += 1
     except Exception:  # noqa: BLE001 - a monitor must never fail a scan
         logger.warning("scanner monitor: run report failed", exc_info=True)

@@ -68,9 +68,12 @@ class TestScanMessages:
         text = monitor.format_scan(
             scanner_name="accumulation", session="REGULAR", trading_day="2026-08-20",
             scanned=5960, candidates=0, status="SUCCESS")
-        assert "[SCANNER S2 VOLUME · REGULAR]" in text
+        assert "[S2 VOLUME]" in text
+        assert "Session: REGULAR" in text
+        # §7 verbatim: the quiet day is reported as a successful scan that
+        # found nothing, never as an absence of a message.
         assert "Candidates: 0" in text
-        assert "Status: SUCCESS" in text
+        assert "Scanner: SUCCESS" in text
 
     def test_a_failure_reads_differently_from_a_quiet_day(self):
         quiet = monitor.format_scan(scanner_name="accumulation", session="REGULAR",
@@ -201,15 +204,69 @@ class TestItDoesNotDisturbTheAlertChannel:
         assert "SCANNER_MONITOR" not in source
 
     def test_the_monitor_does_not_import_the_alerter(self):
+        """It may share the transport. It may not share the CHANNEL.
+
+        `slack_utils.send_to_webhook` is a socket with a timeout -- reusing
+        it is the point, so there is one place where the transport lives.
+        What must never be reused is anything that decides WHERE a message
+        lands: `send_slack_alert` and `send_slack_message` resolve the
+        alert and report webhooks internally, so importing either would
+        put tickers in the channel whose whole discipline is that it
+        carries none.
+        """
         import ast
 
+        banned = {"send_slack_alert", "send_slack_message",
+                  "send_kis_live_alert", "send_kis_live_message"}
         source = (REPO_ROOT / "scanners" / "notify" / "monitor.py").read_text()
         for node in ast.walk(ast.parse(source)):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
-                names = [getattr(node, "module", "") or ""] + [a.name for a in node.names]
-                for name in names:
-                    assert "notify.slack" not in str(name)
-                    assert "slack_utils" not in str(name)
+                module = str(getattr(node, "module", "") or "")
+                assert "notify.slack" not in module
+                for alias in node.names:
+                    assert "notify.slack" not in alias.name
+                    assert alias.name not in banned, f"imports {alias.name}"
+        # And no alert/report webhook name appears anywhere in the file.
+        for env_name in ("SLACK_ALERT_WEBHOOK_URL", "KIS_LIVE_SLACK"):
+            assert env_name not in source
+
+    def test_the_monitor_sends_through_the_shared_transport(self):
+        """§2: reuse the existing sender rather than a second requests.post.
+
+        Two copies of the outbound call means two timeouts, two status
+        rules, and one of them silently not getting the next fix.
+        """
+        source = (REPO_ROOT / "scanners" / "notify" / "monitor.py").read_text()
+        assert "send_to_webhook" in source
+        assert "requests.post" not in source
+
+    def test_the_shared_transport_resolves_no_webhook_of_its_own(self):
+        """`send_to_webhook` takes the URL from its caller.
+
+        If it fell back to an env webhook, an unset monitor URL would
+        reroute scanner tickers into whichever channel it defaulted to.
+        """
+        import inspect
+
+        import slack_utils
+
+        assert "SCANNER_MONITOR_SLACK_WEBHOOK_URL" not in inspect.getsource(
+            slack_utils.send_to_webhook)
+        assert list(inspect.signature(
+            slack_utils.send_to_webhook).parameters) == ["webhook_url", "message"]
+
+
+@pytest.fixture(autouse=True)
+def _fresh_dedup():
+    """Each test starts with nothing sent.
+
+    Production does not need this -- a scan is one cron process -- but the
+    suppression is module state, and without a reset one test's message
+    silences the next test's identical one.
+    """
+    monitor.reset_scan_dedup()
+    yield
+    monitor.reset_scan_dedup()
 
 
 class TestRunnerWiring:
@@ -270,8 +327,8 @@ class TestRunnerWiring:
         sent = self.capture(monkeypatch)
         monitor.notify_run(self.Report([
             self.Outcome("hma_early_trend", []), self.Outcome("orb", [])]))
-        assert "Live: LIMITED_LIVE" in sent[0], "S1 is the live strategy"
-        assert "Live: DISCOVERY_ONLY" in sent[1], "S6 is discovery only"
+        assert "Mode: LIMITED_LIVE" in sent[0], "S1 is the live strategy"
+        assert "Mode: DISCOVERY_ONLY" in sent[1], "S6 is discovery only"
 
     def test_a_broken_report_cannot_fail_a_scan(self, monkeypatch):
         self.capture(monkeypatch)
@@ -289,3 +346,113 @@ class TestRunnerWiring:
         source = (REPO_ROOT / "scanners" / "runner.py").read_text()
         block = source[source.index("from scanners.notify import monitor"):][:300]
         assert "except Exception" in block
+
+
+class TestOperationalEventsReachTheSameChannel:
+    """§6: the live lifecycle is mirrored into #scanner-monitor.
+
+    Mirrored, not rerouted. The KIS live channels are where a real order
+    is announced and they keep receiving exactly what they received
+    before; the monitor gets a copy so one channel answers "what did the
+    system do today" without an operator reading three.
+    """
+
+    def capture(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(monitor, "_send", lambda msg, env=None: seen.append(msg) or True)
+        return seen
+
+    @pytest.mark.parametrize("event,tag", [
+        ("FILL_COMPLETED", "LIVE FILL"),
+        ("PARTIAL_FILL", "LIVE FILL"),
+        ("SELL_FILLED", "LIVE SELL"),
+        ("SELL_SUBMITTED", "LIVE SELL"),
+        ("EXIT_TRIGGERED", "LIVE SELL"),
+        ("RECONCILIATION_MISMATCH", "RECONCILIATION"),
+        ("POSITION_MISMATCH", "RECONCILIATION"),
+        ("ORDER_REJECTED", "RISK"),
+        ("ORDER_UNKNOWN", "RISK"),
+        ("KILL_SWITCH_ACTIVATED", "RISK"),
+        ("HALT_ACTIVATED", "RISK"),
+        ("KIS_API_FAILURE", "RISK"),
+        ("DAILY_SUMMARY", "DAILY SUMMARY"),
+    ])
+    def test_each_event_carries_its_tag(self, event, tag):
+        from operations import live_notifications as ln
+
+        assert ln.monitor_tag_for(event) == tag
+
+    def test_a_submit_is_tagged_by_side_not_by_event_name(self):
+        """ORDER_SUBMITTED carries both directions. Filing a sell under
+        [LIVE BUY] would make the channel lie about a real order."""
+        from operations import live_notifications as ln
+
+        assert ln.monitor_tag_for("ORDER_SUBMITTED", {"side": "buy"}) == "LIVE BUY"
+        assert ln.monitor_tag_for("ORDER_SUBMITTED", {"side": "sell"}) == "LIVE SELL"
+        assert ln.monitor_tag_for("ORDER_ACCEPTED", {"side": "SELL"}) == "LIVE SELL"
+
+    def test_routine_intermediate_events_are_not_mirrored(self):
+        """§11: summary over commentary. These stay on the KIS channel."""
+        from operations import live_notifications as ln
+
+        for event in ("MARKET_START", "BUY_CANDIDATE_SELECTED",
+                      "LIVE_ORDER_PREPARED", "ORDER_PENDING",
+                      "CANCEL_REQUESTED", "CANCEL_COMPLETED"):
+            assert ln.monitor_tag_for(event) is None, event
+
+    def test_an_unknown_event_mirrors_nowhere(self):
+        from operations import live_notifications as ln
+
+        assert ln.monitor_tag_for("SOMETHING_NEW") is None
+
+    def test_the_mirror_cannot_break_the_kis_notification(self, monkeypatch):
+        """The order path must survive a monitor that throws."""
+        from operations import live_notifications as ln
+
+        def boom(*a, **k):
+            raise RuntimeError("monitor down")
+
+        monkeypatch.setattr(monitor, "notify_tagged", boom)
+        delivered = []
+        assert ln.notify("FILL_COMPLETED", {"symbol": "TX"},
+                         send_fn=lambda m: delivered.append(m) or True,
+                         track_health=False) is True
+        assert delivered, "the KIS message still went out"
+
+    def test_the_mirror_is_sent_even_when_the_kis_send_fails(self, monkeypatch):
+        """If the primary webhook is down the monitor line is the only
+        record there is -- gating it on the primary would lose it."""
+        from operations import live_notifications as ln
+
+        seen = self.capture(monkeypatch)
+        assert ln.notify("FILL_COMPLETED", {"symbol": "TX"},
+                         send_fn=lambda m: False, track_health=False) is False
+        assert any("LIVE FILL" in m and "TX" in m for m in seen)
+
+    def test_the_watchdog_announces_only_the_stale_case(self):
+        source = (REPO_ROOT / "scripts" / "run_s1_position_watchdog.py").read_text()
+        # The CALL, not the `def` -- "notify_monitor(result" matches the
+        # definition too, and the definition is above this line by
+        # construction, so the loose form would pass for the wrong reason.
+        healthy_return = source.index('if result["status"] != STATUS_STALE')
+        assert source.index("notify_monitor(result, escalated=escalated)") > healthy_return
+
+    def test_the_watchdog_states_whether_it_actually_escalated(self):
+        """"already ENTRY_DISABLED" and "disabled entries just now" are
+        different facts; one message for both hides a repeating fault."""
+        import scripts.run_s1_position_watchdog as wd
+
+        sent = []
+        original = monitor.notify_tagged
+        try:
+            monitor.notify_tagged = lambda tag, body, **k: sent.append((tag, body)) or True
+            wd.notify_monitor({"status": "STALE", "detail": "d", "symbol": "TX",
+                               "silent_minutes": 51}, escalated=True)
+            wd.notify_monitor({"status": "STALE", "detail": "d", "symbol": "TX",
+                               "silent_minutes": 51}, escalated=False)
+        finally:
+            monitor.notify_tagged = original
+        assert sent[0][0] == monitor.TAG_WATCHDOG
+        assert "escalated now" in sent[0][1]
+        assert "unchanged" in sent[1][1]
+        assert "Exits remain permitted." in sent[0][1]

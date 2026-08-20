@@ -26,6 +26,11 @@ SLACK_ALERT_WEBHOOK_URL = os.getenv("SLACK_ALERT_WEBHOOK_URL")
 KIS_LIVE_WEBHOOK_ENV = "KIS_LIVE_SLACK_WEBHOOK_URL"
 KIS_LIVE_ALERT_WEBHOOK_ENV = "KIS_LIVE_SLACK_ALERT_WEBHOOK_URL"
 
+# The scanner monitor channel. Read per call for the same reason as the
+# KIS pair above, and with the same no-fallback rule: unset means silence,
+# never a reroute into the paper/alert streams.
+SCANNER_MONITOR_WEBHOOK_ENV = "SCANNER_MONITOR_SLACK_WEBHOOK_URL"
+
 
 def _send(webhook_url, message):
     if not webhook_url:
@@ -56,9 +61,35 @@ def send_slack_alert(message):
     return _send(SLACK_ALERT_WEBHOOK_URL, message)
 
 
-def _kis_live_webhook(env_name):
+def send_to_webhook(webhook_url, message):
+    """Public name for the one outbound call.
+
+    Callers that resolve their own webhook (the scanner monitor reads a
+    caller-supplied env mapping so it stays testable) route through this
+    rather than opening a second `requests.post`. One transport means one
+    place where the timeout, the status handling and any future retry
+    live -- a private copy elsewhere would drift from this one silently.
+    """
+    return _send(webhook_url, message)
+
+
+def _env_webhook(env_name):
     value = os.getenv(env_name)
     return value.strip() if value else ""
+
+
+def _kis_live_webhook(env_name):
+    return _env_webhook(env_name)
+
+
+def scanner_monitor_configured():
+    """True when the monitor channel has somewhere to send."""
+    return bool(_env_webhook(SCANNER_MONITOR_WEBHOOK_ENV))
+
+
+def send_scanner_monitor_message(message):
+    """The #scanner-monitor channel. Never falls back to another webhook."""
+    return _send(_env_webhook(SCANNER_MONITOR_WEBHOOK_ENV), message)
 
 
 def kis_live_notifications_configured():

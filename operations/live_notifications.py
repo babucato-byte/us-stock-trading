@@ -137,6 +137,75 @@ KIS_LIVE_PREFIX = "[KIS LIVE]"
 KIS_LIVE_CRITICAL_PREFIX = "[KIS LIVE][CRITICAL]"
 
 
+#: Which lifecycle events are ALSO mirrored into #scanner-monitor, and
+#: under which tag. The KIS live channels keep receiving everything they
+#: received before -- this is a copy, never a reroute.
+#:
+#: The map is deliberately partial. MARKET_START, BUY_CANDIDATE_SELECTED,
+#: LIVE_ORDER_PREPARED, ORDER_PENDING and the CANCEL_* pair stay off the
+#: monitor: it is the channel an operator reads to see what the system
+#: did, and a per-symbol running commentary of every intermediate state
+#: is what makes such a channel stop being read. An unmapped event
+#: mirrors nowhere rather than defaulting into a catch-all tag.
+#:
+#: A submit is tagged by SIDE, not by event name: ORDER_SUBMITTED carries
+#: both entries and exits, and filing a sell under [LIVE BUY] would make
+#: the channel lie about the direction of a real order.
+_MONITOR_TAGS = {
+    ORDER_SUBMITTED: None,   # resolved from the side field
+    ORDER_ACCEPTED: None,
+    PARTIAL_FILL: "LIVE FILL",
+    FILL_COMPLETED: "LIVE FILL",
+    EXIT_TRIGGERED: "LIVE SELL",
+    SELL_SUBMITTED: "LIVE SELL",
+    SELL_FILLED: "LIVE SELL",
+    RECONCILIATION_MISMATCH: "RECONCILIATION",
+    POSITION_MISMATCH: "RECONCILIATION",
+    ORDER_REJECTED: "RISK",
+    ORDER_UNKNOWN: "RISK",
+    CANCEL_FAILED: "RISK",
+    KIS_API_FAILURE: "RISK",
+    DB_FAILURE: "RISK",
+    HALT_ACTIVATED: "RISK",
+    KILL_SWITCH_ACTIVATED: "RISK",
+    DAILY_SUMMARY: "DAILY SUMMARY",
+}
+
+
+def monitor_tag_for(event, fields=None):
+    """The #scanner-monitor tag for a lifecycle event, or None to skip."""
+    if event not in _MONITOR_TAGS:
+        return None
+    tag = _MONITOR_TAGS[event]
+    if tag is not None:
+        return tag
+    side = str((fields or {}).get("side") or "").strip().lower()
+    return "LIVE SELL" if side == "sell" else "LIVE BUY"
+
+
+def _mirror_to_monitor(event, fields):
+    """Copy a lifecycle event into the unified monitor channel.
+
+    Structurally incapable of affecting the order path: it is called after
+    the KIS delivery has already happened, its result is discarded, and it
+    catches everything. It also stays outside `notification_health` -- the
+    monitor is a second channel, and a monitor outage must not count
+    against the counter that escalates the kill switch.
+    """
+    try:
+        tag = monitor_tag_for(event, fields)
+        if not tag:
+            return
+        from scanners.notify import monitor
+
+        body = "\n".join([f"Event: {event}"]
+                         + [f"{key}: {value}" for key, value in (fields or {}).items()])
+        monitor.notify_tagged(tag, body)
+    except Exception:  # noqa: BLE001 - a monitor must never reach the order path
+        logger.warning("live notification could not be mirrored to the monitor",
+                       exc_info=True)
+
+
 def _format(event, fields, *, test=False):
     """`[KIS LIVE] [EVENT]` headline plus one `- key: value` line per field.
 
@@ -206,6 +275,12 @@ def notify(event, fields=None, *, test=False, send_fn=None, track_health=True):
         return False
 
     sender = send_fn or _sender_for(event)
+
+    # The monitor copy is sent regardless of how the KIS delivery goes.
+    # It is a second, independent channel: if the KIS webhook is down, the
+    # monitor line is the only record an operator gets, so gating it on
+    # the primary send would lose exactly the message that mattered most.
+    _mirror_to_monitor(event, safe)
 
     if not track_health:
         # Deliberately outside notification_health. The one caller that
