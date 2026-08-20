@@ -1,19 +1,15 @@
 """How many positions may be open at once, globally and per strategy.
 
-Status: IMPLEMENTED, NOT ACTIVATED
-----------------------------------
-The limits below are the DESIGN. Raising what the account may actually
-hold is a real-money risk change and is the operator's decision, not a
-side effect of merging this file, so `ACTIVE` is False and
-`effective_limits()` returns the currently-live posture until someone
-changes that deliberately.
+Status: ACTIVE, by operator approval
+------------------------------------
+The matrix below is in force. It was implemented and tested while
+inactive, reviewed, and then activated as an explicit decision -- which
+is the sequence that makes the numbers reviewable rather than incidental.
 
-That distinction is the whole point of the module: the shape of the rule
-can be reviewed, tested and argued about now, while the number of shares
-the account can lose money on stays exactly where it is.
+Raising them again is the same kind of decision, not a code change.
 
-The proposed matrix
--------------------
+The matrix
+----------
     global   2      the account may hold two positions at once
     S1       1      one HMA early-trend position
     S2       1      one volume-accumulation position
@@ -34,22 +30,22 @@ strategy that is not in the table has not had a limit agreed for it, and
 
 from typing import Dict, Mapping, Optional
 
-#: Flip to True only as a deliberate, approved risk change. Nothing in
-#: this repository should set it from code, a test, or an env default:
-#: the value is the record of a decision, and a decision that can be
-#: made by a fixture is not one.
-ACTIVE = False
+#: Changed only as a deliberate, approved risk change. Nothing in this
+#: repository sets it from code, a test, or an env default: the value is
+#: the record of a decision, and a decision that can be made by a
+#: fixture is not one. A test asserts no code assigns it.
+ACTIVE = True
 
-#: The proposed matrix. Not in force while ACTIVE is False.
+#: In force while ACTIVE. S2 joins at 1 for limited-live validation.
 PROPOSED_GLOBAL_MAX = 2
 PROPOSED_STRATEGY_MAX: Dict[str, int] = {
     "S1_HMA_EARLY_TREND_V1": 1,
     "S2_VOLUME_ACCUMULATION_V1": 1,
 }
 
-#: What is actually enforced today: one S1 position, and nothing else
-#: trades. This mirrors the live posture -- S1 is LIMITED_LIVE and S2..S6
-#: are DISCOVERY_ONLY -- rather than describing an intention.
+#: The pre-activation posture, kept so `effective_limits(active=False)`
+#: still describes what was in force before -- a rollback target that is
+#: read from code rather than reconstructed from memory.
 CURRENT_GLOBAL_MAX = 1
 CURRENT_STRATEGY_MAX: Dict[str, int] = {
     "S1_HMA_EARLY_TREND_V1": 1,

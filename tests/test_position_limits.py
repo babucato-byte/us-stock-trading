@@ -107,29 +107,45 @@ class TestBothLimitsApplyIndependently:
         assert decision.as_dict()["reason"] == pl.BLOCK_STRATEGY
 
 
-class TestActivationIsHeld:
-    def test_the_matrix_is_not_in_force(self):
-        """§12: implementation and tests proceed, activation does not."""
-        assert pl.ACTIVE is False
+class TestActivationIsDeliberate:
+    """The matrix is in force, and the way it got there is the point.
 
-    def test_the_live_limits_are_todays_posture_not_the_proposal(self):
+    It was implemented and tested while inactive, reviewed, and then
+    activated as an explicit decision. These tests assert the activated
+    state AND the properties that made the activation reviewable -- the
+    pre-activation posture is still readable as a rollback target, and no
+    code anywhere can set the flag.
+    """
+
+    def test_the_matrix_is_in_force(self):
+        assert pl.ACTIVE is True
         global_max, strategy_max = pl.effective_limits()
-        assert global_max == 1, "one position, as today"
-        assert strategy_max == {S1: 1}
-        assert S2 not in strategy_max, "S2 is DISCOVERY_ONLY and holds nothing"
+        assert global_max == 2
+        assert strategy_max == {S1: 1, S2: 1}
 
-    def test_s2_cannot_open_a_position_under_the_live_limits(self):
+    def test_s2_may_now_open_one_position(self):
         decision = pl.check_entry(S2, {})
-        assert decision.allowed is False
-        assert decision.reason == pl.BLOCK_UNKNOWN_STRATEGY
+        assert decision.allowed is True
 
-    def test_a_second_s1_is_refused_under_the_live_limits_too(self):
+    def test_the_pre_activation_posture_is_still_readable(self):
+        """A rollback target read from code rather than reconstructed
+        from memory."""
+        global_max, strategy_max = pl.effective_limits(active=False)
+        assert global_max == 1
+        assert strategy_max == {S1: 1}
+        assert pl.check_entry(S2, {}, active=False).allowed is False
+
+    def test_the_existing_s1_position_is_unaffected(self):
+        """TX is open. Activation must not change what S1 may do."""
+        assert pl.check_entry(S1, {}).allowed is True
         assert pl.check_entry(S1, {S1: 1}).allowed is False
 
-    def test_the_first_s1_position_still_works(self):
-        """The live posture must be unchanged by this file existing -- TX
-        is open and S1 keeps trading."""
-        assert pl.check_entry(S1, {}).allowed is True
+    def test_the_limits_did_not_widen_beyond_what_was_approved(self):
+        """global 2 / S1 1 / S2 1, and nothing else gains an allowance."""
+        assert pl.PROPOSED_GLOBAL_MAX == 2
+        assert set(pl.PROPOSED_STRATEGY_MAX) == {S1, S2}
+        assert pl.check_entry("S3_FUTURE", {}).reason == \
+            pl.BLOCK_UNKNOWN_STRATEGY
 
     def test_no_code_in_the_repo_sets_active_to_true(self):
         """The value is the record of a decision, and a decision that can
@@ -155,10 +171,9 @@ class TestActivationIsHeld:
                             offenders.append(f"{path.name}:{node.lineno}")
         assert offenders == [], f"ACTIVE set from code: {offenders}"
 
-    def test_activating_it_is_a_one_line_change_with_no_other_edit(self):
-        """The design is complete: turning it on must not require also
-        writing the logic, or the review that approves it is approving
-        something that does not exist yet."""
-        _, strategy_max = pl.effective_limits(active=True)
-        assert strategy_max == {S1: 1, S2: 1}
-        assert pl.check_entry(S2, {S1: 1}, active=True).allowed is True
+    def test_the_flag_is_the_only_thing_that_changed(self):
+        """Activation was a one-line change because the logic was already
+        written and tested. `active=` still selects either posture, so
+        the same code paths serve both."""
+        assert pl.effective_limits(active=True) == (2, {S1: 1, S2: 1})
+        assert pl.effective_limits(active=False) == (1, {S1: 1})
