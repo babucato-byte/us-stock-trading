@@ -12,6 +12,7 @@ dressed as a finding, so an unmeasured comparison says INSUFFICIENT_SAMPLE.
 """
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -463,3 +464,61 @@ class TestOperationalEventsReachTheSameChannel:
         assert "escalated now" in sent[0][1]
         assert "unchanged" in sent[1][1]
         assert "Exits remain permitted." in sent[0][1]
+
+
+class TestTheWebhookIsFoundUnderCron:
+    """The bug this class exists for: configured, deployed, and silent.
+
+    The webhook lives in `.env`. `slack_utils` is what loads that file, at
+    import. The monitor read `os.environ` and returned early when the key
+    was missing -- which under cron is the state BEFORE anything has
+    imported `slack_utils`. Every message was dropped, with no error and
+    no log, while the key sat correctly in the file.
+    """
+
+    def test_the_env_file_is_loaded_before_the_key_is_read(self, monkeypatch):
+        """A key that only appears once `slack_utils` is imported must
+        still be found -- that is exactly the cron ordering."""
+        import sys
+
+        monkeypatch.delitem(sys.modules, "slack_utils", raising=False)
+        monkeypatch.delenv(monitor.WEBHOOK_ENV, raising=False)
+
+        loaded = {}
+
+        class FakeSlackUtils:
+            def __init__(self):
+                # Stands in for load_dotenv() running at import time.
+                os.environ[monitor.WEBHOOK_ENV] = "https://hooks.slack.test/late"
+                loaded["yes"] = True
+
+        monkeypatch.setitem(sys.modules, "slack_utils", FakeSlackUtils())
+        try:
+            assert monitor.webhook_configured() is True
+            assert loaded == {"yes": True}
+        finally:
+            os.environ.pop(monitor.WEBHOOK_ENV, None)
+
+    def test_an_explicit_mapping_is_used_as_given(self):
+        """A caller that passes a mapping means that mapping. Preloading
+        for it would let the real environment leak into a test."""
+        assert monitor.webhook_configured({}) is False
+        assert monitor.webhook_configured(
+            {monitor.WEBHOOK_ENV: "https://hooks.slack.test/x"}) is True
+
+    def test_a_missing_slack_utils_is_not_fatal(self, monkeypatch):
+        """The process environment alone is still a valid answer."""
+        import builtins
+        import sys
+
+        monkeypatch.delitem(sys.modules, "slack_utils", raising=False)
+        real_import = builtins.__import__
+
+        def refuse(name, *a, **k):
+            if name == "slack_utils":
+                raise ImportError("no dotenv here")
+            return real_import(name, *a, **k)
+
+        monkeypatch.setattr(builtins, "__import__", refuse)
+        monkeypatch.setenv(monitor.WEBHOOK_ENV, "https://hooks.slack.test/x")
+        assert monitor.webhook_configured() is True

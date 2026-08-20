@@ -84,8 +84,32 @@ def is_all_session(scanner_name: str) -> bool:
     return str(scanner_name) in ALL_SESSION_SCANNERS
 
 
+def _process_env():
+    """`os.environ` AFTER the `.env` file has been loaded.
+
+    The webhook lives in `.env`, and in this codebase the module that
+    loads it is `slack_utils` -- it calls `load_dotenv()` at import. The
+    monitor used to read `os.environ` and return early on an empty
+    result, which under cron happens BEFORE anything has imported
+    `slack_utils`. The key was present in the file, the code was
+    deployed, and every message was dropped with no error: the check that
+    was supposed to make the module safe when unconfigured also made it
+    silent when it was configured.
+
+    Importing first is what makes the read answer the right question.
+    Failure is tolerated -- if `dotenv` or `requests` is missing, the
+    process environment on its own is still a valid answer.
+    """
+    try:
+        import slack_utils  # noqa: F401 - imported for its load_dotenv()
+    except Exception:  # noqa: BLE001
+        logger.debug("scanner monitor: could not preload the env file",
+                     exc_info=True)
+    return os.environ
+
+
 def webhook_configured(env=None) -> bool:
-    mapping = os.environ if env is None else env
+    mapping = _process_env() if env is None else env
     return bool(str(mapping.get(WEBHOOK_ENV) or "").strip())
 
 
@@ -97,7 +121,7 @@ def _send(message: str, *, env=None) -> bool:
     where every other Slack path in this codebase already goes. Imported
     lazily so a missing `requests` cannot break `import scanners.runner`.
     """
-    mapping = os.environ if env is None else env
+    mapping = _process_env() if env is None else env
     url = str(mapping.get(WEBHOOK_ENV) or "").strip()
     if not url:
         logger.debug("scanner monitor: %s unset, message not sent", WEBHOOK_ENV)
