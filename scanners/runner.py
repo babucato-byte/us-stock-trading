@@ -53,7 +53,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from scanners.base import activity as act
 from scanners.base import eligibility as elig
-from scanners.base import result_store, run_context
+from scanners.base import result_store, run_context, scan_session
 from scanners.base.trading_calendar import us_trading_day
 from scanners.base.features import build_features
 from scanners.base.market_data_provider import (
@@ -140,6 +140,9 @@ class RunReport:
     universe_size: int
     run_id: Optional[str] = None
     profile: Optional[str] = None
+    #: Which of the four clock sessions this run belongs to. A label
+    #: on the run, never a condition: see scanners/base/scan_session.
+    session: Optional[str] = None
     provider_feed: Optional[str] = None
     outcomes: List[ScanOutcome] = field(default_factory=list)
     fetch_failures: int = 0
@@ -314,6 +317,7 @@ def run_scanners(
     intraday_interval: str = "1m",
     intraday_lookback_days: int = 5,
     profile: Optional[str] = None,
+    session: Optional[str] = None,
     run_id: Optional[str] = None,
     use_eligibility: bool = True,
     universe_type: Optional[str] = None,
@@ -363,6 +367,12 @@ def run_scanners(
         universe_size=0,
         run_id=identifier,
         profile=profile,
+        # An explicit session wins; otherwise it is read off the clock.
+        # A caller-supplied name that is not one of the four is NOT
+        # silently corrected -- `normalize` returns None and the clock
+        # answers instead, because a typo quietly becoming REGULAR would
+        # file an off-hours scan under the one session allowed to trade.
+        session=scan_session.normalize(session) or scan_session.session_at(),
     )
 
     requested = list(scanners or ALL_SCANNERS)
@@ -666,6 +676,8 @@ def parse_args(argv=None):
                         help="comma-separated symbols; defaults to universe.csv")
     parser.add_argument("--limit", type=int, default=None,
                         help="scan at most this many universe symbols")
+    parser.add_argument("--session", choices=list(scan_session.SESSIONS),
+                        help="scan session label; defaults to the ET clock")
     parser.add_argument("--trading-day", default=None,
                         help="override the trading day label (YYYY-MM-DD)")
     parser.add_argument("--no-store", action="store_true",
@@ -684,6 +696,48 @@ def parse_args(argv=None):
     parser.add_argument("--intraday-lookback-days", type=int, default=5)
     parser.add_argument("--daily-lookback-days", type=int, default=400)
     return parser.parse_args(argv)
+
+
+#: Which scanners publish a candidate file. Publication is a hand-off to
+#: the trading runtime, and a hand-off is only worth writing for a
+#: strategy that has a consumer on the other side. S3..S6 are
+#: DISCOVERY_ONLY with nothing reading them, so publishing for them would
+#: create files whose only reader is a future misunderstanding.
+PUBLISHING_SCANNERS = {
+    "hma_early_trend": "S1_HMA_EARLY_TREND_V1",
+    "accumulation": "S2_VOLUME_ACCUMULATION_V1",
+}
+
+
+def publish_report_candidates(report) -> int:
+    """Write one candidate file per publishing scanner. Returns rows written.
+
+    Only scanners that SUCCEEDED publish. A failed scanner's signal list
+    is a partial answer -- it stopped somewhere -- and a partial answer
+    written into the hand-off file is indistinguishable from a complete
+    one once the run is over.
+    """
+    from scanners.publish import candidates as candidate_publisher
+
+    written = 0
+    for outcome in getattr(report, "outcomes", None) or []:
+        name = getattr(outcome, "scanner_name", None)
+        strategy_id = PUBLISHING_SCANNERS.get(str(name))
+        if not strategy_id:
+            continue
+        if getattr(outcome, "failed", False):
+            logger.info("not publishing %s candidates: the scanner failed", name)
+            continue
+        signals = list(getattr(outcome, "signals", None) or [])
+        if not signals:
+            continue
+        rows = candidate_publisher.publish(
+            signals, strategy_id=strategy_id,
+            trading_day=getattr(report, "trading_day", None),
+            session=getattr(report, "session", None),
+            run_id=getattr(report, "run_id", None))
+        written += len(rows)
+    return written
 
 
 def main(argv=None) -> int:
@@ -711,6 +765,7 @@ def main(argv=None) -> int:
                 universe_size=0,
                 run_id=run_context.new_run_id(day, args.profile),
                 profile=args.profile,
+        session=args.session,
                 terminal_status=run_context.SKIPPED_MARKET_CLOSED,
                 skipped_reason="US market closed",
             )
@@ -764,6 +819,16 @@ def main(argv=None) -> int:
         monitor.notify_run(report)
     except Exception:  # noqa: BLE001 - a monitor must never fail a scan
         logger.warning("scanner monitor could not be attempted", exc_info=True)
+
+    # Publication is a record of what was found, not a decision about it.
+    # Candidate Decision stays disabled; see scanners/publish/candidates.
+    # Guarded separately from the monitor so a Slack outage and a failed
+    # write cannot mask each other, and after the exit code either way.
+    try:
+        publish_report_candidates(report)
+    except Exception:  # noqa: BLE001 - a scan must survive a failed write
+        logger.warning("candidate publication could not be attempted",
+                       exc_info=True)
     return exit_code
 
 

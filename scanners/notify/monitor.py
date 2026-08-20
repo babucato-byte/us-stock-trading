@@ -84,6 +84,36 @@ def is_all_session(scanner_name: str) -> bool:
     return str(scanner_name) in ALL_SESSION_SCANNERS
 
 
+#: Set only in the KIS trading release's environment -- the scanner
+#: runtime has no such key, because it deploys from a working checkout
+#: rather than an immutable release. That difference is what identifies
+#: the two runtimes to each other without anyone hardcoding a path.
+TRADING_RUNTIME_MARKER = "DEPLOYED_COMMIT"
+
+
+def scanner_notifications_owned_here(env=None) -> bool:
+    """Whether THIS runtime is the one that announces scanner results.
+
+    The two runtimes share a repository and a webhook, so the same
+    `scanners/runner.py` exists in both. Only one of them actually runs
+    scanners: the scanner runtime's cron invokes `run_scanners.py`, and
+    the trading release's cron never does. The wiring in the release is
+    therefore unreachable rather than wrong.
+
+    "Unreachable today" is not a property anyone can see, though, and the
+    day someone adds a scanner cron to the release every scan would be
+    announced twice by two runtimes that each believed they owned it.
+    Duplicated alerts are how a channel stops being trusted, so the rule
+    is stated here and enforced rather than left to the crontab.
+
+    Live order events are NOT gated by this -- announcing them is the
+    trading runtime's job, and gating both halves on the same flag would
+    silence exactly the runtime that owns the half that matters most.
+    """
+    mapping = _process_env() if env is None else env
+    return not str(mapping.get(TRADING_RUNTIME_MARKER) or "").strip()
+
+
 def _process_env():
     """`os.environ` AFTER the `.env` file has been loaded.
 
@@ -135,6 +165,23 @@ def _send(message: str, *, env=None) -> bool:
         return False
 
 
+def _session_execution_status(session):
+    """REFERENCE_VERIFIED / SCAN_ONLY for one of the four clock sessions.
+
+    Returns None for anything else -- a profile name, "RUN", a legacy
+    report with no session -- because claiming a verification status for a
+    label that is not a session would be inventing one.
+    """
+    try:
+        from scanners.base import scan_session
+
+        if scan_session.normalize(session) is None:
+            return None
+        return scan_session.execution_status(session)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _fmt(value, digits=2, dash="-"):
     if value is None:
         return dash
@@ -181,6 +228,14 @@ def format_scan(*, scanner_name, session, trading_day, scanned, candidates,
         lines.append(f"Mode: {live_status}")
     if is_all_session(scanner_name):
         lines.append(f"All-session coverage: {' · '.join(ALL_SESSIONS)}")
+    # Whether THIS session can place a live order, printed rather than
+    # left to be inferred from the fact that a scan happened. A premarket
+    # candidate list looks identical to a regular-hours one, and the
+    # difference -- that no verified order route exists for it -- is
+    # exactly what a reader would otherwise assume away.
+    status_line = _session_execution_status(session)
+    if status_line:
+        lines.append(f"Session execution: {status_line}")
 
     if ranked:
         best = ranked[0]
@@ -405,11 +460,23 @@ def notify_run(report, *, env=None) -> int:
     """
     sent = 0
     try:
+        if not scanner_notifications_owned_here(env):
+            logger.info("scanner monitor: scan results belong to the scanner "
+                        "runtime; this is the trading release, not sending")
+            return 0
         from config import scanner_live_mode
 
         modes = getattr(scanner_live_mode, "SCANNER_LIVE_MODE", {}) or {}
         trading_day = getattr(report, "trading_day", None)
-        session = getattr(report, "profile", None) or "RUN"
+        # The run's real clock session, not its profile name. A profile is
+        # a scanner GROUP ("daily", "open"); reporting it under "Session:"
+        # meant the line said DAILY where the reader needed REGULAR, and
+        # made two runs of the same profile in different sessions
+        # indistinguishable. Falls back to the profile only when a caller
+        # predates the session field, so an old report still says
+        # something rather than nothing.
+        session = (getattr(report, "session", None)
+                   or getattr(report, "profile", None) or "RUN")
         for outcome in getattr(report, "outcomes", None) or []:
             name = getattr(outcome, "scanner_name", "?")
             signals = list(getattr(outcome, "signals", None) or [])

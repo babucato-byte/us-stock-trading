@@ -532,3 +532,71 @@ class TestTheWebhookIsFoundUnderCron:
         monkeypatch.setattr(builtins, "__import__", refuse)
         monkeypatch.setenv(monitor.WEBHOOK_ENV, "https://hooks.slack.test/x")
         assert monitor.webhook_configured() is True
+
+
+class TestOwnershipIsEnforcedNotAssumed:
+    """§2: one runtime announces scans, the other announces orders.
+
+    Both runtimes deploy from the same repository, so `scanners/runner.py`
+    exists in both and both could reach the same webhook. Only the
+    scanner runtime's cron actually invokes it today -- but "nobody calls
+    it yet" is not a guarantee anyone can see, and the day a scanner cron
+    is added to the release, every scan is announced twice.
+    """
+
+    def capture(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(monitor, "_send",
+                            lambda msg, env=None: seen.append(msg) or True)
+        return seen
+
+    class Outcome:
+        def __init__(self, name):
+            self.scanner_name, self.signals = name, []
+            self.symbols_seen, self.failed, self.failure_reason = 10, False, None
+
+    class Report:
+        def __init__(self, outcomes):
+            self.outcomes, self.trading_day, self.profile = outcomes, "2026-08-20", "daily"
+
+    def test_the_scanner_runtime_owns_scan_messages(self):
+        """No DEPLOYED_COMMIT -- a working checkout, so it announces."""
+        assert monitor.scanner_notifications_owned_here({}) is True
+
+    def test_the_trading_release_does_not_announce_scans(self):
+        assert monitor.scanner_notifications_owned_here(
+            {monitor.TRADING_RUNTIME_MARKER: "bee3ee88f53f"}) is False
+
+    def test_a_blank_marker_is_not_a_release(self):
+        assert monitor.scanner_notifications_owned_here(
+            {monitor.TRADING_RUNTIME_MARKER: "   "}) is True
+
+    def test_notify_run_sends_nothing_from_the_trading_release(self, monkeypatch):
+        """The dead wiring is inert by rule, not merely by crontab."""
+        sent = self.capture(monkeypatch)
+        count = monitor.notify_run(
+            self.Report([self.Outcome("hma_early_trend")]),
+            env={monitor.TRADING_RUNTIME_MARKER: "bee3ee88f53f",
+                 monitor.WEBHOOK_ENV: "https://hooks.slack.test/x"})
+        assert count == 0
+        assert sent == [], "the release must not announce a scan"
+
+    def test_notify_run_sends_from_the_scanner_runtime(self, monkeypatch):
+        sent = self.capture(monkeypatch)
+        count = monitor.notify_run(
+            self.Report([self.Outcome("hma_early_trend")]),
+            env={monitor.WEBHOOK_ENV: "https://hooks.slack.test/x"})
+        assert count == 1
+        assert "[S1 HMA]" in sent[0]
+
+    @pytest.mark.skipif(not KIS_LIVE_PRESENT,
+                        reason="no live lifecycle in the scanner runtime")
+    def test_order_events_are_not_gated_by_scanner_ownership(self, monkeypatch):
+        """Gating both halves on one flag would silence the trading
+        runtime for the messages it is the only one able to send."""
+        sent = self.capture(monkeypatch)
+        monkeypatch.setenv(monitor.TRADING_RUNTIME_MARKER, "bee3ee88f53f")
+        _ln().notify("FILL_COMPLETED", {"symbol": "TX"},
+                     send_fn=lambda m: True, track_health=False)
+        assert any("LIVE FILL" in m for m in sent), \
+            "the release must still announce its own fills"
