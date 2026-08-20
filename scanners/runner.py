@@ -754,6 +754,16 @@ def main(argv=None) -> int:
         notify.notify_run(report)
     except Exception:  # noqa: BLE001 - see scanners/notify/slack.py
         logger.warning("scanner notification could not be attempted", exc_info=True)
+    # The monitor channel is separate from the alert channel and reports
+    # EVERY run, quiet ones included -- see scanners/notify/monitor.py for
+    # why the two cannot share a policy. Same placement and same guard: it
+    # runs after the exit code is decided and cannot change it.
+    try:
+        from scanners.notify import monitor
+
+        monitor.notify_run(report)
+    except Exception:  # noqa: BLE001 - a monitor must never fail a scan
+        logger.warning("scanner monitor could not be attempted", exc_info=True)
     return exit_code
 
 

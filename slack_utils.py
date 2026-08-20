@@ -30,6 +30,22 @@ def _send(webhook_url, message):
     return False
 
 
+def send_to_webhook(webhook_url, message):
+    """Public name for the one outbound call.
+
+    Callers that resolve their own webhook -- the scanner monitor reads a
+    caller-supplied env mapping so it stays testable -- route through this
+    rather than opening a second `requests.post`. One transport means one
+    place where the timeout and the status handling live; a private copy
+    elsewhere would drift from this one silently.
+
+    It resolves no webhook of its own, deliberately. A fallback here would
+    let a caller with an unset URL reroute into whichever channel this
+    module happened to default to.
+    """
+    return _send(webhook_url, message)
+
+
 def send_slack_message(message):
     return _send(SLACK_WEBHOOK_URL, message)
 

@@ -552,11 +552,17 @@ class TestActivityFunnel:
     def test_daily_populates_the_ranking_and_open_consumes_it(self):
         prov = self.wide_provider()
         symbols = [f"S{i}" for i in range(8)]
+        # `runner` reads the pool without passing `today`, so the ranking
+        # has to be recent by the real clock for the open profile to see
+        # it. A fixed DAY makes this test pass until it is more than
+        # DEFAULT_MAX_AGE_DAYS old and then fail forever; the day it is
+        # written for is not what the test is about.
+        recent = date.today().isoformat()
         runner.run_scanners(scanners=runner.PROFILES["daily"], provider=prov,
-                            symbols=symbols, trading_day=DAY, store=False,
+                            symbols=symbols, trading_day=recent, store=False,
                             profile="daily")
         report = runner.run_scanners(scanners=runner.PROFILES["open"], provider=prov,
-                                     trading_day=DAY, store=False, profile="open",
+                                     trading_day=recent, store=False, profile="open",
                                      active_pool_size=3)
         assert report.universe_type == runner.UNIVERSE_ACTIVE
         assert report.universe_size == 3
@@ -567,7 +573,13 @@ class TestActivityFunnel:
         runner.run_scanners(scanners=runner.PROFILES["daily"], provider=prov,
                             symbols=symbols, trading_day=DAY, store=False,
                             profile="daily")
-        pool = act.ActivityStore.load("static").active_symbols(limit=3)
+        # Judged AS OF the day the ranking is for. `active_symbols` takes
+        # `today` precisely so a caller can ask that question, and using it
+        # keeps this test about ORDERING rather than about how long ago
+        # DAY was: without it the ranking ages past DEFAULT_MAX_AGE_DAYS
+        # and the assertion starts failing on a calendar, not on a change.
+        pool = act.ActivityStore.load("static").active_symbols(
+            limit=3, today=date.fromisoformat(DAY))
         assert pool == ["S7", "S6", "S5"], pool
 
     def test_a_stale_ranking_is_not_used(self):
