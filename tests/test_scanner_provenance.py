@@ -587,8 +587,16 @@ class TestHorizonStatus:
     def test_everything_measured_rolls_up_to_complete(self):
         closes = np.array([100.0 + index * 0.1 for index in range(200)])
         intraday = fx.intraday_frame(closes, day=date.fromisoformat(DAY))
-        daily = fx.forward_daily(DAY, sessions=5, start_price=100.0,
-                                 highs=[105] * 5, lows=[98] * 5, closes=[103] * 5)
+        # Enough sessions for the LONGEST horizon, read from the tracker
+        # rather than written out. The claim under test is "every horizon
+        # measured rolls up to complete"; a hardcoded 5 quietly changed
+        # that to "the horizons that existed when this was written", and
+        # adding a 10-session horizon turned a passing test into a
+        # failing one without anything being wrong.
+        sessions = max(performance_tracker.DAY_HORIZONS)
+        daily = fx.forward_daily(DAY, sessions=sessions, start_price=100.0,
+                                 highs=[105] * sessions, lows=[98] * sessions,
+                                 closes=[103] * sessions)
         record = performance_tracker.compute_performance(
             self.signal(), daily=daily, intraday=intraday,
             now=datetime.now(timezone.utc))

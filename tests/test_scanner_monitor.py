@@ -363,7 +363,17 @@ def _ln():
     return live_notifications
 
 
-KIS_LIVE_PRESENT = importlib.util.find_spec("operations.live_notifications") is not None
+def _kis_live_present():
+    """`find_spec` RAISES when the parent package is absent rather than
+    returning None -- and absent is exactly the case in the scanner
+    runtime, so the unguarded call fails collection for the whole file."""
+    try:
+        return importlib.util.find_spec("operations.live_notifications") is not None
+    except (ImportError, ModuleNotFoundError, ValueError):
+        return False
+
+
+KIS_LIVE_PRESENT = _kis_live_present()
 
 
 @pytest.mark.skipif(not KIS_LIVE_PRESENT,
@@ -522,3 +532,200 @@ class TestTheWebhookIsFoundUnderCron:
         monkeypatch.setattr(builtins, "__import__", refuse)
         monkeypatch.setenv(monitor.WEBHOOK_ENV, "https://hooks.slack.test/x")
         assert monitor.webhook_configured() is True
+
+
+class TestOwnershipIsEnforcedNotAssumed:
+    """§2: one runtime announces scans, the other announces orders.
+
+    Both runtimes deploy from the same repository, so `scanners/runner.py`
+    exists in both and both could reach the same webhook. Only the
+    scanner runtime's cron actually invokes it today -- but "nobody calls
+    it yet" is not a guarantee anyone can see, and the day a scanner cron
+    is added to the release, every scan is announced twice.
+    """
+
+    def capture(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(monitor, "_send",
+                            lambda msg, env=None: seen.append(msg) or True)
+        return seen
+
+    class Outcome:
+        def __init__(self, name):
+            self.scanner_name, self.signals = name, []
+            self.symbols_seen, self.failed, self.failure_reason = 10, False, None
+
+    class Report:
+        def __init__(self, outcomes):
+            self.outcomes, self.trading_day, self.profile = outcomes, "2026-08-20", "daily"
+
+    def test_the_scanner_runtime_owns_scan_messages(self):
+        """No DEPLOYED_COMMIT -- a working checkout, so it announces."""
+        assert monitor.scanner_notifications_owned_here({}) is True
+
+    def test_the_trading_release_does_not_announce_scans(self):
+        assert monitor.scanner_notifications_owned_here(
+            {monitor.TRADING_RUNTIME_MARKER: "bee3ee88f53f"}) is False
+
+    def test_a_blank_marker_is_not_a_release(self):
+        assert monitor.scanner_notifications_owned_here(
+            {monitor.TRADING_RUNTIME_MARKER: "   "}) is True
+
+    def test_notify_run_sends_nothing_from_the_trading_release(self, monkeypatch):
+        """The dead wiring is inert by rule, not merely by crontab."""
+        sent = self.capture(monkeypatch)
+        count = monitor.notify_run(
+            self.Report([self.Outcome("hma_early_trend")]),
+            env={monitor.TRADING_RUNTIME_MARKER: "bee3ee88f53f",
+                 monitor.WEBHOOK_ENV: "https://hooks.slack.test/x"})
+        assert count == 0
+        assert sent == [], "the release must not announce a scan"
+
+    def test_notify_run_sends_from_the_scanner_runtime(self, monkeypatch):
+        sent = self.capture(monkeypatch)
+        count = monitor.notify_run(
+            self.Report([self.Outcome("hma_early_trend")]),
+            env={monitor.WEBHOOK_ENV: "https://hooks.slack.test/x"})
+        assert count == 1
+        assert "[S1 HMA]" in sent[0]
+
+    @pytest.mark.skipif(not KIS_LIVE_PRESENT,
+                        reason="no live lifecycle in the scanner runtime")
+    def test_order_events_are_not_gated_by_scanner_ownership(self, monkeypatch):
+        """Gating both halves on one flag would silence the trading
+        runtime for the messages it is the only one able to send."""
+        sent = self.capture(monkeypatch)
+        monkeypatch.setenv(monitor.TRADING_RUNTIME_MARKER, "bee3ee88f53f")
+        _ln().notify("FILL_COMPLETED", {"symbol": "TX"},
+                     send_fn=lambda m: True, track_health=False)
+        assert any("LIVE FILL" in m for m in sent), \
+            "the release must still announce its own fills"
+
+
+class TestOneSessionVocabulary:
+    """The channel and the code must mean the same thing by "session".
+
+    The coverage line used to name OVERNIGHT and DAYTIME separately --
+    two names `scan_session.normalize()` rejects, because the venue
+    treats that window as a single bucket. So a message advertised
+    coverage of sessions no scan could ever be labelled with, and a
+    reader comparing the line against a Session: field would find names
+    that never appear there.
+    """
+
+    def test_the_coverage_line_uses_the_real_session_names(self):
+        from scanners.base import scan_session
+
+        assert monitor.ALL_SESSIONS == tuple(scan_session.SESSIONS)
+
+    def test_every_advertised_session_is_one_a_scan_can_carry(self):
+        from scanners.base import scan_session
+
+        for name in monitor.ALL_SESSIONS:
+            assert scan_session.normalize(name) == name, name
+
+    def test_the_split_overnight_names_are_gone(self):
+        assert "OVERNIGHT" not in monitor.ALL_SESSIONS
+        assert "DAYTIME" not in monitor.ALL_SESSIONS
+        assert "OVERNIGHT_DAYTIME" in monitor.ALL_SESSIONS
+
+    def test_a_scan_only_session_says_so_in_the_message(self):
+        """§5: PREMARKET is scannable and must not read as live-capable."""
+        text = monitor.format_scan(
+            scanner_name="accumulation", session="PREMARKET", trading_day="d",
+            scanned=10, candidates=1, status="SUCCESS")
+        assert "Session execution: SCAN_ONLY / LIVE UNVERIFIED" in text
+
+    def test_a_verified_session_says_that_instead(self):
+        text = monitor.format_scan(
+            scanner_name="accumulation", session="REGULAR", trading_day="d",
+            scanned=10, candidates=1, status="SUCCESS")
+        assert "Session execution: REFERENCE_VERIFIED" in text
+
+    def test_a_profile_name_claims_no_execution_status(self):
+        """"DAILY" is a scanner group, not a session. Claiming a
+        verification status for it would be inventing one."""
+        text = monitor.format_scan(
+            scanner_name="accumulation", session="DAILY", trading_day="d",
+            scanned=10, candidates=0, status="SUCCESS")
+        assert "Session execution:" not in text
+
+    def test_the_run_reports_its_clock_session_not_its_profile(self, monkeypatch):
+        sent = []
+        monkeypatch.setattr(monitor, "_send",
+                            lambda msg, env=None: sent.append(msg) or True)
+
+        class Outcome:
+            scanner_name, failed, failure_reason = "accumulation", False, None
+            signals, symbols_seen = [], 100
+
+        class Report:
+            outcomes = [Outcome()]
+            trading_day, profile, session = "d", "daily", "REGULAR"
+
+        monitor.notify_run(Report(), env={monitor.WEBHOOK_ENV: "https://x.test"})
+        assert "Session: REGULAR" in sent[0]
+        assert "Session: DAILY" not in sent[0]
+
+
+class TestAScannerThatVanishedIsNotSilent:
+    """The worst case §8 guards against, found by breaking a real config.
+
+    A scanner that fails to CONSTRUCT never reaches `report.outcomes`, so
+    the per-outcome loop cannot see it. Before this, a scanner with an
+    unparseable config produced no message at all -- not "0 candidates",
+    not "FAILED", nothing. Five messages arrived where six were expected
+    and the reader had to notice an absence to catch it, which is the one
+    thing a monitor exists to stop being necessary.
+    """
+
+    def capture(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(monitor, "_send",
+                            lambda msg, env=None: seen.append(msg) or True)
+        return seen
+
+    class Outcome:
+        def __init__(self, name):
+            self.scanner_name, self.signals = name, []
+            self.symbols_seen, self.failed, self.failure_reason = 5, False, None
+
+    class Report:
+        def __init__(self, outcomes, construction_failures=None):
+            self.outcomes = outcomes
+            self.construction_failures = construction_failures or {}
+            self.trading_day, self.profile, self.session = "d", "daily", "REGULAR"
+
+    def test_a_scanner_that_could_not_be_built_is_reported(self, monkeypatch):
+        sent = self.capture(monkeypatch)
+        count = monitor.notify_run(
+            self.Report([self.Outcome("accumulation")],
+                        {"breakout_ready": "invalid config json"}),
+            env={monitor.WEBHOOK_ENV: "https://x.test"})
+        assert count == 2, "the built one AND the broken one"
+        broken = [m for m in sent if "S3 BREAKOUT" in m]
+        assert broken, "the scanner that vanished must still get a line"
+        assert "FAILED_NOT_BUILT" in broken[0]
+        assert "invalid config json" in broken[0]
+
+    def test_it_is_not_reported_as_a_quiet_day(self, monkeypatch):
+        """`Candidates: 0` would say the scanner ran and found nothing.
+        It did not run."""
+        sent = self.capture(monkeypatch)
+        monitor.notify_run(self.Report([], {"orb": "boom"}),
+                           env={monitor.WEBHOOK_ENV: "https://x.test"})
+        assert "Candidates: 0" not in sent[0]
+        assert "Candidates: -" in sent[0]
+        assert "Scanner: SUCCESS" not in sent[0]
+
+    def test_every_scanner_in_the_run_gets_exactly_one_line(self, monkeypatch):
+        sent = self.capture(monkeypatch)
+        monitor.notify_run(
+            self.Report([self.Outcome("hma_early_trend"),
+                         self.Outcome("accumulation")],
+                        {"orb": "a", "gap_pullback": "b"}),
+            env={monitor.WEBHOOK_ENV: "https://x.test"})
+        tags = ["S1 HMA", "S2 VOLUME", "S6 ORB", "S5 GAP"]
+        for tag in tags:
+            assert sum(f"[{tag}]" in m for m in sent) == 1, tag
+        assert len(sent) == 4

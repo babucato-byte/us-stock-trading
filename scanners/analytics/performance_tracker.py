@@ -70,13 +70,32 @@ logger = logging.getLogger(__name__)
 INTRADAY_HORIZONS = (("return_30m", 30), ("return_1h", 60), ("return_2h", 120))
 
 #: Multi-day horizons, in trading sessions (sections 12 and 13).
-DAY_HORIZONS = (1, 3, 5)
+#:
+#: 2 and 10 were added for the unbought-candidate study: the question
+#: "would this have worked" is not answerable from 1/3/5 alone. 2d
+#: separates a one-day pop that gave back from one that held, and 10d is
+#: the first horizon longer than S1's 10-session time exit, so a
+#: candidate's fate can be compared against the rule that would have
+#: closed it.
+#:
+#: Adding a horizon is additive by construction. Rows already written
+#: have no return_2d, and `common.numbers()` EXCLUDES nulls rather than
+#: reading them as zero, so historical averages are unchanged rather
+#: than silently dragged toward zero by the days that predate the field.
+DAY_HORIZONS = (1, 2, 3, 5, 10)
 
 #: How many calendar days of daily bars to pull when following a signal
-#: forward. 5 trading sessions can span a long weekend plus a holiday,
-#: so this is deliberately generous -- an under-fetch would silently
-#: report a 5-day return as unavailable.
-FORWARD_LOOKBACK_DAYS = 30
+#: forward. The bars are fetched relative to NOW, so this has to cover
+#: the oldest signal still being followed plus its longest horizon.
+#:
+#: Raised from 30 with the 10-session horizon: 10 sessions is about 14
+#: calendar days, so a signal only reaches its 10d horizon a fortnight
+#: after it fired, and a run that was missed for a few days is asking
+#: about a signal older still. At 30 that window was tight enough that a
+#: skipped run could push a signal out of reach -- and the failure mode
+#: is silent, because an under-fetch is indistinguishable from a horizon
+#: that has not elapsed. Both report "not available".
+FORWARD_LOOKBACK_DAYS = 45
 
 #: Calendar days after which minute bars are no longer served. Yahoo
 #: Finance keeps roughly 8; 7 is used so a horizon is called EXPIRED

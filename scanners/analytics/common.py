@@ -28,11 +28,12 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 #: The return horizons every report summarises (section 15/16).
 RETURN_FIELDS = ("return_30m", "return_1h", "return_2h", "return_close",
-                 "return_1d", "return_3d", "return_5d")
+                 "return_1d", "return_2d", "return_3d", "return_5d",
+                 "return_10d")
 
 #: Excursion fields (section 13).
-MFE_FIELDS = ("mfe_1d", "mfe_3d", "mfe_5d")
-MAE_FIELDS = ("mae_1d", "mae_3d", "mae_5d")
+MFE_FIELDS = ("mfe_1d", "mfe_2d", "mfe_3d", "mfe_5d", "mfe_10d")
+MAE_FIELDS = ("mae_1d", "mae_2d", "mae_3d", "mae_5d", "mae_10d")
 
 
 def numbers(rows: Iterable[Dict[str, Any]], field: str) -> List[float]:
