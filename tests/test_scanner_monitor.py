@@ -210,3 +210,82 @@ class TestItDoesNotDisturbTheAlertChannel:
                 for name in names:
                     assert "notify.slack" not in str(name)
                     assert "slack_utils" not in str(name)
+
+
+class TestRunnerWiring:
+    """Every run is reported, including the quiet ones."""
+
+    class Signal:
+        def __init__(self, symbol, score, price=None, metrics=None):
+            self.symbol, self.scanner_score = symbol, score
+            self.signal_price, self.metrics = price, metrics or {}
+
+    class Outcome:
+        def __init__(self, name, signals=(), seen=100, failed=False, reason=None):
+            self.scanner_name, self.signals = name, list(signals)
+            self.symbols_seen, self.failed, self.failure_reason = seen, failed, reason
+
+    class Report:
+        def __init__(self, outcomes, profile="daily", trading_day="2026-08-21"):
+            self.outcomes, self.profile, self.trading_day = outcomes, profile, trading_day
+
+    def capture(self, monkeypatch):
+        sent = []
+        monkeypatch.setattr(monitor, "_send", lambda msg, env=None: sent.append(msg) or True)
+        return sent
+
+    def test_one_message_per_scanner_including_empty_ones(self, monkeypatch):
+        sent = self.capture(monkeypatch)
+        report = self.Report([
+            self.Outcome("accumulation", [self.Signal("ABC", 90.0)]),
+            self.Outcome("orb", []),
+        ])
+        assert monitor.notify_run(report) == 2
+        assert "S2 VOLUME" in sent[0] and "Candidates: 1" in sent[0]
+        assert "S6 ORB" in sent[1] and "Candidates: 0" in sent[1]
+
+    def test_a_failed_scanner_says_so(self, monkeypatch):
+        sent = self.capture(monkeypatch)
+        report = self.Report([self.Outcome("orb", [], failed=True, reason="PROVIDER")])
+        monitor.notify_run(report)
+        assert "FAILED: PROVIDER" in sent[0]
+
+    def test_candidates_are_ranked_by_score(self, monkeypatch):
+        sent = self.capture(monkeypatch)
+        signals = [self.Signal("LOW", 10.0), self.Signal("HIGH", 99.0),
+                   self.Signal("MID", 50.0)]
+        monitor.notify_run(self.Report([self.Outcome("accumulation", signals)]))
+        body = sent[0]
+        assert body.index("HIGH") < body.index("MID") < body.index("LOW")
+
+    def test_scanner_metrics_reach_the_top_candidate_block(self, monkeypatch):
+        sent = self.capture(monkeypatch)
+        signal = self.Signal("ABC", 90.0, price=12.5,
+                             metrics={"volume_multiple": 3.4, "vwap": 12.1})
+        monitor.notify_run(self.Report([self.Outcome("accumulation", [signal])]))
+        assert "volume multiple: 3.40" in sent[0]
+        assert "VWAP: 12.10" in sent[0]
+
+    def test_the_live_mode_is_reported_per_scanner(self, monkeypatch):
+        sent = self.capture(monkeypatch)
+        monitor.notify_run(self.Report([
+            self.Outcome("hma_early_trend", []), self.Outcome("orb", [])]))
+        assert "Live: LIMITED_LIVE" in sent[0], "S1 is the live strategy"
+        assert "Live: DISCOVERY_ONLY" in sent[1], "S6 is discovery only"
+
+    def test_a_broken_report_cannot_fail_a_scan(self, monkeypatch):
+        self.capture(monkeypatch)
+        assert monitor.notify_run(object()) == 0
+        assert monitor.notify_run(None) == 0
+
+    def test_the_runner_calls_it_after_the_exit_code_is_decided(self):
+        source = (REPO_ROOT / "scanners" / "runner.py").read_text()
+        exit_code = source.index("exit_code = 0 if report.status")
+        call = source.index("monitor.notify_run(report)")
+        returned = source.index("return exit_code")
+        assert exit_code < call < returned
+
+    def test_the_runner_guards_the_import(self):
+        source = (REPO_ROOT / "scanners" / "runner.py").read_text()
+        block = source[source.index("from scanners.notify import monitor"):][:300]
+        assert "except Exception" in block

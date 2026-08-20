@@ -286,6 +286,52 @@ def format_daily_summary(*, trading_day, rows: Iterable[Dict[str, Any]],
     return "\n".join(lines)
 
 
+def notify_run(report, *, env=None) -> int:
+    """One monitor message per scanner in `report`. Returns how many sent.
+
+    Unlike the alert channel this reports EVERY run, including the quiet
+    ones: "S2 scanned 5,960 and found nothing" is the answer to "why did
+    it not trade today", and it is only an answer if it was said.
+
+    A scanner that FAILED is reported with its own status, so a broken
+    scanner cannot hide behind a zero-candidate day.
+    """
+    sent = 0
+    try:
+        from config import scanner_live_mode
+
+        modes = getattr(scanner_live_mode, "SCANNER_LIVE_MODE", {}) or {}
+        trading_day = getattr(report, "trading_day", None)
+        session = getattr(report, "profile", None) or "RUN"
+        for outcome in getattr(report, "outcomes", None) or []:
+            name = getattr(outcome, "scanner_name", "?")
+            signals = list(getattr(outcome, "signals", None) or [])
+            ranked = sorted(
+                signals,
+                key=lambda sig: (-(getattr(sig, "scanner_score", None) or 0.0),
+                                 getattr(sig, "symbol", "")))
+            top = [{
+                "symbol": getattr(sig, "symbol", "?"),
+                "score": getattr(sig, "scanner_score", None),
+                "price": getattr(sig, "signal_price", None),
+                "volume_multiple": (getattr(sig, "metrics", None) or {}).get(
+                    "volume_multiple"),
+                "vwap": (getattr(sig, "metrics", None) or {}).get("vwap"),
+            } for sig in ranked[:TOP_N]]
+            status = "FAILED" if getattr(outcome, "failed", False) else "SUCCESS"
+            if getattr(outcome, "failure_reason", None):
+                status = f"FAILED: {outcome.failure_reason}"
+            if notify_scan(scanner_name=name, session=str(session).upper(),
+                           trading_day=trading_day,
+                           scanned=getattr(outcome, "symbols_seen", None),
+                           candidates=len(signals), status=status, top=top,
+                           live_status=modes.get(name, "DISCOVERY_ONLY"), env=env):
+                sent += 1
+    except Exception:  # noqa: BLE001 - a monitor must never fail a scan
+        logger.warning("scanner monitor: run report failed", exc_info=True)
+    return sent
+
+
 def notify_daily_summary(*, trading_day, rows, minimum_trades_for_winner=1,
                          env=None) -> bool:
     try:
