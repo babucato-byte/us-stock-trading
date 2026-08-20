@@ -666,3 +666,66 @@ class TestOneSessionVocabulary:
         monitor.notify_run(Report(), env={monitor.WEBHOOK_ENV: "https://x.test"})
         assert "Session: REGULAR" in sent[0]
         assert "Session: DAILY" not in sent[0]
+
+
+class TestAScannerThatVanishedIsNotSilent:
+    """The worst case §8 guards against, found by breaking a real config.
+
+    A scanner that fails to CONSTRUCT never reaches `report.outcomes`, so
+    the per-outcome loop cannot see it. Before this, a scanner with an
+    unparseable config produced no message at all -- not "0 candidates",
+    not "FAILED", nothing. Five messages arrived where six were expected
+    and the reader had to notice an absence to catch it, which is the one
+    thing a monitor exists to stop being necessary.
+    """
+
+    def capture(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(monitor, "_send",
+                            lambda msg, env=None: seen.append(msg) or True)
+        return seen
+
+    class Outcome:
+        def __init__(self, name):
+            self.scanner_name, self.signals = name, []
+            self.symbols_seen, self.failed, self.failure_reason = 5, False, None
+
+    class Report:
+        def __init__(self, outcomes, construction_failures=None):
+            self.outcomes = outcomes
+            self.construction_failures = construction_failures or {}
+            self.trading_day, self.profile, self.session = "d", "daily", "REGULAR"
+
+    def test_a_scanner_that_could_not_be_built_is_reported(self, monkeypatch):
+        sent = self.capture(monkeypatch)
+        count = monitor.notify_run(
+            self.Report([self.Outcome("accumulation")],
+                        {"breakout_ready": "invalid config json"}),
+            env={monitor.WEBHOOK_ENV: "https://x.test"})
+        assert count == 2, "the built one AND the broken one"
+        broken = [m for m in sent if "S3 BREAKOUT" in m]
+        assert broken, "the scanner that vanished must still get a line"
+        assert "FAILED_NOT_BUILT" in broken[0]
+        assert "invalid config json" in broken[0]
+
+    def test_it_is_not_reported_as_a_quiet_day(self, monkeypatch):
+        """`Candidates: 0` would say the scanner ran and found nothing.
+        It did not run."""
+        sent = self.capture(monkeypatch)
+        monitor.notify_run(self.Report([], {"orb": "boom"}),
+                           env={monitor.WEBHOOK_ENV: "https://x.test"})
+        assert "Candidates: 0" not in sent[0]
+        assert "Candidates: -" in sent[0]
+        assert "Scanner: SUCCESS" not in sent[0]
+
+    def test_every_scanner_in_the_run_gets_exactly_one_line(self, monkeypatch):
+        sent = self.capture(monkeypatch)
+        monitor.notify_run(
+            self.Report([self.Outcome("hma_early_trend"),
+                         self.Outcome("accumulation")],
+                        {"orb": "a", "gap_pullback": "b"}),
+            env={monitor.WEBHOOK_ENV: "https://x.test"})
+        tags = ["S1 HMA", "S2 VOLUME", "S6 ORB", "S5 GAP"]
+        for tag in tags:
+            assert sum(f"[{tag}]" in m for m in sent) == 1, tag
+        assert len(sent) == 4

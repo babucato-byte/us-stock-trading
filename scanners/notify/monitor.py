@@ -520,6 +520,22 @@ def notify_run(report, *, env=None) -> int:
                            live_status=modes.get(name, MODE_DISCOVERY_ONLY),
                            env=env):
                 sent += 1
+
+        # A scanner that could not be BUILT never reaches `outcomes`, so
+        # the loop above cannot see it and the channel said nothing at
+        # all about it. That is the worst version of the failure this
+        # module exists to make visible: a broken scanner does not report
+        # zero candidates, it reports nothing, and the reader has to
+        # notice an ABSENCE among five other messages to catch it.
+        for name, reason in (getattr(report, "construction_failures", None)
+                             or {}).items():
+            if notify_scan(scanner_name=name, session=str(session).upper(),
+                           trading_day=trading_day, scanned=None,
+                           candidates=None,
+                           status=f"FAILED_NOT_BUILT: {reason}",
+                           live_status=modes.get(name, MODE_DISCOVERY_ONLY),
+                           env=env):
+                sent += 1
     except Exception:  # noqa: BLE001 - a monitor must never fail a scan
         logger.warning("scanner monitor: run report failed", exc_info=True)
     return sent
