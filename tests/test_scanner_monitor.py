@@ -11,6 +11,7 @@ the comparison, "best scanner today" from one candidate is arithmetic
 dressed as a finding, so an unmeasured comparison says INSUFFICIENT_SAMPLE.
 """
 
+import importlib.util
 import sys
 from pathlib import Path
 
@@ -348,6 +349,24 @@ class TestRunnerWiring:
         assert "except Exception" in block
 
 
+#: The scanner runtime and the KIS live runtime are separate deployments:
+#: the scanners run from a working checkout, the live trading from an
+#: immutable release. The monitor MODULE belongs to both, but the live
+#: lifecycle it mirrors only exists in the release, so these tests skip
+#: where there is no lifecycle to mirror rather than failing on it.
+#: Scoped to this class, NOT the module. A module-level importorskip
+#: would take the scanner-message tests with it, and those are exactly
+#: the ones that must run in the scanner runtime.
+def _ln():
+    from operations import live_notifications
+    return live_notifications
+
+
+KIS_LIVE_PRESENT = importlib.util.find_spec("operations.live_notifications") is not None
+
+
+@pytest.mark.skipif(not KIS_LIVE_PRESENT,
+                    reason="KIS live lifecycle is not part of the scanner runtime")
 class TestOperationalEventsReachTheSameChannel:
     """§6: the live lifecycle is mirrored into #scanner-monitor.
 
@@ -378,43 +397,33 @@ class TestOperationalEventsReachTheSameChannel:
         ("DAILY_SUMMARY", "DAILY SUMMARY"),
     ])
     def test_each_event_carries_its_tag(self, event, tag):
-        from operations import live_notifications as ln
-
-        assert ln.monitor_tag_for(event) == tag
+        assert _ln().monitor_tag_for(event) == tag
 
     def test_a_submit_is_tagged_by_side_not_by_event_name(self):
         """ORDER_SUBMITTED carries both directions. Filing a sell under
         [LIVE BUY] would make the channel lie about a real order."""
-        from operations import live_notifications as ln
-
-        assert ln.monitor_tag_for("ORDER_SUBMITTED", {"side": "buy"}) == "LIVE BUY"
-        assert ln.monitor_tag_for("ORDER_SUBMITTED", {"side": "sell"}) == "LIVE SELL"
-        assert ln.monitor_tag_for("ORDER_ACCEPTED", {"side": "SELL"}) == "LIVE SELL"
+        assert _ln().monitor_tag_for("ORDER_SUBMITTED", {"side": "buy"}) == "LIVE BUY"
+        assert _ln().monitor_tag_for("ORDER_SUBMITTED", {"side": "sell"}) == "LIVE SELL"
+        assert _ln().monitor_tag_for("ORDER_ACCEPTED", {"side": "SELL"}) == "LIVE SELL"
 
     def test_routine_intermediate_events_are_not_mirrored(self):
         """§11: summary over commentary. These stay on the KIS channel."""
-        from operations import live_notifications as ln
-
         for event in ("MARKET_START", "BUY_CANDIDATE_SELECTED",
                       "LIVE_ORDER_PREPARED", "ORDER_PENDING",
                       "CANCEL_REQUESTED", "CANCEL_COMPLETED"):
-            assert ln.monitor_tag_for(event) is None, event
+            assert _ln().monitor_tag_for(event) is None, event
 
     def test_an_unknown_event_mirrors_nowhere(self):
-        from operations import live_notifications as ln
-
-        assert ln.monitor_tag_for("SOMETHING_NEW") is None
+        assert _ln().monitor_tag_for("SOMETHING_NEW") is None
 
     def test_the_mirror_cannot_break_the_kis_notification(self, monkeypatch):
         """The order path must survive a monitor that throws."""
-        from operations import live_notifications as ln
-
         def boom(*a, **k):
             raise RuntimeError("monitor down")
 
         monkeypatch.setattr(monitor, "notify_tagged", boom)
         delivered = []
-        assert ln.notify("FILL_COMPLETED", {"symbol": "TX"},
+        assert _ln().notify("FILL_COMPLETED", {"symbol": "TX"},
                          send_fn=lambda m: delivered.append(m) or True,
                          track_health=False) is True
         assert delivered, "the KIS message still went out"
@@ -422,10 +431,8 @@ class TestOperationalEventsReachTheSameChannel:
     def test_the_mirror_is_sent_even_when_the_kis_send_fails(self, monkeypatch):
         """If the primary webhook is down the monitor line is the only
         record there is -- gating it on the primary would lose it."""
-        from operations import live_notifications as ln
-
         seen = self.capture(monkeypatch)
-        assert ln.notify("FILL_COMPLETED", {"symbol": "TX"},
+        assert _ln().notify("FILL_COMPLETED", {"symbol": "TX"},
                          send_fn=lambda m: False, track_health=False) is False
         assert any("LIVE FILL" in m and "TX" in m for m in seen)
 
