@@ -600,3 +600,69 @@ class TestOwnershipIsEnforcedNotAssumed:
                      send_fn=lambda m: True, track_health=False)
         assert any("LIVE FILL" in m for m in sent), \
             "the release must still announce its own fills"
+
+
+class TestOneSessionVocabulary:
+    """The channel and the code must mean the same thing by "session".
+
+    The coverage line used to name OVERNIGHT and DAYTIME separately --
+    two names `scan_session.normalize()` rejects, because the venue
+    treats that window as a single bucket. So a message advertised
+    coverage of sessions no scan could ever be labelled with, and a
+    reader comparing the line against a Session: field would find names
+    that never appear there.
+    """
+
+    def test_the_coverage_line_uses_the_real_session_names(self):
+        from scanners.base import scan_session
+
+        assert monitor.ALL_SESSIONS == tuple(scan_session.SESSIONS)
+
+    def test_every_advertised_session_is_one_a_scan_can_carry(self):
+        from scanners.base import scan_session
+
+        for name in monitor.ALL_SESSIONS:
+            assert scan_session.normalize(name) == name, name
+
+    def test_the_split_overnight_names_are_gone(self):
+        assert "OVERNIGHT" not in monitor.ALL_SESSIONS
+        assert "DAYTIME" not in monitor.ALL_SESSIONS
+        assert "OVERNIGHT_DAYTIME" in monitor.ALL_SESSIONS
+
+    def test_a_scan_only_session_says_so_in_the_message(self):
+        """§5: PREMARKET is scannable and must not read as live-capable."""
+        text = monitor.format_scan(
+            scanner_name="accumulation", session="PREMARKET", trading_day="d",
+            scanned=10, candidates=1, status="SUCCESS")
+        assert "Session execution: SCAN_ONLY / LIVE UNVERIFIED" in text
+
+    def test_a_verified_session_says_that_instead(self):
+        text = monitor.format_scan(
+            scanner_name="accumulation", session="REGULAR", trading_day="d",
+            scanned=10, candidates=1, status="SUCCESS")
+        assert "Session execution: REFERENCE_VERIFIED" in text
+
+    def test_a_profile_name_claims_no_execution_status(self):
+        """"DAILY" is a scanner group, not a session. Claiming a
+        verification status for it would be inventing one."""
+        text = monitor.format_scan(
+            scanner_name="accumulation", session="DAILY", trading_day="d",
+            scanned=10, candidates=0, status="SUCCESS")
+        assert "Session execution:" not in text
+
+    def test_the_run_reports_its_clock_session_not_its_profile(self, monkeypatch):
+        sent = []
+        monkeypatch.setattr(monitor, "_send",
+                            lambda msg, env=None: sent.append(msg) or True)
+
+        class Outcome:
+            scanner_name, failed, failure_reason = "accumulation", False, None
+            signals, symbols_seen = [], 100
+
+        class Report:
+            outcomes = [Outcome()]
+            trading_day, profile, session = "d", "daily", "REGULAR"
+
+        monitor.notify_run(Report(), env={monitor.WEBHOOK_ENV: "https://x.test"})
+        assert "Session: REGULAR" in sent[0]
+        assert "Session: DAILY" not in sent[0]

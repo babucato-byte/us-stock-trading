@@ -46,11 +46,29 @@ SCANNER_TAGS = {
     "orb": "S6 ORB",
 }
 
-#: The five sessions an all-session scanner covers, in clock order. Only
-#: S2 is all-session today; S1 is frozen at its measured sessions and
-#: S3..S6 are DISCOVERY_ONLY, so neither advertises coverage it does not
-#: have. Membership is a fact about the scanner, not about this channel.
-ALL_SESSIONS = ("OVERNIGHT", "DAYTIME", "PREMARKET", "REGULAR", "AFTER_HOURS")
+def _scan_sessions():
+    """The session vocabulary, taken from the module that defines it.
+
+    This list used to be written out here, and it named OVERNIGHT and
+    DAYTIME separately -- two names `scan_session.normalize()` rejects,
+    because the venue treats that window as one bucket. The message
+    therefore advertised coverage of sessions no scan could ever be
+    labelled with. One vocabulary, defined once, or the channel and the
+    code disagree about what a session is.
+    """
+    try:
+        from scanners.base import scan_session
+
+        return tuple(scan_session.SESSIONS)
+    except Exception:  # noqa: BLE001
+        return ()
+
+
+#: The sessions an all-session scanner covers, in clock order. Only S2 is
+#: all-session today; S1 is frozen at its measured sessions and S3..S6 are
+#: DISCOVERY_ONLY, so neither advertises coverage it does not have.
+#: Membership is a fact about the scanner, not about this channel.
+ALL_SESSIONS = _scan_sessions()
 ALL_SESSION_SCANNERS = frozenset({"accumulation"})
 
 #: Printed for S3..S6 so a reader never has to infer whether a candidate
