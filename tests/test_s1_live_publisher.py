@@ -101,16 +101,17 @@ class TestOnlyS1Publishes:
 
 
 class TestLiveModeConfiguration:
-    def test_s1_and_s2_are_live_and_the_other_four_are_not(self):
-        """The posture after S2's approved promotion. S1's publisher now
-        asks for S1 BY NAME rather than for "the only live scanner" --
-        the two were the same thing until a second strategy was
-        promoted, and inferring identity from being alone would have
-        broken the moment that stopped being true."""
+    def test_s1_is_live_and_asks_for_itself_by_name(self):
+        """S1's publisher asks for S1 BY NAME rather than for "the only
+        live scanner". The two were the same thing until a second
+        strategy was promoted; inferring identity from being alone broke
+        the moment that stopped being true, and would break again on the
+        next promotion. S2 has since stood down and S1 is alone again --
+        which is exactly why the name is checked rather than the count.
+        """
         assert scanner_live_mode.is_limited_live(S1) is True
-        assert scanner_live_mode.is_limited_live("accumulation") is True
-        assert len(scanner_live_mode.discovery_only_scanners()) == 4
         assert scanner_live_mode.require_limited_live(S1) == S1
+        assert len(scanner_live_mode.discovery_only_scanners()) == 5
 
     def test_s1s_publisher_refuses_when_s1_itself_is_not_live(self):
         """The failure that still matters. A second strategy going live

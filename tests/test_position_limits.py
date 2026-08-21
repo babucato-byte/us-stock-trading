@@ -26,6 +26,10 @@ if str(REPO_ROOT) not in sys.path:
 from config import position_limits as pl  # noqa: E402
 
 S1 = "S1_HMA_EARLY_TREND_V1"
+#: S6 replaced S2 in the matrix when it took over the fast-turnover
+#: validation slot. S2 is kept as a name so the "a stood-down strategy
+#: is refused" case stays meaningful.
+S6 = "S6_ORB_BREAKOUT_V1"
 S2 = "S2_VOLUME_ACCUMULATION_V1"
 
 
@@ -36,14 +40,14 @@ def proposed(strategy, **open_counts):
 
 class TestTheFiveCasesFromTheDirective:
     def test_s1_1_s2_0_allows_an_s2_entry(self):
-        decision = proposed(S2, **{S1: 1})
+        decision = proposed(S6, **{S1: 1})
         assert decision.allowed is True
         assert decision.reason == pl.ALLOW
 
     def test_s1_1_s2_1_is_the_full_allowed_book(self):
         """Both limits satisfied, global exactly at capacity."""
-        assert proposed(S1, **{S1: 0, S2: 1}).allowed is True
-        assert proposed(S2, **{S1: 1, S2: 0}).allowed is True
+        assert proposed(S1, **{S1: 0, S6: 1}).allowed is True
+        assert proposed(S6, **{S1: 1, S6: 0}).allowed is True
 
     def test_a_second_s1_is_blocked_by_the_strategy_limit(self):
         """Not by the global limit -- the global cap would have allowed a
@@ -54,13 +58,13 @@ class TestTheFiveCasesFromTheDirective:
         assert decision.reason == pl.BLOCK_STRATEGY
 
     def test_a_second_s2_is_blocked_by_the_strategy_limit(self):
-        decision = proposed(S2, **{S2: 1})
+        decision = proposed(S6, **{S6: 1})
         assert decision.allowed is False
         assert decision.reason == pl.BLOCK_STRATEGY
 
     def test_a_third_position_is_blocked_by_the_global_limit(self):
         """S1=1, S2=1 already; anything further is refused globally."""
-        decision = proposed(S1, **{S1: 1, S2: 1})
+        decision = proposed(S1, **{S1: 1, S6: 1})
         assert decision.allowed is False
         # S1 is at its own limit too, and the strategy limit is checked
         # first because it is the more specific reason.
@@ -70,7 +74,7 @@ class TestTheFiveCasesFromTheDirective:
         """The case that isolates the global cap: a strategy under its own
         limit still cannot push the book past two."""
         decision = pl.check_entry(
-            S2, {S1: 1, S2: 0, "S3_FUTURE": 1},
+            S6, {S1: 1, S6: 0, "S3_FUTURE": 1},
             active=True)
         assert decision.allowed is False
         assert decision.reason == pl.BLOCK_GLOBAL
@@ -84,7 +88,7 @@ class TestBothLimitsApplyIndependently:
         assert sum(pl.PROPOSED_STRATEGY_MAX.values()) == 2
         # A third strategy at 1 would make the sum 3; the global cap
         # still holds the book at 2.
-        decision = pl.check_entry("S3_FUTURE", {S1: 1, S2: 1}, active=True)
+        decision = pl.check_entry("S3_FUTURE", {S1: 1, S6: 1}, active=True)
         assert decision.allowed is False
 
     def test_an_unknown_strategy_gets_no_allowance(self):
@@ -95,7 +99,7 @@ class TestBothLimitsApplyIndependently:
 
     def test_an_empty_book_allows_a_first_position(self):
         assert proposed(S1).allowed is True
-        assert proposed(S2).allowed is True
+        assert proposed(S6).allowed is True
 
     def test_the_decision_carries_the_numbers_it_used(self):
         """A refusal an operator cannot act on is a refusal they will
@@ -121,10 +125,10 @@ class TestActivationIsDeliberate:
         assert pl.ACTIVE is True
         global_max, strategy_max = pl.effective_limits()
         assert global_max == 2
-        assert strategy_max == {S1: 1, S2: 1}
+        assert strategy_max == {S1: 1, S6: 1}
 
     def test_s2_may_now_open_one_position(self):
-        decision = pl.check_entry(S2, {})
+        decision = pl.check_entry(S6, {})
         assert decision.allowed is True
 
     def test_the_pre_activation_posture_is_still_readable(self):
@@ -133,7 +137,7 @@ class TestActivationIsDeliberate:
         global_max, strategy_max = pl.effective_limits(active=False)
         assert global_max == 1
         assert strategy_max == {S1: 1}
-        assert pl.check_entry(S2, {}, active=False).allowed is False
+        assert pl.check_entry(S6, {}, active=False).allowed is False
 
     def test_the_existing_s1_position_is_unaffected(self):
         """TX is open. Activation must not change what S1 may do."""
@@ -141,9 +145,9 @@ class TestActivationIsDeliberate:
         assert pl.check_entry(S1, {S1: 1}).allowed is False
 
     def test_the_limits_did_not_widen_beyond_what_was_approved(self):
-        """global 2 / S1 1 / S2 1, and nothing else gains an allowance."""
+        """global 2 / S1 1 / S6 1, and nothing else gains an allowance."""
         assert pl.PROPOSED_GLOBAL_MAX == 2
-        assert set(pl.PROPOSED_STRATEGY_MAX) == {S1, S2}
+        assert set(pl.PROPOSED_STRATEGY_MAX) == {S1, S6}
         assert pl.check_entry("S3_FUTURE", {}).reason == \
             pl.BLOCK_UNKNOWN_STRATEGY
 
@@ -175,5 +179,5 @@ class TestActivationIsDeliberate:
         """Activation was a one-line change because the logic was already
         written and tested. `active=` still selects either posture, so
         the same code paths serve both."""
-        assert pl.effective_limits(active=True) == (2, {S1: 1, S2: 1})
+        assert pl.effective_limits(active=True) == (2, {S1: 1, S6: 1})
         assert pl.effective_limits(active=False) == (1, {S1: 1})

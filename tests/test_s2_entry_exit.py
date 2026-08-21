@@ -498,45 +498,41 @@ class TestEntryFailsClosed:
 # Activation posture
 # --------------------------------------------------------------------------
 
-class TestTheApprovedRiskMatrix:
-    S1 = "S1_HMA_EARLY_TREND_V1"
-    S2 = "S2_VOLUME_ACCUMULATION_V1"
+class TestS2HasStoodDown:
+    """S2 returned to DISCOVERY_ONLY when S6 took over the fast-turnover
+    validation slot. Its policy code, data and infrastructure stay -- only
+    the live mode and the matrix entry changed.
 
-    def test_it_is_active(self):
+    The risk-matrix cases these tests used to duplicate now live in
+    tests/test_s6_sessions.py, against the strategy that actually holds
+    the slot.
+    """
+
+    def test_s2_is_discovery_only(self):
+        from config import scanner_live_mode
+
+        assert scanner_live_mode.SCANNER_LIVE_MODE["accumulation"] == \
+            "DISCOVERY_ONLY"
+
+    def test_s2_cannot_take_a_position(self):
         from config import position_limits as pl
 
-        assert pl.ACTIVE is True
-        assert pl.effective_limits() == (2, {self.S1: 1, self.S2: 1})
-
-    def test_s1_1_s2_0_allows_s2(self):
-        from config import position_limits as pl
-
-        assert pl.check_entry(self.S2, {self.S1: 1}).allowed is True
-
-    def test_s1_1_s2_1_is_the_full_book(self):
-        from config import position_limits as pl
-
-        assert pl.check_entry(self.S1, {self.S2: 1}).allowed is True
-        assert pl.check_entry(self.S2, {self.S1: 1}).allowed is True
-
-    def test_two_s1_is_blocked(self):
-        from config import position_limits as pl
-
-        assert pl.check_entry(self.S1, {self.S1: 1}).reason == pl.BLOCK_STRATEGY
-
-    def test_two_s2_is_blocked(self):
-        from config import position_limits as pl
-
-        assert pl.check_entry(self.S2, {self.S2: 1}).reason == pl.BLOCK_STRATEGY
-
-    def test_a_third_position_is_blocked_globally(self):
-        from config import position_limits as pl
-
-        decision = pl.check_entry("S3_FUTURE", {self.S1: 1, self.S2: 1})
+        decision = pl.check_entry("S2_VOLUME_ACCUMULATION_V1", {})
         assert decision.allowed is False
+        assert decision.reason == pl.BLOCK_UNKNOWN_STRATEGY
 
-    def test_the_existing_s1_position_is_unaffected(self):
-        """TX is open and S1 keeps trading exactly as before."""
+    def test_the_exit_policy_is_still_intact(self):
+        """Kept deliberately: S2 holds no position today, but the policy
+        is what a re-promotion would run and what the month-1 study
+        describes."""
+        assert policy.S2_LIMITED_LIVE_MAX_LOSS_PCT == 3.0
+        assert policy.ALLOW_OVERNIGHT_CARRY is False
+        assert ex.EXIT_REASONS
+
+    def test_s1_is_unaffected_by_s2_standing_down(self):
         from config import position_limits as pl
+        from config import scanner_live_mode
 
-        assert pl.check_entry(self.S1, {}).allowed is True
+        assert scanner_live_mode.SCANNER_LIVE_MODE["hma_early_trend"] == \
+            "LIMITED_LIVE"
+        assert pl.check_entry("S1_HMA_EARLY_TREND_V1", {}).allowed is True

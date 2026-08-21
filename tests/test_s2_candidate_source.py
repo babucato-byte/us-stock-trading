@@ -59,9 +59,26 @@ def published(tmp_path, monkeypatch):
     return publish
 
 
+def live_modes():
+    """A mode table in which S2 IS live.
+
+    Supplied explicitly because S2 stood down to DISCOVERY_ONLY when S6
+    took the fast-turnover slot. These tests are about what the SOURCE
+    does -- ranking, staleness, session isolation, qualification -- not
+    about which strategy is live this week, so they state the posture
+    they exercise rather than inheriting today's.
+    """
+    from config import scanner_live_mode
+
+    modes = dict(scanner_live_mode.SCANNER_LIVE_MODE)
+    modes["accumulation"] = scanner_live_mode.MODE_LIMITED_LIVE
+    return modes
+
+
 def source(**kw):
     kw.setdefault("trading_day", DAY)
     kw.setdefault("session", "REGULAR")
+    kw.setdefault("modes", live_modes())
     return cs.S2CandidateSource(**kw)
 
 
@@ -132,10 +149,11 @@ class TestEachRefusalIsItsOwn:
     def test_yesterdays_rows_are_not_reused(self, published):
         published(["AAA"], day="2026-08-19")
         src = cs.S2CandidateSource(trading_day="2026-08-19",
-                                   session="REGULAR")
+                                   session="REGULAR", modes=live_modes())
         assert src.symbols() == ["AAA"], "its own day is fine"
 
-        stale = cs.S2CandidateSource(trading_day=DAY, session="REGULAR")
+        stale = cs.S2CandidateSource(trading_day=DAY, session="REGULAR",
+                                     modes=live_modes())
         assert stale.symbols() == []
 
     def test_an_unreadable_file_is_empty_not_an_exception(self, monkeypatch):
@@ -239,7 +257,7 @@ class TestStrategyAwareResolution:
     def test_s2_resolves_to_its_own_source(self, published):
         published(["AAA"])
         src = cs.resolve_for_strategy(cs.STRATEGY_ID, trading_day=DAY,
-                                      session="REGULAR")
+                                      session="REGULAR", modes=live_modes())
         assert src.name == cs.SOURCE_S2
         assert src.symbols() == ["AAA"]
 
@@ -367,7 +385,7 @@ class TestProducerToConsumerEndToEnd:
         assert runner.publish_report_candidates(Report()) == 2
 
         src = cs.resolve_for_strategy(cs.STRATEGY_ID, trading_day=DAY,
-                                      session="REGULAR")
+                                      session="REGULAR", modes=live_modes())
         assert src.symbols() == ["ABC", "XYZ"], "rank order preserved"
         assert src.describe()["refusal"] is None
 
@@ -392,7 +410,8 @@ class TestProducerToConsumerEndToEnd:
             trading_day, session, run_id = DAY, "AFTER_HOURS", "run-pm"
 
         runner.publish_report_candidates(Report())
-        regular = cs.S2CandidateSource(trading_day=DAY, session="REGULAR")
+        regular = cs.S2CandidateSource(trading_day=DAY, session="REGULAR",
+                                       modes=live_modes())
         assert regular.symbols() == []
         assert "EVENING" not in regular.allowed_symbols()
 
@@ -500,7 +519,8 @@ class TestS2Qualification:
 
     def test_the_wrong_trading_day_is_refused(self, published):
         published(["ABC"], day="2026-08-19")
-        q = cs.S2CandidateSource(trading_day=DAY, session="REGULAR").qualify("ABC")
+        q = cs.S2CandidateSource(trading_day=DAY, session="REGULAR",
+                                 modes=live_modes()).qualify("ABC")
         assert q.qualified is False
 
     def test_the_wrong_session_is_refused(self, published):

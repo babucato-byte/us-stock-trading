@@ -74,11 +74,21 @@ def store(tmp_path, monkeypatch):
 
 @pytest.fixture
 def s2_live(monkeypatch):
-    """Pretend S2 has been promoted, without touching the real table."""
-    from config import scanner_live_mode
+    """Pretend S2 has been promoted, without touching the real tables.
+
+    Grants BOTH things a live strategy needs: the live-mode entry and a
+    position limit. S2 has neither today -- it returned to
+    DISCOVERY_ONLY when S6 took over the fast-turnover slot, and it was
+    removed from the risk matrix rather than set to zero. These tests are
+    about whether the EXECUTOR's gates work, not about which strategy is
+    live this week, so they grant the posture they exercise.
+    """
+    from config import position_limits, scanner_live_mode
 
     monkeypatch.setitem(scanner_live_mode.SCANNER_LIVE_MODE,
                         "accumulation", "LIMITED_LIVE")
+    monkeypatch.setitem(position_limits.PROPOSED_STRATEGY_MAX,
+                        executor.STRATEGY_ID, 1)
 
 
 def held(**kw):
@@ -117,17 +127,18 @@ class TestNothingIsSubmittedWhileS2IsDiscoveryOnly:
     gate WORKS, not that it happens to be closed.
     """
 
-    def test_s1_and_s2_are_both_live_and_the_rest_are_not(self):
+    def test_only_s1_is_live_and_s2_has_stood_down(self):
+        """S2 returned to DISCOVERY_ONLY when S6 took over the
+        fast-turnover validation slot. Its code and data stay; only the
+        live mode changed."""
         from config import scanner_live_mode
 
         assert scanner_live_mode.SCANNER_LIVE_MODE["hma_early_trend"] == \
             "LIMITED_LIVE"
-        assert scanner_live_mode.SCANNER_LIVE_MODE["accumulation"] == \
-            "LIMITED_LIVE"
-        for name in ("breakout_ready", "premarket_momentum", "gap_pullback",
-                     "orb"):
+        for name in ("accumulation", "breakout_ready", "premarket_momentum",
+                     "gap_pullback", "orb"):
             assert scanner_live_mode.SCANNER_LIVE_MODE[name] == "DISCOVERY_ONLY"
-        assert executor.s2_is_limited_live() is True
+        assert executor.s2_is_limited_live() is False
 
     def test_a_confirmed_candidate_is_not_bought_when_not_live(
             self, store, s2_discovery_only):

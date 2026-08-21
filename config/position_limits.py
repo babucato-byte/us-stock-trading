@@ -40,7 +40,12 @@ ACTIVE = True
 PROPOSED_GLOBAL_MAX = 2
 PROPOSED_STRATEGY_MAX: Dict[str, int] = {
     "S1_HMA_EARLY_TREND_V1": 1,
-    "S2_VOLUME_ACCUMULATION_V1": 1,
+    # S6 replaces S2 as the fast-turnover validation strategy. S2 is
+    # ABSENT rather than set to 0: absent means "no agreed limit", which
+    # `check_entry` refuses with BLOCK_UNKNOWN_STRATEGY. A 0 would read
+    # as a limit that was decided and happens to be zero, and the two
+    # need different operator responses.
+    "S6_ORB_BREAKOUT_V1": 1,
 }
 
 #: The pre-activation posture, kept so `effective_limits(active=False)`

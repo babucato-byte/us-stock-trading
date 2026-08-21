@@ -30,7 +30,7 @@ VALID_MODES = frozenset({MODE_LIMITED_LIVE, MODE_DISCOVERY_ONLY})
 #: Every scanner in `scanners/registry.py` must appear here.
 SCANNER_LIVE_MODE = {
     "hma_early_trend": MODE_LIMITED_LIVE,
-    "accumulation": MODE_LIMITED_LIVE,
+    "accumulation": MODE_DISCOVERY_ONLY,
     "breakout_ready": MODE_DISCOVERY_ONLY,
     "premarket_momentum": MODE_DISCOVERY_ONLY,
     "gap_pullback": MODE_DISCOVERY_ONLY,
@@ -63,6 +63,7 @@ def _limited_live_names(modes=None):
 #: about "whichever one happens to be live".
 S1_SCANNER_NAME = "hma_early_trend"
 S2_SCANNER_NAME = "accumulation"
+S6_SCANNER_NAME = "orb"
 
 
 def limited_live_scanner(modes=None) -> str:
