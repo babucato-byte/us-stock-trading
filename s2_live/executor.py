@@ -59,20 +59,26 @@ SKIP_UNGATED_SUBMITTER = "S2_SUBMIT_FUNCTION_NOT_GATED"
 
 #: A live submit function must carry this attribute, set True.
 #:
-#: `submit_fn` is injected so this module needs no broker import, which
-#: keeps a bug here from placing an order. But injection cuts both ways:
-#: it would also let someone bind a raw broker call and skip the shared
-#: BUY gate -- the twenty-step sequence in `execution/order_gate` that
-#: checks COMMON_STOCK, orderable cash, reconciliation, duplicate
-#: signals and the kill switch. S2's own three gates do not replace any
-#: of those; they sit in front of them.
+#: The marker is a backstop, not the design. The DESIGN is that S2's
+#: real BUY goes through `kis_live_trading.run_live_buy_entry_cycle`,
+#: whose docstring states the rule this module has to obey:
 #:
-#: So a function that has not declared itself gated is refused in live
-#: mode. The marker is deliberately something a caller must set on
-#: purpose: forgetting it fails closed, which is the direction that
-#: costs nothing, while forgetting the gate itself would cost real
-#: money on an unchecked order.
+#:     "Only the SOURCE is pluggable. Every gate below ... is shared by
+#:      every source and exists exactly once. A second candidate source
+#:      must never mean a second pipeline: two pipelines are two ideas
+#:      of what is safe, and they diverge silently."
+#:
+#: So S2 joins that pipeline as a CANDIDATE SOURCE. It does not get its
+#: own submit path, and `submit_fn` exists here only for the shadow
+#: cycle and for tests -- which is why an undeclared callable is refused
+#: rather than called. Forgetting the marker fails closed and costs
+#: nothing; forgetting the gate would cost real money on an unchecked
+#: order.
 GATED_SUBMIT_MARKER = "applies_buy_gate"
+
+#: Refused when a caller asks for a live ENTRY through this module. The
+#: entry belongs to the shared pipeline; see GATED_SUBMIT_MARKER above.
+SKIP_WRONG_ENTRY_PATH = "S2_ENTRY_MUST_USE_SHARED_BUY_CYCLE"
 
 
 @dataclass

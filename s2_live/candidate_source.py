@@ -1,0 +1,189 @@
+"""S2's candidates, offered to the SHARED buy cycle.
+
+Why this is a source and not a pipeline
+---------------------------------------
+`kis_live_trading.run_live_buy_entry_cycle` states the rule:
+
+    "Only the SOURCE is pluggable. Every gate below -- allow-list check,
+     price re-validation, orderable cash, duplicate order, entry limits,
+     kill switch, reconciliation, the Execution Engine -- is shared by
+     every source and exists exactly once. A second candidate source
+     must never mean a second pipeline: two pipelines are two ideas of
+     what is safe, and they diverge silently."
+
+So S2 does not get a submit path. It answers the two questions the cycle
+asks a source -- which symbols to look at, and which the Order Gate is
+told are permitted -- and every safety check downstream is the same code
+that runs for S1.
+
+What this refuses, and why each refusal is separate
+---------------------------------------------------
+An empty set is returned, never an exception, for each of:
+
+    S2 is not LIMITED_LIVE            the strategy's status
+    the session is not REGULAR        the rollout's reach
+    the published set is stale        the day it was written for
+    the operator list excludes it     LIVE_ROLLOUT_ALLOWED_SYMBOLS
+
+They are checked separately and logged separately because an operator
+reading "no S2 candidates" needs to know WHICH of those it was. A single
+combined refusal would make a stood-down strategy look like a quiet
+market.
+
+Staleness is the trading day, at this stage
+-------------------------------------------
+The published file must be for today, compared the same way S1's is. How
+fresh a price must be at the moment an order is placed is a different
+question, asked later by the shared gate -- guessing at it here would put
+a second freshness policy in the codebase.
+"""
+
+import logging
+from typing import FrozenSet, List, Optional
+
+from config import scanner_live_mode
+
+logger = logging.getLogger(__name__)
+
+SOURCE_S2 = "s2_accumulation"
+
+#: The strategy id the publisher writes and the risk matrix knows.
+STRATEGY_ID = "S2_VOLUME_ACCUMULATION_V1"
+
+
+class S2CandidateSource:
+    """Today's published S2 rows, or nothing at all.
+
+    Shares the `CandidateSource` shape used by S1 -- `symbols()`,
+    `allowed_symbols()`, `describe()` -- so the buy cycle needs no branch
+    for which strategy it is serving. A branch there would be the second
+    pipeline the cycle's docstring forbids.
+    """
+
+    name = SOURCE_S2
+
+    def __init__(self, *, trading_day, session=None, rollout=None,
+                 modes=None):
+        self._trading_day = str(trading_day)
+        self._session = session
+        self._rollout = rollout
+        self._modes = modes
+        self._rows: Optional[List[dict]] = None
+        self._loaded = False
+        self._refusal: Optional[str] = None
+
+    # -- refusals, each answered on its own ------------------------------
+
+    def _live_mode_ok(self) -> bool:
+        try:
+            scanner_live_mode.require_limited_live(
+                scanner_live_mode.S2_SCANNER_NAME, self._modes)
+            return True
+        except scanner_live_mode.ScannerLiveModeError as exc:
+            self._refusal = f"S2 is not LIMITED_LIVE: {exc}"
+            return False
+
+    def _session_ok(self) -> bool:
+        from s2_live import entry_policy
+        from scanners.base import scan_session
+
+        normalised = scan_session.normalize(self._session)
+        if normalised in entry_policy.S2_LIVE_SESSIONS:
+            return True
+        self._refusal = (
+            f"session {self._session!r} is not enabled for S2 live orders; "
+            f"enabled: {sorted(entry_policy.S2_LIVE_SESSIONS)}")
+        return False
+
+    def _load(self):
+        if self._loaded:
+            return self._rows
+        self._loaded = True
+
+        if not self._live_mode_ok() or not self._session_ok():
+            logger.info("S2 candidate source empty: %s", self._refusal)
+            return None
+
+        try:
+            from scanners.publish import candidates as publisher
+
+            rows = [row for row in publisher.read(self._trading_day,
+                                                  self._session)
+                    if str(row.get("strategy_id")) == STRATEGY_ID]
+        except Exception:  # noqa: BLE001 - an unreadable file is empty,
+            # never an exception that could abort the shared cycle and
+            # take S1's entries down with it.
+            logger.warning("could not read S2 candidates for %s/%s",
+                           self._trading_day, self._session, exc_info=True)
+            self._refusal = "candidate file could not be read"
+            return None
+
+        if not rows:
+            self._refusal = "no S2 candidates published for this session"
+            return None
+
+        # The published file is per (day, session) by construction, but
+        # the day is re-checked rather than trusted: a path is not a
+        # guarantee, and reusing yesterday's rows is exactly the failure
+        # this comparison exists to prevent.
+        fresh = [row for row in rows
+                 if str(row.get("trading_day")) == self._trading_day]
+        if not fresh:
+            self._refusal = (
+                f"published S2 rows are not for {self._trading_day}")
+            logger.warning("S2 candidate source refused: %s", self._refusal)
+            return None
+
+        self._rows = sorted(fresh, key=lambda r: (int(r.get("rank") or 10**6),
+                                                  str(r.get("symbol") or "")))
+        return self._rows
+
+    # -- the CandidateSource interface -----------------------------------
+
+    def _validated_symbols(self) -> FrozenSet[str]:
+        rows = self._load()
+        if not rows:
+            return frozenset()
+        symbols = frozenset(str(r.get("symbol") or "").upper() for r in rows)
+        operator = getattr(self._rollout, "allowed_symbols", None) or frozenset()
+        if operator:
+            tightened = symbols & frozenset(s.upper() for s in operator)
+            if tightened != symbols:
+                logger.info(
+                    "S2 candidate set tightened by the operator allow-list: "
+                    "%s of %s symbols remain", len(tightened), len(symbols))
+            return tightened
+        return symbols
+
+    def symbols(self) -> List[str]:
+        """Ranked order, not set order -- rank 1 is examined first."""
+        rows = self._load()
+        if not rows:
+            return []
+        allowed = self._validated_symbols()
+        return [str(r["symbol"]).upper() for r in rows
+                if str(r.get("symbol") or "").upper() in allowed]
+
+    def allowed_symbols(self) -> FrozenSet[str]:
+        return self._validated_symbols()
+
+    def candidate_row(self, symbol) -> Optional[dict]:
+        rows = self._load() or []
+        wanted = str(symbol or "").upper()
+        for row in rows:
+            if str(row.get("symbol") or "").upper() == wanted:
+                return row
+        return None
+
+    def describe(self) -> dict:
+        """What this source did, for the cycle's audit record."""
+        rows = self._load()
+        return {
+            "source": self.name,
+            "strategy_id": STRATEGY_ID,
+            "trading_day": self._trading_day,
+            "session": self._session,
+            "candidates": len(rows or []),
+            "allowed": len(self._validated_symbols()),
+            "refusal": self._refusal,
+        }
