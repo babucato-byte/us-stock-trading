@@ -694,6 +694,80 @@ MIGRATION_14_STATEMENTS = [
     S1_POSITIONS_OPEN_SYMBOL_INDEX,
 ]
 
+# S2's open positions.
+#
+# A separate table rather than columns bolted onto s1_positions, and not
+# a generic one either. The two strategies persist DIFFERENT things
+# because their exits are different: S1 ratchets an R-multiple floor, S2
+# tracks a volume peak. Merging them would give each strategy a set of
+# columns that are always NULL for it, and a CHECK constraint that can
+# only be written as "NULL is fine", which is how a storage layer stops
+# being able to reject a malformed row.
+#
+# What generalising WOULD have bought -- one reconciliation query -- is
+# bought instead by `venue` and `strategy_id` being present here in the
+# same shape S1 uses, so a UNION answers "what do we hold" without a
+# refactor of either table.
+#
+# Only history is stored. `effective_stop` and `hard_stop` are written
+# because they are the levels that were in force AT ENTRY, and the
+# config they came from is expected to change; recomputing them later
+# would answer with today's policy about yesterday's position. The
+# volume peak and the price at that peak are gone the moment volume
+# falls. Everything else a decision needs is recomputed from the
+# current observation, deliberately.
+S2_POSITIONS_TABLE = """
+CREATE TABLE IF NOT EXISTS s2_positions (
+    position_id             TEXT PRIMARY KEY,
+    strategy_id             TEXT NOT NULL,
+    symbol                  TEXT NOT NULL,
+    -- The broker's own exchange code for the row, not the one we asked
+    -- with. KIS answers a NASD request with NYSE rows, so the requested
+    -- code is not an identity -- the same correction TX needed.
+    venue                   TEXT,
+    quantity                INTEGER NOT NULL,
+    -- The KIS ACTUAL AVERAGE FILL PRICE, never the intended limit. The
+    -- catastrophic cap is measured from this, so an intended-price
+    -- entry would put the stop wrong by the slippage.
+    entry_price             REAL NOT NULL,
+    entry_time              TEXT NOT NULL,
+    entry_session           TEXT,
+    entry_order_id          TEXT,
+    entry_volume_multiple   REAL,
+    baseline_volume         REAL,
+    peak_volume_multiple    REAL,
+    price_at_volume_peak    REAL,
+    decay_since             TEXT,
+    effective_stop          REAL,
+    hard_stop               REAL,
+    status                  TEXT NOT NULL DEFAULT 'OPEN',
+    exit_reason             TEXT,
+    exit_submitted          INTEGER NOT NULL DEFAULT 0,
+    pending_exit_reason     TEXT,
+    pending_exit_since      TEXT,
+    created_at              TEXT NOT NULL,
+    updated_at              TEXT NOT NULL,
+    closed_at               TEXT,
+    CHECK (status IN ('OPEN', 'EXIT_PENDING', 'EXIT_SUBMITTED', 'CLOSED')),
+    CHECK (entry_price > 0),
+    CHECK (quantity >= 1),
+    CHECK (exit_submitted IN (0, 1))
+)
+"""
+
+# One OPEN position per symbol, for the reason S1's index exists: it
+# makes a second entry into a name already held impossible at the
+# storage layer rather than merely unlikely at the gate layer.
+S2_POSITIONS_OPEN_SYMBOL_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_s2_positions_open_symbol
+    ON s2_positions (symbol) WHERE status != 'CLOSED'
+"""
+
+MIGRATION_15_STATEMENTS = [
+    S2_POSITIONS_TABLE,
+    S2_POSITIONS_OPEN_SYMBOL_INDEX,
+]
+
 # Every table this schema version creates -- used by export.py's
 # export_all() and by tests asserting the full table set exists.
 ALL_TABLES = [
@@ -702,5 +776,5 @@ ALL_TABLES = [
     "exit_intents", "live_entry_reservations", "kis_order_idempotency",
     "order_state_events", "shadow_audit_events", "s1_live_trades",
     "s1_risk_state", "s1_risk_peak", "s1_verification_state",
-    "s1_positions",
+    "s1_positions", "s2_positions",
 ]

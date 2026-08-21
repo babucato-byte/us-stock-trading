@@ -15,6 +15,7 @@ from state_store.schema import (
     MIGRATION_8_STATEMENTS, MIGRATION_9_STATEMENTS, MIGRATION_10_STATEMENTS,
     MIGRATION_11_STATEMENTS, MIGRATION_12_STATEMENTS,
     MIGRATION_13_STATEMENTS, MIGRATION_14_STATEMENTS,
+    MIGRATION_15_STATEMENTS,
 )
 
 MIGRATIONS = [
@@ -44,6 +45,8 @@ MIGRATIONS = [
      MIGRATION_13_STATEMENTS),
     (14, "S1 STAGE 1: s1_positions -- the ratcheting exit state that cannot be recomputed",
      MIGRATION_14_STATEMENTS),
+    (15, "S2 LIMITED LIVE: s2_positions -- the volume peak and entry stops that cannot be recomputed",
+     MIGRATION_15_STATEMENTS),
 ]
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1][0]

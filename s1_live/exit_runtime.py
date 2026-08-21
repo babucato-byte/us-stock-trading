@@ -85,14 +85,25 @@ class ExitOutcome:
         return dict(vars(self))
 
 
-def _submit_sell(conn, *, broker_adapter, position_id, row, reason, now=None) -> ExitOutcome:
+def _submit_sell(conn, *, broker_adapter, position_id, row, reason, now=None,
+                 store=None, prefix="s1exit") -> ExitOutcome:
     """Reserve the intent, place the order through the VERIFIED path, and
-    record the outcome. Never places a second order for a position."""
+    record the outcome. Never places a second order for a position.
+
+    `store` is the position store to latch against, defaulting to S1's.
+    S2 passes its own and everything else here is byte-identical: the
+    ledger reservation, the UNKNOWN handling that refuses to retry, the
+    rejection path that does not chase the price. Those behaviours were
+    hard-won on S1 and a second copy of them would be a second idea of
+    what is safe -- which is exactly what the buy cycle's docstring
+    warns about, applied to the sell side.
+    """
     symbol, quantity = row["symbol"], int(row["quantity"])
+    store = store or position_store
 
     # Ledger-level duplicate prevention. If an intent is already active
     # the broker is not called at all.
-    client_order_id = f"s1exit-{symbol}-{uuid.uuid4().hex[:12]}"
+    client_order_id = f"{prefix}-{symbol}-{uuid.uuid4().hex[:12]}"
     try:
         intent_id = exit_intent_ledger.reserve(
             conn, position_id, reason, quantity, client_order_id)
@@ -110,7 +121,7 @@ def _submit_sell(conn, *, broker_adapter, position_id, row, reason, now=None) ->
         # auto-retried and NEVER clears the trigger. The intent goes to
         # SUBMISSION_UNKNOWN and reconciliation decides.
         exit_intent_ledger.mark_submission_unknown(conn, intent_id)
-        position_store.latch_pending_exit(conn, position_id, reason, now=now)
+        store.latch_pending_exit(conn, position_id, reason, now=now)
         logger.error("S1 exit submission for %s ended UNKNOWN -- left latched for "
                      "reconciliation, not retried: %s", position_id, exc)
         return ExitOutcome(position_id, symbol, ACTION_BLOCKED, reason,
@@ -123,16 +134,16 @@ def _submit_sell(conn, *, broker_adapter, position_id, row, reason, now=None) ->
         # enlarge the quantity, do not retry in a loop. The trigger stays
         # latched so the next orderable session tries once more.
         exit_intent_ledger.mark_aborted(conn, intent_id)
-        position_store.latch_pending_exit(conn, position_id, reason, now=now)
+        store.latch_pending_exit(conn, position_id, reason, now=now)
         logger.error("S1 exit for %s REJECTED by broker (status=%s): %s",
                      position_id, status, getattr(response, "text", ""))
         return ExitOutcome(position_id, symbol, ACTION_BLOCKED, reason,
                            f"broker rejected: {getattr(response, 'text', '')}", status)
 
     exit_intent_ledger.mark_submitted(conn, intent_id)
-    position_store.mark_exit_submitted(conn, position_id, reason, now=now)
-    logger.info("S1 SELL submitted: %s %s qty=%d reason=%s",
-                position_id, symbol, quantity, reason)
+    store.mark_exit_submitted(conn, position_id, reason, now=now)
+    logger.info("%s SELL submitted: %s %s qty=%d reason=%s",
+                prefix.upper(), position_id, symbol, quantity, reason)
     return ExitOutcome(position_id, symbol, ACTION_SOLD, reason,
                        getattr(response, "text", "") or "", status)
 

@@ -140,7 +140,15 @@ _EXIT_ELIGIBLE_STATES = (states.STOP_ACTIVE, states.TARGET_1_ACTIVE, states.PART
 #: policy. An S1 position sized against a -6% stop must not acquire the
 #: -8% one, and must not be liquidated 60 minutes after entry. S1 exits
 #: live in s1_positions and are decided by s1_live/exit_policy.py.
-EXIT_MANAGED_ELSEWHERE_STRATEGY_IDS = frozenset({"S1_HMA_EARLY_TREND_V1"})
+EXIT_MANAGED_ELSEWHERE_STRATEGY_IDS = frozenset({
+    "S1_HMA_EARLY_TREND_V1",
+    # S2 joins for the same reason S1 is here: its exit is owned by
+    # S2_EXIT_V0, and a position evaluated by two exit policies gets two
+    # SELLs for one holding. This guard covers EXIT ownership only --
+    # fill synchronisation is deliberately NOT gated by it, because that
+    # conflation is exactly what cost S1 its bookkeeping once already.
+    "S2_VOLUME_ACCUMULATION_V1",
+})
 _FILL_PENDING_STATES = (states.ENTRY_SUBMITTED, states.PARTIALLY_FILLED)
 
 
