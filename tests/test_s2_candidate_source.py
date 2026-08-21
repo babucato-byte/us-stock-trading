@@ -409,3 +409,187 @@ class TestProducerToConsumerEndToEnd:
                         for segment in name.split("."):
                             assert segment not in {"kis_broker", "brokers",
                                                    "kis_live_trading"}, name
+
+
+#: Every method the shared BUY cycle actually calls on a source.
+#:
+#: Derived from the call sites in kis_live_trading, not from memory --
+#: `qualify` was missed precisely because reading the class definition
+#: showed symbols()/allowed_symbols()/describe() and the fourth method is
+#: only reached once a real candidate exists. It cost a live session.
+SOURCE_CONTRACT = ("symbols", "allowed_symbols", "describe", "qualify")
+
+
+class TestTheSourceContractIsFixedInCode:
+    """A source missing a method must fail HERE, not at the first
+    candidate. The gap was invisible for as long as S2 found nothing,
+    which is the worst possible time for it to surface."""
+
+    def test_the_contract_matches_what_the_cycle_calls(self):
+        """Derived from the source file, so adding a call to the cycle
+        without adding it here fails."""
+        import ast
+
+        cycle = (REPO_ROOT / "kis_live_trading.py").read_text()
+        called = set()
+        for node in ast.walk(ast.parse(cycle)):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "source"):
+                called.add(node.func.attr)
+        assert called <= set(SOURCE_CONTRACT), (
+            f"the cycle calls {called - set(SOURCE_CONTRACT)} on a source; "
+            "add it to SOURCE_CONTRACT and implement it on every source")
+
+    @pytest.mark.parametrize("method", SOURCE_CONTRACT)
+    def test_s1s_source_satisfies_the_contract(self, method):
+        from s1_live import candidate_source as s1cs
+
+        assert callable(getattr(s1cs.S1CandidateSource, method, None)), method
+
+    @pytest.mark.parametrize("method", SOURCE_CONTRACT)
+    def test_s2s_source_satisfies_the_contract(self, method):
+        assert callable(getattr(cs.S2CandidateSource, method, None)), method
+
+    @pytest.mark.parametrize("method", SOURCE_CONTRACT)
+    def test_the_refusal_source_satisfies_the_contract(self, method):
+        """It is handed to the cycle like any other source."""
+        assert callable(getattr(cs.RefusedSource, method, None)), method
+
+    @pytest.mark.parametrize("method", SOURCE_CONTRACT)
+    def test_the_legacy_source_satisfies_the_contract(self, method):
+        from s1_live import candidate_source as s1cs
+
+        assert callable(getattr(s1cs.LegacyWatchlistSource, method, None))
+
+    def test_a_source_missing_a_method_is_caught(self):
+        """The check that would have failed before the live session."""
+        class Incomplete:
+            name = "incomplete"
+
+            def symbols(self):
+                return []
+
+            def allowed_symbols(self):
+                return frozenset()
+
+            def describe(self):
+                return {}
+
+        missing = [m for m in SOURCE_CONTRACT
+                   if not callable(getattr(Incomplete, m, None))]
+        assert missing == ["qualify"]
+
+
+class TestS2Qualification:
+    def test_a_published_candidate_qualifies(self, published):
+        published(["ABC"])
+        q = source().qualify("ABC")
+        assert q.qualified is True
+        assert q.strategy_id == "S2_VOLUME_ACCUMULATION_V1"
+        assert q.price == 100.0
+        assert q.source_signal_id == "s-ABC"
+        assert q.entry_reason == "s2_volume_accumulation_candidate"
+
+    def test_a_symbol_that_is_not_a_candidate_is_refused(self, published):
+        published(["ABC"])
+        q = source().qualify("NOTME")
+        assert q.qualified is False
+        assert q.reason_code == "NOT_AN_S2_CANDIDATE"
+
+    def test_the_wrong_trading_day_is_refused(self, published):
+        published(["ABC"], day="2026-08-19")
+        q = cs.S2CandidateSource(trading_day=DAY, session="REGULAR").qualify("ABC")
+        assert q.qualified is False
+
+    def test_the_wrong_session_is_refused(self, published):
+        published(["ABC"], session="AFTER_HOURS")
+        q = source().qualify("ABC")
+        assert q.qualified is False
+
+    def test_a_row_without_a_usable_price_is_refused(self):
+        from s2_live import qualification
+
+        q = qualification.qualify_s2("ABC", candidate_row={
+            "strategy_id": "S2_VOLUME_ACCUMULATION_V1", "price": None,
+            "provenance": {"signal_id": "s"}})
+        assert q.reason_code == "UNUSABLE_CANDIDATE_ROW"
+
+    def test_another_strategys_row_is_refused(self):
+        from s2_live import qualification
+
+        q = qualification.qualify_s2("ABC", candidate_row={
+            "strategy_id": "S1_HMA_EARLY_TREND_V1", "price": 100.0,
+            "provenance": {"signal_id": "s"}})
+        assert q.reason_code == "CANDIDATE_BELONGS_TO_ANOTHER_STRATEGY"
+
+    def test_no_second_score_is_applied(self):
+        """Requiring the legacy score too would make the thing that
+        trades "S2 AND legacy score"."""
+        import inspect
+
+        body = inspect.getsource(cs.S2CandidateSource.qualify)
+        assert "analyze" in body and "score_threshold" in body
+        assert "qualify_s2" in body
+
+    def test_the_refused_source_qualifies_nothing(self):
+        q = cs.RefusedSource("because").qualify("ABC")
+        assert q.qualified is False
+
+
+class TestTheBabaCase:
+    """The row that actually reached production on 2026-08-21.
+
+    NOT a claim that these values should be bought. The negative
+    price_change_pct is normal: S2 has an 8% ceiling and deliberately no
+    floor, and whether to buy is decided later by execution-time
+    confirmation. What this fixes is that a real row travels from
+    publication through qualification into the shared cycle without a
+    runtime error.
+    """
+
+    def row(self):
+        return {
+            "strategy_id": "S2_VOLUME_ACCUMULATION_V1", "symbol": "BABA",
+            "rank": 1, "score": 20.538396739356727,
+            "price": 122.27559661865234, "volume_multiple": 1.7119950507877528,
+            "price_change_pct": -6.323758705155025, "session": "REGULAR",
+            "trading_day": "2026-08-21",
+            "provenance": {"signal_id": "s-BABA", "scanner_name": "accumulation"},
+        }
+
+    def test_it_qualifies_without_a_runtime_error(self):
+        from s2_live import qualification
+
+        q = qualification.qualify_s2("BABA", candidate_row=self.row())
+        assert q.qualified is True
+        assert q.price == pytest.approx(122.2756, abs=1e-3)
+        assert q.score == pytest.approx(20.5384, abs=1e-3)
+
+    def test_a_negative_price_change_does_not_disqualify_the_candidate(self):
+        """The scanner has no floor. Changing that to avoid this row
+        would be tuning the strategy to today's data."""
+        import json
+
+        config = json.loads(
+            (REPO_ROOT / "scanners" / "accumulation" / "config.json").read_text())
+        assert "price_change_min_pct" not in config["params"]
+        assert config["params"]["price_change_max_pct"] == 8.0
+
+    def test_buying_is_still_decided_later(self):
+        """Qualification says "this is a candidate", not "buy it"."""
+        from s2_live import entry_policy, qualification
+
+        q = qualification.qualify_s2("BABA", candidate_row=self.row())
+        assert q.qualified is True
+
+        class F:
+            hma200, hma200_slope = 95.0, 0.4
+
+        # Price has not confirmed: still at the signal price.
+        verdict = entry_policy.confirm(current_price=q.price,
+                                       signal_price=q.price,
+                                       session="REGULAR", features=F())
+        assert verdict.allowed is False
+        assert verdict.reason == entry_policy.REASON_PRICE_NOT_CONFIRMED

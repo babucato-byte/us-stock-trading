@@ -193,6 +193,24 @@ class S2CandidateSource:
                 return row
         return None
 
+    def qualify(self, symbol, *, analyze=None, score_threshold=None):
+        """The source-specific step of the shared cycle.
+
+        `analyze`/`score_threshold` are accepted so the cycle can call
+        every source identically, and are ignored for the reason S1
+        ignores them: applying the legacy score to an S2 candidate would
+        make the thing that trades "S2 AND legacy score".
+
+        Everything after this -- instrument validation, the live price
+        re-check, the Order Gate, entry limits, the kill switch,
+        reconciliation, the Execution Engine -- is shared and is not
+        touched here.
+        """
+        from s2_live import qualification
+
+        return qualification.qualify_s2(
+            symbol, candidate_row=self.candidate_row(symbol))
+
     def describe(self) -> dict:
         """What this source did, for the cycle's audit record."""
         rows = self._load()
@@ -235,6 +253,19 @@ class RefusedSource:
 
     def candidate_row(self, symbol):
         return None
+
+    def qualify(self, symbol, *, analyze=None, score_threshold=None):
+        """Nothing qualifies from a source that offers nothing.
+
+        Present because the shared cycle calls it on whatever source it
+        is given, and a refusal is still a source. Omitting it would turn
+        a clean "no candidates" into an AttributeError inside the cycle
+        -- which is exactly the failure this class exists to avoid.
+        """
+        from s1_live.qualification import Qualification
+
+        return Qualification(False, symbol, reason_code="SOURCE_REFUSED",
+                             detail=self._reason)
 
     def describe(self):
         return {"source": self.name, "strategy_id": self._strategy_id,
