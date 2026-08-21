@@ -124,7 +124,10 @@ class TestEachRefusalIsItsOwn:
         """Both give zero symbols, and they are not the same event."""
         src = source()
         assert src.symbols() == []
-        assert "no S2 candidates published" in src.describe()["refusal"]
+        # Now distinguishes the two zero states; see
+        # TestQuietIsNotTheSameAsAbsent. With no run marker written, this
+        # is the missing-producer case.
+        assert src.describe()["refusal"] == cs.NO_PRODUCER_RUN
 
     def test_yesterdays_rows_are_not_reused(self, published):
         published(["AAA"], day="2026-08-19")
@@ -267,3 +270,142 @@ class TestStrategyAwareResolution:
         assert src.allowed_symbols() == frozenset()
         assert src.candidate_row("ABC") is None
         assert src.describe()["refusal"] == "because"
+
+
+class TestTheHandoffDirectoryMustBeShared:
+    """The gap that made the whole path silently dead.
+
+    The scanner runtime wrote to its own checkout and the trading runtime
+    read a directory INSIDE the release -- different paths, and the
+    reader's changes on every deploy. Neither side errored: the scanner
+    published successfully, the executor found an empty directory, and
+    both reported success.
+    """
+
+    def test_a_release_scoped_default_is_refused(self, monkeypatch):
+        # Both must be cleared: analytics_dir() prefers
+        # SCANNER_ANALYTICS_DIR and only falls back to the project root,
+        # so leaving it set would never reach the release path at all.
+        monkeypatch.delenv(publisher.CANDIDATE_DIR_ENV, raising=False)
+        monkeypatch.delenv("SCANNER_ANALYTICS_DIR", raising=False)
+        monkeypatch.setenv(
+            "TRADING_PROJECT_ROOT",
+            "/home/ubuntu/releases/us-stock-trading/abc123")
+        with pytest.raises(publisher.CandidateHandoffMisconfigured,
+                           match="shared directory"):
+            publisher.candidate_dir()
+
+    def test_an_explicit_shared_directory_is_accepted(self, monkeypatch,
+                                                      tmp_path):
+        monkeypatch.setenv(publisher.CANDIDATE_DIR_ENV, str(tmp_path))
+        monkeypatch.setenv(
+            "TRADING_PROJECT_ROOT",
+            "/home/ubuntu/releases/us-stock-trading/abc123")
+        assert publisher.candidate_dir() == tmp_path
+
+    def test_a_non_release_default_still_works(self, monkeypatch, tmp_path):
+        """The scanner runtime is a working checkout and needs no env."""
+        monkeypatch.delenv(publisher.CANDIDATE_DIR_ENV, raising=False)
+        monkeypatch.setenv("TRADING_PROJECT_ROOT", str(tmp_path))
+        monkeypatch.setenv("SCANNER_ANALYTICS_DIR", str(tmp_path / "a"))
+        assert "candidates" in str(publisher.candidate_dir())
+
+
+class TestQuietIsNotTheSameAsAbsent:
+    def test_a_scan_that_ran_and_found_nothing_says_so(self, published):
+        publisher.mark_run(DAY, "REGULAR", strategy_id=cs.STRATEGY_ID,
+                           candidates=0)
+        src = source()
+        assert src.symbols() == []
+        assert src.describe()["refusal"] == cs.NO_CANDIDATE
+
+    def test_a_missing_producer_says_something_different(self, published):
+        src = source()
+        assert src.symbols() == []
+        assert src.describe()["refusal"] == cs.NO_PRODUCER_RUN
+
+    def test_the_two_refusals_are_not_interchangeable(self):
+        """One is waited out; the other is fixed. A shared phrasing is
+        how a missing producer waits forever."""
+        assert cs.NO_CANDIDATE != cs.NO_PRODUCER_RUN
+        assert "producer is missing" in cs.NO_PRODUCER_RUN
+        assert "producer" not in cs.NO_CANDIDATE
+
+    def test_the_marker_is_written_even_for_an_empty_scan(self, published):
+        from scanners import runner
+
+        class Outcome:
+            scanner_name, failed = "accumulation", False
+            signals = []
+
+        class Report:
+            outcomes = [Outcome()]
+            trading_day, session, run_id = DAY, "REGULAR", "run-1"
+
+        assert runner.publish_report_candidates(Report()) == 0
+        assert publisher.scan_ran(DAY, "REGULAR") is True
+
+
+class TestProducerToConsumerEndToEnd:
+    """The whole path, with the real publisher and the real source.
+
+    A scanner test alone would have passed throughout the outage: the
+    scan worked, the publication worked, and nothing consumed it.
+    """
+
+    def test_a_regular_scan_reaches_the_executors_source(self, published):
+        from scanners import runner
+
+        class Outcome:
+            scanner_name, failed = "accumulation", False
+            signals = [Signal("ABC", 88.0), Signal("XYZ", 71.0)]
+
+        class Report:
+            outcomes = [Outcome()]
+            trading_day, session, run_id = DAY, "REGULAR", "run-1"
+
+        assert runner.publish_report_candidates(Report()) == 2
+
+        src = cs.resolve_for_strategy(cs.STRATEGY_ID, trading_day=DAY,
+                                      session="REGULAR")
+        assert src.symbols() == ["ABC", "XYZ"], "rank order preserved"
+        assert src.describe()["refusal"] is None
+
+        row = src.candidate_row("ABC")
+        assert row["strategy_id"] == cs.STRATEGY_ID
+        assert row["session"] == "REGULAR"
+        assert row["trading_day"] == DAY
+        assert row["rank"] == 1
+        assert row["provenance"]["candidate_decision"] == "DISABLED"
+
+    def test_an_after_hours_row_is_not_consumed_in_regular(self, published):
+        """§3: the executor must not pick up the 16:00 daily scan's
+        output during the session."""
+        from scanners import runner
+
+        class Outcome:
+            scanner_name, failed = "accumulation", False
+            signals = [Signal("EVENING", 90.0)]
+
+        class Report:
+            outcomes = [Outcome()]
+            trading_day, session, run_id = DAY, "AFTER_HOURS", "run-pm"
+
+        runner.publish_report_candidates(Report())
+        regular = cs.S2CandidateSource(trading_day=DAY, session="REGULAR")
+        assert regular.symbols() == []
+        assert "EVENING" not in regular.allowed_symbols()
+
+    def test_no_broker_is_reachable_from_the_producer_path(self):
+        import ast
+
+        for module in ("scanners/publish/candidates.py", "scanners/runner.py"):
+            source_text = (REPO_ROOT / module).read_text()
+            for node in ast.walk(ast.parse(source_text)):
+                if isinstance(node, (ast.Import, ast.ImportFrom)):
+                    names = [str(getattr(node, "module", "") or "")]
+                    names += [a.name for a in node.names]
+                    for name in names:
+                        for segment in name.split("."):
+                            assert segment not in {"kis_broker", "brokers",
+                                                   "kis_live_trading"}, name

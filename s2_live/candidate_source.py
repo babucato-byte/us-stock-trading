@@ -47,6 +47,12 @@ logger = logging.getLogger(__name__)
 
 SOURCE_S2 = "s2_accumulation"
 
+#: The scan ran and the market was quiet. Wait.
+NO_CANDIDATE = "REGULAR scan ran; no symbol met the S2 conditions"
+#: No scan ran at all. Waiting will not help.
+NO_PRODUCER_RUN = ("no S2 scan ran for this session -- the candidate "
+                   "producer is missing, not the candidates")
+
 #: The strategy id the publisher writes and the risk matrix knows.
 STRATEGY_ID = "S2_VOLUME_ACCUMULATION_V1"
 
@@ -119,7 +125,19 @@ class S2CandidateSource:
             return None
 
         if not rows:
-            self._refusal = "no S2 candidates published for this session"
+            # Two different situations, and they demand opposite
+            # responses: a quiet market is waited out, a missing producer
+            # is fixed. Without the run marker they read identically --
+            # which is how S2 sat at NO_CANDIDATE for a whole session
+            # while no REGULAR scan existed to produce anything.
+            if publisher.scan_ran(self._trading_day, self._session):
+                self._refusal = NO_CANDIDATE
+            else:
+                self._refusal = NO_PRODUCER_RUN
+                logger.error(
+                    "no S2 scan ran for %s/%s -- the candidate producer is "
+                    "missing, not the candidates", self._trading_day,
+                    self._session)
             return None
 
         # The published file is per (day, session) by construction, but

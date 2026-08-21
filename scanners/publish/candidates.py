@@ -56,6 +56,16 @@ DEFAULT_SUBDIR = "candidates"
 
 SCHEMA_VERSION = "scanner_candidates_v1"
 
+#: Written once per (day, session) whenever a publishing scanner RUNS,
+#: whether or not it found anything.
+#:
+#: Without it, "no candidate file" is ambiguous between two situations
+#: that demand opposite responses: the scan ran and the market was quiet
+#: (wait), or the producer never ran at all (fix the schedule). Those
+#: read identically in a log and the second one waits forever -- which is
+#: exactly how S2 sat at NO_CANDIDATE while no REGULAR scan existed.
+RUN_MARKER_SUFFIX = ".ran"
+
 
 @dataclass(frozen=True)
 class PublishedCandidate:
@@ -87,13 +97,80 @@ class PublishedCandidate:
         return asdict(self)
 
 
+#: A path under an immutable release directory cannot be the hand-off
+#: location. Two runtimes have to agree on one directory, and a
+#: release-scoped default gives each of them a DIFFERENT one that also
+#: changes on every deploy. The failure is silent in the worst way: the
+#: scanner writes candidates, the executor reads an empty directory, and
+#: both report success.
+RELEASE_PATH_MARKER = "/releases/"
+
+
+class CandidateHandoffMisconfigured(Exception):
+    """The two runtimes would not be looking at the same directory."""
+
+
 def candidate_dir() -> Path:
+    """Where published candidates live. Shared by both runtimes.
+
+    Requires `SCANNER_CANDIDATE_DIR` when running from a release. The
+    default -- analytics_dir()/candidates -- resolves under
+    TRADING_PROJECT_ROOT, which for the trading runtime is the release
+    directory itself. Falling back to it there would mean the scanner
+    runtime writes to its checkout and the trading runtime reads inside a
+    release that changes every deploy, with no error on either side.
+
+    Refusing is the only honest option: a hand-off nobody can see failing
+    is worse than one that will not start.
+    """
     configured = os.environ.get(CANDIDATE_DIR_ENV)
     if configured and str(configured).strip():
         return Path(str(configured).strip())
+
     from scanners.base import result_store
 
-    return result_store.analytics_dir() / DEFAULT_SUBDIR
+    fallback = result_store.analytics_dir() / DEFAULT_SUBDIR
+    if RELEASE_PATH_MARKER in str(fallback):
+        raise CandidateHandoffMisconfigured(
+            f"{CANDIDATE_DIR_ENV} must be set to a shared directory when "
+            f"running from a release; the default {fallback} is inside the "
+            "release and is not visible to the scanner runtime")
+    return fallback
+
+
+def run_marker_path(trading_day: str, session: Optional[str] = None) -> Path:
+    return Path(str(candidates_path(trading_day, session)) + RUN_MARKER_SUFFIX)
+
+
+def mark_run(trading_day: str, session: Optional[str] = None, *,
+             strategy_id: Optional[str] = None, candidates: int = 0,
+             run_id: Optional[str] = None) -> bool:
+    """Record that a publishing scanner ran for this (day, session).
+
+    Best-effort: losing the marker makes a quiet session indistinguishable
+    from a missing one, which is a reporting loss, not a trading one.
+    """
+    try:
+        payload = {"trading_day": trading_day, "session": session,
+                   "strategy_id": strategy_id, "candidates": candidates,
+                   "scanner_run_id": run_id,
+                   "marked_at": datetime.now(timezone.utc).isoformat()}
+        with run_marker_path(trading_day, session).open(
+                "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
+        return True
+    except Exception:  # noqa: BLE001
+        logger.warning("could not mark the %s/%s scanner run", trading_day,
+                       session, exc_info=True)
+        return False
+
+
+def scan_ran(trading_day: str, session: Optional[str] = None) -> bool:
+    """Did a publishing scanner run for this (day, session)?"""
+    try:
+        return run_marker_path(trading_day, session).exists()
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def candidates_path(trading_day: str, session: Optional[str] = None) -> Path:

@@ -729,6 +729,13 @@ def publish_report_candidates(report) -> int:
             logger.info("not publishing %s candidates: the scanner failed", name)
             continue
         signals = list(getattr(outcome, "signals", None) or [])
+        # Marked BEFORE the early return, so a scan that ran and found
+        # nothing is distinguishable from a producer that never ran.
+        # Those need opposite responses and read identically without it.
+        candidate_publisher.mark_run(
+            getattr(report, "trading_day", None),
+            getattr(report, "session", None), strategy_id=strategy_id,
+            candidates=len(signals), run_id=getattr(report, "run_id", None))
         if not signals:
             continue
         rows = candidate_publisher.publish(
