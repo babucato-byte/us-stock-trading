@@ -216,3 +216,42 @@ class TestExitContinuityUnderMismatch:
         from s2_live import exit_runtime
 
         assert callable(exit_runtime.run_exits)
+
+
+class TestTheAccountStoreRecordsNoVenue:
+    """`positions` has no venue column, and inventing a fault out of a
+    field it does not record would fire on every strategy position.
+
+    Venue identity is enforced where it can be: against the broker's own
+    rows. Here the question is only whether fill sync recorded the
+    position at all.
+    """
+
+    def test_a_venueless_account_row_covers_a_venued_strategy_position(
+            self, conn):
+        s2_position(conn, symbol="ABC", venue="NASD")
+        result = ih.summary(conn, [{"symbol": "ABC", "venue": None,
+                                    "quantity": 1}])
+        assert result["coverage_healthy"] is True
+        assert result["coverage_gaps"] == []
+
+    def test_it_still_catches_a_genuinely_missing_position(self, conn):
+        s2_position(conn, symbol="ABC", venue="NASD")
+        result = ih.summary(conn, [{"symbol": "OTHER", "venue": None,
+                                    "quantity": 1}])
+        assert result["coverage_healthy"] is False
+
+    def test_it_still_catches_a_short_quantity(self, conn):
+        s2_position(conn, symbol="ABC", venue="NASD", quantity=2)
+        result = ih.summary(conn, [{"symbol": "ABC", "venue": None,
+                                    "quantity": 1}])
+        assert result["coverage_healthy"] is False
+
+    def test_an_exact_venue_match_is_preferred_over_the_venueless_row(
+            self, conn):
+        s2_position(conn, symbol="ABC", venue="NASD", quantity=1)
+        result = ih.summary(conn, [{"symbol": "ABC", "venue": "NASD",
+                                    "quantity": 1},
+                                   {"symbol": "ABC", "venue": None,
+                                    "quantity": 5}])
+        assert result["coverage_healthy"] is True

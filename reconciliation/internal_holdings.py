@@ -129,6 +129,28 @@ def attribution(conn) -> List[str]:
     return lines
 
 
+def _account_quantity(account: Dict[Tuple[str, Optional[str]], int],
+                      symbol: str, venue: Optional[str]) -> int:
+    """Account quantity for a strategy's (symbol, venue).
+
+    The account-level `positions` table has no venue column, so its rows
+    key as (symbol, None). Comparing a strategy's ("ABC", "NASD")
+    against that directly would report a coverage gap for EVERY strategy
+    position -- a fault invented out of a field the account store simply
+    does not record.
+
+    So an exact (symbol, venue) match is preferred and a venue-less
+    account row satisfies any venue. This is not a weakening of venue
+    identity: the broker comparison is where venue identity is enforced,
+    and it is enforced on the broker's own rows. Here the question is
+    only "did fill sync record this at all".
+    """
+    exact = account.get((symbol, venue))
+    if exact is not None:
+        return exact
+    return account.get((symbol, None), 0)
+
+
 def coverage_gaps(conn, account_rows) -> List[Dict[str, Any]]:
     """Positions a strategy holds that the account store does not.
 
@@ -149,12 +171,17 @@ def coverage_gaps(conn, account_rows) -> List[Dict[str, Any]]:
         for symbol, venue, quantity in rows:
             key = _key(symbol, venue)
             claimed[key] += quantity
-            if account.get(key, 0) < quantity:
+            # Also credit the venue-less account key, so an account row
+            # that records no venue is not later reported unattributed.
+            if key not in account and (key[0], None) in account:
+                claimed[(key[0], None)] += quantity
+            held = _account_quantity(account, key[0], key[1])
+            if held < quantity:
                 gaps.append({
                     "gap": GAP_NOT_IN_ACCOUNT, "strategy_id": strategy_id,
                     "symbol": key[0], "venue": key[1],
                     "strategy_quantity": quantity,
-                    "account_quantity": account.get(key, 0),
+                    "account_quantity": held,
                 })
 
     for key, quantity in account.items():
@@ -173,9 +200,13 @@ def summary(conn, account_rows) -> Dict[str, Any]:
     totals = aggregate(account_rows)
     gaps = coverage_gaps(conn, account_rows)
     return {
+        # Sorted with None mapped to "" -- a venue-less key and a venued
+        # one are both normal here (the account store records no venue),
+        # and comparing None against a string raises.
         "internal_holdings": [
             {"symbol": s, "venue": v, "quantity": q}
-            for (s, v), q in sorted(totals.items())],
+            for (s, v), q in sorted(totals.items(),
+                                    key=lambda kv: (kv[0][0], kv[0][1] or ""))],
         "attribution": attribution(conn),
         "coverage_gaps": gaps,
         # Only a missing account row is a fault. An unattributed account
