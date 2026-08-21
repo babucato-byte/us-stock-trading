@@ -30,7 +30,7 @@ VALID_MODES = frozenset({MODE_LIMITED_LIVE, MODE_DISCOVERY_ONLY})
 #: Every scanner in `scanners/registry.py` must appear here.
 SCANNER_LIVE_MODE = {
     "hma_early_trend": MODE_LIMITED_LIVE,
-    "accumulation": MODE_DISCOVERY_ONLY,
+    "accumulation": MODE_LIMITED_LIVE,
     "breakout_ready": MODE_DISCOVERY_ONLY,
     "premarket_momentum": MODE_DISCOVERY_ONLY,
     "gap_pullback": MODE_DISCOVERY_ONLY,
@@ -58,14 +58,25 @@ def _limited_live_names(modes=None):
     return sorted(name for name, mode in table.items() if mode == MODE_LIMITED_LIVE)
 
 
+#: The two strategies cleared to place real orders, by name. Kept as
+#: constants so a caller asks about the strategy it means rather than
+#: about "whichever one happens to be live".
+S1_SCANNER_NAME = "hma_early_trend"
+S2_SCANNER_NAME = "accumulation"
+
+
 def limited_live_scanner(modes=None) -> str:
     """The single LIMITED_LIVE scanner name, or raise.
 
-    Raises on zero as well as on two. Zero is safe but it is also not a
-    state the publisher should silently run in -- a publisher that finds
-    no live scanner and writes an empty candidate file is
-    indistinguishable from one that ran on a quiet day, and those two
-    need different operator responses.
+    Answers a question that only makes sense while exactly one strategy
+    is live, which is no longer the posture: S1 and S2 are both
+    LIMITED_LIVE. Production code asks `require_limited_live(name)`
+    instead -- a caller that needs S1's scanner should say so, not
+    infer it from being the only one.
+
+    Retained because "how many strategies are live" is still worth being
+    able to assert, and because a caller that genuinely requires
+    single-strategy operation should fail loudly rather than pick one.
     """
     names = _limited_live_names(modes)
     if len(names) != 1:
@@ -76,11 +87,37 @@ def limited_live_scanner(modes=None) -> str:
 
 
 def is_limited_live(scanner_name, modes=None) -> bool:
-    """Fail-closed membership test. Any configuration problem is False."""
+    """Fail-closed membership test for ONE named scanner.
+
+    Asks about the scanner it was given, and nothing else. It used to
+    delegate to `limited_live_scanner()`, which raises unless exactly one
+    scanner is live -- so the day a second strategy was promoted this
+    would have answered False for BOTH of them, including the one that
+    was already trading. A live strategy quietly reading as not-live is
+    the worst direction for this to fail in: it does not stop an order,
+    it stops the checks that decide whether to place one.
+    """
     try:
-        return scanner_name == limited_live_scanner(modes)
+        return scanner_name in _limited_live_names(modes)
     except ScannerLiveModeError:
         return False
+
+
+def require_limited_live(scanner_name, modes=None) -> str:
+    """`scanner_name` if it is LIMITED_LIVE, else raise.
+
+    The question a live strategy's own publisher should ask. Raising
+    rather than returning False because the callers are publishers and
+    candidate sources: a publisher that finds its strategy not live and
+    writes an empty file is indistinguishable from one that ran on a
+    quiet day, and those need different operator responses.
+    """
+    names = _limited_live_names(modes)
+    if scanner_name not in names:
+        raise ScannerLiveModeError(
+            f"scanner {scanner_name!r} is not {MODE_LIMITED_LIVE}; "
+            f"live scanners are {names or '(none)'}")
+    return scanner_name
 
 
 def discovery_only_scanners(modes=None):

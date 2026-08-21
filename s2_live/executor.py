@@ -55,6 +55,24 @@ SKIP_NOT_LIVE = "S2_NOT_LIMITED_LIVE"
 SKIP_LIMIT = "S2_POSITION_LIMIT"
 SKIP_NOT_CONFIRMED = "S2_ENTRY_NOT_CONFIRMED"
 SKIP_NO_SUBMITTER = "S2_NO_SUBMIT_FUNCTION"
+SKIP_UNGATED_SUBMITTER = "S2_SUBMIT_FUNCTION_NOT_GATED"
+
+#: A live submit function must carry this attribute, set True.
+#:
+#: `submit_fn` is injected so this module needs no broker import, which
+#: keeps a bug here from placing an order. But injection cuts both ways:
+#: it would also let someone bind a raw broker call and skip the shared
+#: BUY gate -- the twenty-step sequence in `execution/order_gate` that
+#: checks COMMON_STOCK, orderable cash, reconciliation, duplicate
+#: signals and the kill switch. S2's own three gates do not replace any
+#: of those; they sit in front of them.
+#:
+#: So a function that has not declared itself gated is refused in live
+#: mode. The marker is deliberately something a caller must set on
+#: purpose: forgetting it fails closed, which is the direction that
+#: costs nothing, while forgetting the gate itself would cost real
+#: money on an unchecked order.
+GATED_SUBMIT_MARKER = "applies_buy_gate"
 
 
 @dataclass
@@ -75,6 +93,17 @@ class CycleResult:
                 "exits": self.exits, "entries": self.entries,
                 "skipped": self.skipped, "submitted": self.submitted,
                 "errors": self.errors}
+
+
+def _may_submit(submit_fn) -> bool:
+    """True only for a submitter that declared itself gated."""
+    if submit_fn is None:
+        return False
+    if not getattr(submit_fn, GATED_SUBMIT_MARKER, False):
+        logger.error("refusing to submit: the submit function has not "
+                     "declared that it applies the shared order gates")
+        return False
+    return True
 
 
 def s2_is_limited_live() -> bool:
@@ -129,7 +158,12 @@ def run_cycle(*, positions, candidates, features_fn, price_fn,
             entry = {"symbol": position.symbol, **decision.as_dict()}
 
             if decision.sells:
-                if live and submit_fn is not None:
+                # The same marker is required for a SELL. Not because a
+                # sell needs the BUY gate -- exits must never be gated by
+                # entry risk -- but because the injection risk is
+                # identical: an undeclared callable here is just as
+                # likely to be a raw broker call.
+                if live and _may_submit(submit_fn):
                     submit_fn(symbol=position.symbol, side="sell",
                               quantity=VALIDATION_QUANTITY,
                               reason=decision.reason)
@@ -225,6 +259,14 @@ def _consider_entry(candidate, *, symbol, features_fn, price_fn, session,
 
     if submit_fn is None:
         return {"symbol": symbol, "entered": False, "reason": SKIP_NO_SUBMITTER}
+
+    if not _may_submit(submit_fn):
+        # Refused rather than sent. S2's three gates run BEFORE the
+        # shared BUY gate, not instead of it, and an ungated submitter
+        # would place a real order without the COMMON_STOCK, cash,
+        # reconciliation and kill-switch checks.
+        return {"symbol": symbol, "entered": False,
+                "reason": SKIP_UNGATED_SUBMITTER}
 
     submit_fn(symbol=symbol, side="buy", quantity=VALIDATION_QUANTITY,
               limit_price=_number(current))

@@ -28,6 +28,8 @@ can abort the thing it monitors is worse than no monitor.
 
 import logging
 import os
+
+from scanners.notify import labels
 from typing import Any, Dict, Iterable, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -224,28 +226,41 @@ def format_scan(*, scanner_name, session, trading_day, scanned, candidates,
     scanner hides behind a quiet day, so the count never doubles as the
     health signal.
     """
-    tag = scanner_tag(scanner_name)
-    lines = [f"[{tag}]", ""]
+    lines = [f"[{labels.scanner(scanner_name)}]", ""]
     if generated_at:
-        lines.append(f"Time: {generated_at}")
+        lines.append(f"{labels.field('Generated at')}: "
+                     f"{labels.dual_time(generated_at)}")
     lines += [
-        f"Session: {session}",
-        f"Trading day: {trading_day}",
-        f"Scanned: {scanned if scanned is not None else '-'}",
-        f"Candidates: {candidates if candidates is not None else '-'}",
+        f"{labels.field('Status')}: {labels.status(status)}",
+        f"{labels.field('Session')}: {labels.session(session)}",
+        f"{labels.field('Trading day')}: {trading_day}",
+        f"{labels.field('Scanned')}: "
+        f"{f'{scanned:,}' if isinstance(scanned, int) else '-'}",
+        # 0 and "-" mean different things and always will: 0 is a
+        # completed scan that found nothing, "-" is a scan that never
+        # completed. See the empty-result line below.
+        f"{labels.field('Candidates')}: "
+        f"{candidates if candidates is not None else '-'}",
         "",
     ]
     ranked = list(top or [])[:TOP_N]
     if ranked:
         for index, item in enumerate(ranked, start=1):
-            lines.append(f"#{index} {item.get('symbol', '?'):<6} "
-                         f"score {_fmt(item.get('score'))}")
+            lines.append(f"{index}위 {item.get('symbol', '?'):<6} "
+                         f"{labels.field('Score')} {_fmt(item.get('score'))}")
         lines.append("")
-    lines.append(f"Scanner: {status}")
+    elif candidates == 0:
+        # Said in words as well as in the count. "후보 수: 0" with no
+        # sentence reads like a truncated message; the sentence is what
+        # makes a quiet day unmistakably a RESULT rather than an absence.
+        lines.append("결과: 조건을 충족한 종목이 없습니다.")
+        lines.append("")
     if live_status:
-        lines.append(f"Mode: {live_status}")
+        lines.append(f"{labels.field('Mode')}: {labels.status(live_status)}")
     if is_all_session(scanner_name):
-        lines.append(f"All-session coverage: {' · '.join(ALL_SESSIONS)}")
+        covered = " · ".join(labels.session(name, with_code=False)
+                             for name in ALL_SESSIONS)
+        lines.append(f"전 세션 스캔: {covered}")
     # Whether THIS session can place a live order, printed rather than
     # left to be inferred from the fact that a scan happened. A premarket
     # candidate list looks identical to a regular-hours one, and the
@@ -253,18 +268,18 @@ def format_scan(*, scanner_name, session, trading_day, scanned, candidates,
     # exactly what a reader would otherwise assume away.
     status_line = _session_execution_status(session)
     if status_line:
-        lines.append(f"Session execution: {status_line}")
+        lines.append(f"{labels.field('Session execution')}: "
+                     f"{labels.status(status_line)}")
 
     if ranked:
         best = ranked[0]
-        details = [("volume multiple", best.get("volume_multiple")),
-                   ("price", best.get("price")),
-                   ("VWAP", best.get("vwap")),
-                   ("session", session)]
+        details = [(labels.field("Volume Multiple"), best.get("volume_multiple")),
+                   (labels.field("Price"), best.get("price")),
+                   (labels.field("VWAP"), best.get("vwap"))]
         shown = [f"  {label}: {_fmt(value)}" for label, value in details
                  if value is not None]
         if shown:
-            lines += ["", f"Top candidate: {best.get('symbol', '?')}"] + shown
+            lines += ["", f"상위 후보: {best.get('symbol', '?')}"] + shown
     return "\n".join(lines)
 
 
@@ -340,45 +355,57 @@ def notify_scan(*, scanner_name, session, trading_day, scanned, candidates,
 
 def format_buy(*, strategy, symbol, session, qty, limit_price, order_id,
                status="ACCEPTED", rank=None) -> str:
-    lines = [f"[{TAG_LIVE_BUY} · {strategy}]", "",
-             f"Symbol: {symbol}"]
+    lines = [f"[{labels.tag(TAG_LIVE_BUY)} · {_strategy_number(strategy)}]", "",
+             f"전략: {labels.strategy(strategy)}",
+             f"{labels.field('Symbol')}: {symbol}"]
     if rank is not None:
-        lines.append(f"Rank: {rank}")
+        lines.append(f"{labels.field('Rank')}: {rank}")
     lines += [
-        f"Session: {session}",
-        f"Qty: {qty}",
-        f"Limit: {_fmt(limit_price, 4)}",
-        f"Order ID: {order_id}",
-        f"Status: {status}",
+        f"{labels.field('Session')}: {labels.session(session)}",
+        f"{labels.field('Quantity')}: {qty}주",
+        f"주문가: {_fmt(limit_price, 4)}",
+        f"{labels.field('Order ID')}: {order_id}",
+        f"{labels.field('Status')}: {labels.status(status)}",
     ]
     return "\n".join(lines)
 
 
-def format_fill(*, strategy, symbol, qty, average_fill_price, position_id) -> str:
-    return "\n".join([
-        f"[{TAG_LIVE_FILL} · {strategy}]", "",
-        f"Symbol: {symbol}",
-        f"Qty: {qty}",
-        f"Avg fill: {_fmt(average_fill_price, 4)}",
-        f"Position ID: {position_id}",
-    ])
+def format_fill(*, strategy, symbol, qty, average_fill_price, position_id,
+                side=None, position_state=None) -> str:
+    """A fill, tagged by the ACTUAL side.
+
+    Not by the event name: one fill event carries both directions, and
+    labelling a sell "매수 체결" would make the channel lie about a real
+    order. An unknown side degrades to the neutral "체결".
+    """
+    lines = [f"[{labels.fill_tag(side)} · {_strategy_number(strategy)}]", "",
+             f"전략: {labels.strategy(strategy)}",
+             f"{labels.field('Symbol')}: {symbol}",
+             f"{labels.field('Quantity')}: {qty}주",
+             f"{labels.field('Avg Fill')}: {_fmt(average_fill_price, 4)}"]
+    if position_state:
+        lines.append(f"{labels.field('Position')}: {position_state}")
+    lines.append(f"포지션 ID: {position_id}")
+    return "\n".join(lines)
 
 
 def format_sell(*, strategy, symbol, reason, qty, average_entry, average_sell,
                 realized_pnl=None, holding_time=None) -> str:
-    lines = [f"[{TAG_LIVE_SELL} · {strategy}]", "",
-             f"Symbol: {symbol}",
-             f"Reason: {reason}",
-             f"Qty: {qty}",
-             f"Avg entry: {_fmt(average_entry, 4)}",
-             f"Avg sell: {_fmt(average_sell, 4)}"]
+    lines = [f"[{labels.tag(TAG_LIVE_SELL)} · {_strategy_number(strategy)}]", "",
+             f"전략: {labels.strategy(strategy)}",
+             f"{labels.field('Symbol')}: {symbol}",
+             f"매도 사유: {labels.exit_reason(reason)}",
+             f"{labels.field('Quantity')}: {qty}주",
+             f"평균 매수가: {_fmt(average_entry, 4)}",
+             f"평균 매도가: {_fmt(average_sell, 4)}"]
     # PnL is printed only when it is known. A fee-inclusive realised
     # number is not available until settlement, and printing a
     # gross figure labelled "Realized PnL" would be a claim the ledger
     # cannot support.
-    lines.append(f"Realized PnL: {_fmt(realized_pnl) if realized_pnl is not None else 'PENDING_SETTLEMENT'}")
+    lines.append(f"{labels.field('Realized PnL')}: "
+                 f"{_fmt(realized_pnl) if realized_pnl is not None else labels.status('PENDING_SETTLEMENT')}")
     if holding_time:
-        lines.append(f"Holding time: {holding_time}")
+        lines.append(f"{labels.field('Holding Time')}: {holding_time}")
     return "\n".join(lines)
 
 
@@ -411,9 +438,24 @@ def notify_sell(**kwargs) -> bool:
 
 # --- operational tags -----------------------------------------------------
 
+def _strategy_number(strategy) -> str:
+    """S1 / S2 for the header, from either a scanner name or a strategy id.
+
+    The number is kept in the header because it is how the operator
+    refers to the strategies everywhere else; the Korean name goes on
+    its own line rather than replacing it.
+    """
+    text = str(strategy or "")
+    if text.startswith("S1") or text == "hma_early_trend":
+        return "S1"
+    if text.startswith("S2") or text == "accumulation":
+        return "S2"
+    return text
+
+
 def notify_tagged(tag: str, body: str, *, env=None) -> bool:
     try:
-        return _send(f"[{tag}]\n\n{body}", env=env)
+        return _send(f"[{labels.tag(tag)}]\n\n{body}", env=env)
     except Exception:  # noqa: BLE001
         logger.warning("scanner monitor: tagged message failed", exc_info=True)
         return False
@@ -431,37 +473,42 @@ def _leader(rows: List[Dict[str, Any]], key, *, minimum_trades=0, highest=True):
     usable = [r for r in rows
               if r.get(key) is not None and (r.get("trades") or 0) >= minimum_trades]
     if not usable:
-        return INSUFFICIENT_SAMPLE
+        return labels.status(INSUFFICIENT_SAMPLE)
     best = (max if highest else min)(usable, key=lambda r: r[key])
-    return f"{best.get('label', '?')} ({_fmt(best[key])})"
+    return f"{labels.scanner(best.get('label', '?'))} ({_fmt(best[key])})"
 
 
 def format_daily_summary(*, trading_day, rows: Iterable[Dict[str, Any]],
                          minimum_trades_for_winner: int = 1) -> str:
     rows = list(rows)
-    lines = [f"[{TAG_DAILY_SUMMARY}]", "", f"Trading day: {trading_day}", ""]
+    lines = [f"[{labels.tag(TAG_DAILY_SUMMARY)}]", "",
+             f"{labels.field('Trading day')}: {trading_day}", ""]
     for row in rows:
-        lines.append(f"{row.get('label', '?')}")
-        lines.append(f"  candidates: {row.get('candidates', '-')}")
-        for label, key in (("live opportunities", "live_opportunities"),
-                           ("trades", "trades"),
-                           ("avg holding", "avg_holding"),
-                           ("best MFE", "best_mfe"),
-                           ("avg MFE", "avg_mfe"),
-                           ("avg MAE", "avg_mae"),
-                           ("PnL", "pnl"),
-                           ("live result", "live_result")):
+        lines.append(labels.scanner(row.get("label", "?")))
+        lines.append(f"  {labels.field('Candidates')}: "
+                     f"{row.get('candidates', '-')}")
+        for label, key in (("실거래 기회", "live_opportunities"),
+                           ("거래 수", "trades"),
+                           ("평균 보유시간", "avg_holding"),
+                           ("최고 MFE", "best_mfe"),
+                           ("평균 MFE", "avg_mfe"),
+                           ("평균 MAE", "avg_mae"),
+                           ("실현손익", "pnl"),
+                           ("실거래 결과", "live_result")):
             if row.get(key) is not None:
                 lines.append(f"  {label}: {_fmt(row[key])}")
         lines.append("")
     lines += [
-        "Best scanner today: " + _leader(rows, "avg_mfe",
-                                         minimum_trades=minimum_trades_for_winner),
-        "Most opportunities: " + _leader(rows, "candidates"),
-        "Best MFE: " + _leader(rows, "best_mfe"),
-        "Lowest MAE: " + _leader(rows, "avg_mae", highest=False),
-        "Highest turnover: " + _leader(rows, "trades",
-                                       minimum_trades=minimum_trades_for_winner),
+        "오늘 가장 많은 기회: " + _leader(rows, "candidates"),
+        "최고 MFE: " + _leader(rows, "best_mfe"),
+        "최저 MAE: " + _leader(rows, "avg_mae", highest=False),
+        "거래 최다: " + _leader(rows, "trades",
+                            minimum_trades=minimum_trades_for_winner),
+        # Last, and phrased as a verdict rather than a winner, because
+        # with too little behind it the honest answer is that there is
+        # no answer -- not a name printed with a caveat beside it.
+        "성과 판정: " + _leader(rows, "avg_mfe",
+                            minimum_trades=minimum_trades_for_winner),
     ]
     return "\n".join(lines)
 

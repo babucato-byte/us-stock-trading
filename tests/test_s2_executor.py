@@ -44,7 +44,13 @@ class Features:
 
 
 class Recorder:
-    """Stands in for the broker. Records; never sends."""
+    """Stands in for a GATED submitter. Records; never sends.
+
+    Carries the marker because the executor refuses an ungated one --
+    see TestOnlyAGatedSubmitterMaySend for why that refusal exists.
+    """
+
+    applies_buy_gate = True
 
     def __init__(self):
         self.calls = []
@@ -52,6 +58,12 @@ class Recorder:
     def __call__(self, **kwargs):
         self.calls.append(kwargs)
         return {"order_id": f"test-{len(self.calls)}"}
+
+
+class UngatedRecorder(Recorder):
+    """A raw broker call: no marker, so it must never be used."""
+
+    applies_buy_gate = False
 
 
 @pytest.fixture
@@ -88,15 +100,37 @@ def cycle(**kw):
     return executor.run_cycle(**kw)
 
 
+@pytest.fixture
+def s2_discovery_only(monkeypatch):
+    """Put S2 back to DISCOVERY_ONLY without touching the real table."""
+    from config import scanner_live_mode
+
+    monkeypatch.setitem(scanner_live_mode.SCANNER_LIVE_MODE,
+                        "accumulation", "DISCOVERY_ONLY")
+
+
 class TestNothingIsSubmittedWhileS2IsDiscoveryOnly:
-    def test_the_live_mode_table_still_says_discovery_only(self):
+    """The live-mode table is a gate in its own right.
+
+    S2 is LIMITED_LIVE now, so these drive the table back down rather
+    than reading today's value -- the property under test is that the
+    gate WORKS, not that it happens to be closed.
+    """
+
+    def test_s1_and_s2_are_both_live_and_the_rest_are_not(self):
         from config import scanner_live_mode
 
+        assert scanner_live_mode.SCANNER_LIVE_MODE["hma_early_trend"] == \
+            "LIMITED_LIVE"
         assert scanner_live_mode.SCANNER_LIVE_MODE["accumulation"] == \
-            "DISCOVERY_ONLY"
-        assert executor.s2_is_limited_live() is False
+            "LIMITED_LIVE"
+        for name in ("breakout_ready", "premarket_momentum", "gap_pullback",
+                     "orb"):
+            assert scanner_live_mode.SCANNER_LIVE_MODE[name] == "DISCOVERY_ONLY"
+        assert executor.s2_is_limited_live() is True
 
-    def test_a_confirmed_candidate_is_not_bought(self, store):
+    def test_a_confirmed_candidate_is_not_bought_when_not_live(
+            self, store, s2_discovery_only):
         broker = Recorder()
         result = cycle(candidates=[{"symbol": "ABC", "price": 100.0}],
                        live=True, submit_fn=broker)
@@ -104,13 +138,21 @@ class TestNothingIsSubmittedWhileS2IsDiscoveryOnly:
         assert result.submitted == 0
         assert result.skipped[0]["reason"] == executor.SKIP_NOT_LIVE
 
-    def test_it_still_records_that_it_would_have_entered(self, store):
+    def test_it_still_records_that_it_would_have_entered(
+            self, store, s2_discovery_only):
         """The refusals are the more interesting half of the dataset."""
         cycle(candidates=[{"symbol": "ABC", "price": 100.0}], live=True,
               submit_fn=Recorder())
         rows = tr.read("2026-08-19")
         assert rows[0]["provenance"]["would_have_entered"] is True
         assert rows[0]["live"] is False
+
+    def test_a_shadow_cycle_submits_nothing_even_when_live(self, store):
+        """live=False is the default and the executor honours it."""
+        broker = Recorder()
+        cycle(candidates=[{"symbol": "ABC", "price": 100.0}], live=False,
+              submit_fn=broker)
+        assert broker.calls == []
 
     def test_an_exit_is_decided_but_not_sent(self, store):
         broker = Recorder()
@@ -261,3 +303,70 @@ class TestTheCycleIsRecorded:
     def test_validation_quantity_is_one_whole_share(self):
         assert executor.VALIDATION_QUANTITY == 1
         assert isinstance(executor.VALIDATION_QUANTITY, int)
+
+
+class TestOnlyAGatedSubmitterMaySend:
+    """S2's three gates run BEFORE the shared BUY gate, not instead of it.
+
+    Injection keeps a bug in this module from reaching a broker, but it
+    would equally let someone bind a raw broker call and skip the
+    twenty-step sequence in execution/order_gate -- COMMON_STOCK,
+    orderable cash, reconciliation, duplicate signals, kill switch. None
+    of those is replaced by anything here.
+
+    The marker must be set deliberately, so forgetting it fails closed.
+    That costs nothing; forgetting the gate would cost real money on an
+    unchecked order.
+    """
+
+    def test_an_ungated_submitter_is_refused(self, store, s2_live):
+        broker = UngatedRecorder()
+        result = cycle(candidates=[{"symbol": "ABC", "price": 100.0}],
+                       live=True, submit_fn=broker, open_book={})
+        assert broker.calls == []
+        assert result.submitted == 0
+        assert result.skipped[0]["reason"] == executor.SKIP_UNGATED_SUBMITTER
+
+    def test_a_plain_function_is_ungated_by_default(self, store, s2_live):
+        """No marker means not gated. A caller has to opt in."""
+        sent = []
+        result = cycle(candidates=[{"symbol": "ABC", "price": 100.0}],
+                       live=True, submit_fn=lambda **kw: sent.append(kw),
+                       open_book={})
+        assert sent == []
+        assert result.skipped[0]["reason"] == executor.SKIP_UNGATED_SUBMITTER
+
+    def test_a_gated_submitter_is_allowed(self, store, s2_live):
+        broker = Recorder()
+        cycle(candidates=[{"symbol": "ABC", "price": 100.0}], live=True,
+              submit_fn=broker, open_book={})
+        assert len(broker.calls) == 1
+
+    def test_no_production_entrypoint_binds_a_submitter_yet(self):
+        """The honest state of the rollout: S2 is LIMITED_LIVE in the
+        table and its executor is not scheduled or bound to anything, so
+        no S2 order can be placed. Recorded as a test so the claim is
+        checked rather than asserted in a report.
+        """
+        import pathlib
+
+        for script in (REPO_ROOT / "scripts").glob("*.py"):
+            source = script.read_text(encoding="utf-8", errors="ignore")
+            if "s2_live" in source and "run_cycle" in source:
+                assert "applies_buy_gate" in source, (
+                    f"{script.name} runs the S2 cycle; it must bind a gated "
+                    "submitter")
+
+    def test_an_ungated_submitter_cannot_send_a_sell_either(self, store):
+        """A sell does not need the BUY gate -- exits must never be
+        gated by entry risk -- but the injection risk is the same: an
+        undeclared callable is just as likely to be a raw broker call."""
+        broker = UngatedRecorder()
+        result = cycle(positions=[held(symbol="OLD", peak_volume_multiple=6.0,
+                                       price_at_volume_peak=110.0)],
+                       features_fn=lambda s: Features(price=104.0,
+                                                      volume=2 * BASE),
+                       price_fn=lambda s: 104.0, live=True, submit_fn=broker)
+        assert result.exits[0]["action"] == ex.SELL, "the decision still stands"
+        assert result.exits[0]["submitted"] is False
+        assert broker.calls == []

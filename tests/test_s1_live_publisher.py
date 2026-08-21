@@ -101,34 +101,60 @@ class TestOnlyS1Publishes:
 
 
 class TestLiveModeConfiguration:
-    def test_exactly_one_limited_live_scanner_by_default(self):
-        assert scanner_live_mode.limited_live_scanner() == S1
-        assert len(scanner_live_mode.discovery_only_scanners()) == 5
+    def test_s1_and_s2_are_live_and_the_other_four_are_not(self):
+        """The posture after S2's approved promotion. S1's publisher now
+        asks for S1 BY NAME rather than for "the only live scanner" --
+        the two were the same thing until a second strategy was
+        promoted, and inferring identity from being alone would have
+        broken the moment that stopped being true."""
+        assert scanner_live_mode.is_limited_live(S1) is True
+        assert scanner_live_mode.is_limited_live("accumulation") is True
+        assert len(scanner_live_mode.discovery_only_scanners()) == 4
+        assert scanner_live_mode.require_limited_live(S1) == S1
 
-    def test_two_limited_live_scanners_fail_closed(self):
-        modes = dict(scanner_live_mode.SCANNER_LIVE_MODE,
-                     orb=scanner_live_mode.MODE_LIMITED_LIVE)
-        with pytest.raises(scanner_live_mode.ScannerLiveModeError, match="exactly one"):
-            scanner_live_mode.limited_live_scanner(modes)
+    def test_s1s_publisher_refuses_when_s1_itself_is_not_live(self):
+        """The failure that still matters. A second strategy going live
+        is no longer an error -- S1 being switched OFF while its
+        publisher runs is, because an empty candidate file from a
+        stood-down strategy is indistinguishable from a quiet day."""
+        modes = dict(scanner_live_mode.SCANNER_LIVE_MODE)
+        modes[S1] = scanner_live_mode.MODE_DISCOVERY_ONLY
+        with pytest.raises(scanner_live_mode.ScannerLiveModeError,
+                           match="not LIMITED_LIVE"):
+            scanner_live_mode.require_limited_live(S1, modes)
         write_signals([signal("NVDA")])
         write_run()
         with pytest.raises(publisher.S1PublishRefused):
             publisher.publish(DAY, modes=modes)
+
+    def test_a_second_live_strategy_does_not_disturb_s1(self):
+        """S2 is live now. S1's publisher must be unaffected by that --
+        `is_limited_live` used to delegate to a helper that raises unless
+        exactly one scanner is live, so promoting S2 would have made S1
+        read as not-live too, silently stopping the checks that decide
+        whether to place an order."""
+        modes = dict(scanner_live_mode.SCANNER_LIVE_MODE,
+                     orb=scanner_live_mode.MODE_LIMITED_LIVE)
+        assert scanner_live_mode.is_limited_live(S1, modes) is True
+        assert scanner_live_mode.require_limited_live(S1, modes) == S1
 
     def test_zero_limited_live_scanners_fail_closed(self):
         modes = {name: scanner_live_mode.MODE_DISCOVERY_ONLY
                  for name in scanner_live_mode.SCANNER_LIVE_MODE}
         with pytest.raises(scanner_live_mode.ScannerLiveModeError, match="exactly one"):
             scanner_live_mode.limited_live_scanner(modes)
+        with pytest.raises(scanner_live_mode.ScannerLiveModeError):
+            scanner_live_mode.require_limited_live(S1, modes)
 
     def test_an_unknown_mode_value_fails_closed(self):
         modes = dict(scanner_live_mode.SCANNER_LIVE_MODE, orb="SORT_OF_LIVE")
         with pytest.raises(scanner_live_mode.ScannerLiveModeError, match="unknown live mode"):
             scanner_live_mode.limited_live_scanner(modes)
 
-    def test_is_limited_live_is_false_on_any_config_error(self):
-        broken = dict(scanner_live_mode.SCANNER_LIVE_MODE,
-                      orb=scanner_live_mode.MODE_LIMITED_LIVE)
+    def test_is_limited_live_is_false_on_a_malformed_table(self):
+        """A table with an unknown mode value cannot be trusted about any
+        scanner in it, so the answer is False rather than a guess."""
+        broken = dict(scanner_live_mode.SCANNER_LIVE_MODE, orb="SORT_OF_LIVE")
         assert scanner_live_mode.is_limited_live(S1, broken) is False
 
 
@@ -341,14 +367,25 @@ class TestDynamicAllowlist:
         assert source.allowed_symbols() == frozenset()
         assert source.symbols() == []
 
-    def test_two_limited_live_scanners_yield_an_empty_allowlist(self):
+    def test_s1_stood_down_yields_an_empty_allowlist(self):
+        """The refusal that matters for the allowlist: S1 itself not
+        live. Another strategy being live is now normal."""
+        write_signals([signal("NVDA")])
+        publish_default()
+        modes = dict(scanner_live_mode.SCANNER_LIVE_MODE)
+        modes[S1] = scanner_live_mode.MODE_DISCOVERY_ONLY
+        source = candidate_source.S1CandidateSource(
+            trading_day=DAY, rollout=self.Rollout(), modes=modes)
+        assert source.allowed_symbols() == frozenset()
+
+    def test_a_second_live_strategy_leaves_s1s_allowlist_intact(self):
         write_signals([signal("NVDA")])
         publish_default()
         modes = dict(scanner_live_mode.SCANNER_LIVE_MODE,
                      orb=scanner_live_mode.MODE_LIMITED_LIVE)
         source = candidate_source.S1CandidateSource(
             trading_day=DAY, rollout=self.Rollout(), modes=modes)
-        assert source.allowed_symbols() == frozenset()
+        assert source.allowed_symbols() == {"NVDA"}
 
     def test_an_operator_list_tightens_and_never_loosens(self):
         write_signals([signal("NVDA", score=88.0), signal("AMD", score=70.0)])

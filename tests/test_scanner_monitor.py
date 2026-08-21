@@ -70,12 +70,12 @@ class TestScanMessages:
         text = monitor.format_scan(
             scanner_name="accumulation", session="REGULAR", trading_day="2026-08-20",
             scanned=5960, candidates=0, status="SUCCESS")
-        assert "[S2 VOLUME]" in text
-        assert "Session: REGULAR" in text
+        assert "[S2 · 거래량 누적]" in text
+        assert "세션: 정규장 (REGULAR)" in text
         # §7 verbatim: the quiet day is reported as a successful scan that
         # found nothing, never as an absence of a message.
-        assert "Candidates: 0" in text
-        assert "Scanner: SUCCESS" in text
+        assert "후보 수: 0" in text
+        assert "상태: 정상" in text
 
     def test_a_failure_reads_differently_from_a_quiet_day(self):
         quiet = monitor.format_scan(scanner_name="accumulation", session="REGULAR",
@@ -84,7 +84,7 @@ class TestScanMessages:
         broken = monitor.format_scan(scanner_name="accumulation", session="REGULAR",
                                      trading_day="d", scanned=0, candidates=None,
                                      status="FAILED_PROVIDER")
-        assert "SUCCESS" in quiet and "FAILED_PROVIDER" in broken
+        assert "정상" in quiet and "데이터 공급 실패" in broken
         assert quiet != broken
 
     def test_only_the_top_three_are_listed(self):
@@ -92,8 +92,8 @@ class TestScanMessages:
         text = monitor.format_scan(scanner_name="accumulation", session="REGULAR",
                                    trading_day="d", scanned=10, candidates=10,
                                    status="SUCCESS", top=top)
-        assert "#1 S0" in text and "#3 S2" in text
-        assert "#4" not in text
+        assert "1위 S0" in text and "3위 S2" in text
+        assert "4위" not in text
         assert monitor.TOP_N == 3
 
     def test_the_top_candidate_detail_is_included_when_present(self):
@@ -102,8 +102,8 @@ class TestScanMessages:
         text = monitor.format_scan(scanner_name="accumulation", session="REGULAR",
                                    trading_day="d", scanned=1, candidates=1,
                                    status="SUCCESS", top=top)
-        assert "Top candidate: ABC" in text
-        assert "volume multiple: 3.20" in text
+        assert "상위 후보: ABC" in text
+        assert "거래량 배수: 3.20" in text
         assert "VWAP: 12.10" in text
 
     def test_absent_details_are_omitted_not_faked(self):
@@ -112,7 +112,7 @@ class TestScanMessages:
                                    trading_day="d", scanned=1, candidates=1,
                                    status="SUCCESS", top=top)
         assert "VWAP" not in text
-        assert "volume multiple" not in text
+        assert "거래량 배수" not in text
 
     @pytest.mark.parametrize("name,tag", [
         ("hma_early_trend", "S1 HMA"), ("accumulation", "S2 VOLUME"),
@@ -131,15 +131,15 @@ class TestOrderMessages:
         text = monitor.format_buy(strategy="S2", symbol="ABC", session="REGULAR",
                                   qty=1, limit_price=12.34, order_id="0030469882",
                                   rank=2)
-        assert "[LIVE BUY · S2]" in text
-        assert "Status: ACCEPTED" in text
-        assert "Order ID: 0030469882" in text
-        assert "Avg fill" not in text, "a buy message must not imply a fill"
+        assert "[실거래 매수 · S2]" in text
+        assert "상태: 주문 접수" in text
+        assert "주문번호: 0030469882" in text
+        assert "평균 체결가" not in text, "a buy message must not imply a fill"
 
     def test_a_fill_carries_the_actual_average(self):
         text = monitor.format_fill(strategy="S1", symbol="TX", qty=1,
                                    average_fill_price=53.68, position_id="s1pos_x")
-        assert "[LIVE FILL · S1]" in text
+        assert "[체결 · S1]" in text
         assert "53.6800" in text
         assert "s1pos_x" in text
 
@@ -148,14 +148,14 @@ class TestOrderMessages:
         the ledger cannot support until settlement."""
         text = monitor.format_sell(strategy="S2", symbol="ABC", reason="VWAP_FAIL",
                                    qty=1, average_entry=10.0, average_sell=10.5)
-        assert "PENDING_SETTLEMENT" in text
+        assert "실현손익: 정산 대기" in text
 
     def test_a_sell_with_pnl_prints_it(self):
         text = monitor.format_sell(strategy="S2", symbol="ABC", reason="VWAP_FAIL",
                                    qty=1, average_entry=10.0, average_sell=10.5,
                                    realized_pnl=0.5, holding_time="2h 15m")
-        assert "Realized PnL: 0.50" in text
-        assert "Holding time: 2h 15m" in text
+        assert "실현손익: 0.50" in text
+        assert "보유시간: 2h 15m" in text
 
 
 class TestDailySummaryRefusesToInventAWinner:
@@ -164,23 +164,23 @@ class TestDailySummaryRefusesToInventAWinner:
             {"label": "S1", "candidates": 10},
             {"label": "S2", "candidates": 12},
         ])
-        assert text.count(monitor.INSUFFICIENT_SAMPLE) >= 3
+        assert text.count("표본 부족") >= 3
         # Candidate counts ARE measured, so that comparison is allowed.
-        assert "Most opportunities: S2 (12.00)" in text
+        assert "오늘 가장 많은 기회: S2 (12.00)" in text
 
     def test_a_winner_needs_a_trade_behind_it(self):
         rows = [{"label": "S1", "candidates": 5, "avg_mfe": 3.0, "trades": 0},
                 {"label": "S2", "candidates": 9, "avg_mfe": 1.0, "trades": 2}]
         text = monitor.format_daily_summary(trading_day="d", rows=rows,
                                             minimum_trades_for_winner=1)
-        assert "Best scanner today: S2 (1.00)" in text, \
+        assert "성과 판정: S2 (1.00)" in text, \
             "S1 has the better MFE but no trade behind it"
 
     def test_lowest_mae_takes_the_minimum(self):
         rows = [{"label": "S1", "avg_mae": -4.0, "trades": 1},
                 {"label": "S2", "avg_mae": -1.0, "trades": 1}]
         text = monitor.format_daily_summary(trading_day="d", rows=rows)
-        assert "Lowest MAE: S1 (-4.00)" in text
+        assert "최저 MAE: S1 (-4.00)" in text
 
     def test_every_scanner_appears_even_with_nothing_to_report(self):
         rows = [{"label": f"S{i}", "candidates": 0} for i in range(1, 7)]
@@ -300,14 +300,14 @@ class TestRunnerWiring:
             self.Outcome("orb", []),
         ])
         assert monitor.notify_run(report) == 2
-        assert "S2 VOLUME" in sent[0] and "Candidates: 1" in sent[0]
-        assert "S6 ORB" in sent[1] and "Candidates: 0" in sent[1]
+        assert "S2 · 거래량 누적" in sent[0] and "후보 수: 1" in sent[0]
+        assert "S6 · 장초반 돌파" in sent[1] and "후보 수: 0" in sent[1]
 
     def test_a_failed_scanner_says_so(self, monkeypatch):
         sent = self.capture(monkeypatch)
         report = self.Report([self.Outcome("orb", [], failed=True, reason="PROVIDER")])
         monitor.notify_run(report)
-        assert "FAILED: PROVIDER" in sent[0]
+        assert "상태: 실패: PROVIDER" in sent[0]
 
     def test_candidates_are_ranked_by_score(self, monkeypatch):
         sent = self.capture(monkeypatch)
@@ -322,15 +322,15 @@ class TestRunnerWiring:
         signal = self.Signal("ABC", 90.0, price=12.5,
                              metrics={"volume_multiple": 3.4, "vwap": 12.1})
         monitor.notify_run(self.Report([self.Outcome("accumulation", [signal])]))
-        assert "volume multiple: 3.40" in sent[0]
+        assert "거래량 배수: 3.40" in sent[0]
         assert "VWAP: 12.10" in sent[0]
 
     def test_the_live_mode_is_reported_per_scanner(self, monkeypatch):
         sent = self.capture(monkeypatch)
         monitor.notify_run(self.Report([
             self.Outcome("hma_early_trend", []), self.Outcome("orb", [])]))
-        assert "Mode: LIMITED_LIVE" in sent[0], "S1 is the live strategy"
-        assert "Mode: DISCOVERY_ONLY" in sent[1], "S6 is discovery only"
+        assert "운영 모드: 제한 실거래" in sent[0], "S1 is the live strategy"
+        assert "운영 모드: 분석 전용" in sent[1], "S6 is discovery only"
 
     def test_a_broken_report_cannot_fail_a_scan(self, monkeypatch):
         self.capture(monkeypatch)
@@ -445,7 +445,7 @@ class TestOperationalEventsReachTheSameChannel:
         seen = self.capture(monkeypatch)
         assert _ln().notify("FILL_COMPLETED", {"symbol": "TX"},
                          send_fn=lambda m: False, track_health=False) is False
-        assert any("LIVE FILL" in m and "TX" in m for m in seen)
+        assert any("체결" in m and "TX" in m for m in seen)
 
     def test_the_watchdog_announces_only_the_stale_case(self):
         source = (REPO_ROOT / "scripts" / "run_s1_position_watchdog.py").read_text()
@@ -471,9 +471,9 @@ class TestOperationalEventsReachTheSameChannel:
         finally:
             monitor.notify_tagged = original
         assert sent[0][0] == monitor.TAG_WATCHDOG
-        assert "escalated now" in sent[0][1]
-        assert "unchanged" in sent[1][1]
-        assert "Exits remain permitted." in sent[0][1]
+        assert "지금 차단됨" in sent[0][1]
+        assert "변경 없음" in sent[1][1]
+        assert "매도 경로는 계속 유지됩니다." in sent[0][1]
 
 
 class TestTheWebhookIsFoundUnderCron:
@@ -587,7 +587,7 @@ class TestOwnershipIsEnforcedNotAssumed:
             self.Report([self.Outcome("hma_early_trend")]),
             env={monitor.WEBHOOK_ENV: "https://hooks.slack.test/x"})
         assert count == 1
-        assert "[S1 HMA]" in sent[0]
+        assert "[S1 · HMA 초기추세]" in sent[0]
 
     @pytest.mark.skipif(not KIS_LIVE_PRESENT,
                         reason="no live lifecycle in the scanner runtime")
@@ -598,7 +598,7 @@ class TestOwnershipIsEnforcedNotAssumed:
         monkeypatch.setenv(monitor.TRADING_RUNTIME_MARKER, "bee3ee88f53f")
         _ln().notify("FILL_COMPLETED", {"symbol": "TX"},
                      send_fn=lambda m: True, track_health=False)
-        assert any("LIVE FILL" in m for m in sent), \
+        assert any("체결" in m for m in sent), \
             "the release must still announce its own fills"
 
 
@@ -634,13 +634,13 @@ class TestOneSessionVocabulary:
         text = monitor.format_scan(
             scanner_name="accumulation", session="PREMARKET", trading_day="d",
             scanned=10, candidates=1, status="SUCCESS")
-        assert "Session execution: SCAN_ONLY / LIVE UNVERIFIED" in text
+        assert "세션 주문: 스캔 전용 (실거래 미검증)" in text
 
     def test_a_verified_session_says_that_instead(self):
         text = monitor.format_scan(
             scanner_name="accumulation", session="REGULAR", trading_day="d",
             scanned=10, candidates=1, status="SUCCESS")
-        assert "Session execution: REFERENCE_VERIFIED" in text
+        assert "세션 주문: 실거래 가능" in text
 
     def test_a_profile_name_claims_no_execution_status(self):
         """"DAILY" is a scanner group, not a session. Claiming a
@@ -648,7 +648,7 @@ class TestOneSessionVocabulary:
         text = monitor.format_scan(
             scanner_name="accumulation", session="DAILY", trading_day="d",
             scanned=10, candidates=0, status="SUCCESS")
-        assert "Session execution:" not in text
+        assert "세션 주문:" not in text
 
     def test_the_run_reports_its_clock_session_not_its_profile(self, monkeypatch):
         sent = []
@@ -664,8 +664,8 @@ class TestOneSessionVocabulary:
             trading_day, profile, session = "d", "daily", "REGULAR"
 
         monitor.notify_run(Report(), env={monitor.WEBHOOK_ENV: "https://x.test"})
-        assert "Session: REGULAR" in sent[0]
-        assert "Session: DAILY" not in sent[0]
+        assert "세션: 정규장 (REGULAR)" in sent[0]
+        assert "세션: DAILY" not in sent[0]
 
 
 class TestAScannerThatVanishedIsNotSilent:
@@ -703,9 +703,9 @@ class TestAScannerThatVanishedIsNotSilent:
                         {"breakout_ready": "invalid config json"}),
             env={monitor.WEBHOOK_ENV: "https://x.test"})
         assert count == 2, "the built one AND the broken one"
-        broken = [m for m in sent if "S3 BREAKOUT" in m]
+        broken = [m for m in sent if "S3 · 돌파 준비" in m]
         assert broken, "the scanner that vanished must still get a line"
-        assert "FAILED_NOT_BUILT" in broken[0]
+        assert "실행 준비 실패" in broken[0]
         assert "invalid config json" in broken[0]
 
     def test_it_is_not_reported_as_a_quiet_day(self, monkeypatch):
@@ -714,9 +714,9 @@ class TestAScannerThatVanishedIsNotSilent:
         sent = self.capture(monkeypatch)
         monitor.notify_run(self.Report([], {"orb": "boom"}),
                            env={monitor.WEBHOOK_ENV: "https://x.test"})
-        assert "Candidates: 0" not in sent[0]
-        assert "Candidates: -" in sent[0]
-        assert "Scanner: SUCCESS" not in sent[0]
+        assert "후보 수: 0" not in sent[0]
+        assert "후보 수: -" in sent[0]
+        assert "상태: 정상" not in sent[0]
 
     def test_every_scanner_in_the_run_gets_exactly_one_line(self, monkeypatch):
         sent = self.capture(monkeypatch)
@@ -725,7 +725,230 @@ class TestAScannerThatVanishedIsNotSilent:
                          self.Outcome("accumulation")],
                         {"orb": "a", "gap_pullback": "b"}),
             env={monitor.WEBHOOK_ENV: "https://x.test"})
-        tags = ["S1 HMA", "S2 VOLUME", "S6 ORB", "S5 GAP"]
+        tags = ["S1 · HMA 초기추세", "S2 · 거래량 누적",
+                "S6 · 장초반 돌파", "S5 · 갭 눌림"]
         for tag in tags:
             assert sum(f"[{tag}]" in m for m in sent) == 1, tag
         assert len(sent) == 4
+
+
+class TestKoreanDisplayLayer:
+    """Korean in the message, English in the data.
+
+    The property that matters is the boundary. `exit_reason` stays
+    VOLUME_DECAY_PRICE_WEAKNESS in the decision, the trade record, the
+    database and every comparison; only the printed line is Korean. A
+    localisation that reached the stored values would make historical
+    rows unqueryable by the code that wrote them, and a strategy_id that
+    differed by locale would break the position limit silently -- a
+    failure that shows up as a missing refusal rather than an error.
+    """
+
+    def test_every_scanner_has_a_korean_name(self):
+        from scanners.notify import labels
+
+        expected = {
+            "hma_early_trend": "S1 · HMA 초기추세",
+            "accumulation": "S2 · 거래량 누적",
+            "breakout_ready": "S3 · 돌파 준비",
+            "premarket_momentum": "S4 · 프리마켓 모멘텀",
+            "gap_pullback": "S5 · 갭 눌림",
+            "orb": "S6 · 장초반 돌파"}
+        for name, korean in expected.items():
+            assert labels.scanner(name) == korean
+
+    @pytest.mark.parametrize("code,korean", [
+        ("REGULAR", "정규장"), ("PREMARKET", "프리마켓"),
+        ("AFTER_HOURS", "시간외"), ("OVERNIGHT_DAYTIME", "주간/오버나이트"),
+        ("CLOSED", "장 마감")])
+    def test_sessions_are_translated_and_keep_their_code(self, code, korean):
+        from scanners.notify import labels
+
+        assert labels.session(code) == f"{korean} ({code})"
+        assert labels.session(code, with_code=False) == korean
+
+    @pytest.mark.parametrize("code,korean", [
+        ("SUCCESS", "정상"), ("FAILED", "실패"),
+        ("FAILED_NOT_BUILT", "실행 준비 실패"),
+        ("DISCOVERY_ONLY", "분석 전용"), ("LIMITED_LIVE", "제한 실거래"),
+        ("SCAN_ONLY", "스캔 전용"), ("LIVE_UNVERIFIED", "실거래 미검증"),
+        ("INSUFFICIENT_SAMPLE", "표본 부족"),
+        ("PENDING_SETTLEMENT", "정산 대기")])
+    def test_statuses_are_translated(self, code, korean):
+        from scanners.notify import labels
+
+        assert labels.status(code) == korean
+
+    @pytest.mark.parametrize("code,korean", [
+        ("VOLUME_DECAY", "거래량 모멘텀 감소"),
+        ("VOLUME_DECAY_PRICE_WEAKNESS", "거래량 감소 + 가격 약화"),
+        ("VWAP_FAILURE", "VWAP 이탈"),
+        ("STRUCTURE_FAILURE", "가격 구조 붕괴"),
+        ("HARD_STOP", "최대 손실 제한"),
+        ("SESSION_EXIT", "세션 종료 청산")])
+    def test_exit_reasons_print_korean_and_the_code(self, code, korean):
+        from scanners.notify import labels
+
+        assert labels.exit_reason(code) == f"{korean} ({code})"
+
+    def test_every_s2_exit_reason_has_a_translation(self):
+        """A reason the code can emit but the channel cannot name would
+        reach an operator as a bare identifier."""
+        from s2_live import exit_policy
+        from scanners.notify import labels
+
+        for reason in exit_policy.EXIT_REASONS:
+            assert reason in labels.EXIT_REASON_LABELS, reason
+
+    def test_an_untranslated_value_passes_through_rather_than_hiding(self):
+        """Failing to translate must not look like failing to happen."""
+        from scanners.notify import labels
+
+        assert labels.scanner("something_new") == "something_new"
+        assert labels.exit_reason("NEW_REASON") == "NEW_REASON"
+        assert labels.status("NEW_STATUS") == "NEW_STATUS"
+
+    def test_a_failure_status_keeps_its_detail(self):
+        """The detail is usually the only thing that says WHY."""
+        from scanners.notify import labels
+
+        assert labels.status("FAILED: config 로드 실패") == "실패: config 로드 실패"
+
+    def test_zero_candidates_reads_as_a_result(self):
+        text = monitor.format_scan(
+            scanner_name="accumulation", session="REGULAR",
+            trading_day="2026-08-20", scanned=5960, candidates=0,
+            status="SUCCESS", live_status="LIMITED_LIVE")
+        assert "[S2 · 거래량 누적]" in text
+        assert "상태: 정상" in text
+        assert "후보 수: 0" in text
+        assert "조건을 충족한 종목이 없습니다" in text
+        assert "운영 모드: 제한 실거래" in text
+
+    def test_a_build_failure_reads_differently_and_shows_a_dash(self):
+        """0 means a completed scan that found nothing; "-" means the
+        scan never completed. The two must never share a phrasing."""
+        text = monitor.format_scan(
+            scanner_name="breakout_ready", session="REGULAR", trading_day="d",
+            scanned=None, candidates=None,
+            status="FAILED_NOT_BUILT: config 로드 실패")
+        assert "[S3 · 돌파 준비]" in text
+        assert "상태: 실행 준비 실패: config 로드 실패" in text
+        assert "후보 수: -" in text
+        assert "후보 수: 0" not in text
+        assert "조건을 충족한 종목이 없습니다" not in text
+
+    def test_a_buy_message_is_korean(self):
+        text = monitor.format_buy(
+            strategy="S2_VOLUME_ACCUMULATION_V1", symbol="ABC",
+            session="REGULAR", qty=1, limit_price=12.34, order_id="003")
+        assert "[실거래 매수 · S2]" in text
+        assert "전략: 거래량 누적" in text
+        assert "수량: 1주" in text
+        assert "상태: 주문 접수" in text
+
+    @pytest.mark.parametrize("side,expected", [
+        ("buy", "[매수 체결 · S2]"), ("sell", "[매도 체결 · S2]"),
+        ("BUY", "[매수 체결 · S2]"), (None, "[체결 · S2]")])
+    def test_a_fill_is_tagged_by_the_actual_side(self, side, expected):
+        """One fill event carries both directions; labelling a sell
+        매수 체결 would make the channel lie about a real order."""
+        text = monitor.format_fill(
+            strategy="accumulation", symbol="ABC", qty=1,
+            average_fill_price=12.35, position_id="p", side=side)
+        assert expected in text
+
+    def test_a_sell_message_is_korean_with_the_reason_code(self):
+        text = monitor.format_sell(
+            strategy="accumulation", symbol="ABC",
+            reason="VOLUME_DECAY_PRICE_WEAKNESS", qty=1,
+            average_entry=12.35, average_sell=12.80, holding_time="2시간")
+        assert "[실거래 매도 · S2]" in text
+        assert "매도 사유: 거래량 감소 + 가격 약화 (VOLUME_DECAY_PRICE_WEAKNESS)" in text
+        assert "실현손익: 정산 대기" in text
+
+    @pytest.mark.parametrize("tag,korean", [
+        ("RISK", "위험 관리"), ("WATCHDOG", "시스템 감시"),
+        ("RECONCILIATION", "계좌 대조"), ("DAILY SUMMARY", "일일 스캐너 요약")])
+    def test_operational_tags_are_korean(self, tag, korean, monkeypatch):
+        sent = []
+        monkeypatch.setattr(monitor, "_send",
+                            lambda m, env=None: sent.append(m) or True)
+        monitor.notify_tagged(tag, "본문")
+        assert sent[0].startswith(f"[{korean}]")
+
+    def test_the_summary_refuses_to_name_a_winner_without_a_sample(self):
+        text = monitor.format_daily_summary(
+            trading_day="d", rows=[{"label": "accumulation", "candidates": 14,
+                                    "trades": 0}])
+        assert "성과 판정: 표본 부족" in text
+
+    def test_times_show_et_and_kst(self):
+        from scanners.notify import labels
+
+        both = labels.dual_time("2026-08-20T14:15:00+00:00")
+        assert "10:15 ET" in both and "23:15 KST" in both
+
+    def test_an_unparseable_time_is_returned_not_dropped(self):
+        from scanners.notify import labels
+
+        assert labels.dual_time("not a time") == "not a time"
+
+
+class TestLocalisationDidNotReachTheData:
+    """§O: this was a display change. Nothing behavioural moved."""
+
+    def test_internal_exit_reasons_are_still_ascii_identifiers(self):
+        from s2_live import exit_policy
+
+        for reason in exit_policy.EXIT_REASONS:
+            assert reason.isascii() and reason.isupper()
+
+    def test_internal_session_names_are_unchanged(self):
+        from scanners.base import scan_session
+
+        assert scan_session.SESSIONS == ("PREMARKET", "REGULAR", "AFTER_HOURS",
+                                         "OVERNIGHT_DAYTIME")
+
+    def test_strategy_ids_are_unchanged(self):
+        from config import position_limits
+
+        for name in position_limits.PROPOSED_STRATEGY_MAX:
+            assert name.isascii()
+
+    def test_the_live_mode_values_are_unchanged(self):
+        from config import scanner_live_mode
+
+        for mode in scanner_live_mode.SCANNER_LIVE_MODE.values():
+            assert mode.isascii() and mode.isupper()
+
+    def test_the_labels_module_decides_nothing(self):
+        """A display table that could reach a policy would let a
+        translation change a trade."""
+        import ast
+
+        banned = {"brokers", "execution", "order_gate", "s2_live", "s1_live",
+                  "position_limits", "kis_broker"}
+        source = (REPO_ROOT / "scanners" / "notify" / "labels.py").read_text()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                names = [str(getattr(node, "module", "") or "")]
+                names += [a.name for a in node.names]
+                for name in names:
+                    for segment in name.split("."):
+                        assert segment not in banned, f"imports {name}"
+
+    def test_dedup_still_works_after_localisation(self):
+        monitor.reset_scan_dedup()
+        sent = []
+        first = monitor.format_scan(scanner_name="accumulation",
+                                    session="REGULAR", trading_day="d",
+                                    scanned=1, candidates=0, status="SUCCESS")
+        second = monitor.format_scan(scanner_name="accumulation",
+                                     session="REGULAR", trading_day="d",
+                                     scanned=1, candidates=0, status="SUCCESS")
+        assert first == second, "identical scans still render identically"
+        monitor.reset_scan_dedup()
+
+    def test_the_webhook_env_is_unchanged(self):
+        assert monitor.WEBHOOK_ENV == "SCANNER_MONITOR_SLACK_WEBHOOK_URL"

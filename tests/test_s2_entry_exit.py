@@ -464,12 +464,34 @@ class TestEntryFailsClosed:
             features=Features(hma200=95.0, hma200_slope=0.4))
         assert verdict.reason == entry.REASON_STALE_SESSION
 
-    @pytest.mark.parametrize("session", ["REGULAR", "OVERNIGHT_DAYTIME"])
-    def test_a_verified_session_is_allowed_through(self, session):
+    def test_only_regular_is_enabled_for_live_orders(self):
+        """The rollout has reached REGULAR and nothing else."""
+        assert entry.S2_LIVE_SESSIONS == {"REGULAR"}
         verdict = entry.confirm(
-            current_price=101.0, signal_price=100.0, session=session,
+            current_price=101.0, signal_price=100.0, session="REGULAR",
             features=Features(hma200=95.0, hma200_slope=0.4))
         assert verdict.allowed is True
+
+    def test_a_verified_route_is_not_by_itself_permission_to_trade(self):
+        """OVERNIGHT_DAYTIME's route IS verified, and S2 still may not
+        use it. Two separate facts, refused with two separate reasons, so
+        an operator can tell "never verified" from "verified and not yet
+        switched on"."""
+        from scanners.base import scan_session
+
+        assert scan_session.order_route_verified("OVERNIGHT_DAYTIME") is True
+        verdict = entry.confirm(
+            current_price=101.0, signal_price=100.0,
+            session="OVERNIGHT_DAYTIME",
+            features=Features(hma200=95.0, hma200_slope=0.4))
+        assert verdict.allowed is False
+        assert verdict.reason == entry.REASON_SESSION_NOT_ENABLED
+
+    def test_an_unverified_route_is_refused_for_a_different_reason(self):
+        verdict = entry.confirm(
+            current_price=101.0, signal_price=100.0, session="PREMARKET",
+            features=Features(hma200=95.0, hma200_slope=0.4))
+        assert verdict.reason == entry.REASON_STALE_SESSION
 
 
 # --------------------------------------------------------------------------

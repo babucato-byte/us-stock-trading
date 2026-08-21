@@ -106,7 +106,8 @@ def build(trading_day: str, *, limit: int = MAX_S1_LIVE_CANDIDATES,
           modes=None) -> Dict[str, Any]:
     """The rows and manifest fields for `trading_day`, or raise S1PublishRefused."""
     try:
-        scanner_name = scanner_live_mode.limited_live_scanner(modes)
+        scanner_name = scanner_live_mode.require_limited_live(
+            scanner_live_mode.S1_SCANNER_NAME, modes)
     except scanner_live_mode.ScannerLiveModeError as exc:
         raise S1PublishRefused(f"live-mode configuration refused: {exc}") from exc
 

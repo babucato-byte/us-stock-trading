@@ -54,6 +54,20 @@ REASON_BELOW_HMA200 = "S2_ENTRY_BELOW_HMA200"
 REASON_HMA200_NOT_RISING = "S2_ENTRY_HMA200_NOT_RISING"
 REASON_HMA200_UNAVAILABLE = "S2_ENTRY_HMA200_UNAVAILABLE"
 REASON_STALE_SESSION = "S2_ENTRY_SESSION_NOT_ORDER_VERIFIED"
+REASON_SESSION_NOT_ENABLED = "S2_ENTRY_SESSION_NOT_ENABLED"
+
+#: Sessions in which S2 may place a REAL order today.
+#:
+#: Deliberately narrower than `scan_session.ORDER_VERIFIED_SESSIONS`,
+#: and the two are checked separately because they answer different
+#: questions. That set records which order routes have been verified
+#: against the broker; this records which sessions S2's rollout has
+#: actually reached. OVERNIGHT_DAYTIME is in the first and not the
+#: second: a verified route is a precondition for trading a session, not
+#: a decision to. Widening this is a rollout step that follows a
+#: completed REGULAR lifecycle, not a consequence of the route already
+#: being known to work.
+S2_LIVE_SESSIONS = frozenset({"REGULAR"})
 
 
 @dataclass
@@ -119,6 +133,7 @@ def confirm(*, current_price, signal_price, features=None, session=None,
     if require_order_verified_session:
         from scanners.base import scan_session
 
+        normalised = scan_session.normalize(session)
         if not scan_session.order_route_verified(session):
             # PREMARKET and AFTER_HOURS scan but have no verified order
             # route. A reservation is an instruction to trade later, not
@@ -128,6 +143,15 @@ def confirm(*, current_price, signal_price, features=None, session=None,
                                 {"session": session,
                                  "verified": sorted(
                                      scan_session.ORDER_VERIFIED_SESSIONS)})
+        if normalised not in S2_LIVE_SESSIONS:
+            # The route works and the rollout has not reached it. Two
+            # separate facts, refused with two separate reasons, so an
+            # operator reading the log can tell "this session was never
+            # verified" from "this session is verified and not yet
+            # switched on".
+            return EntryVerdict(BLOCK, REASON_SESSION_NOT_ENABLED,
+                                {"session": session,
+                                 "enabled": sorted(S2_LIVE_SESSIONS)})
 
     confirmed = price_confirmed(current, signal)
     if confirmed is not True:

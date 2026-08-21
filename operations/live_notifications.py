@@ -198,6 +198,13 @@ def _mirror_to_monitor(event, fields):
             return
         from scanners.notify import monitor
 
+        # A fill is tagged by its ACTUAL side, so 매수 체결 and 매도 체결
+        # are never confused -- one fill event carries both directions.
+        if tag == "LIVE FILL":
+            from scanners.notify import labels
+
+            tag = {"매수 체결": "BUY FILL", "매도 체결": "SELL FILL"}.get(
+                labels.fill_tag((fields or {}).get("side")), tag)
         body = "\n".join([f"Event: {event}"]
                          + [f"{key}: {value}" for key, value in (fields or {}).items()])
         monitor.notify_tagged(tag, body)

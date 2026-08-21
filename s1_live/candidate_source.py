@@ -181,7 +181,8 @@ class S1CandidateSource(CandidateSource):
             return self._result
         self._loaded = True
         try:
-            scanner_name = scanner_live_mode.limited_live_scanner(self._modes)
+            scanner_name = scanner_live_mode.require_limited_live(
+                scanner_live_mode.S1_SCANNER_NAME, self._modes)
         except scanner_live_mode.ScannerLiveModeError as exc:
             self._refusal = f"live-mode configuration refused: {exc}"
             logger.warning("S1 candidate source empty: %s", self._refusal)

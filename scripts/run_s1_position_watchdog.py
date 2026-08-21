@@ -188,12 +188,13 @@ def notify_monitor(result, *, escalated: bool) -> bool:
         from scanners.notify import monitor
 
         body = "\n".join([
-            f"Status: {result.get('status')}",
-            f"Detail: {result.get('detail', '-')}",
-            f"Symbol: {result.get('symbol', '-')}",
-            f"Silent for: {result.get('silent_minutes', '-')} min",
-            f"Kill switch: {'ENTRY_DISABLED (escalated now)' if escalated else 'unchanged'}",
-            "Exits remain permitted.",
+            f"상태: {result.get('status')}",
+            f"내용: {result.get('detail', '-')}",
+            f"종목: {result.get('symbol', '-')}",
+            f"무응답 시간: {result.get('silent_minutes', '-')}분",
+            f"킬 스위치: "
+            f"{'ENTRY_DISABLED (지금 차단됨)' if escalated else '변경 없음'}",
+            "매도 경로는 계속 유지됩니다.",
         ])
         return monitor.notify_tagged(monitor.TAG_WATCHDOG, body)
     except Exception:  # noqa: BLE001 - the watchdog's job is the kill switch

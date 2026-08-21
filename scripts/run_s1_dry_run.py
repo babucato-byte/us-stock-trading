@@ -81,7 +81,8 @@ def main(argv=None) -> int:
         return USAGE_ERROR
 
     try:
-        scanner = scanner_live_mode.limited_live_scanner()
+        scanner = scanner_live_mode.require_limited_live(
+            scanner_live_mode.S1_SCANNER_NAME)
     except scanner_live_mode.ScannerLiveModeError as exc:
         print(f"refused: {exc}")
         return 1
