@@ -706,6 +706,7 @@ def parse_args(argv=None):
 PUBLISHING_SCANNERS = {
     "hma_early_trend": "S1_HMA_EARLY_TREND_V1",
     "accumulation": "S2_VOLUME_ACCUMULATION_V1",
+    "orb": "S6_ORB_BREAKOUT_V1",
 }
 
 
@@ -738,10 +739,19 @@ def publish_report_candidates(report) -> int:
             candidates=len(signals), run_id=getattr(report, "run_id", None))
         if not signals:
             continue
+        session = getattr(report, "session", None)
+        variant = None
+        if str(name) == "orb":
+            from config import s6_sessions
+
+            # The variant is the session's, so a candidate always says
+            # which range produced it. S6-R and S6-O are different
+            # setups that happen to share a scanner.
+            variant = s6_sessions.variant_for(session) or None
         rows = candidate_publisher.publish(
             signals, strategy_id=strategy_id,
             trading_day=getattr(report, "trading_day", None),
-            session=getattr(report, "session", None),
+            session=session, variant=variant,
             run_id=getattr(report, "run_id", None))
         written += len(rows)
     return written

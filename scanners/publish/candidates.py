@@ -90,6 +90,22 @@ class PublishedCandidate:
     hma200_slope: Optional[float] = None
     hma89: Optional[float] = None
     vwap: Optional[float] = None
+    #: Breakout fields. Present for S6 and None for strategies that do
+    #: not form a range -- carried on the same row rather than in a
+    #: second table, because a consumer that had to know which shape it
+    #: was reading would branch on strategy, which is the thing the
+    #: shared hand-off exists to avoid.
+    variant: Optional[str] = None
+    session_date: Optional[str] = None
+    range_minutes: Optional[int] = None
+    range_high: Optional[float] = None
+    range_low: Optional[float] = None
+    breakout_price: Optional[float] = None
+    ema9: Optional[float] = None
+    ema21: Optional[float] = None
+    volume_expansion: Optional[float] = None
+    extension_pct: Optional[float] = None
+
     #: Everything needed to reproduce the judgement later.
     provenance: Dict[str, Any] = field(default_factory=dict)
 
@@ -207,7 +223,10 @@ def _number(value):
 
 def build_rows(signals: Iterable[Any], *, strategy_id: str, trading_day: str,
                session: Optional[str], run_id: Optional[str] = None,
-               generated_at: Optional[str] = None) -> List[PublishedCandidate]:
+               generated_at: Optional[str] = None,
+               variant: Optional[str] = None,
+               session_date: Optional[str] = None
+               ) -> List[PublishedCandidate]:
     """Rank a scan's signals and turn them into publishable rows.
 
     Ranking is score-descending with the symbol as tie-break -- the same
@@ -240,7 +259,19 @@ def build_rows(signals: Iterable[Any], *, strategy_id: str, trading_day: str,
             hma200=_number(getattr(signal, "hma200", None)),
             hma200_slope=_number(getattr(signal, "hma200_slope", None)),
             hma89=_number(getattr(signal, "hma89", None)),
-            vwap=_number(getattr(signal, "vwap", None)),
+            vwap=_number(getattr(signal, "vwap", None)
+                         or metrics.get("vwap")),
+            variant=variant,
+            session_date=session_date,
+            range_minutes=(int(metrics["orb_minutes"])
+                           if metrics.get("orb_minutes") is not None else None),
+            range_high=_number(metrics.get("opening_range_high")),
+            range_low=_number(metrics.get("opening_range_low")),
+            breakout_price=_number(metrics.get("price")),
+            ema9=_number(metrics.get("session_ema9")),
+            ema21=_number(metrics.get("session_ema21")),
+            volume_expansion=_number(metrics.get("volume_expansion")),
+            extension_pct=_number(metrics.get("extension_above_or_high_pct")),
             provenance={
                 "schema": SCHEMA_VERSION,
                 "scanner_name": getattr(signal, "scanner_name", None),
@@ -265,7 +296,8 @@ def build_rows(signals: Iterable[Any], *, strategy_id: str, trading_day: str,
 
 def publish(signals: Iterable[Any], *, strategy_id: str, trading_day: str,
             session: Optional[str], run_id: Optional[str] = None,
-            generated_at: Optional[str] = None) -> List[PublishedCandidate]:
+            generated_at: Optional[str] = None, variant: Optional[str] = None,
+            session_date: Optional[str] = None) -> List[PublishedCandidate]:
     """Write the rows and return them. Never raises.
 
     A publication failure must not fail a scan: the scan already happened
@@ -274,7 +306,8 @@ def publish(signals: Iterable[Any], *, strategy_id: str, trading_day: str,
     disk was full is a lost observation.
     """
     rows = build_rows(signals, strategy_id=strategy_id, trading_day=trading_day,
-                      session=session, run_id=run_id, generated_at=generated_at)
+                      session=session, run_id=run_id, generated_at=generated_at,
+                      variant=variant, session_date=session_date)
     if not rows:
         return rows
     try:

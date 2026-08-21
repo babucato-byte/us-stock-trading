@@ -83,17 +83,47 @@ class OpeningRangeBreakoutScanner(BaseScanner):
         reasons: List[str] = []
         minutes = self.orb_minutes()
 
-        session = sess.slice_session(
-            data.intraday,
-            regular_only=config.require_bool("regular_session_only"),
-        )
-        if session is None or len(session) == 0:
-            raise ScannerDataError(f"{data.symbol}: no regular-session bars today")
+        # Which session's range this run is judging. REGULAR is the
+        # default and takes the ORIGINAL path byte for byte -- S6-R is
+        # the measured v1.0 behaviour and is not being changed. The other
+        # sessions route through the session-aware engine, which is the
+        # only thing that knows a 20:00->04:00 window wraps midnight.
+        requested = str(context.get("session") or "REGULAR").strip().upper()
 
-        range_high, range_low, range_bars = sess.opening_range(session, minutes)
-        if range_high is None or range_low is None or len(range_bars) == 0:
-            raise ScannerDataError(
-                f"{data.symbol}: opening range ({minutes}m) not computable")
+        if requested == "REGULAR":
+            session = sess.slice_session(
+                data.intraday,
+                regular_only=config.require_bool("regular_session_only"),
+            )
+            if session is None or len(session) == 0:
+                raise ScannerDataError(f"{data.symbol}: no regular-session bars today")
+
+            range_high, range_low, range_bars = sess.opening_range(session, minutes)
+            if range_high is None or range_low is None or len(range_bars) == 0:
+                raise ScannerDataError(
+                    f"{data.symbol}: opening range ({minutes}m) not computable")
+        else:
+            from scanners.base import session_range as srange
+
+            session = srange.slice_session_bars(data.intraday, requested)
+            if session is None or len(session) == 0:
+                raise ScannerDataError(
+                    f"{data.symbol}: no {requested} bars for this session")
+
+            window = srange.opening_range(data.intraday, requested,
+                                          minutes=minutes)
+            if not window.complete:
+                # Not a rejection. A session whose range has not formed
+                # yet has nothing to say; calling it a market judgement
+                # would make an early scan look like a session with no
+                # setups.
+                raise ScannerDataError(
+                    f"{data.symbol}: {requested} opening range ({minutes}m) "
+                    "not computable")
+            range_high, range_low = window.range_high, window.range_low
+            range_bars = session[[stamp <= window.range_end
+                                  for stamp in session.index]] \
+                if window.range_end is not None else session.iloc[:0]
 
         post = session.iloc[len(range_bars):]
         minimum_post = config.require_int("min_post_range_bars")

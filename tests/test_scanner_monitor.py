@@ -725,8 +725,11 @@ class TestAScannerThatVanishedIsNotSilent:
                          self.Outcome("accumulation")],
                         {"orb": "a", "gap_pullback": "b"}),
             env={monitor.WEBHOOK_ENV: "https://x.test"})
+        # S6 renders by VARIANT: one scanner runs in four sessions and
+        # each forms its own range, so "S6 · 돌파" alone would not say
+        # WHICH range broke. The report's session is REGULAR, hence S6-R.
         tags = ["S1 · HMA 초기추세", "S2 · 거래량 누적",
-                "S6 · 장초반 돌파", "S5 · 갭 눌림"]
+                "S6 · 정규장 돌파", "S5 · 갭 눌림"]
         for tag in tags:
             assert sum(f"[{tag}]" in m for m in sent) == 1, tag
         assert len(sent) == 4

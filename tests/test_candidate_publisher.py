@@ -207,15 +207,22 @@ class TestNumbersAreRealOrAbsent:
 
 
 class TestOnlyStrategiesWithAConsumerPublish:
-    def test_s1_and_s2_publish(self):
+    def test_the_strategies_with_a_consumer_publish(self):
+        """S6 joined when it took over the fast-turnover slot. S2 still
+        publishes although it stood down to DISCOVERY_ONLY: the rows are
+        the month-1 dataset, and the live-mode table -- not the
+        publisher -- is what stops them being traded."""
         from scanners import runner
 
-        assert set(runner.PUBLISHING_SCANNERS) == {"hma_early_trend", "accumulation"}
+        assert set(runner.PUBLISHING_SCANNERS) == {
+            "hma_early_trend", "accumulation", "orb"}
 
-    def test_discovery_only_scanners_do_not(self):
+    def test_scanners_with_no_consumer_do_not_publish(self):
+        """A hand-off file whose only reader is a future
+        misunderstanding is worse than no file."""
         from scanners import runner
 
-        for name in ("breakout_ready", "premarket_momentum", "gap_pullback", "orb"):
+        for name in ("breakout_ready", "premarket_momentum", "gap_pullback"):
             assert name not in runner.PUBLISHING_SCANNERS
 
     def test_a_failed_scanner_publishes_nothing(self, store):

@@ -216,7 +216,8 @@ def _fmt(value, digits=2, dash="-"):
 # --- scanner runs --------------------------------------------------------
 
 def format_scan(*, scanner_name, session, trading_day, scanned, candidates,
-                status, top=None, live_status=None, generated_at=None) -> str:
+                status, top=None, live_status=None, generated_at=None,
+                variant=None) -> str:
     """A scan result, including the zero-candidate case.
 
     Zero candidates and a failed scanner are different facts and are
@@ -226,7 +227,7 @@ def format_scan(*, scanner_name, session, trading_day, scanned, candidates,
     scanner hides behind a quiet day, so the count never doubles as the
     health signal.
     """
-    lines = [f"[{labels.scanner(scanner_name)}]", ""]
+    lines = [f"[{labels.scanner(scanner_name, variant=variant)}]", ""]
     if generated_at:
         lines.append(f"{labels.field('Generated at')}: "
                      f"{labels.dual_time(generated_at)}")
@@ -274,8 +275,12 @@ def format_scan(*, scanner_name, session, trading_day, scanned, candidates,
     if ranked:
         best = ranked[0]
         details = [(labels.field("Volume Multiple"), best.get("volume_multiple")),
+                   ("거래량 확장", best.get("volume_expansion")),
                    (labels.field("Price"), best.get("price")),
-                   (labels.field("VWAP"), best.get("vwap"))]
+                   (labels.field("VWAP"), best.get("vwap")),
+                   ("EMA9", best.get("ema9")), ("EMA21", best.get("ema21")),
+                   ("Range 상단", best.get("range_high")),
+                   ("Range 하단", best.get("range_low"))]
         shown = [f"  {label}: {_fmt(value)}" for label, value in details
                  if value is not None]
         if shown:
@@ -333,12 +338,13 @@ def reset_scan_dedup() -> None:
 
 def notify_scan(*, scanner_name, session, trading_day, scanned, candidates,
                 status, top=None, live_status=None, generated_at=None,
-                env=None) -> bool:
+                variant=None, env=None) -> bool:
     try:
         message = format_scan(
             scanner_name=scanner_name, session=session, trading_day=trading_day,
             scanned=scanned, candidates=candidates, status=status, top=top,
-            live_status=live_status, generated_at=generated_at)
+            live_status=live_status, generated_at=generated_at,
+            variant=variant)
         if _scan_is_duplicate(message, trading_day):
             logger.info("scanner monitor: identical scan message suppressed")
             return False
@@ -513,6 +519,25 @@ def format_daily_summary(*, trading_day, rows: Iterable[Dict[str, Any]],
     return "\n".join(lines)
 
 
+def _variant_for(scanner_name, session):
+    """The S6 variant this scanner/session pair belongs to, or None.
+
+    Looked up per call rather than computed once, so the outcomes loop
+    and the construction-failure loop do not depend on each other's
+    locals -- an earlier version bound it only in the first loop and a
+    run with no outcomes raised UnboundLocalError inside the very
+    handler that is supposed to keep a monitor from failing a scan.
+    """
+    if str(scanner_name) != "orb":
+        return None
+    try:
+        from config import s6_sessions
+
+        return s6_sessions.variant_for(session) or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def notify_run(report, *, env=None) -> int:
     """One monitor message per scanner in `report`. Returns how many sent.
 
@@ -549,14 +574,22 @@ def notify_run(report, *, env=None) -> int:
                 signals,
                 key=lambda sig: (-(getattr(sig, "scanner_score", None) or 0.0),
                                  getattr(sig, "symbol", "")))
-            top = [{
-                "symbol": getattr(sig, "symbol", "?"),
-                "score": getattr(sig, "scanner_score", None),
-                "price": getattr(sig, "signal_price", None),
-                "volume_multiple": (getattr(sig, "metrics", None) or {}).get(
-                    "volume_multiple"),
-                "vwap": (getattr(sig, "metrics", None) or {}).get("vwap"),
-            } for sig in ranked[:TOP_N]]
+            top = []
+            for sig in ranked[:TOP_N]:
+                metrics = getattr(sig, "metrics", None) or {}
+                top.append({
+                    "symbol": getattr(sig, "symbol", "?"),
+                    "score": getattr(sig, "scanner_score", None),
+                    "price": getattr(sig, "signal_price", None),
+                    "volume_multiple": metrics.get("volume_multiple"),
+                    "volume_expansion": metrics.get("volume_expansion"),
+                    "vwap": metrics.get("vwap"),
+                    "ema9": metrics.get("session_ema9"),
+                    "ema21": metrics.get("session_ema21"),
+                    "range_high": metrics.get("opening_range_high"),
+                    "range_low": metrics.get("opening_range_low"),
+                })
+
             status = "FAILED" if getattr(outcome, "failed", False) else "SUCCESS"
             if getattr(outcome, "failure_reason", None):
                 status = f"FAILED: {outcome.failure_reason}"
@@ -565,7 +598,7 @@ def notify_run(report, *, env=None) -> int:
                            scanned=getattr(outcome, "symbols_seen", None),
                            candidates=len(signals), status=status, top=top,
                            live_status=modes.get(name, MODE_DISCOVERY_ONLY),
-                           env=env):
+                           variant=_variant_for(name, session), env=env):
                 sent += 1
 
         # A scanner that could not be BUILT never reaches `outcomes`, so
@@ -581,7 +614,7 @@ def notify_run(report, *, env=None) -> int:
                            candidates=None,
                            status=f"FAILED_NOT_BUILT: {reason}",
                            live_status=modes.get(name, MODE_DISCOVERY_ONLY),
-                           env=env):
+                           variant=_variant_for(name, session), env=env):
                 sent += 1
     except Exception:  # noqa: BLE001 - a monitor must never fail a scan
         logger.warning("scanner monitor: run report failed", exc_info=True)

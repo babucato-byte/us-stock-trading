@@ -43,6 +43,17 @@ SCANNER_LABELS = {
     "orb": "S6 · 장초반 돌파",
 }
 
+#: S6 runs one scanner in four sessions, and each forms its own range.
+#: The variant is what the reader needs -- "S6 · 돌파" alone would not say
+#: WHICH range broke, and a 20:00 breakout and a 09:30 one are different
+#: setups that happen to share a scanner.
+S6_VARIANT_LABELS = {
+    "S6-R": "S6 · 정규장 돌파",
+    "S6-O": "S6 · 오버나이트 돌파",
+    "S6-P": "S6 · 프리마켓 돌파",
+    "S6-A": "S6 · 시간외 돌파",
+}
+
 #: Short strategy names for order messages, where the full scanner label
 #: would repeat the S-number already in the header.
 STRATEGY_LABELS = {
@@ -76,6 +87,7 @@ STATUS_LABELS = {
     # than by parts: splitting on "/" here would put a formatting rule
     # in a lookup table and break the moment the phrasing changes.
     "SCAN_ONLY / LIVE UNVERIFIED": "스캔 전용 (실거래 미검증)",
+    "REALTIME_SHADOW": "실시간 검증",
     "LIVE_ELIGIBLE": "실거래 가능",
     "LIVE_UNVERIFIED": "실거래 미검증",
     "REFERENCE_VERIFIED": "실거래 가능",
@@ -160,7 +172,14 @@ def _lookup(table, value, default=None):
     return table.get(str(value), str(value))
 
 
-def scanner(name) -> str:
+def scanner(name, *, variant=None) -> str:
+    """The scanner's display name, specialised by variant where one
+    exists. An unknown variant falls back to the scanner's own name
+    rather than to a placeholder."""
+    if variant:
+        label = S6_VARIANT_LABELS.get(str(variant))
+        if label:
+            return label
     return _lookup(SCANNER_LABELS, name)
 
 
