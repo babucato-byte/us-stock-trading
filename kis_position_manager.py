@@ -46,10 +46,13 @@ exit reasons (STOP_LOSS, TARGET_2 full exit, TARGET_1 partial exit,
 TIME_STOP, EOD_FORCED_CLOSE) are all reused, unmodified.
 """
 
+import logging
 from datetime import datetime, timedelta, timezone
 
 import risk_config
 from config import scalping_strategy_v1_config as strat_cfg
+
+logger = logging.getLogger(__name__)
 from config.live_exit_flags import LiveExitFlags
 from domain.position import Position
 from execution import idempotency, order_repository
@@ -271,6 +274,42 @@ def _reconcile_account_and_orders(*, kis_broker, conn, open_positions, kis_posit
         for record in open_positions.values() if record["remaining_qty"]
     ]
     mismatches = reconcile_positions(internal_positions, kis_positions)
+
+    # Strategy attribution and coverage, alongside the broker comparison.
+    #
+    # The comparison above asks "does the account store agree with the
+    # broker". It structurally CANNOT ask "did every strategy's position
+    # reach the account store" -- if fill synchronisation skipped one,
+    # the account still agrees with the broker and the strategy simply
+    # holds something nobody counts. That is how S1 lost its bookkeeping
+    # once, and it is what `coverage_gaps` looks for.
+    #
+    # Deliberately NOT summed into internal_positions: the strategy
+    # tables are bookkeeping layered on the account record, not a second
+    # copy of it. TX is in `positions` and in `s1_positions`; adding
+    # them would report 2 against the broker's 1 and fail-close every
+    # entry, including the strategy that is trading correctly.
+    try:
+        from reconciliation import internal_holdings
+
+        holdings_summary = internal_holdings.summary(
+            conn, [{"symbol": r["symbol"], "venue": r.get("venue"),
+                    "quantity": r["remaining_qty"]}
+                   for r in open_positions.values() if r["remaining_qty"]])
+        for line in holdings_summary["attribution"]:
+            logger.info("reconciliation strategy holdings -- %s", line)
+        for gap in holdings_summary["coverage_gaps"]:
+            if gap["gap"] == internal_holdings.GAP_NOT_IN_ACCOUNT:
+                logger.error(
+                    "reconciliation coverage gap: %s holds %s/%s x%s but the "
+                    "account store has x%s -- fill sync may have skipped it",
+                    gap["strategy_id"], gap["symbol"], gap["venue"],
+                    gap["strategy_quantity"], gap["account_quantity"])
+    except Exception:  # noqa: BLE001 - a diagnostic must never be able to
+        # fail the reconciliation it is describing.
+        logger.warning("could not compute strategy holdings attribution",
+                       exc_info=True)
+        holdings_summary = None
     still_unknown = idempotency.has_unknown_order(conn)
     unknown_count = idempotency.count_unknown_orders(conn)
     try:

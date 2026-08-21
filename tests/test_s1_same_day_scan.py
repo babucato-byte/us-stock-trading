@@ -34,7 +34,15 @@ SESSIONS = ("OVERNIGHT", "PREMARKET", "REGULAR", "AFTER_HOURS")
 #: The fixed MONDAY/FRIDAY pair stays for the pure calendar assertions
 #: (`signal_day_for` is a date function with no staleness rule), which is
 #: where a hardcoded date is the point rather than a liability.
+#: Rolled back to a BUSINESS day. `today()` can be a Saturday, and the
+#: frames below are built with `bdate_range`, so on a weekend the "bar
+#: for today" these tests expect to see dropped is never in the frame to
+#: begin with -- `signal_day_for(Saturday)` is Friday, Friday's bar is
+#: the last one present, and nothing gets truncated. The assertions then
+#: fail on the calendar rather than on a change in behaviour.
 SCAN_DAY = pd.Timestamp.today().normalize()
+if SCAN_DAY.weekday() >= 5:
+    SCAN_DAY = SCAN_DAY - pd.offsets.BDay(1)
 SCAN_DAY_ISO = SCAN_DAY.date().isoformat()
 
 
