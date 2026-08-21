@@ -207,8 +207,28 @@ class TestTheGateUsesTheVerdict:
 
         assert LiveRolloutConfig.from_env({}).max_price_deviation_percent == 0.30
 
-    def test_only_the_s1_source_gets_the_new_check(self):
+    def test_only_a_strategy_source_gets_the_new_check(self):
+        """The legacy watchlist keeps the 0.30% deviation check.
+
+        The scope widened from "S1" to "any live strategy" when S2 was
+        promoted -- the two were the same thing until then. What has NOT
+        changed is the thing this test protects: the legacy source, which
+        ships with an operator-curated allow-list and was never written
+        against the day-range check, is still excluded.
+        """
+        import kis_live_trading as klt
+
         source = (REPO_ROOT / "kis_live_trading.py").read_text()
-        assert "s1_candidate_source.SOURCE_S1" in source
         block = source[source.index("execution_price_verdict = None"):][:900]
-        assert "SOURCE_S1" in block
+        assert "is_strategy_source(source)" in block
+
+        class Source:
+            def __init__(self, name):
+                self.name = name
+
+        from s1_live import candidate_source as s1cs
+        from s2_live import candidate_source as s2cs
+
+        assert klt.is_strategy_source(Source(s1cs.SOURCE_S1)) is True
+        assert klt.is_strategy_source(Source(s2cs.SOURCE_S2)) is True
+        assert klt.is_strategy_source(Source("legacy_watchlist")) is False

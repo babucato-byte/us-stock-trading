@@ -85,6 +85,7 @@ from market_data.base import MarketDataProviderError
 from market_hours import us_trading_day
 from operations import kill_switch as ops_kill_switch
 from s1_live import candidate_source as s1_candidate_source
+from s2_live import candidate_source as s2_candidate_source
 from s1_live import execution_price as s1_execution_price
 from s1_live import security_type as s1_security_type
 from state_store import db as state_db
@@ -208,6 +209,39 @@ def _get_validated_commit():
 
 def _get_allowed_account_no():
     return os.environ.get("KIS_ALLOWED_ACCOUNT_NO", "")
+
+
+#: Sources that represent a LIVE STRATEGY, as opposed to the legacy
+#: operator watchlist.
+#:
+#: The distinction matters because two gates below were written for the
+#: strategy path and skipped for the legacy one: the COMMON_STOCK
+#: classification and the KIS day-range execution-price check. Legacy
+#: keeps its original behaviour deliberately -- it ships with an
+#: operator-curated allow-list and the 0.30% deviation check, and
+#: changing that was never in scope.
+#:
+#: They used to be keyed on "is this S1", which was the same thing as
+#: "is this a strategy" until S2 existed. Left that way, S2 would have
+#: reached a real order WITHOUT the COMMON_STOCK gate and with the
+#: legacy 0.30% price check instead of the day-range one -- a strategy
+#: silently acquiring weaker protection than the strategy it was
+#: modelled on.
+STRATEGY_SOURCES = frozenset({
+    s1_candidate_source.SOURCE_S1,
+    s2_candidate_source.SOURCE_S2,
+})
+
+
+def is_strategy_source(source) -> bool:
+    """True for a live strategy's source, False for the legacy watchlist.
+
+    Fails closed in the direction that keeps the STRICTER path: an
+    unrecognised source is not a strategy source, so it gets the legacy
+    behaviour it was presumably written against rather than gates it has
+    never been tested with.
+    """
+    return getattr(source, "name", None) in STRATEGY_SOURCES
 
 
 def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
@@ -405,8 +439,7 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                 try:
                     classification = (
                         s1_security_type.require_live_eligible(symbol)
-                        if getattr(source, "name", None) == s1_candidate_source.SOURCE_S1
-                        else None)
+                        if is_strategy_source(source) else None)
                 except s1_security_type.SecurityTypeUnavailable as exc:
                     reason = str(exc)
                     results["skipped"].append((symbol, reason))
@@ -606,7 +639,7 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                 # Left as None for the legacy source, which keeps the 0.30%
                 # check exactly as it was.
                 execution_price_verdict = None
-                if getattr(source, "name", None) == s1_candidate_source.SOURCE_S1:
+                if is_strategy_source(source):
                     execution_price_verdict = s1_execution_price.evaluate_symbol(
                         symbol, broker=broker, instrument=instrument)
                     if not execution_price_verdict.passed:

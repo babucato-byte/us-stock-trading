@@ -177,3 +177,93 @@ class TestTheDescriptionIsAuditable:
 
     def test_a_refusal_is_named_in_the_description(self):
         assert source().describe()["refusal"] is not None
+
+
+class TestS2GetsTheSameGatesAsS1:
+    """The gap this class exists for.
+
+    Two gates in the shared cycle were keyed on "is this the S1 source":
+    the COMMON_STOCK classification and the KIS day-range execution-price
+    check. That was the same thing as "is this a strategy" until S2
+    existed. Left alone, S2 would have reached a real order WITHOUT the
+    COMMON_STOCK gate and with the legacy 0.30% deviation check instead
+    of the day-range one -- a new strategy silently getting weaker
+    protection than the one it was modelled on.
+    """
+
+    class Source:
+        def __init__(self, name):
+            self.name = name
+
+    def test_both_strategy_sources_are_recognised(self):
+        import kis_live_trading as klt
+        from s1_live import candidate_source as s1cs
+
+        assert klt.is_strategy_source(self.Source(s1cs.SOURCE_S1)) is True
+        assert klt.is_strategy_source(self.Source(cs.SOURCE_S2)) is True
+
+    def test_the_legacy_watchlist_keeps_its_own_behaviour(self):
+        """It ships with an operator-curated allow-list and the 0.30%
+        check; changing that was never in scope."""
+        import kis_live_trading as klt
+
+        assert klt.is_strategy_source(self.Source("legacy_watchlist")) is False
+
+    def test_an_unrecognised_source_gets_the_legacy_path(self):
+        """Fails closed toward the behaviour a source was written
+        against, rather than gates it has never been tested with."""
+        import kis_live_trading as klt
+
+        assert klt.is_strategy_source(self.Source("something_new")) is False
+        assert klt.is_strategy_source(object()) is False
+
+    def test_the_common_stock_gate_is_not_keyed_on_s1_any_more(self):
+        source = (REPO_ROOT / "kis_live_trading.py").read_text()
+        assert "== s1_candidate_source.SOURCE_S1" not in source, \
+            "a gate still keyed on S1 alone would skip for S2"
+        assert source.count("is_strategy_source(source)") >= 2
+
+
+class TestStrategyAwareResolution:
+    def test_s1_resolves_through_its_own_unchanged_resolver(self):
+        """Delegated, not reimplemented -- S1 keeps running the code it
+        has been running rather than one that happens to agree today."""
+        import inspect
+
+        body = inspect.getsource(cs.resolve_for_strategy)
+        assert "s1_source.resolve(" in body
+
+    def test_s2_resolves_to_its_own_source(self, published):
+        published(["AAA"])
+        src = cs.resolve_for_strategy(cs.STRATEGY_ID, trading_day=DAY,
+                                      session="REGULAR")
+        assert src.name == cs.SOURCE_S2
+        assert src.symbols() == ["AAA"]
+
+    def test_an_unknown_strategy_gets_nothing(self):
+        """A default here would mean a typo silently trading somebody
+        else's candidates."""
+        src = cs.resolve_for_strategy("S9_TYPO", trading_day=DAY)
+        assert src.symbols() == []
+        assert src.allowed_symbols() == frozenset()
+        assert "unknown strategy" in src.describe()["refusal"]
+
+    def test_a_missing_trading_day_refuses_rather_than_guessing(self):
+        src = cs.resolve_for_strategy(cs.STRATEGY_ID, trading_day=None)
+        assert src.symbols() == []
+        assert "refusing to guess" in src.describe()["refusal"]
+
+    def test_resolution_never_raises(self):
+        """S1's entries run through the same cycle; an exception raised
+        on S2's behalf would stop them."""
+        for sid in (None, "", 7, "S9", cs.STRATEGY_ID):
+            src = cs.resolve_for_strategy(sid, trading_day=DAY,
+                                          session="REGULAR")
+            assert src.symbols() == [] or isinstance(src.symbols(), list)
+
+    def test_a_refused_source_satisfies_the_interface(self):
+        src = cs.RefusedSource("because", strategy_id="S9")
+        assert src.symbols() == []
+        assert src.allowed_symbols() == frozenset()
+        assert src.candidate_row("ABC") is None
+        assert src.describe()["refusal"] == "because"

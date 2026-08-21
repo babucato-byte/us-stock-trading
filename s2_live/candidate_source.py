@@ -187,3 +187,74 @@ class S2CandidateSource:
             "allowed": len(self._validated_symbols()),
             "refusal": self._refusal,
         }
+
+
+#: Strategy ids this module can resolve a source for. Unknown strategies
+#: get nothing -- see `resolve_for_strategy`.
+KNOWN_STRATEGIES = frozenset({STRATEGY_ID, "S1_HMA_EARLY_TREND_V1"})
+
+
+class RefusedSource:
+    """A source that offers nothing, and says why.
+
+    Returned instead of raising when a strategy cannot be served. The
+    shared buy cycle must not learn to catch exceptions from source
+    resolution: S1's entries run through that same cycle, and an
+    exception raised on S2's behalf would stop them.
+    """
+
+    name = "refused"
+
+    def __init__(self, reason, strategy_id=None):
+        self._reason = str(reason)
+        self._strategy_id = strategy_id
+
+    def symbols(self):
+        return []
+
+    def allowed_symbols(self):
+        return frozenset()
+
+    def candidate_row(self, symbol):
+        return None
+
+    def describe(self):
+        return {"source": self.name, "strategy_id": self._strategy_id,
+                "candidates": 0, "allowed": 0, "refusal": self._reason}
+
+
+def resolve_for_strategy(strategy_id, *, rollout=None, trading_day=None,
+                         session=None, env=None, modes=None,
+                         watchlist_module=None):
+    """The candidate source for one strategy. Never raises.
+
+    Strategy-aware rather than env-aware. The env switch stays exactly
+    where it was for S1 -- this delegates to `s1_live.candidate_source.
+    resolve()` unchanged, so S1's behaviour is the same code it has been
+    running, not a reimplementation that happens to agree today.
+
+    An unknown strategy gets a RefusedSource rather than a default. A
+    default here would mean a typo in a caller silently trading somebody
+    else's candidates.
+    """
+    wanted = str(strategy_id or "").strip()
+
+    if wanted == "S1_HMA_EARLY_TREND_V1":
+        from s1_live import candidate_source as s1_source
+
+        return s1_source.resolve(rollout, trading_day=trading_day, env=env,
+                                 modes=modes,
+                                 watchlist_module=watchlist_module)
+
+    if wanted == STRATEGY_ID:
+        if not trading_day:
+            # The trading day is what makes a stale candidate set
+            # detectable; guessing one would defeat the check it exists
+            # for. Same rule S1's resolver applies.
+            return RefusedSource(
+                "no trading day supplied; refusing to guess one",
+                strategy_id=wanted)
+        return S2CandidateSource(trading_day=trading_day, session=session,
+                                 rollout=rollout, modes=modes)
+
+    return RefusedSource(f"unknown strategy {wanted!r}", strategy_id=wanted)
