@@ -262,3 +262,23 @@ def close_position(conn, position_id, exit_reason=None, now=None):
         "exit_reason": exit_reason, "closed_at": stamp,
     }, now=now)
     logger.info("S1 position closed: %s (%s)", position_id, exit_reason)
+
+
+def holdings(conn):
+    """(symbol, venue, quantity) for every live S1 position.
+
+    The shape reconciliation attribution reads. Added when S2 arrived and
+    attribution reported "S1: none" while TX was plainly held -- the
+    lookup is `hasattr(module, "holdings")`, so a missing function is
+    silently an empty answer rather than an error. An attribution that
+    can be wrong without saying so is worse than none.
+
+    `s1_positions` has no venue column, so venue is None here. That is
+    honest rather than convenient: the account store records no venue
+    either, and inventing one would put a guess where the comparison
+    expects a fact.
+    """
+    rows = conn.execute(
+        "SELECT symbol, quantity FROM s1_positions WHERE status != 'CLOSED'"
+    ).fetchall()
+    return [(row["symbol"], None, int(row["quantity"])) for row in rows]

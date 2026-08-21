@@ -255,3 +255,32 @@ class TestTheAccountStoreRecordsNoVenue:
                                    {"symbol": "ABC", "venue": None,
                                     "quantity": 5}])
         assert result["coverage_healthy"] is True
+
+
+class TestAttributionCoversBothStrategies:
+    """`strategy_holdings` looks the function up with `hasattr`, so a
+    store without one answers "none" instead of failing. That is how
+    attribution reported "S1: none" while TX was plainly held."""
+
+    def test_s1s_store_exposes_holdings(self):
+        from s1_live import position_store as s1ps
+
+        assert hasattr(s1ps, "holdings"), \
+            "a missing holdings() is silently an empty attribution"
+
+    def test_an_s1_position_is_attributed(self, conn):
+        from s1_live import position_store as s1ps
+
+        s1ps.open_position(conn, symbol="TX", quantity=1, entry_price=53.68,
+                           strategy_id=S1, signal_id="sig", now=T0)
+        assert "S1: TX / - / 1" in ih.attribution(conn)
+
+    def test_both_strategies_appear_together(self, conn):
+        from s1_live import position_store as s1ps
+
+        s1ps.open_position(conn, symbol="TX", quantity=1, entry_price=53.68,
+                           strategy_id=S1, signal_id="sig", now=T0)
+        s2_position(conn, symbol="ABC", venue="NASD")
+        lines = ih.attribution(conn)
+        assert "S1: TX / - / 1" in lines
+        assert "S2: ABC / NASD / 1" in lines
