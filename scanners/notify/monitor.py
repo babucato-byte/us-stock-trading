@@ -217,7 +217,7 @@ def _fmt(value, digits=2, dash="-"):
 
 def format_scan(*, scanner_name, session, trading_day, scanned, candidates,
                 status, top=None, live_status=None, generated_at=None,
-                variant=None) -> str:
+                variant=None, live_candidates=None) -> str:
     """A scan result, including the zero-candidate case.
 
     Zero candidates and a failed scanner are different facts and are
@@ -242,8 +242,16 @@ def format_scan(*, scanner_name, session, trading_day, scanned, candidates,
         # completed. See the empty-result line below.
         f"{labels.field('Candidates')}: "
         f"{candidates if candidates is not None else '-'}",
-        "",
     ]
+    # The two counts are separated because they answered the same
+    # question differently on 2026-08-21: S6 found one candidate and it
+    # was an ETP, so "후보 수: 1" read as an opportunity while the number
+    # an operator could act on was zero.
+    if live_candidates is not None:
+        lines.append(f"실거래 가능 후보: {live_candidates}")
+        if candidates and not live_candidates:
+            lines.append("  (전체 후보는 있으나 COMMON_STOCK 없음 — 연구용만)")
+    lines.append("")
     ranked = list(top or [])[:TOP_N]
     if ranked:
         for index, item in enumerate(ranked, start=1):
@@ -274,6 +282,7 @@ def format_scan(*, scanner_name, session, trading_day, scanned, candidates,
 
     if ranked:
         best = ranked[0]
+        eligible_note = best.get("security_type")
         details = [(labels.field("Volume Multiple"), best.get("volume_multiple")),
                    ("거래량 확장", best.get("volume_expansion")),
                    (labels.field("Price"), best.get("price")),
@@ -284,7 +293,23 @@ def format_scan(*, scanner_name, session, trading_day, scanned, candidates,
         shown = [f"  {label}: {_fmt(value)}" for label, value in details
                  if value is not None]
         if shown:
-            lines += ["", f"상위 후보: {best.get('symbol', '?')}"] + shown
+            # Named "실거래 가능 상위 후보" only when the list it came
+            # from was the eligible one -- otherwise an operator reads a
+            # research symbol as something they could buy.
+            # Three states, not two. A caller that passed NO live count
+            # (S1, S2) keeps the original heading; only a caller that
+            # measured eligibility gets the qualified wording, and only
+            # a measured ZERO is labelled research.
+            if live_candidates is None:
+                heading = "상위 후보"
+            elif live_candidates:
+                heading = "실거래 가능 상위 후보"
+            else:
+                heading = "상위 후보 (연구용)"
+            label = f"{heading}: {best.get('symbol', '?')}"
+            if eligible_note:
+                label += f" [{eligible_note}]"
+            lines += ["", label] + shown
     return "\n".join(lines)
 
 
@@ -338,13 +363,13 @@ def reset_scan_dedup() -> None:
 
 def notify_scan(*, scanner_name, session, trading_day, scanned, candidates,
                 status, top=None, live_status=None, generated_at=None,
-                variant=None, env=None) -> bool:
+                variant=None, live_candidates=None, env=None) -> bool:
     try:
         message = format_scan(
             scanner_name=scanner_name, session=session, trading_day=trading_day,
             scanned=scanned, candidates=candidates, status=status, top=top,
             live_status=live_status, generated_at=generated_at,
-            variant=variant)
+            variant=variant, live_candidates=live_candidates)
         if _scan_is_duplicate(message, trading_day):
             logger.info("scanner monitor: identical scan message suppressed")
             return False
@@ -574,8 +599,38 @@ def notify_run(report, *, env=None) -> int:
                 signals,
                 key=lambda sig: (-(getattr(sig, "scanner_score", None) or 0.0),
                                  getattr(sig, "symbol", "")))
-            top = []
-            for sig in ranked[:TOP_N]:
+            # Classified before ranking so the top block is drawn from
+            # the symbols an operator could actually buy. The full count
+            # still reports every observed candidate.
+            rows = []
+            for sig in ranked:
+                metrics = getattr(sig, "metrics", None) or {}
+                rows.append({
+                    "symbol": getattr(sig, "symbol", "?"),
+                    "score": getattr(sig, "scanner_score", None),
+                    "price": getattr(sig, "signal_price", None),
+                    "volume_multiple": metrics.get("volume_multiple"),
+                    "volume_expansion": metrics.get("volume_expansion"),
+                    "vwap": metrics.get("vwap"),
+                    "ema9": metrics.get("session_ema9"),
+                    "ema21": metrics.get("session_ema21"),
+                    "range_high": metrics.get("opening_range_high"),
+                    "range_low": metrics.get("opening_range_low"),
+                })
+            try:
+                from scanners.publish import eligibility
+
+                enriched = eligibility.enrich(rows)
+                live_rows = eligibility.top_live(enriched, limit=TOP_N)
+                live_count = len(eligibility.split(enriched)[1])
+            except Exception:  # noqa: BLE001 - a classification outage
+                # must narrow what is shown, never widen it, and must
+                # never fail the scan it is describing.
+                logger.warning("could not classify candidates", exc_info=True)
+                enriched, live_rows, live_count = rows, [], 0
+
+            top = live_rows or []
+            for sig in ranked[:0]:
                 metrics = getattr(sig, "metrics", None) or {}
                 top.append({
                     "symbol": getattr(sig, "symbol", "?"),
@@ -597,6 +652,7 @@ def notify_run(report, *, env=None) -> int:
                            trading_day=trading_day,
                            scanned=getattr(outcome, "symbols_seen", None),
                            candidates=len(signals), status=status, top=top,
+                           live_candidates=live_count if signals else None,
                            live_status=modes.get(name, MODE_DISCOVERY_ONLY),
                            variant=_variant_for(name, session), env=env):
                 sent += 1

@@ -271,6 +271,23 @@ def _fresh_dedup():
     monitor.reset_scan_dedup()
 
 
+@pytest.fixture(autouse=True)
+def _classifiable(monkeypatch):
+    """Treat every test symbol as ordinary stock.
+
+    `notify_run` classifies candidates before ranking them, and the test
+    environment has no KIS master -- so without this every symbol is
+    UNKNOWN, fails closed, and the top block is empty. That behaviour is
+    correct and is asserted in tests/test_candidate_eligibility.py; here
+    it would only hide what these tests are about.
+    """
+    from scanners.publish import eligibility
+
+    monkeypatch.setattr(eligibility, "classify_symbol", lambda symbol, index=None: {
+        "security_type": "COMMON_STOCK", "etp_type": None, "exchange": "NASD",
+        "live_eligible": True, "classified_at": None})
+
+
 class TestRunnerWiring:
     """Every run is reported, including the quiet ones."""
 
