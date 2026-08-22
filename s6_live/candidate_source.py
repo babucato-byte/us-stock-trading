@@ -17,7 +17,8 @@ because a path is not a guarantee.
 """
 
 import logging
-from typing import FrozenSet, List, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, FrozenSet, List, Optional
 
 from config import s6_sessions, scanner_live_mode
 
@@ -48,6 +49,10 @@ class S6CandidateSource:
         self._rows: Optional[List[dict]] = None
         self._loaded = False
         self._refusal: Optional[str] = None
+        # Stamped when the rows are actually READ, not when the source is
+        # constructed. The age that matters is between publication and
+        # use, and a constructor that ran early would understate it.
+        self._consumed_at: Optional[datetime] = None
 
     def _live_mode_ok(self) -> bool:
         try:
@@ -110,6 +115,7 @@ class S6CandidateSource:
             logger.warning("S6 candidate source refused: %s", self._refusal)
             return None
 
+        self._consumed_at = datetime.now(timezone.utc)
         self._rows = sorted(fresh, key=lambda r: (int(r.get("rank") or 10**6),
                                                   str(r.get("symbol") or "")))
         return self._rows
@@ -156,10 +162,40 @@ class S6CandidateSource:
         return qualification.qualify_s6(
             symbol, candidate_row=self.candidate_row(symbol))
 
+    def freshness(self) -> Dict[str, Any]:
+        """When the rows were made and when they were used.
+
+        Reported rather than enforced: the trading-day and session checks
+        above are this stage's staleness policy, and how old a price may
+        be at the moment an order is placed is the shared gate's
+        question. Inventing a second age limit here would put two
+        freshness policies in the codebase.
+        """
+        rows = self._rows or []
+        generated = rows[0].get("generated_at") if rows else None
+        age = None
+        if generated and self._consumed_at is not None:
+            try:
+                made = datetime.fromisoformat(
+                    str(generated).replace("Z", "+00:00"))
+                if made.tzinfo is None:
+                    made = made.replace(tzinfo=timezone.utc)
+                age = (self._consumed_at - made).total_seconds()
+            except Exception:  # noqa: BLE001 - a display value must not
+                # be able to fail the source that carries it.
+                age = None
+        return {
+            "candidate_generated_at": generated,
+            "candidate_consumed_at": (self._consumed_at.isoformat()
+                                      if self._consumed_at else None),
+            "candidate_age_at_consume_seconds": age,
+        }
+
     def describe(self) -> dict:
         rows = self._load()
         return {
             "source": self.name, "strategy_id": STRATEGY_ID,
+            **self.freshness(),
             "variant": self._variant, "trading_day": self._trading_day,
             "session": self._session, "candidates": len(rows or []),
             "allowed": len(self._validated_symbols()),

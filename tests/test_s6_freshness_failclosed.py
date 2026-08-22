@@ -212,3 +212,52 @@ class TestExitsAreNotBlockedByAnyOfThis:
         verdict = readiness.evaluate(crontab="")
         for name in readiness.MARKET_DEPENDENT:
             assert verdict.checks[name].status == readiness.NOT_MEASURED
+
+
+class TestFreshnessIsMeasuredNotInvented:
+    def test_consumption_is_stamped_when_the_rows_are_read(self, store):
+        """Not at construction: the age that matters is between
+        publication and USE, and stamping early would understate it."""
+        store(["AAPL"])
+        src = source()
+        assert src.freshness()["candidate_consumed_at"] is None
+        src.symbols()
+        assert src.freshness()["candidate_consumed_at"] is not None
+
+    def test_the_age_is_reported_with_both_endpoints(self, store):
+        store(["AAPL"])
+        src = source()
+        src.symbols()
+        fresh = src.freshness()
+        assert fresh["candidate_generated_at"] is not None
+        assert fresh["candidate_age_at_consume_seconds"] >= 0
+
+    def test_an_unread_source_reports_no_age(self, store):
+        assert source().freshness()["candidate_age_at_consume_seconds"] is None
+
+    def test_freshness_appears_in_the_audit_record(self, store):
+        store(["AAPL"])
+        described = source().describe()
+        for field in ("candidate_generated_at", "candidate_consumed_at",
+                      "candidate_age_at_consume_seconds"):
+            assert field in described
+
+    def test_it_enforces_no_second_age_limit(self):
+        """The trading-day and session checks are this stage's staleness
+        policy; how old a price may be at order time is the shared
+        gate's. Two freshness policies would disagree."""
+        import inspect
+
+        body = inspect.getsource(cs.S6CandidateSource.freshness)
+        for word in ("max_age", "threshold", "expired", "too old"):
+            assert word not in body.lower().split('"""')[2] if '"""' in body \
+                else True
+
+    def test_an_unparseable_timestamp_does_not_break_the_source(self, store,
+                                                                monkeypatch):
+        store(["AAPL"])
+        src = source()
+        src.symbols()
+        src._rows[0]["generated_at"] = "not a timestamp"
+        assert src.freshness()["candidate_age_at_consume_seconds"] is None
+        assert src.symbols() == ["AAPL"]
