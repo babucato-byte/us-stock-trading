@@ -768,6 +768,79 @@ MIGRATION_15_STATEMENTS = [
     S2_POSITIONS_OPEN_SYMBOL_INDEX,
 ]
 
+# S6's open positions.
+#
+# SUBMITTED is a state of its own, which s1_positions and s2_positions do
+# not have. Those stores only ever see a position after a fill, because
+# their entry path records nothing until one arrives. S6 records the
+# submission so an ambiguous BUY -- sent, no confirmation -- is a row
+# that reconciliation can find rather than an order nobody is tracking.
+# A SUBMITTED row has no entry_price by construction: the column is
+# nullable and `open_from_fill()` is the only thing that sets it.
+#
+# `variant` and `entry_session` are stored because one scanner runs in
+# four sessions and each forms its own range. A position that cannot say
+# which variant produced it cannot be compared with the shadow dataset
+# that measured it.
+S6_POSITIONS_TABLE = """
+CREATE TABLE IF NOT EXISTS s6_positions (
+    position_id             TEXT PRIMARY KEY,
+    strategy_id             TEXT NOT NULL,
+    variant                 TEXT,
+    symbol                  TEXT NOT NULL,
+    venue                   TEXT,
+    quantity                INTEGER,
+    -- NULL while SUBMITTED. Set only from the broker's actual average
+    -- fill: the structural stop is compared against it, and an
+    -- intended-price entry would misplace every later decision.
+    entry_price             REAL,
+    entry_time              TEXT,
+    entry_session           TEXT,
+    entry_order_id          TEXT,
+    client_order_id         TEXT,
+    range_minutes           INTEGER,
+    range_high              REAL,
+    range_low               REAL,
+    entry_vwap              REAL,
+    entry_ema9              REAL,
+    entry_ema21             REAL,
+    entry_volume_expansion  REAL,
+    peak_price              REAL,
+    peak_volume_expansion   REAL,
+    effective_stop          REAL,
+    status                  TEXT NOT NULL DEFAULT 'SUBMITTED',
+    exit_reason             TEXT,
+    exit_submitted          INTEGER NOT NULL DEFAULT 0,
+    pending_exit_reason     TEXT,
+    pending_exit_since      TEXT,
+    submitted_at            TEXT NOT NULL,
+    created_at              TEXT NOT NULL,
+    updated_at              TEXT NOT NULL,
+    closed_at               TEXT,
+    CHECK (status IN ('SUBMITTED', 'OPEN', 'EXIT_PENDING', 'EXIT_SUBMITTED',
+                      'CLOSED')),
+    CHECK (exit_submitted IN (0, 1)),
+    -- An OPEN position must have a real fill behind it. The storage
+    -- layer refuses the combination rather than trusting every caller.
+    CHECK (status = 'SUBMITTED' OR status = 'CLOSED'
+           OR (entry_price IS NOT NULL AND entry_price > 0
+               AND quantity IS NOT NULL AND quantity >= 1))
+)
+"""
+
+# One live row per symbol, covering SUBMITTED too: a second BUY into a
+# name whose first order is still unconfirmed is exactly the duplicate
+# an ambiguous submission invites.
+S6_POSITIONS_OPEN_SYMBOL_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_s6_positions_open_symbol
+    ON s6_positions (symbol) WHERE status != 'CLOSED'
+"""
+
+MIGRATION_16_STATEMENTS = [
+    S6_POSITIONS_TABLE,
+    S6_POSITIONS_OPEN_SYMBOL_INDEX,
+]
+
 # Every table this schema version creates -- used by export.py's
 # export_all() and by tests asserting the full table set exists.
 ALL_TABLES = [
@@ -776,5 +849,5 @@ ALL_TABLES = [
     "exit_intents", "live_entry_reservations", "kis_order_idempotency",
     "order_state_events", "shadow_audit_events", "s1_live_trades",
     "s1_risk_state", "s1_risk_peak", "s1_verification_state",
-    "s1_positions", "s2_positions",
+    "s1_positions", "s2_positions", "s6_positions",
 ]
