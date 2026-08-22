@@ -39,6 +39,17 @@ HORIZONS = (5, 15, 30, 60)
 REENTRY_HORIZONS = (5, 15, 30, 60)
 VWAP_FAILURE_HORIZONS = (5, 15, 30)
 
+#: MFE levels whose ARRIVAL TIME is recorded, in percent.
+#:
+#: Not thresholds anything passes or fails -- they are the x-axis of
+#: "how fast did it get there". A candidate that reaches +0.5% in eight
+#: minutes and one that takes two hours are different events for a
+#: turnover strategy, and a single MFE number cannot tell them apart.
+#: The levels are round numbers chosen to span IEFA's observed +0.24%
+#: rather than to sit near it, so the scale does not encode one
+#: observation.
+MFE_ARRIVAL_LEVELS = (0.25, 0.50, 1.00)
+
 #: Populations reported separately. Merging them would let the
 #: instruments that happen to be tradeable be judged by the ones that
 #: are not, and vice versa.
@@ -183,6 +194,33 @@ def follow(candidate: Dict[str, Any], bars: Sequence[Dict[str, Any]], *,
     else:
         row["mae_pct"] = row["time_to_max_adverse_minutes"] = None
 
+    # -- per-horizon excursions ------------------------------------------
+    for minutes in HORIZONS:
+        window = [b for b in forward
+                  if (_minutes(start, b.get("timestamp")) or 0) <= minutes]
+        elapsed = any((_minutes(start, b.get("timestamp")) or -1) >= minutes
+                      for b in forward)
+        wh = [_num(b.get("high")) for b in window]
+        wl = [_num(b.get("low")) for b in window]
+        wh = [v for v in wh if v is not None]
+        wl = [v for v in wl if v is not None]
+        # None until the window has elapsed, for the same reason the
+        # returns are: a partial window's extreme is not that window's.
+        row[f"mfe_{minutes}m"] = (max(0.0, _pct(price, max(wh)) or 0.0)
+                                  if (price and wh and elapsed) else None)
+        row[f"mae_{minutes}m"] = (min(0.0, _pct(price, min(wl)) or 0.0)
+                                  if (price and wl and elapsed) else None)
+        # Speed, not size. The same +1% in ten minutes and in two hours
+        # are different events for a turnover strategy.
+        mfe = row[f"mfe_{minutes}m"]
+        row[f"mfe_per_minute_{minutes}m"] = (mfe / minutes
+                                             if mfe is not None else None)
+
+    # -- how quickly each level was reached -------------------------------
+    for level in MFE_ARRIVAL_LEVELS:
+        key = "time_to_mfe_%03d" % int(round(level * 100))
+        row[key] = _time_to_gain(forward, start, price, level)
+
     # -- research labels ------------------------------------------------
     row.update(_reentry_labels(forward, start, range_high))
     row.update(_vwap_labels(forward, start))
@@ -191,7 +229,36 @@ def follow(candidate: Dict[str, Any], bars: Sequence[Dict[str, Any]], *,
     row["false_breakout"] = row.get("range_reentry_30m")
     row["time_to_range_reentry_minutes"] = _first_reentry_minutes(
         forward, start, range_high)
+
+    # Structure and profitability are separate questions, and IEFA is
+    # why: it held its range for 221 minutes -- structurally a clean
+    # breakout -- while offering +0.24% against -0.16%. "The breakout
+    # survived" and "the breakout paid" are not the same claim, and a
+    # single label that answered both would hide exactly the case a
+    # fast-turnover strategy most needs to recognise.
+    row["structure_valid"] = (None if row.get("false_breakout") is None
+                              else not row["false_breakout"])
+    row["momentum_strength"] = row.get("mfe_30m")
+    row["momentum_speed"] = row.get("mfe_per_minute_30m")
     return row
+
+
+def _time_to_gain(bars, start, price, level_pct) -> Optional[float]:
+    """Minutes until the high first reached `level_pct` above entry.
+
+    None when it never did within the bars available -- which is not the
+    same as "it took a long time", and must not be recorded as a large
+    number that would then average as one.
+    """
+    base = _num(price)
+    if base is None or base <= 0:
+        return None
+    target = base * (1.0 + level_pct / 100.0)
+    for bar in bars or []:
+        high = _num(bar.get("high"))
+        if high is not None and high >= target:
+            return _minutes(start, bar.get("timestamp"))
+    return None
 
 
 def _reentry_labels(bars, start, range_high) -> Dict[str, Any]:
@@ -289,6 +356,12 @@ def summarise(rows: List[Dict[str, Any]], *, minimum: int = 1
         groups.setdefault(population_of(row), []).append(row)
 
     fields = (["return_%dm" % m for m in HORIZONS]
+              + ["mfe_%dm" % m for m in HORIZONS]
+              + ["mae_%dm" % m for m in HORIZONS]
+              + ["mfe_per_minute_%dm" % m for m in HORIZONS]
+              + ["time_to_mfe_%03d" % int(round(l * 100))
+                 for l in MFE_ARRIVAL_LEVELS]
+              + ["momentum_strength", "momentum_speed"]
               + ["return_close", "mfe_pct", "mae_pct",
                  "time_to_peak_minutes", "volume_expansion",
                  "daily_relative_volume", "normalized_breakout_by_range",

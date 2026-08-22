@@ -223,3 +223,122 @@ class TestPopulationsStayApart:
     def test_the_false_breakout_rate_reports_its_sample(self):
         summary = t.summarise(self.rows())
         assert "n" in summary[t.POP_ALL]["false_breakout_rate"]
+
+
+class TestStructureAndProfitabilityAreSeparate:
+    """IEFA is why these are two questions.
+
+    It held its range for 221 minutes -- structurally a clean breakout --
+    while offering +0.24% against -0.16%. "The breakout survived" and
+    "the breakout paid" are different claims, and one label answering
+    both would hide exactly the case a fast-turnover strategy most needs
+    to recognise.
+    """
+
+    def held_but_flat(self):
+        """Structure intact, almost no movement -- the IEFA shape."""
+        return [bar(m, 100.0 + m * 0.0005, high=100.0 + m * 0.001,
+                    low=99.98) for m in range(0, 61, 5)]
+
+    def fast_mover(self):
+        return [bar(0, 100.0, high=100.1, low=100.0),
+                bar(5, 101.0, high=101.2, low=100.0),
+                bar(30, 101.0, high=101.5, low=100.5),
+                bar(60, 101.0, high=101.5, low=100.5)]
+
+    def test_a_held_range_is_structurally_valid(self):
+        row = t.follow(candidate(range_high=99.5), self.held_but_flat(),
+                       candidate_time=T0)
+        assert row["structure_valid"] is True
+        assert row["false_breakout"] is False
+
+    def test_structure_valid_does_not_imply_momentum(self):
+        row = t.follow(candidate(range_high=99.5), self.held_but_flat(),
+                       candidate_time=T0)
+        assert row["structure_valid"] is True
+        assert row["momentum_strength"] < 0.2, "held, but went nowhere"
+
+    def test_two_candidates_can_share_structure_and_differ_in_speed(self):
+        slow = t.follow(candidate(range_high=99.5), self.held_but_flat(),
+                        candidate_time=T0)
+        fast = t.follow(candidate(range_high=99.5), self.fast_mover(),
+                        candidate_time=T0)
+        assert slow["structure_valid"] is fast["structure_valid"] is True
+        assert fast["momentum_speed"] > slow["momentum_speed"]
+
+    def test_structure_is_none_when_the_label_is(self):
+        row = t.follow(candidate(range_high=None), [bar(0, 100.0)],
+                       candidate_time=T0)
+        assert row["structure_valid"] is None
+
+
+class TestPerHorizonExcursions:
+    def bars(self):
+        return [bar(0, 100.0, high=100.2, low=99.9),
+                bar(5, 100.5, high=100.6, low=100.0),
+                bar(15, 101.0, high=101.5, low=99.5),
+                bar(30, 100.0, high=102.0, low=99.0),
+                bar(60, 100.0, high=102.0, low=98.5)]
+
+    @pytest.mark.parametrize("minutes,mfe,mae", [
+        (5, 0.6, -0.1), (15, 1.5, -0.5), (30, 2.0, -1.0), (60, 2.0, -1.5)])
+    def test_each_window_has_its_own_extremes(self, minutes, mfe, mae):
+        row = t.follow(candidate(), self.bars(), candidate_time=T0)
+        assert row[f"mfe_{minutes}m"] == pytest.approx(mfe, abs=0.01)
+        assert row[f"mae_{minutes}m"] == pytest.approx(mae, abs=0.01)
+
+    def test_an_unelapsed_window_has_no_extreme(self):
+        """A partial window's extreme is not that window's."""
+        row = t.follow(candidate(), [bar(0, 100.0, high=105.0)],
+                       candidate_time=T0)
+        assert row["mfe_60m"] is None
+        assert row["mae_60m"] is None
+
+
+class TestMomentumSpeed:
+    def test_the_same_gain_in_less_time_is_faster(self):
+        quick = t.follow(candidate(),
+                         [bar(0, 100.0, high=100.0), bar(5, 101.0, high=101.0),
+                          bar(15, 101.0, high=101.0)], candidate_time=T0)
+        slow = t.follow(candidate(),
+                        [bar(0, 100.0, high=100.0), bar(60, 101.0, high=101.0)],
+                        candidate_time=T0)
+        assert quick["mfe_per_minute_15m"] > slow["mfe_per_minute_60m"]
+
+    def test_speed_is_none_where_the_excursion_is(self):
+        row = t.follow(candidate(), [bar(0, 100.0)], candidate_time=T0)
+        assert row["mfe_per_minute_60m"] is None
+
+    @pytest.mark.parametrize("level,key", [
+        (0.25, "time_to_mfe_025"), (0.50, "time_to_mfe_050"),
+        (1.00, "time_to_mfe_100")])
+    def test_each_level_records_when_it_was_reached(self, level, key):
+        row = t.follow(candidate(),
+                       [bar(0, 100.0, high=100.0), bar(10, 101.5, high=101.5)],
+                       candidate_time=T0)
+        assert row[key] == 10
+
+    def test_a_level_never_reached_is_none_not_a_large_number(self):
+        """A large sentinel would average as one, making a candidate that
+        never got there look merely slow."""
+        row = t.follow(candidate(),
+                       [bar(0, 100.0, high=100.0), bar(60, 100.1, high=100.1)],
+                       candidate_time=T0)
+        assert row["time_to_mfe_050"] is None
+        assert row["time_to_mfe_025"] is None
+
+    def test_the_levels_span_rather_than_hug_the_benchmark(self):
+        """IEFA reached +0.241%. Levels sitting at that value would
+        encode one observation into the scale."""
+        assert t.MFE_ARRIVAL_LEVELS == (0.25, 0.50, 1.00)
+        assert 0.241 not in t.MFE_ARRIVAL_LEVELS
+
+    def test_the_new_fields_are_aggregated_per_population(self):
+        rows = [t.follow(candidate(), [bar(0, 100.0, high=100.0),
+                                       bar(30, 101.0, high=101.0)],
+                         candidate_time=T0)]
+        summary = t.summarise(rows)
+        for field in ("mfe_30m", "mae_30m", "mfe_per_minute_30m",
+                      "momentum_strength", "momentum_speed",
+                      "time_to_mfe_025"):
+            assert field in summary[t.POP_ALL], field
