@@ -97,7 +97,11 @@ class TestTheStrategyTablesAreNotSummedIntoTotals:
         assert "S1: none" in lines
 
     def test_a_strategy_with_nothing_says_none(self, conn):
-        assert sorted(ih.attribution(conn)) == ["S1: none", "S2: none"]
+        """Every live strategy is listed, including the empty ones -- an
+        absent line and a strategy holding nothing look identical
+        otherwise."""
+        assert sorted(ih.attribution(conn)) == ["S1: none", "S2: none",
+                                                "S6: none"]
 
     def test_a_broken_strategy_table_does_not_fail_reconciliation(
             self, conn, monkeypatch):
@@ -284,3 +288,100 @@ class TestAttributionCoversBothStrategies:
         lines = ih.attribution(conn)
         assert "S1: TX / - / 1" in lines
         assert "S2: ABC / NASD / 1" in lines
+
+
+class TestS6JoinsAttribution:
+    """S6's positions are attribution, not additional quantity.
+
+    The rule that made this safe for S2 applies unchanged: the account
+    table is the total, and adding a strategy table on top would report
+    two against the broker's one and fail-close every entry -- including
+    the strategy trading correctly.
+    """
+
+    def s6_position(self, conn, symbol="ABC", venue="NASD", quantity=1):
+        from s6_live import position_store as s6ps
+
+        pid = s6ps.record_submission(conn, symbol=symbol, variant="S6-R",
+                                     range_high=99.5, range_low=99.0, now=T0)
+        s6ps.open_from_fill(conn, pid, quantity=quantity,
+                            average_fill_price=100.0, venue=venue, now=T0)
+        return pid
+
+    def test_s6_appears_in_attribution(self, conn):
+        self.s6_position(conn)
+        assert "S6: ABC / NASD / 1" in ih.attribution(conn)
+
+    def test_all_three_strategies_are_attributed_together(self, conn):
+        from s1_live import position_store as s1ps
+
+        s1ps.open_position(conn, symbol="TX", quantity=1, entry_price=53.68,
+                           strategy_id=S1, signal_id="sig", now=T0)
+        s2_position(conn, symbol="S2SYM", venue="NASD")
+        self.s6_position(conn, symbol="S6SYM")
+        lines = ih.attribution(conn)
+        assert "S1: TX / - / 1" in lines
+        assert "S2: S2SYM / NASD / 1" in lines
+        assert "S6: S6SYM / NASD / 1" in lines
+
+    def test_an_s6_position_does_not_inflate_the_account_total(self, conn):
+        """The bug the module exists for, now with a third strategy."""
+        self.s6_position(conn, symbol="ABC")
+        totals = ih.aggregate(account(("ABC", "NASD", 1)))
+        assert totals == {("ABC", "NASD"): 1}
+
+    def test_broker_holding_with_no_s6_row_is_reported_unattributed(self, conn):
+        result = ih.summary(conn, account(("ORPHAN", None, 1)))
+        assert result["coverage_healthy"] is True
+        assert any(g["gap"] == ih.GAP_UNATTRIBUTED
+                   for g in result["coverage_gaps"])
+
+    def test_an_s6_position_missing_from_the_account_store_is_a_gap(self, conn):
+        """Fill sync did not record it -- the failure the broker
+        comparison structurally cannot see."""
+        self.s6_position(conn, symbol="ABC")
+        result = ih.summary(conn, account(("OTHER", None, 1)))
+        assert result["coverage_healthy"] is False
+        gap = [g for g in result["coverage_gaps"]
+               if g["gap"] == ih.GAP_NOT_IN_ACCOUNT][0]
+        assert gap["strategy_id"] == ih.S6_STRATEGY_ID
+
+    def test_a_matched_s6_position_is_healthy(self, conn):
+        self.s6_position(conn, symbol="ABC")
+        assert ih.summary(conn, account(("ABC", None, 1)))["coverage_healthy"]
+
+    def test_an_unfilled_s6_order_is_not_counted_as_a_holding(self, conn):
+        """SUBMITTED is a yes to "could a position appear" and a no to
+        "what do we hold". Counting it here would report shares the
+        account does not have."""
+        from s6_live import position_store as s6ps
+
+        s6ps.record_submission(conn, symbol="PENDING", range_high=99.5,
+                               range_low=99.0, now=T0)
+        result = ih.summary(conn, account())
+        assert result["coverage_healthy"] is True
+        assert "S6: none" in ih.attribution(conn)
+
+
+class TestStructuralRiskIsRecordedNotApplied:
+    def test_it_is_computed_from_the_entry_and_the_range_low(self):
+        from scanners.publish import eligibility as el
+
+        metrics = el.derived_metrics({"price": 100.0, "range_high": 99.5,
+                                      "range_low": 99.0})
+        assert metrics["structural_risk_pct"] == pytest.approx(1.0)
+
+    def test_it_is_none_without_a_range(self):
+        from scanners.publish import eligibility as el
+
+        assert el.derived_metrics(
+            {"price": 100.0})["structural_risk_pct"] is None
+
+    def test_no_threshold_uses_it(self):
+        """§5: recorded for the shadow study, not applied as a rule."""
+        import ast
+
+        for module in ("s6_live/exit_policy.py", "config/s6_exit_v0.py",
+                       "s6_live/candidate_source.py"):
+            source = (REPO_ROOT / module).read_text()
+            assert "structural_risk_pct" not in source, module

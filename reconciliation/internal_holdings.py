@@ -52,6 +52,7 @@ logger = logging.getLogger(__name__)
 
 S1_STRATEGY_ID = "S1_HMA_EARLY_TREND_V1"
 S2_STRATEGY_ID = "S2_VOLUME_ACCUMULATION_V1"
+S6_STRATEGY_ID = "S6_ORB_BREAKOUT_V1"
 
 #: A strategy position with no account-level row behind it.
 GAP_NOT_IN_ACCOUNT = "STRATEGY_POSITION_NOT_IN_ACCOUNT_STORE"
@@ -96,8 +97,13 @@ def strategy_holdings(conn) -> Dict[str, List[Tuple[str, Optional[str], int]]]:
     a healthy reconciliation into a mismatch.
     """
     holdings: Dict[str, List[Tuple[str, Optional[str], int]]] = {}
+    # S6's holdings() excludes SUBMITTED rows deliberately: an unfilled
+    # order is a yes to "could another position appear" and a no to
+    # "what do we hold". Reconciliation asks the second, so counting a
+    # submission here would report shares the account does not have.
     for strategy_id, module_path in ((S1_STRATEGY_ID, "s1_live.position_store"),
-                                     (S2_STRATEGY_ID, "s2_live.position_store")):
+                                     (S2_STRATEGY_ID, "s2_live.position_store"),
+                                     (S6_STRATEGY_ID, "s6_live.position_store")):
         try:
             module = __import__(module_path, fromlist=["holdings"])
             rows = module.holdings(conn) if hasattr(module, "holdings") else []

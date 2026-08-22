@@ -134,7 +134,17 @@ def derived_metrics(row: Dict[str, Any]) -> Dict[str, Any]:
     if ema9 is not None and ema21 not in (None, 0):
         ema_spread = (ema9 / ema21 - 1.0) * 100.0
 
+    # How much of the entry is at risk down to the structural stop.
+    # Recorded, not applied: S6_EXIT_V0 exits at range_low itself, and
+    # this is the same fact expressed as a percentage so candidates with
+    # different price levels can be compared. Whether some level of it
+    # is too much is a question the shadow sample has to answer.
+    structural_risk = None
+    if price is not None and low is not None and price > 0:
+        structural_risk = (price - low) / price * 100.0
+
     return {
+        "structural_risk_pct": structural_risk,
         "opening_range_width_pct": width_pct,
         "breakout_pct": breakout_pct,
         "normalized_breakout_by_range": normalised,
