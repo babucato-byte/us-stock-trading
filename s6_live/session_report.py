@@ -78,10 +78,17 @@ def build(*, conn=None, trading_day=None, session=None, now=None,
         "session": resolved,
         "variant": variant or None,
         "market_state": market,
-        "strategy_mode": s6_sessions.mode_for(resolved),
+        # Capability and promotion, kept apart. `session_mode` describes
+        # what THIS SESSION permits; `strategy_live_mode` is whether S6
+        # itself may act. One word for both would let a shadow session
+        # under a promoted strategy read the same as a promoted session
+        # under a shadow strategy.
+        "session_mode": s6_sessions.mode_for(resolved),
+        "strategy_live_mode": _strategy_live_mode(),
         "order_capable": s6_sessions.orders_allowed(resolved),
         "orders_allowed": (market != "CLOSED"
-                           and s6_sessions.orders_allowed(resolved)),
+                           and s6_sessions.orders_allowed(resolved)
+                           and _strategy_is_live()),
         "order_route_verified": scan_session.order_route_verified(resolved),
         "broker_submit_count": 0,
         "errors": [],
@@ -107,11 +114,26 @@ def build(*, conn=None, trading_day=None, session=None, now=None,
     return report
 
 
+def _strategy_live_mode(modes=None) -> str:
+    """Whether S6 ITSELF is promoted -- not what its session permits."""
+    from config import scanner_live_mode
+
+    table = modes if modes is not None else scanner_live_mode.SCANNER_LIVE_MODE
+    return str(table.get(s6_sessions.SCANNER_NAME,
+                         scanner_live_mode.MODE_DISCOVERY_ONLY))
+
+
+def _strategy_is_live(modes=None) -> bool:
+    from config import scanner_live_mode
+
+    return scanner_live_mode.is_limited_live(s6_sessions.SCANNER_NAME, modes)
+
+
 def _expectations(session: str) -> Dict[str, Any]:
     """Read from the session matrix, so the two cannot disagree."""
     return {
         "variant": s6_sessions.variant_for(session) or None,
-        "strategy_mode": s6_sessions.mode_for(session),
+        "session_mode": s6_sessions.mode_for(session),
         "order_capable": s6_sessions.orders_allowed(session),
         "broker_submit_count": 0,
     }
@@ -262,7 +284,7 @@ def format_report(report: Dict[str, Any]) -> str:
         "  observed vs expected",
         "  " + "-" * 62,
     ]
-    for key in ("variant", "strategy_mode", "order_capable",
+    for key in ("variant", "session_mode", "order_capable",
                 "broker_submit_count"):
         expected = (report.get("expected") or {}).get(key)
         observed = report.get(key)
@@ -270,6 +292,7 @@ def format_report(report: Dict[str, Any]) -> str:
         lines.append(f"    {mark}{key:<24}: {_fmt(observed):<20} "
                      f"expected {_fmt(expected)}")
     lines += [
+        f"    strategy_live_mode      : {_fmt(report.get('strategy_live_mode'))}",
         f"    orders_allowed          : {_fmt(report.get('orders_allowed'))}",
         f"    order_route_verified    : {_fmt(report.get('order_route_verified'))}",
         "",

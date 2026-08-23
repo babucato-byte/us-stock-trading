@@ -441,7 +441,8 @@ class TestSessionReport:
         report = session_report.build(conn=conn, trading_day=DAY,
                                       session="OVERNIGHT_DAYTIME", now=T0)
         assert report["variant"] == "S6-O"
-        assert report["strategy_mode"] == s6_sessions.MODE_REALTIME_SHADOW
+        assert report["session_mode"] == s6_sessions.MODE_REALTIME_SHADOW
+        assert report["strategy_live_mode"] == slm.MODE_DISCOVERY_ONLY
         assert report["order_capable"] is False
         assert report["orders_allowed"] is False
         assert report["broker_submit_count"] == 0
@@ -833,3 +834,48 @@ class TestS6GetsTheStrategyGates:
             name = "something_new"
 
         assert klt.is_strategy_source(Mystery()) is False
+
+
+class TestCapabilityIsNotPromotion:
+    """A session that WOULD permit orders and a strategy that MAY place
+    them are different facts. The final check printed the first under the
+    name of the second, so a REGULAR report read `LIMITED_LIVE` while S6
+    was DISCOVERY_ONLY -- on the one page an operator reads immediately
+    before deciding to promote it."""
+
+    def test_the_final_check_separates_them(self, handoff, master):
+        publish(["AAPL"])
+        report = final_check.build(trading_day=DAY, session="REGULAR", now=T0)
+        assert report["session_mode"] == s6_sessions.MODE_LIMITED_LIVE
+        assert report["strategy_live_mode"] == slm.MODE_DISCOVERY_ONLY
+        assert report["order_capable"] is True
+        # Capable session, unpromoted strategy -> no orders.
+        assert report["orders_allowed"] is False
+
+    def test_both_are_printed_with_what_they_mean(self, handoff, master):
+        text = final_check.format_report(
+            final_check.build(trading_day=DAY, session="REGULAR", now=T0))
+        assert "what this SESSION permits" in text
+        assert "whether S6 ITSELF may act" in text
+
+    def test_a_promoted_strategy_says_so(self, handoff, master):
+        report = final_check.build(trading_day=DAY, session="REGULAR",
+                                   modes=live_modes(), now=T0)
+        assert report["strategy_live_mode"] == slm.MODE_LIMITED_LIVE
+
+    def test_the_session_report_separates_them_too(self, handoff, conn):
+        report = session_report.build(conn=conn, trading_day=DAY,
+                                      session="OVERNIGHT_DAYTIME", now=T0)
+        assert report["session_mode"] == s6_sessions.MODE_REALTIME_SHADOW
+        assert report["strategy_live_mode"] == slm.MODE_DISCOVERY_ONLY
+        assert report["orders_allowed"] is False
+
+    def test_orders_allowed_needs_both(self, handoff, master):
+        """Neither alone is enough, in either direction."""
+        capable_not_promoted = final_check.build(
+            trading_day=DAY, session="REGULAR", now=T0)
+        promoted_not_capable = final_check.build(
+            trading_day=DAY, session="OVERNIGHT_DAYTIME", modes=live_modes(),
+            now=T0)
+        assert capable_not_promoted["orders_allowed"] is False
+        assert promoted_not_capable["orders_allowed"] is False

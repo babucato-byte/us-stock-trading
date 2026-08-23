@@ -72,6 +72,21 @@ GATES = (
 OFFLINE_GATES = frozenset({"instrument", "risk_matrix"})
 
 
+def _strategy_live_mode(modes=None) -> str:
+    """Whether S6 ITSELF is promoted -- not what its session permits."""
+    from config import scanner_live_mode
+
+    table = modes if modes is not None else scanner_live_mode.SCANNER_LIVE_MODE
+    return str(table.get(s6_sessions.SCANNER_NAME,
+                         scanner_live_mode.MODE_DISCOVERY_ONLY))
+
+
+def _strategy_is_live(modes=None) -> bool:
+    from config import scanner_live_mode
+
+    return scanner_live_mode.is_limited_live(s6_sessions.SCANNER_NAME, modes)
+
+
 def _result(status: str, detail: str = "") -> Dict[str, str]:
     return {"status": status, "detail": detail}
 
@@ -107,10 +122,22 @@ def build(*, conn=None, broker=None, trading_day=None, session=None,
         "session": resolved_session,
         "variant": variant,
         "market_state": market,
-        "strategy_mode": s6_sessions.mode_for(resolved_session),
+        # Capability and promotion, never merged into one word.
+        #
+        # `session_mode` is what THIS SESSION would permit; it reads
+        # LIMITED_LIVE for REGULAR whether or not S6 is promoted, because
+        # it describes the session. `strategy_live_mode` is whether S6
+        # itself may act, and it is the one that is DISCOVERY_ONLY today.
+        # Printed as `strategy_mode`, the session's answer said
+        # "LIMITED_LIVE" on a report read immediately before deciding to
+        # promote -- which is the misreading this whole file exists to
+        # prevent, committed by the file itself.
+        "session_mode": s6_sessions.mode_for(resolved_session),
+        "strategy_live_mode": _strategy_live_mode(modes),
         "order_capable": s6_sessions.orders_allowed(resolved_session),
         "orders_allowed": (market != "CLOSED"
-                           and s6_sessions.orders_allowed(resolved_session)),
+                           and s6_sessions.orders_allowed(resolved_session)
+                           and _strategy_is_live(modes)),
         # The invariant, stated rather than computed: no path through
         # this module reaches a broker submission.
         "broker_submit_count": 0,
@@ -560,7 +587,10 @@ def format_report(report: Dict[str, Any]) -> str:
         f"  session/variant  : {_fmt(report.get('session'))} / "
         f"{_fmt(report.get('variant'))}",
         f"  market state     : {_fmt(report.get('market_state'))}",
-        f"  strategy mode    : {_fmt(report.get('strategy_mode'))}",
+        f"  session mode     : {_fmt(report.get('session_mode'))}"
+        f"   (what this SESSION permits)",
+        f"  strategy mode    : {_fmt(report.get('strategy_live_mode'))}"
+        f"   (whether S6 ITSELF may act)",
         f"  order capable    : {_fmt(report.get('order_capable'))}",
         f"  orders allowed   : {_fmt(report.get('orders_allowed'))}",
         "",
