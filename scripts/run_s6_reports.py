@@ -35,7 +35,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-REPORTS = ("final-check", "session", "trade", "readiness", "all")
+REPORTS = ("final-check", "session", "trade", "readiness", "variants", "all")
 
 
 def _broker(live: bool):
@@ -197,6 +197,27 @@ def main(argv=None) -> int:
             payload["trade_timeline"] = report
             if not args.json:
                 print(trade_timeline.format_report(report))
+                print("")
+
+        if want in ("variants", "all"):
+            from s6_live import observations as obs_module
+            from s6_live import variant_state
+
+            # Observations come from the production artifacts, exactly as
+            # the activation gate takes them. A variant's state can only
+            # move on evidence a validated deployment recorded.
+            observed = obs_module.load(conn=conn, trading_day=args.trading_day,
+                                       session=args.session)
+            states = variant_state.evaluate(observations=observed)
+            payload["variants"] = {k: v.as_dict() for k, v in states.items()}
+            if not args.json:
+                print("S6 VARIANT STATES")
+                print("=" * 64)
+                print(variant_state.format_table(states))
+                print("")
+                for state in states.values():
+                    for key, why in sorted(state.detail.items()):
+                        print(f"  {key}: {why}")
                 print("")
 
         if want in ("readiness", "all"):
