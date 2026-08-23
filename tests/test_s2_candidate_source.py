@@ -300,18 +300,25 @@ class TestTheHandoffDirectoryMustBeShared:
     both reported success.
     """
 
-    def test_a_release_scoped_default_is_refused(self, monkeypatch):
-        # Both must be cleared: analytics_dir() prefers
-        # SCANNER_ANALYTICS_DIR and only falls back to the project root,
-        # so leaving it set would never reach the release path at all.
+    def test_a_release_with_no_shared_store_is_refused(self, monkeypatch):
         monkeypatch.delenv(publisher.CANDIDATE_DIR_ENV, raising=False)
         monkeypatch.delenv("SCANNER_ANALYTICS_DIR", raising=False)
         monkeypatch.setenv(
             "TRADING_PROJECT_ROOT",
             "/home/ubuntu/releases/us-stock-trading/abc123")
         with pytest.raises(publisher.CandidateHandoffMisconfigured,
-                           match="shared directory"):
+                           match="no shared store"):
             publisher.candidate_dir()
+
+    def test_a_release_beside_a_shared_store_resolves_to_it(self, monkeypatch,
+                                                            tmp_path):
+        """`<releases>/<sha>` -> `<releases>/shared/state/candidates`, the
+        same sibling resolution the KIS and S1 stores already use."""
+        monkeypatch.delenv(publisher.CANDIDATE_DIR_ENV, raising=False)
+        shared = tmp_path / "shared" / "state" / "candidates"
+        shared.mkdir(parents=True)
+        monkeypatch.setenv("TRADING_PROJECT_ROOT", str(tmp_path / "abc123"))
+        assert publisher.candidate_dir() == shared
 
     def test_an_explicit_shared_directory_is_accepted(self, monkeypatch,
                                                       tmp_path):
@@ -321,12 +328,29 @@ class TestTheHandoffDirectoryMustBeShared:
             "/home/ubuntu/releases/us-stock-trading/abc123")
         assert publisher.candidate_dir() == tmp_path
 
-    def test_a_non_release_default_still_works(self, monkeypatch, tmp_path):
-        """The scanner runtime is a working checkout and needs no env."""
+    def test_a_checkout_without_a_shared_store_is_refused(self, monkeypatch,
+                                                           tmp_path):
+        """This is the case that broke production, and it used to pass.
+
+        The reasoning was "the scanner runtime is a working checkout and
+        needs no env", so `candidate_dir()` fell back to
+        `analytics_dir()/candidates`. On the host that resolved to
+        `/home/ubuntu/trading/logs/scanners/candidates` while the trading
+        runtime read `.../shared/state/candidates` -- a producer writing
+        where no consumer looks, with no error on either side.
+        """
         monkeypatch.delenv(publisher.CANDIDATE_DIR_ENV, raising=False)
         monkeypatch.setenv("TRADING_PROJECT_ROOT", str(tmp_path))
         monkeypatch.setenv("SCANNER_ANALYTICS_DIR", str(tmp_path / "a"))
-        assert "candidates" in str(publisher.candidate_dir())
+        with pytest.raises(publisher.CandidateHandoffMisconfigured):
+            publisher.candidate_dir()
+
+    def test_nothing_configured_at_all_is_refused(self, monkeypatch):
+        monkeypatch.delenv(publisher.CANDIDATE_DIR_ENV, raising=False)
+        monkeypatch.delenv("TRADING_PROJECT_ROOT", raising=False)
+        with pytest.raises(publisher.CandidateHandoffMisconfigured,
+                           match="refusing to guess"):
+            publisher.candidate_dir()
 
 
 class TestQuietIsNotTheSameAsAbsent:

@@ -348,6 +348,9 @@ class TestTheEntryPointTakesTheLock:
             construction_failures = {}
             fetch_failures = 0
             stored_signals = 0
+            publication_status = None
+            publication_detail = None
+            published_rows = 0
 
         def fake_run(**kwargs):
             calls.append(kwargs)

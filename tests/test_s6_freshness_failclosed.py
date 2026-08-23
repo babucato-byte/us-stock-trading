@@ -134,12 +134,28 @@ class TestDataFailuresFailClosed:
         path.write_text("{not json\n", encoding="utf-8")
         assert source().symbols() == []
 
-    def test_an_unreadable_directory_yields_nothing(self, monkeypatch):
+    def test_an_unreadable_candidate_file_yields_nothing(self, store,
+                                                          monkeypatch):
+        """The store resolves; reading it fails."""
+        store(["AAPL"])
         monkeypatch.setattr(publisher, "read",
                             lambda *a, **k: (_ for _ in ()).throw(OSError))
         src = source()
         assert src.symbols() == []
         assert "could not be read" in src.describe()["refusal"]
+
+    def test_an_unresolvable_shared_store_yields_nothing(self, monkeypatch):
+        """The store itself cannot be located.
+
+        A different fact from an unreadable file, and it now says so:
+        before the publisher stopped guessing a path, this case silently
+        resolved to a runtime-local directory and reported a clean zero.
+        """
+        monkeypatch.delenv(publisher.CANDIDATE_DIR_ENV, raising=False)
+        monkeypatch.delenv("TRADING_PROJECT_ROOT", raising=False)
+        src = source()
+        assert src.symbols() == []
+        assert "SCANNER_CANDIDATE_DIR" in src.describe()["refusal"]
 
     def test_a_row_without_a_range_does_not_qualify(self, store):
         """The exit's primary signal is re-entry INTO the range; a

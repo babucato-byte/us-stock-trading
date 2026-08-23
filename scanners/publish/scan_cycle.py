@@ -115,6 +115,21 @@ class CycleState:
                 "detail": self.detail}
 
 
+#: Why a hold was not taken. The two are NOT interchangeable.
+#:
+#: HELD_BY_ANOTHER means a scan is genuinely running, and the right
+#: response is to exit quietly -- the answer is already being produced.
+#:
+#: UNRESOLVED means the shared store could not be located, so no lock
+#: could be taken by anyone. Treating that as an overlap would skip the
+#: scan entirely and report "previous run still in progress" about a run
+#: that does not exist -- losing the day's signals to a message that
+#: sends an operator looking for the wrong thing. The scan should run;
+#: it is the HAND-OFF that is broken, and publication says so.
+BLOCKED_HELD = "HELD_BY_ANOTHER_SCAN"
+BLOCKED_UNRESOLVED = "SHARED_STORE_UNRESOLVED"
+
+
 @dataclass
 class Hold:
     """The result of trying to start a scan cycle."""
@@ -125,10 +140,17 @@ class Hold:
     detail: str = ""
     #: Populated for a caller that wants to name what it collided with.
     blocked_by: Optional[CycleState] = None
+    #: One of BLOCKED_HELD / BLOCKED_UNRESOLVED when not acquired.
+    blocked_reason: Optional[str] = None
 
     @property
     def skipped(self) -> bool:
-        return not self.acquired
+        """Should the caller stand down? Only for a real overlap."""
+        return not self.acquired and self.blocked_reason == BLOCKED_HELD
+
+    @property
+    def unresolved(self) -> bool:
+        return self.blocked_reason == BLOCKED_UNRESOLVED
 
 
 @dataclass
@@ -150,7 +172,18 @@ class Cycle:
 
     @property
     def skipped(self) -> bool:
-        return not self.acquired
+        """A real overlap, and the only case that stands a scan down."""
+        return any(hold.skipped for hold in self.holds)
+
+    @property
+    def unresolved(self) -> bool:
+        """The shared store could not be located.
+
+        The scan still runs -- its signals are worth collecting and no
+        lock is needed to protect a hand-off that has nowhere to go --
+        and publication records PRODUCER_CONFIG_ERROR.
+        """
+        return any(hold.unresolved for hold in self.holds)
 
     def blocked(self) -> List[Hold]:
         return [hold for hold in self.holds if not hold.acquired]
@@ -211,25 +244,24 @@ def hold(trading_day, session=None, *, scanner=None, run_id=None,
     stamp = (now or datetime.now(timezone.utc)).isoformat()
     if fcntl is None:  # pragma: no cover - not reachable on this platform
         yield Hold(False, scanner, stamp,
-                   "flock is unavailable; refusing to run a scan whose "
-                   "overlap could not be detected")
+                   "flock is unavailable on this platform",
+                   blocked_reason=BLOCKED_UNRESOLVED)
         return
 
     try:
         path = cycle_path(trading_day, session, scanner)
-    except Exception as exc:  # noqa: BLE001 - a misconfigured hand-off
-        # directory is already a loud failure elsewhere; here it must not
-        # be reported as "the lock was free".
-        yield Hold(False, scanner, stamp, f"cycle file unavailable: {exc}")
+    except Exception as exc:  # noqa: BLE001 - the shared store could not
+        # be located. Not an overlap: nobody holds a lock, because there
+        # is nowhere to hold one. Publication reports it.
+        yield Hold(False, scanner, stamp, f"cycle file unavailable: {exc}",
+                   blocked_reason=BLOCKED_UNRESOLVED)
         return
 
     try:
         handle = open(path, "a+", encoding="utf-8")  # noqa: SIM115
     except OSError as exc:
-        # A cycle file that cannot be opened is a scan whose overlap
-        # could not be detected. Refusing to run is the same direction
-        # every other check here fails in.
-        yield Hold(False, scanner, stamp, f"cycle file unopenable: {exc}")
+        yield Hold(False, scanner, stamp, f"cycle file unopenable: {exc}",
+                   blocked_reason=BLOCKED_UNRESOLVED)
         return
 
     try:
@@ -244,7 +276,7 @@ def hold(trading_day, session=None, *, scanner=None, run_id=None,
             yield Hold(False, scanner, stamp,
                        f"a {scanner} scan started at {state.started_at} "
                        f"(pid {state.pid}) is still running",
-                       blocked_by=state)
+                       blocked_by=state, blocked_reason=BLOCKED_HELD)
             return
 
         handle.seek(0)
@@ -286,7 +318,10 @@ def hold_all(trading_day, session=None, *, scanners=(), run_id=None, now=None):
                 hold(trading_day, session, scanner=name, run_id=run_id,
                      now=now))
             holds.append(taken)
-            if not taken.acquired:
+            if taken.skipped:
+                # A real overlap stops acquisition; the run is standing
+                # down anyway. An unresolved store does NOT -- the scan
+                # proceeds and only the hand-off fails.
                 break
         yield Cycle(holds=list(holds), started_at=stamp)
 

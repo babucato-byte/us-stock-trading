@@ -75,6 +75,32 @@ ALL_STATUSES = frozenset(
     {SUCCESS, PARTIAL, SKIPPED_MARKET_CLOSED} | set(FAILURE_STATUSES))
 
 
+#: How the candidate hand-off ended. Separate from the run status above,
+#: because the two answer different questions and a run can succeed at
+#: one while failing the other.
+PUBLICATION_OK = "OK"
+
+#: Nothing to hand off -- this run contained no publishing scanner.
+PUBLICATION_NOT_APPLICABLE = "NOT_APPLICABLE"
+
+#: The shared candidate store could not be located, so a publishing scan
+#: published NOTHING.
+#:
+#: Its own status rather than a general FAILED, because the operator
+#: action is specific and immediate: the producer's environment is wrong.
+#: Before this existed, the publisher fell back to a runtime-local
+#: directory and reported success -- so a broken hand-off and a quiet
+#: market produced the same record, and the consumer's "0 candidates"
+#: was the first and only symptom.
+PUBLICATION_CONFIG_ERROR = "PRODUCER_CONFIG_ERROR"
+
+#: The store was found and the write itself failed.
+PUBLICATION_WRITE_FAILED = "PUBLICATION_WRITE_FAILED"
+
+PUBLICATION_FAILURES = frozenset(
+    {PUBLICATION_CONFIG_ERROR, PUBLICATION_WRITE_FAILED})
+
+
 def new_run_id(trading_day: str, profile: Optional[str] = None) -> str:
     """A fresh, unique id for one runner invocation.
 

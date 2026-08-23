@@ -121,37 +121,73 @@ class PublishedCandidate:
 #: both report success.
 RELEASE_PATH_MARKER = "/releases/"
 
+#: Where the shared store sits relative to `TRADING_PROJECT_ROOT`.
+#: `<releases>/<sha>/` -> `<releases>/shared/state/candidates`, matching
+#: `market_data/candidate_store.py` and `s1_live/store.py`, which resolve
+#: `<releases>/shared/state` the same way for the same reason.
+SHARED_STATE_PARTS = ("shared", "state", DEFAULT_SUBDIR)
+
 
 class CandidateHandoffMisconfigured(Exception):
-    """The two runtimes would not be looking at the same directory."""
+    """No shared store could be located, so there is no hand-off.
+
+    Fail-closed for every caller. A producer that raises this has not
+    published and must not report a quiet day; a consumer that catches it
+    has not read an empty store, it has failed to find one.
+    """
+
+    reason_code = "PRODUCER_CONFIG_ERROR"
 
 
 def candidate_dir() -> Path:
-    """Where published candidates live. Shared by both runtimes.
+    """The shared, release-independent directory, or a refusal.
 
-    Requires `SCANNER_CANDIDATE_DIR` when running from a release. The
-    default -- analytics_dir()/candidates -- resolves under
-    TRADING_PROJECT_ROOT, which for the trading runtime is the release
-    directory itself. Falling back to it there would mean the scanner
-    runtime writes to its checkout and the trading runtime reads inside a
-    release that changes every deploy, with no error on either side.
+    Resolution order -- the same one `market_data/candidate_store.py` and
+    `s1_live/store.py` already use, and for the same reason:
 
-    Refusing is the only honest option: a hand-off nobody can see failing
-    is worse than one that will not start.
+      1. `SCANNER_CANDIDATE_DIR` -- how production points both runtimes
+         at one directory, and how tests point at a tmp_path.
+      2. `TRADING_PROJECT_ROOT`'s sibling `shared/state/candidates`, when
+         that directory already EXISTS. Existence is the check, not
+         construction: creating it would manufacture a second empty store
+         on any host whose layout differs, which is the failure being
+         removed.
+
+    There is deliberately no third option.
+
+    It used to fall back to `analytics_dir()/candidates` whenever the
+    resolved path was not inside a release, on the reasoning that "the
+    scanner runtime is a working checkout and needs no env". That
+    reasoning is what produced the split brain in production: `s6_scan.sh`
+    runs in the checkout without the shared env, so S6 published into
+    `/home/ubuntu/trading/logs/scanners/candidates` while the trading
+    runtime read `.../shared/state/candidates`. Neither side errored. The
+    producer reported success, and the day S6 was promoted the executor
+    would have read an empty directory and called it a quiet market.
+
+    That is the identical failure S2 already had once, and the identical
+    failure the two stores named above were rewritten to refuse. Guessing
+    a path is what makes it invisible; refusing is what makes it a
+    fifteen-second fix instead of a post-mortem.
     """
     configured = os.environ.get(CANDIDATE_DIR_ENV)
     if configured and str(configured).strip():
         return Path(str(configured).strip())
 
-    from scanners.base import result_store
-
-    fallback = result_store.analytics_dir() / DEFAULT_SUBDIR
-    if RELEASE_PATH_MARKER in str(fallback):
+    root = os.environ.get("TRADING_PROJECT_ROOT")
+    if root and str(root).strip():
+        shared = Path(str(root).strip()).parent.joinpath(*SHARED_STATE_PARTS)
+        if shared.is_dir():
+            return shared
         raise CandidateHandoffMisconfigured(
-            f"{CANDIDATE_DIR_ENV} must be set to a shared directory when "
-            f"running from a release; the default {fallback} is inside the "
-            "release and is not visible to the scanner runtime")
-    return fallback
+            f"{CANDIDATE_DIR_ENV} is not set and TRADING_PROJECT_ROOT="
+            f"{root!r} has no shared store at {shared}; refusing to fall "
+            "back to a runtime-local candidate path that the other "
+            "runtime cannot see")
+
+    raise CandidateHandoffMisconfigured(
+        f"neither {CANDIDATE_DIR_ENV} nor TRADING_PROJECT_ROOT is set; "
+        "refusing to guess where the shared candidate store lives")
 
 
 def run_marker_path(trading_day: str, session: Optional[str] = None) -> Path:

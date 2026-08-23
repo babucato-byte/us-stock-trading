@@ -161,6 +161,16 @@ class RunReport:
     #: Which universe this run drew from: "full" or "active".
     universe_type: Optional[str] = None
     activity_summary: Dict[str, Any] = field(default_factory=dict)
+    #: What happened to the candidate hand-off. None when this run had no
+    #: publishing scanner in it and there was nothing to hand off.
+    #:
+    #: Carried on the run report, not only in a log line, because the run
+    #: manifest is the only record that survives -- and a producer that
+    #: could not reach the shared store must not be reconstructable later
+    #: as "the scan ran and found nothing".
+    publication_status: Optional[str] = None
+    publication_detail: Optional[str] = None
+    published_rows: int = 0
     #: Symbols never fetched because a current eligibility record ruled
     #: them out. Reported so a shrinking universe is visible rather than
     #: looking like a quiet market.
@@ -256,6 +266,9 @@ class RunReport:
                 outcome.circuit_breaker_reason for outcome in self.outcomes
                 if outcome.circuit_breaker_reason) or None,
             "construction_failures": dict(self.construction_failures),
+            "publication_status": self.publication_status,
+            "publication_detail": self.publication_detail,
+            "published_rows": self.published_rows,
             "stored_signals": self.stored_signals,
             "duration_seconds": round(self.duration_seconds, 3),
             "skipped_reason": self.skipped_reason,
@@ -322,6 +335,7 @@ def run_scanners(
     use_eligibility: bool = True,
     universe_type: Optional[str] = None,
     active_pool_size: int = act.DEFAULT_POOL_SIZE,
+    publish: bool = False,
 ) -> RunReport:
     """Run the requested scanners over the requested symbols.
 
@@ -579,12 +593,21 @@ def run_scanners(
     eligibility_store.save()
     activity_store.save()
 
+    # Stamped BEFORE the manifest is written, not after. The manifest is
+    # the only record of this run that survives, and it recorded 0.0 for
+    # every scan because the duration was set on the line after it.
+    report.duration_seconds = time.monotonic() - started
+
     if store:
         for outcome in report.outcomes:
             report.stored_signals += _store_safely(outcome, day)
+        # Publication happens BEFORE the manifest, so its outcome is IN
+        # the manifest. One row per run: appending a second, amended row
+        # would double-count in every reader that tallies run statuses.
+        if publish:
+            _publish_safely(report)
         _record_manifest(report, day)
 
-    report.duration_seconds = time.monotonic() - started
     _log_summary(report)
     return report
 
@@ -605,6 +628,46 @@ def _store_safely(outcome: ScanOutcome, trading_day: str) -> int:
         outcome.failure_reason = f"storage failed: {type(exc).__name__}: {exc}"
         logger.exception("could not store signals for %s", outcome.scanner_name)
         return 0
+
+
+def _publish_safely(report: RunReport) -> None:
+    """Hand the candidates over, and record how that went.
+
+    Never raises -- but never silently succeeds either. The three
+    outcomes are kept apart because they demand different responses:
+
+        NOT_APPLICABLE       this run had no publishing scanner
+        PRODUCER_CONFIG_ERROR the shared store could not be located
+        PUBLICATION_WRITE_FAILED it was found and the write failed
+
+    The middle one used to be impossible to observe. `candidate_dir()`
+    guessed a runtime-local path, `publish()` wrote there happily, and
+    the run recorded SUCCESS -- so a producer writing where no consumer
+    looks was indistinguishable from a market with nothing to offer.
+    """
+    if not any(PUBLISHING_SCANNERS.get(str(getattr(o, "scanner_name", None)))
+               for o in report.outcomes or []):
+        report.publication_status = run_context.PUBLICATION_NOT_APPLICABLE
+        return
+
+    from scanners.publish.candidates import CandidateHandoffMisconfigured
+
+    try:
+        report.published_rows = publish_report_candidates(report)
+    except CandidateHandoffMisconfigured as exc:
+        report.publication_status = run_context.PUBLICATION_CONFIG_ERROR
+        report.publication_detail = str(exc)
+        logger.error("candidate hand-off is misconfigured; %s published "
+                     "NOTHING: %s",
+                     ", ".join(sorted(PUBLISHING_SCANNERS)), exc)
+        return
+    except Exception as exc:  # noqa: BLE001 - a scan must survive a failed
+        # write; the signals are already in the analytics store.
+        report.publication_status = run_context.PUBLICATION_WRITE_FAILED
+        report.publication_detail = f"{type(exc).__name__}: {exc}"
+        logger.warning("candidate publication failed", exc_info=True)
+        return
+    report.publication_status = run_context.PUBLICATION_OK
 
 
 def _record_manifest(report: RunReport, trading_day: str) -> None:
@@ -661,6 +724,13 @@ def print_report(report: RunReport) -> None:
                   f"{outcome.consecutive_error_peak} consecutive failures")
     print("")
     print(f"stored signals  : {report.stored_signals}")
+    if report.publication_status:
+        print(f"candidate hand-off: {report.publication_status}"
+              + (f" rows={report.published_rows}"
+                 if report.publication_status == run_context.PUBLICATION_OK
+                 else ""))
+        if report.publication_detail:
+            print(f"    {report.publication_detail}")
     print(f"duration        : {report.duration_seconds:.1f}s")
 
 
@@ -717,6 +787,12 @@ def publish_report_candidates(report) -> int:
     is a partial answer -- it stopped somewhere -- and a partial answer
     written into the hand-off file is indistinguishable from a complete
     one once the run is over.
+
+    Raises `CandidateHandoffMisconfigured` when the shared store cannot be
+    located. That is deliberately NOT swallowed here: a publishing scan
+    whose hand-off has nowhere to go has not "found nothing", and the
+    caller records it as a producer failure rather than as a quiet
+    session.
     """
     from scanners.publish import candidates as candidate_publisher
     from scanners.publish import scan_cycle
@@ -728,12 +804,24 @@ def publish_report_candidates(report) -> int:
     completed_at = datetime.now(timezone.utc).isoformat()
     duration = getattr(report, "duration_seconds", None)
 
+    publishing = [o for o in getattr(report, "outcomes", None) or []
+                  if PUBLISHING_SCANNERS.get(str(getattr(o, "scanner_name", None)))]
+    if not publishing:
+        return 0
+
+    # Resolved ONCE, before anything is written, and allowed to raise.
+    # `mark_run` and `publish` are both best-effort by design -- a failed
+    # write must not cost a scan its signals -- which means a
+    # misconfigured store would otherwise produce nothing but two log
+    # warnings and a return value of 0. Indistinguishable from a quiet
+    # session, which is the whole failure.
+    directory = candidate_publisher.candidate_dir()
+    logger.info("candidate hand-off directory: %s", directory)
+
     written = 0
-    for outcome in getattr(report, "outcomes", None) or []:
+    for outcome in publishing:
         name = getattr(outcome, "scanner_name", None)
-        strategy_id = PUBLISHING_SCANNERS.get(str(name))
-        if not strategy_id:
-            continue
+        strategy_id = PUBLISHING_SCANNERS[str(name)]
         failed = bool(getattr(outcome, "failed", False))
         signals = [] if failed else list(getattr(outcome, "signals", None) or [])
         # Marked BEFORE the early return, so a scan that ran and found
@@ -867,6 +955,16 @@ def main(argv=None) -> int:
             # A non-zero exit here would page an operator every time a
             # scan ran long.
             return 0
+        if cycle.unresolved:
+            # No lock, because there is no shared store to hold one in.
+            # The scan still runs: its signals belong in the analytics
+            # dataset either way, and there is no hand-off to protect.
+            # Publication will record PRODUCER_CONFIG_ERROR and the exit
+            # code will be non-zero -- which is a different message to an
+            # operator than "a scan is already running".
+            print(f"[SCAN CYCLE] no shared store -- {cycle.detail()}")
+            logger.error("candidate hand-off cannot be locked: %s",
+                         cycle.detail())
         return _run_and_report(args, names=names, symbols=symbols, day=day,
                                session=session)
 
@@ -893,12 +991,23 @@ def _run_and_report(args, *, names, symbols, day, session) -> int:
         universe_type=args.universe,
         active_pool_size=args.active_pool_size,
         use_eligibility=not args.no_eligibility,
+        # Publication happens inside the run now, before the manifest is
+        # written, so the record of what was handed over is part of the
+        # record of the run rather than a log line beside it.
+        publish=not args.no_store,
     )
     print_report(report)
     # A scanner that failed is an operational problem worth a non-zero
     # exit so cron/systemd surfaces it -- but only after the other
     # scanners' results have been stored.
+    #
+    # A publishing scan whose hand-off has nowhere to go is the same kind
+    # of problem and was previously reported as success: publication was
+    # wrapped in a bare `except` that logged a warning and returned the
+    # scan's own exit code. A cron entry cannot act on a warning.
     exit_code = 0 if report.status == run_context.SUCCESS else 1
+    if report.publication_status in run_context.PUBLICATION_FAILURES:
+        exit_code = 1
     # Notification LAST, and after the exit code is already decided, so
     # that a Slack outage cannot influence what this process reports.
     # `notify_run` swallows its own exceptions; the guard here is for
@@ -919,16 +1028,6 @@ def _run_and_report(args, *, names, symbols, day, session) -> int:
         monitor.notify_run(report)
     except Exception:  # noqa: BLE001 - a monitor must never fail a scan
         logger.warning("scanner monitor could not be attempted", exc_info=True)
-
-    # Publication is a record of what was found, not a decision about it.
-    # Candidate Decision stays disabled; see scanners/publish/candidates.
-    # Guarded separately from the monitor so a Slack outage and a failed
-    # write cannot mask each other, and after the exit code either way.
-    try:
-        publish_report_candidates(report)
-    except Exception:  # noqa: BLE001 - a scan must survive a failed write
-        logger.warning("candidate publication could not be attempted",
-                       exc_info=True)
     return exit_code
 
 
