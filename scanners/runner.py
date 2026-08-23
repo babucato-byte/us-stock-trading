@@ -719,6 +719,14 @@ def publish_report_candidates(report) -> int:
     one once the run is over.
     """
     from scanners.publish import candidates as candidate_publisher
+    from scanners.publish import scan_cycle
+
+    day = getattr(report, "trading_day", None)
+    session = getattr(report, "session", None)
+    run_id = getattr(report, "run_id", None)
+    started_at = getattr(report, "started_at", None)
+    completed_at = datetime.now(timezone.utc).isoformat()
+    duration = getattr(report, "duration_seconds", None)
 
     written = 0
     for outcome in getattr(report, "outcomes", None) or []:
@@ -726,20 +734,28 @@ def publish_report_candidates(report) -> int:
         strategy_id = PUBLISHING_SCANNERS.get(str(name))
         if not strategy_id:
             continue
-        if getattr(outcome, "failed", False):
-            logger.info("not publishing %s candidates: the scanner failed", name)
-            continue
-        signals = list(getattr(outcome, "signals", None) or [])
+        failed = bool(getattr(outcome, "failed", False))
+        signals = [] if failed else list(getattr(outcome, "signals", None) or [])
         # Marked BEFORE the early return, so a scan that ran and found
         # nothing is distinguishable from a producer that never ran.
         # Those need opposite responses and read identically without it.
+        #
+        # A FAILED scanner is marked too, and says so. It used to be
+        # skipped entirely, which left the previous cycle's marker as the
+        # newest one -- so a failed scan was indistinguishable from no
+        # scan having happened since the last good one, and the stale
+        # rows behind it stayed consumable.
         candidate_publisher.mark_run(
-            getattr(report, "trading_day", None),
-            getattr(report, "session", None), strategy_id=strategy_id,
-            candidates=len(signals), run_id=getattr(report, "run_id", None))
+            day, session, strategy_id=strategy_id, candidates=len(signals),
+            run_id=run_id,
+            status=(scan_cycle.STATUS_FAILED if failed else scan_cycle.STATUS_OK),
+            started_at=started_at, completed_at=completed_at,
+            duration_seconds=duration)
+        if failed:
+            logger.info("not publishing %s candidates: the scanner failed", name)
+            continue
         if not signals:
             continue
-        session = getattr(report, "session", None)
         variant = None
         if str(name) == "orb":
             from config import s6_sessions
@@ -749,12 +765,34 @@ def publish_report_candidates(report) -> int:
             # setups that happen to share a scanner.
             variant = s6_sessions.variant_for(session) or None
         rows = candidate_publisher.publish(
-            signals, strategy_id=strategy_id,
-            trading_day=getattr(report, "trading_day", None),
-            session=session, variant=variant,
-            run_id=getattr(report, "run_id", None))
+            signals, strategy_id=strategy_id, trading_day=day,
+            session=session, variant=variant, run_id=run_id)
         written += len(rows)
+        _snapshot_safely(rows, scanner_name=name, report=report)
     return written
+
+
+def _snapshot_safely(rows, *, scanner_name, report) -> None:
+    """Record the first COMMON_STOCK S6-R candidate, if this run has one.
+
+    Guarded the way every other post-scan step here is: a snapshot is an
+    observation record, and a failure to write one must not cost the scan
+    the candidates it just published.
+    """
+    if str(scanner_name) != "orb" or not rows:
+        return
+    try:
+        from scanners.publish import s6_snapshot as snapshot
+
+        snapshot.record_from_published(
+            [row.as_dict() for row in rows],
+            trading_day=getattr(report, "trading_day", None),
+            session=getattr(report, "session", None),
+            run_id=getattr(report, "run_id", None))
+    except Exception:  # noqa: BLE001 - see publish() on why a scan must
+        # survive a failed write.
+        logger.warning("could not record an S6 candidate snapshot",
+                       exc_info=True)
 
 
 def main(argv=None) -> int:
@@ -797,11 +835,56 @@ def main(argv=None) -> int:
         names = PROFILES[args.profile]
     symbols = [item.strip().upper() for item in args.symbols.split(",") if item.strip()] or None
 
+    day = args.trading_day or us_trading_day()
+    # Resolved HERE rather than inside run_scanners, because the cycle
+    # lock below is keyed on it and the lock is taken before the run
+    # starts. Passed down so both agree; `--session` used to be parsed
+    # and then never handed to `run_scanners`, so the flag silently did
+    # nothing on a real run while working on the market-closed path.
+    session = scan_session.normalize(args.session) or scan_session.session_at()
+
+    # One scan per (day, session, publishing scanner) at a time. A cron
+    # entry firing while its own previous run is still going gets a
+    # refusal, not a place in a queue: two concurrent scans append two
+    # answers to one candidate file and nothing downstream could tell
+    # which one it read. Scanners that publish nothing take no lock and
+    # are unaffected.
+    from scanners.publish import scan_cycle
+
+    # `names or ALL_SCANNERS` is what `run_scanners` will actually run --
+    # an invocation with no profile and no explicit list runs everything,
+    # orb included. Reading `names` alone would leave exactly that
+    # invocation unlocked, which is the one a person types by hand while
+    # a scheduled scan is already going.
+    publishing = [name for name in (names or ALL_SCANNERS)
+                  if name in PUBLISHING_SCANNERS]
+    with scan_cycle.hold_all(day, session, scanners=publishing) as cycle:
+        if cycle.skipped:
+            print(f"[SCAN CYCLE] skipped -- {cycle.detail()}")
+            logger.warning("scan skipped, previous run still in progress: %s",
+                           cycle.detail())
+            # Zero: a refused overlap is the guard working, not a fault.
+            # A non-zero exit here would page an operator every time a
+            # scan ran long.
+            return 0
+        return _run_and_report(args, names=names, symbols=symbols, day=day,
+                               session=session)
+
+
+def _run_and_report(args, *, names, symbols, day, session) -> int:
+    """One scan, its notifications and its publication.
+
+    Split out of `main` so the cycle lock wraps the whole of it -- the
+    publication at the end is inside the lock too, which is what makes
+    "the scan is running" and "its candidate file is complete" the same
+    interval.
+    """
     report = run_scanners(
         scanners=names or None,
         symbols=symbols,
         limit=args.limit,
-        trading_day=args.trading_day,
+        trading_day=day,
+        session=session,
         store=not args.no_store,
         daily_lookback_days=args.daily_lookback_days,
         intraday_interval=args.intraday_interval,

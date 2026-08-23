@@ -124,9 +124,13 @@ def open_from_fill(conn, position_id, *, quantity, average_fill_price,
             SET status = ?, quantity = ?, entry_price = ?, entry_time = ?,
                 venue = COALESCE(?, venue),
                 entry_order_id = COALESCE(?, entry_order_id),
-                peak_price = ?, updated_at = ?
+                peak_price = ?, trough_price = ?, updated_at = ?
             WHERE position_id = ? AND status = ?""",
-        (OPEN, qty, price, stamp, venue, entry_order_id, price, stamp,
+        # The entry IS the first peak AND the first trough. Leaving either
+        # NULL would let the first observation set it unopposed, so a
+        # position that only ever went up would report having gone
+        # against us, and one that only fell would report no give-back.
+        (OPEN, qty, price, stamp, venue, entry_order_id, price, price, stamp,
          position_id, SUBMITTED)).rowcount
     conn.commit()
     if changed:
@@ -233,13 +237,20 @@ def open_count(conn) -> int:
 
 def observe(conn, position_id, *, price=None, volume_expansion=None,
             now=None) -> None:
-    """Ratchet the peaks UP only.
+    """Ratchet the peaks UP only, and the trough DOWN only.
 
     A lower reading is decay, not a new peak. A peak that followed the
     market down would hold the decay ratio at 1.0 forever, and the
     give-back check against `peak_price` would never fire -- both failing
     silently, because a signal that cannot fire looks like one that has
     not.
+
+    `trough_price` is the same ratchet in the other direction and is read
+    by NOTHING that decides: no exit condition, no score, no threshold
+    consults it. It exists because MAE -- how far a trade went against us
+    before it resolved -- cannot be recovered from a closed row, and it
+    is the figure that says whether the structural stop was ever actually
+    threatened.
     """
     row = load(conn, position_id)
     if row is None:
@@ -251,6 +262,10 @@ def observe(conn, position_id, *, price=None, volume_expansion=None,
         peak = _finite(row.get("peak_price"))
         if peak is None or new_price > peak:
             updates.append("peak_price = ?")
+            params.append(new_price)
+        trough = _finite(row.get("trough_price"))
+        if trough is None or new_price < trough:
+            updates.append("trough_price = ?")
             params.append(new_price)
     new_exp = _finite(volume_expansion)
     if new_exp is not None:
@@ -290,14 +305,24 @@ def mark_exit_submitted(conn, position_id, reason, *, now=None) -> bool:
     return bool(changed)
 
 
-def close_position(conn, position_id, *, reason=None, now=None) -> bool:
+def close_position(conn, position_id, *, reason=None, exit_price=None,
+                   now=None) -> bool:
+    """Close a position, recording the SELL's actual average fill.
+
+    `exit_price` is COALESCEd rather than overwritten so a second close
+    cannot replace a real fill with a None. It is the same discipline
+    `entry_price` gets on the buy side: realised P&L measured against an
+    intended price is not realised P&L.
+    """
     stamp = _now(now)
     changed = conn.execute(
         f"""UPDATE {TABLE}
             SET status = ?, exit_reason = COALESCE(?, exit_reason),
+                exit_price = COALESCE(?, exit_price),
                 closed_at = ?, updated_at = ?
             WHERE position_id = ? AND status != ?""",
-        (CLOSED, reason, stamp, stamp, position_id, CLOSED)).rowcount
+        (CLOSED, reason, _finite(exit_price), stamp, stamp, position_id,
+         CLOSED)).rowcount
     conn.commit()
     return bool(changed)
 

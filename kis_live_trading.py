@@ -86,6 +86,7 @@ from market_hours import us_trading_day
 from operations import kill_switch as ops_kill_switch
 from s1_live import candidate_source as s1_candidate_source
 from s2_live import candidate_source as s2_candidate_source
+from s6_live import candidate_source as s6_candidate_source
 from s1_live import execution_price as s1_execution_price
 from s1_live import security_type as s1_security_type
 from state_store import db as state_db
@@ -227,9 +228,25 @@ def _get_allowed_account_no():
 #: legacy 0.30% price check instead of the day-range one -- a strategy
 #: silently acquiring weaker protection than the strategy it was
 #: modelled on.
+#:
+#: S6 was in exactly that state until now. Its source, store, exits and
+#: reconciliation were all wired while this set still named two
+#: strategies, so the day S6 was promoted to LIMITED_LIVE its candidates
+#: would have been handed the LEGACY path: no COMMON_STOCK
+#: classification, and the previous-close 0.30% deviation check instead
+#: of the day-range one. That is the same defect the paragraph above
+#: describes, and it was invisible for the same reason -- nothing fails
+#: while the strategy is DISCOVERY_ONLY, because no candidate of its
+#: ever reaches this line.
+#:
+#: Membership here is not permission to trade. It selects which GATES
+#: apply, and every one it selects is stricter than the alternative.
+#: Whether S6 may order at all is `scanner_live_mode` and
+#: `s6_sessions.orders_allowed`, neither of which this touches.
 STRATEGY_SOURCES = frozenset({
     s1_candidate_source.SOURCE_S1,
     s2_candidate_source.SOURCE_S2,
+    s6_candidate_source.SOURCE_S6,
 })
 
 

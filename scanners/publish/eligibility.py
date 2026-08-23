@@ -154,11 +154,35 @@ def derived_metrics(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def enrich(rows: List[Dict[str, Any]], *, index=None) -> List[Dict[str, Any]]:
-    """Add classification and derived metrics to published rows."""
+    """Add classification and derived metrics to published rows.
+
+    The security master is loaded ONCE for the batch. `classify_symbol`
+    loads it per call when given no index, which is right for a single
+    lookup and wrong for a list: an AFTER_HOURS file with several hundred
+    rows re-read and re-parsed the whole KIS master once per symbol. That
+    was tolerable while the only caller was a monitor message; it is not
+    once a runtime tick calls it four times an hour.
+
+    A load failure falls back to the previous behaviour -- index stays
+    None and each row classifies itself, failing individually to UNKNOWN
+    with its own recorded reason. Same answers, same fail-closed
+    direction.
+    """
+    shared = index
+    if shared is None and rows:
+        try:
+            from s1_live import security_type
+
+            shared = security_type.load_index()
+        except Exception as exc:  # noqa: BLE001
+            logger.info("security master unavailable for this batch: %s",
+                        str(exc)[:120])
+            shared = None
+
     enriched = []
     for row in rows or []:
         merged = dict(row)
-        merged.update(classify_symbol(row.get("symbol"), index=index))
+        merged.update(classify_symbol(row.get("symbol"), index=shared))
         merged.update(derived_metrics(row))
         merged["candidate_class"] = (
             LIVE_ELIGIBLE if merged.get("live_eligible") else OBSERVED)

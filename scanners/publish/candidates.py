@@ -160,16 +160,28 @@ def run_marker_path(trading_day: str, session: Optional[str] = None) -> Path:
 
 def mark_run(trading_day: str, session: Optional[str] = None, *,
              strategy_id: Optional[str] = None, candidates: int = 0,
-             run_id: Optional[str] = None) -> bool:
+             run_id: Optional[str] = None, status: Optional[str] = None,
+             started_at: Optional[str] = None,
+             completed_at: Optional[str] = None,
+             duration_seconds: Optional[float] = None) -> bool:
     """Record that a publishing scanner ran for this (day, session).
 
     Best-effort: losing the marker makes a quiet session indistinguishable
     from a missing one, which is a reporting loss, not a trading one.
+
+    `status` and the three timing fields default to None so a caller
+    written before they existed records exactly what it used to. A None
+    status is read downstream as "completed" -- which is what marking a
+    run meant at the time -- rather than as a failure, because reading
+    every historical marker as broken would refuse candidates that were
+    fine. A run that FAILED must say so explicitly.
     """
     try:
         payload = {"trading_day": trading_day, "session": session,
                    "strategy_id": strategy_id, "candidates": candidates,
-                   "scanner_run_id": run_id,
+                   "scanner_run_id": run_id, "status": status,
+                   "started_at": started_at, "completed_at": completed_at,
+                   "duration_seconds": duration_seconds,
                    "marked_at": datetime.now(timezone.utc).isoformat()}
         with run_marker_path(trading_day, session).open(
                 "a", encoding="utf-8") as handle:

@@ -16,6 +16,7 @@ from state_store.schema import (
     MIGRATION_11_STATEMENTS, MIGRATION_12_STATEMENTS,
     MIGRATION_13_STATEMENTS, MIGRATION_14_STATEMENTS,
     MIGRATION_15_STATEMENTS, MIGRATION_16_STATEMENTS,
+    MIGRATION_17_STATEMENTS,
 )
 
 MIGRATIONS = [
@@ -50,6 +51,9 @@ MIGRATIONS = [
     (16, "S6 BREAKOUT: s6_positions -- SUBMITTED is its own state so an "
          "ambiguous BUY is a row rather than an untracked order",
      MIGRATION_16_STATEMENTS),
+    (17, "S6 TRADE TIMELINE: s6_positions.trough_price and .exit_price -- "
+         "MAE and realised P&L cannot be recomputed after the fact",
+     MIGRATION_17_STATEMENTS),
 ]
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1][0]

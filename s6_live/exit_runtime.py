@@ -139,10 +139,15 @@ def sync_sell_fills(conn, *, fills_for, now=None) -> List[Dict[str, Any]]:
         if sold <= 0:
             continue
         if sold >= held:
+            # The broker's own average fill, carried through instead of
+            # discarded: it is the only price at which the trade actually
+            # ended, and nothing downstream can recover it later.
             position_store.close_position(
-                conn, pid, reason=row.get("exit_reason"), now=now)
+                conn, pid, reason=row.get("exit_reason"),
+                exit_price=fill.get("average_fill_price"), now=now)
             results.append({"position_id": pid, "symbol": symbol,
-                            "status": "CLOSED", "sold": sold})
+                            "status": "CLOSED", "sold": sold,
+                            "exit_price": fill.get("average_fill_price")})
         else:
             remaining = held - sold
             conn.execute(

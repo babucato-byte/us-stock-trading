@@ -841,6 +841,32 @@ MIGRATION_16_STATEMENTS = [
     S6_POSITIONS_OPEN_SYMBOL_INDEX,
 ]
 
+#: The two figures a completed S6 trade cannot be described without, and
+#: which nothing recomputes after the fact.
+#:
+#: `trough_price` is the mirror of `peak_price`: the peak ratchets UP and
+#: is what the give-back exit reads, so the position already carries its
+#: best moment and not its worst. MAE -- how far the trade went against
+#: us before it worked or failed -- is therefore unanswerable from a
+#: closed row, and it is the number that says whether a stop was ever
+#: genuinely threatened. Recorded, never read by a decision: no exit
+#: condition, score or threshold consults it.
+#:
+#: `exit_price` is the SELL's actual average fill. `sync_sell_fills`
+#: received it from the broker and discarded it, so realised P&L on an
+#: S6 trade could only ever have been estimated from the intended price
+#: -- which is the same mistake `entry_price` exists to refuse on the
+#: buy side.
+S6_POSITIONS_TROUGH_PRICE = (
+    "ALTER TABLE s6_positions ADD COLUMN trough_price REAL")
+S6_POSITIONS_EXIT_PRICE = (
+    "ALTER TABLE s6_positions ADD COLUMN exit_price REAL")
+
+MIGRATION_17_STATEMENTS = [
+    S6_POSITIONS_TROUGH_PRICE,
+    S6_POSITIONS_EXIT_PRICE,
+]
+
 # Every table this schema version creates -- used by export.py's
 # export_all() and by tests asserting the full table set exists.
 ALL_TABLES = [

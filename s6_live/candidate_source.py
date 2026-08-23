@@ -53,6 +53,9 @@ class S6CandidateSource:
         # constructed. The age that matters is between publication and
         # use, and a constructor that ran early would understate it.
         self._consumed_at: Optional[datetime] = None
+        #: What the scan-cycle check saw, kept so the audit record can
+        #: state it rather than re-deriving it a second time.
+        self._cycle_state: Optional[Dict[str, Any]] = None
 
     def _live_mode_ok(self) -> bool:
         try:
@@ -74,6 +77,51 @@ class S6CandidateSource:
             f"orders are enabled only in {sorted(s6_sessions.LIVE_SESSIONS)}")
         return False
 
+    def _cycle_ok(self) -> bool:
+        """Is the file on disk this cycle's answer, or the last one's?
+
+        S6 scans every fifteen minutes and consumes five minutes later,
+        so a scan that runs long leaves a file whose trading day, session
+        and variant are all CORRECT and whose contents are superseded.
+        Every other refusal in this class is keyed on one of those three,
+        which is why none of them catches it.
+
+        Two facts are enough, and neither is a threshold. A scan holding
+        its cycle lock is producing the answer that replaces this file --
+        so the file is the previous cycle's and is refused. A scan that
+        ended FAILED produced no answer at all -- so whatever is on disk
+        predates it and is refused too.
+
+        Refusing is only ever about a new BUY. Nothing here is reachable
+        from an exit: `s6_live.exit_runtime` reads no candidate file.
+        """
+        from scanners.publish import scan_cycle
+
+        try:
+            state = scan_cycle.state(self._trading_day, self._session,
+                                     scanner=s6_sessions.SCANNER_NAME)
+        except Exception as exc:  # noqa: BLE001 - the source must never
+            # raise into the shared cycle; an unanswerable question is
+            # refused, which is the same direction as every other check.
+            self._refusal = f"scan state could not be established: {exc}"
+            return False
+
+        self._cycle_state = state.as_dict()
+        if state.blocks_consumption:
+            self._refusal = state.refusal()
+            return False
+
+        try:
+            ok, detail = scan_cycle.last_run_consumable(
+                self._trading_day, self._session, strategy_id=STRATEGY_ID)
+        except Exception as exc:  # noqa: BLE001
+            self._refusal = f"last scan status could not be read: {exc}"
+            return False
+        if not ok:
+            self._refusal = detail
+            return False
+        return True
+
     def _load(self):
         if self._loaded:
             return self._rows
@@ -81,6 +129,10 @@ class S6CandidateSource:
 
         if not self._live_mode_ok() or not self._session_ok():
             logger.info("S6 candidate source empty: %s", self._refusal)
+            return None
+
+        if not self._cycle_ok():
+            logger.warning("S6 candidate source refused: %s", self._refusal)
             return None
 
         try:
@@ -200,5 +252,6 @@ class S6CandidateSource:
             "session": self._session, "candidates": len(rows or []),
             "allowed": len(self._validated_symbols()),
             "mode": s6_sessions.mode_for(self._session),
+            "scan_state": self._cycle_state,
             "refusal": self._refusal,
         }

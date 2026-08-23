@@ -50,6 +50,8 @@ def run_once(*, now=None) -> dict:
         if not position_store.load_live(conn) and \
                 not position_store.load_unconfirmed(conn):
             report["status"] = "NO_S6_POSITIONS"
+            _attach_session_report(report, conn=conn, session=session,
+                                   now=moment)
             return report
 
         from s6_live import exit_runtime
@@ -75,8 +77,41 @@ def run_once(*, now=None) -> dict:
                 # evaluated looks exactly like one that held.
                 logger.error("S6 %s stage failed", stage, exc_info=True)
                 report["errors"].append(f"{stage}: {exc}")
-    report["status"] = "ERROR" if report["errors"] else "OK"
+        report["status"] = "ERROR" if report["errors"] else "OK"
+        _attach_session_report(report, conn=conn, session=session, now=moment)
     return report
+
+
+def _attach_session_report(report, *, conn, session, now) -> None:
+    """Generate the shadow-session report automatically, on the tick.
+
+    Only for the sessions that CANNOT order. S6-R has its own report --
+    the final check -- which asks a different question and needs a broker
+    to answer most of it; running it from every tick would open an
+    account connection four times an hour to print a table.
+
+    Attached rather than printed separately so one tick produces one
+    record. Guarded because a report must never be able to fail the
+    runtime that carries it: the exits already ran by the time this is
+    reached, and losing them to a formatting error would be absurd.
+    """
+    from config import s6_sessions
+
+    if not s6_sessions.scans(session) or s6_sessions.orders_allowed(session):
+        return
+    try:
+        from s6_live import session_report
+
+        report["session_report"] = session_report.build(
+            conn=conn, session=session, now=now, runtime_report=report)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("S6 session report could not be built", exc_info=True)
+        # Deliberately NOT `report["errors"]`. That list is what sets
+        # `status` to ERROR, and it means "a trading stage failed". A
+        # report that would not render is not a runtime fault, and
+        # letting it flip the tick's status would train an operator to
+        # ignore the one field that matters.
+        report["session_report_error"] = str(exc)
 
 
 def _dependencies():
