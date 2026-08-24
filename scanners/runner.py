@@ -1077,7 +1077,13 @@ def _run_and_report(args, *, names, symbols, day, session) -> int:
         profile=args.profile,
         universe_type=args.universe,
         active_pool_size=args.active_pool_size,
-        supplement_size=args.supplement_size,
+        # getattr, not args.supplement_size: this is an OPT-IN flag, so a
+        # caller holding an args object that predates it must keep
+        # working with the supplement off rather than raising
+        # AttributeError. The default is 0, so "not passed" and
+        # "explicitly disabled" produce an identical scan.
+        supplement_size=getattr(args, "supplement_size",
+                                intraday_supplement.DEFAULT_SUPPLEMENT_SIZE),
         use_eligibility=not args.no_eligibility,
         # Publication happens inside the run now, before the manifest is
         # written, so the record of what was handed over is part of the
