@@ -96,8 +96,20 @@ def candidate_freshness(final_check: Optional[Dict[str, Any]]
     if not is_production(final_check):
         return None
     generated = final_check.get("candidate_generated_at")
-    consumed = final_check.get("candidate_consumed_at")
-    age = final_check.get("candidate_age_at_consume_seconds")
+    # The observation path's own read, not the live consumer's.
+    #
+    # The live source refuses at its mode gate while S6 is
+    # DISCOVERY_ONLY, so `candidate_consumed_at` is None -- which made
+    # this observation circular: it gated the promotion that would have
+    # made it measurable. The read below is a real read of the real
+    # shared-store rows at a real moment; it simply carries no order
+    # permission. `source_verified` stays the separate, unrelaxed answer
+    # about the live consumer.
+    consumed = (final_check.get("candidate_read_at")
+                or final_check.get("candidate_consumed_at"))
+    age = final_check.get("candidate_age_at_read_seconds")
+    if age is None:
+        age = final_check.get("candidate_age_at_consume_seconds")
     if not generated or not consumed or age is None:
         return None
     try:

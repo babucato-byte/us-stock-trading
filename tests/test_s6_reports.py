@@ -251,7 +251,44 @@ class TestFinalCheckReportsWhatItMeasured:
         publish(["AAPL"])
         report = final_check.build(trading_day=DAY, session="REGULAR", now=T0)
         assert report["candidates"][0]["source_verified"] is False
-        assert report["candidates"][0]["qualify_verified"] is None
+        assert "not LIMITED_LIVE" in (report["source_refusal"] or "")
+
+    def test_qualification_is_measured_even_when_the_source_refuses(
+            self, handoff, master):
+        """Two different facts, reported separately.
+
+        `source_verified` is the LIVE consumer's answer and stays False
+        while S6 is DISCOVERY_ONLY. `qualify_verified` is a pure function
+        of the published row -- no broker, no mode -- so it says what the
+        shared cycle WOULD decide. Tying the second to the first made the
+        freshness observation circular: it gated the promotion that would
+        have made it measurable.
+        """
+        publish(["AAPL"])
+        report = final_check.build(trading_day=DAY, session="REGULAR", now=T0)
+        row = report["candidates"][0]
+        assert row["source_verified"] is False
+        assert row["qualify_verified"] is True
+
+    def test_freshness_is_measured_at_read_without_order_permission(
+            self, handoff, master):
+        publish(["AAPL"])
+        report = final_check.build(trading_day=DAY, session="REGULAR", now=T0)
+        # Measured: the observation path read real rows at a real moment.
+        assert report["candidate_generated_at"]
+        assert report["candidate_read_at"] == T0.isoformat()
+        assert report["candidate_age_at_read_seconds"] is not None
+        assert report["candidate_age_at_read_seconds"] >= 0
+        # The LIVE consumer still refused, and says so separately.
+        assert report["candidate_consumed_at"] is None
+        assert report["candidate_age_at_consume_seconds"] is None
+
+    def test_the_observation_path_still_cannot_order(self, handoff, master):
+        publish(["AAPL"])
+        report = final_check.build(trading_day=DAY, session="REGULAR", now=T0)
+        assert report["broker_submit_count"] == 0
+        assert report["submit_boundary_reached"] is False
+        assert report["strategy_live_mode"] == slm.MODE_DISCOVERY_ONLY
 
     def test_a_limited_live_source_measures_freshness_at_consume(
             self, handoff, master):

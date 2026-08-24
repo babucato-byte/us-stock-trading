@@ -43,7 +43,7 @@ cycle had not been told S6 is a strategy source -- see
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from config import s6_sessions
 
@@ -85,6 +85,35 @@ def _strategy_is_live(modes=None) -> bool:
     from config import scanner_live_mode
 
     return scanner_live_mode.is_limited_live(s6_sessions.SCANNER_NAME, modes)
+
+
+def _age(generated_at, read_at) -> Optional[float]:
+    """Seconds between publication and this read. None if unmeasurable."""
+    if not generated_at or read_at is None:
+        return None
+    try:
+        from s1_live.freshness import as_utc
+
+        made = as_utc(generated_at)
+        if made is None:
+            return None
+        return round((read_at - made).total_seconds(), 3)
+    except Exception:  # noqa: BLE001 - a measurement must not raise
+        return None
+
+
+def _observed_freshness(rows, read_at) -> Dict[str, Any]:
+    """The NEWEST row's age at the moment this report read it.
+
+    Newest, not first: a store appended by six scans holds six
+    generations, and the age that matters is the freshest available --
+    the one a consumer would act on.
+    """
+    stamps = [r.get("generated_at") for r in rows or [] if r.get("generated_at")]
+    newest = max(stamps) if stamps else None
+    return {"generated_at": newest,
+            "read_at": read_at.isoformat() if read_at is not None else None,
+            "age_seconds": _age(newest, read_at)}
 
 
 def _result(status: str, detail: str = "") -> Dict[str, str]:
@@ -238,6 +267,7 @@ def _candidate_facts(day, session, variant, *, modes, conn, broker, rollout,
                      now) -> Dict[str, Any]:
     """Every candidate, its provenance, and each BUY gate's answer."""
     from s6_live import candidate_source as source_module
+    from s6_live import qualification as qualification_module
     from scanners.publish import candidates as publisher
     from scanners.publish import eligibility
 
@@ -251,16 +281,39 @@ def _candidate_facts(day, session, variant, *, modes, conn, broker, rollout,
         trading_day=day, session=session, modes=modes)
     symbols = source.symbols()
     described = source.describe()
-    freshness = source.freshness()
+    live_freshness = source.freshness()
+
+    # Freshness measured HERE, from the rows this report just read, and
+    # NOT taken from the live source.
+    #
+    # The live source refuses at its mode gate while S6 is
+    # DISCOVERY_ONLY, so `consumed_at` is None and the age is
+    # unmeasurable -- which made the observation circular: consuming
+    # needs LIMITED_LIVE, LIMITED_LIVE needs the observation, and the
+    # observation needs consuming. That is a measurement problem, not a
+    # reason to relax a gate.
+    #
+    # This read is genuine: the same shared-store rows, through the same
+    # publisher, at a real moment. It carries NO order permission -- the
+    # rows never reach a broker from here, and `source_verified` below
+    # still reports the LIVE source's own answer, which stays False
+    # until S6 is promoted. The two are different facts and both are
+    # reported.
+    read_at = now
+    observed = _observed_freshness(enriched, read_at)
 
     facts: Dict[str, Any] = {
         "candidate_count": len(enriched),
         "common_stock_count": len(eligible),
         "source_symbols": symbols,
         "source_refusal": described.get("refusal"),
-        "candidate_generated_at": freshness.get("candidate_generated_at"),
-        "candidate_consumed_at": freshness.get("candidate_consumed_at"),
-        "candidate_age_at_consume_seconds": freshness.get(
+        # The observation-path measurement (always available).
+        "candidate_generated_at": observed["generated_at"],
+        "candidate_read_at": observed["read_at"],
+        "candidate_age_at_read_seconds": observed["age_seconds"],
+        # The LIVE consumer's own measurement (None until promoted).
+        "candidate_consumed_at": live_freshness.get("candidate_consumed_at"),
+        "candidate_age_at_consume_seconds": live_freshness.get(
             "candidate_age_at_consume_seconds"),
     }
 
@@ -273,7 +326,12 @@ def _candidate_facts(day, session, variant, *, modes, conn, broker, rollout,
     for row in enriched:
         symbol = str(row.get("symbol") or "").upper()
         offered = symbol in {s.upper() for s in symbols}
-        qualification = source.qualify(symbol) if offered else None
+        # Qualification is a PURE function of the published row -- it
+        # takes no broker and no mode. Calling it directly measures what
+        # the shared cycle WOULD decide, without needing the live source
+        # to have offered the symbol first.
+        qualification = qualification_module.qualify_s6(
+            symbol, candidate_row=row)
         rows.append({
             "symbol": symbol,
             "rank": row.get("rank"),
@@ -281,9 +339,9 @@ def _candidate_facts(day, session, variant, *, modes, conn, broker, rollout,
             "security_type": row.get("security_type"),
             "live_eligible": bool(row.get("live_eligible")),
             "generated_at": row.get("generated_at"),
-            "consumed_at": freshness.get("candidate_consumed_at"),
-            "candidate_age_seconds": freshness.get(
-                "candidate_age_at_consume_seconds"),
+            "read_at": observed["read_at"],
+            "candidate_age_seconds": _age(row.get("generated_at"), read_at),
+            "consumed_at": live_freshness.get("candidate_consumed_at"),
             "source_verified": offered,
             "source_detail": (None if offered else
                               (blocked_before_gates
@@ -605,6 +663,12 @@ def format_report(report: Dict[str, Any]) -> str:
         f"  publisher_verified    : {_fmt(report.get('publisher_verified'))}",
         f"  candidate directory   : {_fmt(report.get('candidate_dir'))}",
         "",
+        f"  candidate age@read (s) : "
+        f"{_fmt(report.get('candidate_age_at_read_seconds'))}",
+        f"  candidate age@consume  : "
+        f"{_fmt(report.get('candidate_age_at_consume_seconds'))}"
+        f"   (live consumer; None until promoted)",
+        "",
         f"  candidates       : {_fmt(report.get('candidate_count'))}",
         f"  COMMON_STOCK     : {_fmt(report.get('common_stock_count'))}",
     ]
@@ -619,6 +683,7 @@ def format_report(report: Dict[str, Any]) -> str:
             f"     security type    : {_fmt(row.get('security_type'))} "
             f"(live_eligible={_fmt(row.get('live_eligible'))})",
             f"     generated at     : {_fmt(row.get('generated_at'))}",
+            f"     read at          : {_fmt(row.get('read_at'))}",
             f"     consumed at      : {_fmt(row.get('consumed_at'))}",
             f"     age at consume   : {_fmt(row.get('candidate_age_seconds'))}s",
             f"     source_verified  : {_fmt(row.get('source_verified'))}"
