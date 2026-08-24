@@ -153,7 +153,15 @@ def _compare(report: Dict[str, Any]) -> Dict[str, Any]:
     return {"matched": not mismatches, "mismatches": mismatches}
 
 
+#: §9's three answers, kept apart. Merging them is how "the window did
+#: not exist" gets read as "the producer is broken".
+NOT_APPLICABLE = "NOT_APPLICABLE"
+PRODUCER_MISSING = "PRODUCER_MISSING"
+CLEAN_ZERO = "CLEAN_ZERO"
+
+
 def _scan(day: str, session: str) -> Dict[str, Any]:
+    from scanners.base import scan_window
     from scanners.publish import candidates as publisher
     from scanners.publish import scan_cycle
 
@@ -161,11 +169,33 @@ def _scan(day: str, session: str) -> Dict[str, Any]:
     marker = scan_cycle.latest_run(day, session,
                                    strategy_id=s6_sessions.STRATEGY_ID) or {}
     ran = publisher.scan_ran(day, session)
+    window = scan_window.evaluate()
+
     status = NOT_MEASURED
     if ran:
         status = (DEGRADED if marker.get("status") == scan_cycle.STATUS_FAILED
                   else OK)
+
+    # §9: a window that does not exist is NOT a missing producer.
+    if not window.scan_allowed:
+        producer = NOT_APPLICABLE
+    elif not ran:
+        producer = PRODUCER_MISSING
+    elif marker.get("status") == scan_cycle.STATUS_FAILED:
+        producer = DEGRADED
+    else:
+        producer = OK
+
     return {
+        # §8: these are DIFFERENT facts and never share a field.
+        "calendar_trading_day": window.calendar_trading_day,
+        "scan_session": window.session,
+        "session_date": (window.session_date.isoformat()
+                         if window.session_date else None),
+        "scan_allowed": window.scan_allowed,
+        "scan_window_reason": window.reason,
+        "regular_market_state": window.regular_market_state,
+        "producer_status": producer,
         "scan_status": status,
         "scan_ran": ran,
         "scan_in_progress": state.running,
@@ -298,6 +328,13 @@ def format_report(report: Dict[str, Any]) -> str:
         "",
         "  pipeline",
         "  " + "-" * 62,
+        f"    calendar trading day    : {_fmt(report.get('calendar_trading_day'))}",
+        f"    scan session / date     : {_fmt(report.get('scan_session'))} / "
+        f"{_fmt(report.get('session_date'))}",
+        f"    scan_allowed            : {_fmt(report.get('scan_allowed'))} "
+        f"({_fmt(report.get('scan_window_reason'))})",
+        f"    regular_market_state    : {_fmt(report.get('regular_market_state'))}",
+        f"    producer                : {_fmt(report.get('producer_status'))}",
         f"    scan                    : {_fmt(report.get('scan_status'))} "
         f"(ran={_fmt(report.get('scan_ran'))} "
         f"in_progress={_fmt(report.get('scan_in_progress'))})",

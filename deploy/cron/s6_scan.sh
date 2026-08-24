@@ -22,16 +22,29 @@ cd "$SCANNER_RUNTIME_ROOT" || exit 1
 # and reporting it is worth more than reporting which session it was.
 resolve_shared_candidate_dir || exit 1
 
+# Whether a scan may run is a CALENDAR question, not a regular-market-
+# hours one. This used to ask `get_market_state() == "CLOSED"`, which is
+# true for the whole of OVERNIGHT_DAYTIME, PREMARKET and AFTER_HOURS --
+# so S6's all-session family could only ever scan in REGULAR, and in
+# practice never scanned at all. `scan_window.probe` prints the session
+# when a scan is allowed and the REFUSAL REASON otherwise, so a skipped
+# window leaves a line instead of a silent gap.
 SESSION=$(venv/bin/python -c "
-from scanners.base import scan_session
-from market_hours import get_market_state
-print('CLOSED' if get_market_state() == 'CLOSED' else scan_session.session_at())
+from scanners.base import scan_window
+print(scan_window.probe())
 " 2>/dev/null)
-# CLOSED: no scan, no entry. A holiday is a correct no-op.
-[ "$SESSION" = "CLOSED" ] && exit 0
 [ -n "$SESSION" ] || exit 0
 
 LOG="$SCANNER_RUNTIME_ROOT/logs/cron/s6_scan.log"
+case "$SESSION" in
+  PREMARKET|REGULAR|AFTER_HOURS|OVERNIGHT_DAYTIME) ;;
+  *)
+    # WEEKEND / US_MARKET_HOLIDAY / CALENDAR_UNAVAILABLE. A correct
+    # no-op, recorded so "no scan" is never mistaken for "scan found
+    # nothing".
+    echo "$(date -u +%FT%TZ) skipped=$SESSION" >> "$LOG"
+    exit 0;;
+esac
 echo "$(date -u +%FT%TZ) session=$SESSION candidates=$SCANNER_CANDIDATE_DIR" >> "$LOG"
 flock -n /home/ubuntu/logs/cron/s6_scan.lock \
   env SCANNER_CANDIDATE_DIR="$SCANNER_CANDIDATE_DIR" \
