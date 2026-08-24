@@ -86,6 +86,23 @@ RECHECK_DAYS = {
 #: Fallback when the shortfall cannot be computed.
 DEFAULT_RECHECK_DAYS = 7
 
+#: Consecutive provider refusals before a symbol is actually benched.
+#:
+#: One failed fetch is a statement about a round trip, not about the
+#: symbol -- but it used to write a `provider_unavailable` record that
+#: `should_skip` honoured for a full day, so a single timeout removed a
+#: name from every remaining scan of the session. On 2026-08-24 that was
+#: 98 of the top 300, leaving 202 symbols actually scanned with no
+#: top-up.
+#:
+#: Three is chosen to survive a transient failure while still benching a
+#: genuinely dead ticker quickly: the intraday scans run every 15
+#: minutes, so a symbol that cannot be fetched three times running has
+#: been unavailable for the better part of an hour, which is no longer
+#: transient. It is deliberately NOT 1 (the old behaviour) and not large
+#: enough for a delisted name to cost a fetch all day.
+PROVIDER_FAILURE_QUARANTINE_THRESHOLD = 3
+
 #: Calendar days per trading day, for turning "needs N more bars" into a
 #: date. Five sessions per seven calendar days, rounded up so the recheck
 #: lands after the bars exist rather than a day before.
@@ -108,6 +125,10 @@ class EligibilityRecord:
     history_bars: Optional[int] = None
     required_bars: Optional[int] = None
     detail: Optional[str] = None
+    #: How many times in a row the provider has refused this symbol.
+    #: Only meaningful for `provider_unavailable`; every other verdict
+    #: is a statement about the symbol rather than about a round trip.
+    consecutive_failures: int = 0
 
     def due(self, today: Optional[date] = None) -> bool:
         """Is this verdict old enough to re-test?"""
@@ -255,6 +276,14 @@ class EligibilityStore:
         record = self.get(symbol)
         if record is None or record.eligible:
             return False
+        if record.reason == PROVIDER_UNAVAILABLE and \
+                record.consecutive_failures < PROVIDER_FAILURE_QUARANTINE_THRESHOLD:
+            # Retried on the next tick. A provider that failed once says
+            # nothing about whether the symbol is tradeable, and the
+            # strategy gates never get to see a name that is skipped
+            # here -- so a transient network fault would otherwise be
+            # indistinguishable from a market judgement.
+            return False
         return not record.due(today)
 
     def record(self, record: EligibilityRecord) -> None:
@@ -263,6 +292,8 @@ class EligibilityStore:
 
     def note_eligible(self, symbol: str, *, history_bars=None, required_bars=None,
                       today: Optional[date] = None) -> None:
+        # A successful fetch resets the provider-failure run: the record
+        # written here carries consecutive_failures=0 by construction.
         self.record(make_record(symbol, eligible=True, reason=ELIGIBLE,
                                 provider=self.provider, history_bars=history_bars,
                                 required_bars=required_bars, today=today))
@@ -270,9 +301,19 @@ class EligibilityStore:
     def note_ineligible(self, symbol: str, reason: str, *, history_bars=None,
                         required_bars=None, detail=None,
                         today: Optional[date] = None) -> None:
-        self.record(make_record(symbol, eligible=False, reason=reason,
-                                provider=self.provider, history_bars=history_bars,
-                                required_bars=required_bars, detail=detail, today=today))
+        built = make_record(symbol, eligible=False, reason=reason,
+                            provider=self.provider, history_bars=history_bars,
+                            required_bars=required_bars, detail=detail, today=today)
+        if reason == PROVIDER_UNAVAILABLE:
+            # Consecutive, not cumulative: the run is what distinguishes
+            # a flaky round trip from a symbol the provider genuinely
+            # cannot serve. Any successful fetch clears it below.
+            previous = self.get(symbol)
+            prior = (previous.consecutive_failures
+                     if previous is not None
+                     and previous.reason == PROVIDER_UNAVAILABLE else 0)
+            built.consecutive_failures = prior + 1
+        self.record(built)
 
     # ---- reporting ----
     def summary(self) -> Dict[str, Any]:

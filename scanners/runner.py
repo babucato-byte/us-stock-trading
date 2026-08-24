@@ -55,6 +55,8 @@ from typing import Any, Dict, Iterable, List, Optional
 from scanners.base import activity as act
 from scanners.base import eligibility as elig
 from scanners.base import result_store, run_context, scan_session
+from scanners.base import intraday_supplement
+from scanners.base import universe_selection as universe_sel
 from scanners.base.trading_calendar import us_trading_day
 from scanners.base.features import build_features
 from scanners.base.market_data_provider import (
@@ -176,6 +178,11 @@ class RunReport:
     #: them out. Reported so a shrinking universe is visible rather than
     #: looking like a quiet market.
     skipped_ineligible: int = 0
+    #: How the scan universe was filled: requested vs selected, how deep
+    #: into the ranking it walked, and how many the supplement added.
+    #: On the manifest so a shrinking universe is a number in the record
+    #: rather than something reconstructed from a log line.
+    universe_selection: Dict[str, Any] = field(default_factory=dict)
     eligibility_summary: Dict[str, Any] = field(default_factory=dict)
     required_history_bars: int = 0
 
@@ -273,6 +280,7 @@ class RunReport:
             "stored_signals": self.stored_signals,
             "duration_seconds": round(self.duration_seconds, 3),
             "skipped_reason": self.skipped_reason,
+            "universe_selection": dict(self.universe_selection),
             "scanners": [outcome.summary() for outcome in self.outcomes],
         }
 
@@ -336,6 +344,7 @@ def run_scanners(
     use_eligibility: bool = True,
     universe_type: Optional[str] = None,
     active_pool_size: int = act.DEFAULT_POOL_SIZE,
+    supplement_size: int = intraday_supplement.DEFAULT_SUPPLEMENT_SIZE,
     publish: bool = False,
 ) -> RunReport:
     """Run the requested scanners over the requested symbols.
@@ -410,9 +419,35 @@ def run_scanners(
     selected_universe = universe_type or PROFILE_UNIVERSE.get(profile or "", UNIVERSE_FULL)
     report.universe_type = selected_universe if symbols is None else "explicit"
 
+    # Loaded BEFORE the universe is chosen, because the active universe
+    # is now filled TO its pool size with eligible names rather than
+    # filtered down from it -- see scanners/base/universe_selection.
+    eligibility_store = (elig.EligibilityStore.load(report.provider)
+                         if use_eligibility
+                         else elig.NullEligibilityStore(report.provider))
+    universe_selection = None
+
     if symbols is None:
         if selected_universe == UNIVERSE_ACTIVE:
-            symbols = activity_store.active_symbols(limit=limit or active_pool_size)
+            pool = limit or active_pool_size
+            universe_selection = universe_sel.eligible_top(
+                activity_store, eligibility_store, limit=pool)
+            symbols = list(universe_selection.symbols)
+            report.skipped_ineligible = universe_selection.skipped_ineligible
+            if symbols and supplement_size > 0:
+                # Yesterday's ranking cannot know what moved this
+                # morning. Bounded and cached per session -- see
+                # scanners/base/intraday_supplement -- and additive
+                # only: it changes which symbols are LOOKED AT, never
+                # what any of them has to do to become a candidate.
+                extra = intraday_supplement.load_or_build(
+                    provider, activity_store, eligibility_store,
+                    trading_day=day, session=report.session,
+                    already=symbols, cut=pool, size=supplement_size)
+                universe_sel.merge_supplement(universe_selection, extra,
+                                              limit=supplement_size)
+                symbols = list(universe_selection.symbols)
+            report.universe_selection = universe_selection.summary()
             if not symbols:
                 # An empty pool means the daily run has not populated the
                 # ranking yet -- an operational fact, not a market with
@@ -426,8 +461,11 @@ def run_scanners(
                 logger.error("%s", report.skipped_reason)
                 _record_manifest(report, day)
                 return report
-            logger.info("active universe: %s symbols (pool limit %s)",
-                        len(symbols), limit or active_pool_size)
+            logger.info("active universe: %s of %s eligible symbols "
+                        "(considered %s, skipped %s ineligible, depth %s)",
+                        len(symbols), pool, universe_selection.considered,
+                        universe_selection.skipped_ineligible,
+                        universe_selection.depth_reached)
         else:
             try:
                 symbols = load_symbols(limit=limit)
@@ -449,16 +487,16 @@ def run_scanners(
     # a data-availability filter only; nothing strategy-shaped reaches
     # it, so it cannot change which symbols pass a scanner condition,
     # only which ones were worth asking about.
-    eligibility_store = (elig.EligibilityStore.load(report.provider)
-                         if use_eligibility
-                         else elig.NullEligibilityStore(report.provider))
+    #
+    # The ACTIVE universe has already been filled with eligible names, so
+    # filtering it again would remove nothing and only re-walk the store.
     # Explicitly named symbols are NEVER filtered. `--symbols AAPL,MSFT`
     # is an instruction to scan those two, and silently dropping one
     # because a cache from last week says it had short history would
     # make the flag untrustworthy exactly when it is used -- debugging a
     # specific name. The cache still LEARNS from such a run; it just
     # does not gate it.
-    if use_eligibility and explicit_symbols is None:
+    if use_eligibility and explicit_symbols is None and universe_selection is None:
         keep = eligibility_store.eligible_symbols(symbols)
         report.skipped_ineligible = len(symbols) - len(keep)
         if report.skipped_ineligible:
@@ -602,7 +640,8 @@ def run_scanners(
     if store:
         for outcome in report.outcomes:
             report.stored_signals += _store_safely(outcome, day)
-            _record_rejects_safely(outcome, day, report.session)
+            _record_rejects_safely(outcome, day, report.session,
+                                   universe_selection)
         # Publication happens BEFORE the manifest, so its outcome is IN
         # the manifest. One row per run: appending a second, amended row
         # would double-count in every reader that tallies run statuses.
@@ -633,7 +672,7 @@ def _store_safely(outcome: ScanOutcome, trading_day: str) -> int:
 
 
 def _record_rejects_safely(outcome: ScanOutcome, trading_day: str,
-                           session: Optional[str]) -> None:
+                           session: Optional[str], selection=None) -> None:
     """Persist why each symbol was refused; never let that failure spread.
 
     The scan itself is unaffected by whether this succeeds -- an
@@ -657,10 +696,18 @@ def _record_rejects_safely(outcome: ScanOutcome, trading_day: str,
         path = directory / f"{trading_day}.jsonl"
         with path.open("a", encoding="utf-8") as handle:
             for row in rows:
-                handle.write(json.dumps(
-                    {"timestamp": stamp, "session": session,
-                     "scanner": outcome.scanner_name, **row},
-                    separators=(",", ":")) + "\n")
+                # Provenance travels with the rejection, so a month from
+                # now "did the supplement find anything the ranking
+                # missed" is a query over these rows rather than an
+                # argument. Without it, PREVIOUS_DAY_ONLY and
+                # INTRADAY_SUPPLEMENT are indistinguishable after the
+                # fact.
+                record = {"timestamp": stamp, "session": session,
+                          "scanner": outcome.scanner_name, **row}
+                if selection is not None:
+                    record["universe_source"] = selection.source_of(row["symbol"])
+                    record["activity_rank"] = selection.rank_of(row["symbol"])
+                handle.write(json.dumps(record, separators=(",", ":")) + "\n")
     except Exception:  # noqa: BLE001 - never costs the scan its results
         logger.warning("could not record reject reasons for %s",
                        outcome.scanner_name, exc_info=True)
@@ -793,6 +840,10 @@ def parse_args(argv=None):
     parser.add_argument("--universe", choices=[UNIVERSE_FULL, UNIVERSE_ACTIVE], default=None,
                         help="which universe to draw from; defaults to the profile's "
                              "own (daily=full, premarket/open=active)")
+    parser.add_argument("--supplement-size", type=int,
+                        default=intraday_supplement.DEFAULT_SUPPLEMENT_SIZE,
+                        help="how many intraday-active names may join the "
+                             "active universe (0 disables the supplement)")
     parser.add_argument("--active-pool-size", type=int, default=act.DEFAULT_POOL_SIZE,
                         help=f"symbols in the intraday active pool (default "
                              f"{act.DEFAULT_POOL_SIZE})")
@@ -1026,6 +1077,7 @@ def _run_and_report(args, *, names, symbols, day, session) -> int:
         profile=args.profile,
         universe_type=args.universe,
         active_pool_size=args.active_pool_size,
+        supplement_size=args.supplement_size,
         use_eligibility=not args.no_eligibility,
         # Publication happens inside the run now, before the manifest is
         # written, so the record of what was handed over is part of the

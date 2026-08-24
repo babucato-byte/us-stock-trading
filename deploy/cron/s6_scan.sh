@@ -50,4 +50,12 @@ flock -n /home/ubuntu/logs/cron/s6_scan.lock \
   env SCANNER_CANDIDATE_DIR="$SCANNER_CANDIDATE_DIR" \
       TRADING_PROJECT_ROOT="$SCANNER_RUNTIME_ROOT" \
   venv/bin/python scripts/run_scanners.py --scanners orb \
-    --session "$SESSION" --universe active >> "$LOG" 2>&1
+    --session "$SESSION" --universe active \
+    --supplement-size 50 >> "$LOG" 2>&1
+# --supplement-size is S6-only on purpose. The active universe is ranked
+# by the PREVIOUS day's dollar volume, so on a Monday it is Friday's and
+# cannot see a name that woke up this morning -- MARA sat at Friday's
+# rank 306 while trading 21.8M shares on the Monday. 50 names from the
+# window just below the cut, computed once per session and cached, is
+# the bounded version of closing that gap. S1 and S2 keep the default of
+# 0 until there is evidence for them too.
