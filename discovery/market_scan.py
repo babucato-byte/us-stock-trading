@@ -94,7 +94,9 @@ def _frame_for(bundle, symbol):
 
 
 def fetch_today(symbols, *, trading_day, download=None,
-                batch_size=BATCH_SIZE) -> Dict[str, Dict[str, float]]:
+                batch_size=BATCH_SIZE, pause=BATCH_PAUSE_SECONDS,
+                backoff=RETRY_BACKOFF_SECONDS,
+                max_rounds=MAX_BATCH_RETRIES) -> Dict[str, Dict[str, float]]:
     """Today's price, volume and relative volume, per symbol.
 
     Five days are requested rather than one so relative volume comes
@@ -114,62 +116,88 @@ def fetch_today(symbols, *, trading_day, download=None,
                                progress=False, threads=True)
 
     out: Dict[str, Dict[str, float]] = {}
-    batches = list(_chunks(list(symbols), batch_size))
-    for index, batch in enumerate(batches):
-        if index:
-            time.sleep(BATCH_PAUSE_SECONDS)
-        bundle = None
-        for attempt in range(1, MAX_BATCH_RETRIES + 1):
+    pending = list(symbols)
+
+    # Retried on the MEASURED ABSENCE of rows, not on an exception.
+    #
+    # The provider catches its own rate limit, logs it, and returns a
+    # frame with those tickers empty -- so a full pass produced 78
+    # YFRateLimitError lines and zero exceptions, and an
+    # except-clause-shaped retry was dead code that never once ran while
+    # coverage sat at 30%. What a caller can actually observe is which
+    # symbols came back without a bar, so that is what drives the retry.
+    #
+    # A symbol still missing after the last round is genuinely absent
+    # today -- delisted, halted, or never traded -- which is a different
+    # finding from throttled and is what `coverage` then reports.
+    for round_number in range(1, int(max_rounds) + 1):
+        if not pending:
+            break
+        if round_number > 1:
+            wait = float(backoff) * (round_number - 1)
+            logger.info("market scan: %d symbols returned no bar; retrying "
+                        "after %.0fs (round %d)", len(pending), wait,
+                        round_number)
+            time.sleep(wait)
+
+        batches = list(_chunks(pending, batch_size))
+        missing: List[str] = []
+        for index, batch in enumerate(batches):
+            if index:
+                time.sleep(float(pause))
             try:
                 bundle = download(batch)
-                break
-            except Exception as exc:  # noqa: BLE001 - one batch must not end the scan
-                throttled = "ratelimit" in type(exc).__name__.lower() \
-                    or "too many requests" in str(exc).lower()
-                if throttled and attempt < MAX_BATCH_RETRIES:
-                    wait = RETRY_BACKOFF_SECONDS * attempt
-                    logger.warning("market scan: throttled on batch %d/%d, "
-                                   "waiting %.0fs (attempt %d)",
-                                   index + 1, len(batches), wait, attempt)
-                    time.sleep(wait)
-                    continue
-                logger.warning("market scan: batch %d/%d of %d failed (%s)",
+            except Exception:  # noqa: BLE001 - one batch must not end the scan
+                logger.warning("market scan: batch %d/%d of %d raised",
                                index + 1, len(batches), len(batch),
-                               type(exc).__name__)
-                break
-        if bundle is None:
-            continue
-        for symbol in batch:
-            frame = _frame_for(bundle, symbol)
-            if frame is None or len(frame) == 0:
+                               exc_info=True)
+                missing.extend(batch)
                 continue
-            try:
-                stamp = str(frame.index[-1])[:10]
-                if stamp != str(trading_day):
-                    continue                      # not today's bar
-                row = frame.iloc[-1]
-                price = float(row["Close"])
-                volume = float(row["Volume"])
-            except Exception:  # noqa: BLE001
-                continue
-            if not (price > 0 and volume > 0):
-                continue
-            prior = frame.iloc[:-1]
-            average = None
-            try:
-                if len(prior):
-                    average = float(prior["Volume"].mean())
-            except Exception:  # noqa: BLE001
-                average = None
-            out[symbol] = {
-                "price": price,
-                "volume": volume,
-                "dollar_volume": price * volume,
-                "avg_volume": average,
-                "relative_volume": (volume / average
-                                    if average and average > 0 else None),
-            }
+            for symbol in batch:
+                row = _measure(bundle, symbol, trading_day)
+                if row is None:
+                    missing.append(symbol)
+                else:
+                    out[symbol] = row
+        pending = missing
     return out
+
+
+def _measure(bundle, symbol, trading_day) -> Optional[Dict[str, float]]:
+    """One symbol's numbers from a batch, or None if it has no bar today.
+
+    None is returned for a stale bar as well as an absent one: ranking a
+    name on Friday's volume is the exact failure this scan exists to
+    remove, so a Friday bar is not a measurement of today.
+    """
+    frame = _frame_for(bundle, symbol)
+    if frame is None or len(frame) == 0:
+        return None
+    try:
+        if str(frame.index[-1])[:10] != str(trading_day):
+            return None
+        last = frame.iloc[-1]
+        price = float(last["Close"])
+        volume = float(last["Volume"])
+    except Exception:  # noqa: BLE001
+        return None
+    if not (price > 0 and volume > 0):
+        return None
+    average = None
+    try:
+        prior = frame.iloc[:-1]
+        if len(prior):
+            average = float(prior["Volume"].mean())
+    except Exception:  # noqa: BLE001
+        average = None
+    return {
+        "price": price,
+        "volume": volume,
+        "dollar_volume": price * volume,
+        "avg_volume": average,
+        "relative_volume": (volume / average
+                            if average and average > 0 else None),
+    }
 
 
 def rank(measured, *, min_price=MIN_PRICE,
@@ -214,8 +242,9 @@ def rank(measured, *, min_price=MIN_PRICE,
 
 def run(symbols, *, trading_day, session, scanner_commit=None,
         download=None, max_symbols=DEFAULT_MAX_SYMBOLS,
-        min_price=MIN_PRICE, min_dollar_volume=MIN_DOLLAR_VOLUME
-        ) -> Dict[str, Any]:
+        min_price=MIN_PRICE, min_dollar_volume=MIN_DOLLAR_VOLUME,
+        pause=BATCH_PAUSE_SECONDS, backoff=RETRY_BACKOFF_SECONDS,
+        max_rounds=MAX_BATCH_RETRIES) -> Dict[str, Any]:
     """One full-market first-stage scan. Returns the manifest document."""
     from discovery import manifest as manifest_module
 
@@ -223,7 +252,8 @@ def run(symbols, *, trading_day, session, scanner_commit=None,
     scan_id = f"{trading_day}-{session}-{uuid.uuid4().hex[:8]}"
     universe = list(symbols)
     measured = fetch_today(universe, trading_day=trading_day,
-                           download=download)
+                           download=download, pause=pause, backoff=backoff,
+                           max_rounds=max_rounds)
     rows = rank(measured, min_price=min_price,
                 min_dollar_volume=min_dollar_volume,
                 max_symbols=max_symbols)

@@ -228,7 +228,8 @@ class TestAStaleBarIsNeverRankedAsToday:
                 index=pd.to_datetime(["2026-08-21"]))}
 
         measured = market_scan.fetch_today(["OLD"], trading_day=DAY,
-                                           download=download)
+                                           download=download, pause=0,
+                                           backoff=0, max_rounds=1)
         assert measured == {}
 
     def test_todays_bar_is_measured(self):
@@ -240,7 +241,8 @@ class TestAStaleBarIsNeverRankedAsToday:
                 index=pd.to_datetime(["2026-08-21", DAY]))}
 
         measured = market_scan.fetch_today(["NEW"], trading_day=DAY,
-                                           download=download)
+                                           download=download, pause=0,
+                                           backoff=0, max_rounds=1)
         assert measured["NEW"]["dollar_volume"] == 60_000_000.0
         assert measured["NEW"]["relative_volume"] == 5.0
 
@@ -252,7 +254,8 @@ class TestAStaleBarIsNeverRankedAsToday:
             raise RuntimeError("provider down")
 
         assert market_scan.fetch_today(["A", "B"], trading_day=DAY,
-                                       download=download) == {}
+                                       download=download, pause=0,
+                                       backoff=0, max_rounds=1) == {}
         assert calls, "the batch was attempted"
 
 
@@ -351,39 +354,58 @@ class TestAThrottledPassIsLabelledNotHidden:
                               "avg_volume": 1e6, "relative_volume": 1.0}
                     for i in range(2)}
 
+        # Keyed to identity, not position: with the retry round, a
+        # `tickers[:2]` stub would serve C and D on the second pass and
+        # report full coverage for a scan that never priced them.
+        servable = {"A", "B"}
+
         def download(tickers):
             import pandas as pd
             return {t: pd.DataFrame(
                 {"Close": [10.0], "Volume": [1_000_000]},
-                index=pd.to_datetime([DAY])) for t in tickers[:2]}
+                index=pd.to_datetime([DAY]))
+                for t in tickers if t in servable}
 
         doc = market_scan.run(["A", "B", "C", "D"], trading_day=DAY,
-                              session="REGULAR", download=download)
+                              session="REGULAR", download=download,
+                              pause=0, backoff=0)
         assert doc["universe_size"] == 4
         assert doc["coverage"] == 0.5
         assert doc["complete"] is False
 
-    def test_a_throttled_batch_is_retried_before_being_given_up(self, monkeypatch):
-        monkeypatch.setattr(market_scan, "RETRY_BACKOFF_SECONDS", 0.0)
-        monkeypatch.setattr(market_scan, "BATCH_PAUSE_SECONDS", 0.0)
-        attempts = []
-
-        class YFRateLimitError(Exception):
-            pass
+    def test_a_symbol_that_came_back_empty_is_retried(self):
+        """The provider catches its own rate limit, logs it, and returns
+        the ticker EMPTY -- a full pass produced 78 YFRateLimitError
+        lines and zero exceptions, so an except-shaped retry was dead
+        code while coverage sat at 30%. The retry keys off the measured
+        absence of a row, which is what a caller can actually see."""
+        rounds = []
 
         def download(tickers):
-            attempts.append(tickers)
-            if len(attempts) < 2:
-                raise YFRateLimitError("Too Many Requests. Rate limited.")
             import pandas as pd
+            rounds.append(list(tickers))
+            if len(rounds) == 1:
+                return {}          # throttled: present, but no rows
             return {t: pd.DataFrame(
                 {"Close": [10.0], "Volume": [1_000_000]},
                 index=pd.to_datetime([DAY])) for t in tickers}
 
         measured = market_scan.fetch_today(["A"], trading_day=DAY,
-                                           download=download)
-        assert len(attempts) == 2, "the throttled batch was not retried"
+                                           download=download, pause=0,
+                                           backoff=0)
+        assert len(rounds) == 2, "the empty symbol was not retried"
         assert "A" in measured
+
+    def test_a_symbol_absent_every_round_is_simply_absent(self):
+        """Delisted or halted. Different from throttled, and coverage is
+        what reports it."""
+        def download(tickers):
+            return {}
+
+        measured = market_scan.fetch_today(["GONE"], trading_day=DAY,
+                                           download=download, pause=0,
+                                           backoff=0, max_rounds=2)
+        assert measured == {}
 
     def test_the_batch_size_reflects_what_a_full_pass_sustains(self):
         """400 was fastest in isolation and throttled a real full pass."""
