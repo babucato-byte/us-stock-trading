@@ -45,13 +45,27 @@ case "$SESSION" in
     echo "$(date -u +%FT%TZ) skipped=$SESSION" >> "$LOG"
     exit 0;;
 esac
-echo "$(date -u +%FT%TZ) session=$SESSION candidates=$SCANNER_CANDIDATE_DIR" >> "$LOG"
+# Derived from the candidate dir the shared env already resolved and
+# validated, rather than from a second variable that could point
+# somewhere else. `shared/state/candidates` and `shared/state/discovery`
+# are siblings by construction.
+MANIFEST_PATH="$(dirname "$SCANNER_CANDIDATE_DIR")/discovery/manifest.json"
+
+echo "$(date -u +%FT%TZ) session=$SESSION candidates=$SCANNER_CANDIDATE_DIR manifest=$MANIFEST_PATH" >> "$LOG"
 flock -n /home/ubuntu/logs/cron/s6_scan.lock \
   env SCANNER_CANDIDATE_DIR="$SCANNER_CANDIDATE_DIR" \
       TRADING_PROJECT_ROOT="$SCANNER_RUNTIME_ROOT" \
   venv/bin/python scripts/run_scanners.py --scanners orb \
-    --session "$SESSION" --universe active \
+    --session "$SESSION" --universe manifest \
+    --manifest-path "$MANIFEST_PATH" \
     --supplement-size 50 >> "$LOG" 2>&1
+# --universe manifest takes the SCANNER NODE's list -- the whole market
+# ranked on today's data -- and falls back to the server's own active
+# ranking whenever that manifest is missing, stale, malformed or from
+# the wrong trading day. The trading node must degrade to what it would
+# have done anyway, never stop, and never trade a symbol nobody
+# re-derived today. See discovery/manifest.py.
+#
 # --supplement-size is S6-only on purpose. The active universe is ranked
 # by the PREVIOUS day's dollar volume, so on a Monday it is Friday's and
 # cannot see a name that woke up this morning -- MARA sat at Friday's
