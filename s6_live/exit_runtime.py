@@ -68,8 +68,19 @@ def sync_buy_fills(conn, *, fills_for, now=None) -> List[Dict[str, Any]]:
     indistinguishable from one still in flight, and the position limit
     counts both.
     """
+    # SUBMITTED rows AND already-open ones. A BUY that fills in two
+    # parts reaches OPEN on the first fill and then stops being
+    # "unconfirmed", so scanning only SUBMITTED would leave the position
+    # permanently short of what the account actually holds -- and
+    # reconciliation would report the difference as an unattributable
+    # broker holding. `apply_fill` compares CUMULATIVE quantity, so
+    # re-reading a completed fill is a no-op.
+    pending = list(position_store.load_unconfirmed(conn))
+    pending += [row for _pid, row in position_store.load_live(conn)
+                if not row.get("exit_submitted")]
+
     applied = []
-    for row in position_store.load_unconfirmed(conn):
+    for row in pending:
         pid, symbol = row["position_id"], row["symbol"]
         try:
             fill = fills_for(row)
@@ -89,8 +100,11 @@ def sync_buy_fills(conn, *, fills_for, now=None) -> List[Dict[str, Any]]:
         quantity = fill.get("filled_quantity")
         if not quantity:
             # Explicitly reported as unfilled -- different from "no
-            # answer yet", and the only case safe to abandon.
-            if fill.get("terminal"):
+            # answer yet", and the only case safe to abandon. Only a
+            # SUBMITTED row can be abandoned: an OPEN position holds
+            # shares, and "no fill rows" for it means the lookup found
+            # nothing, never that the shares are not there.
+            if fill.get("terminal") and row.get("status") == position_store.SUBMITTED:
                 position_store.abandon_submission(
                     conn, pid, reason="BUY_NEVER_FILLED", now=now)
                 applied.append({"position_id": pid, "symbol": symbol,

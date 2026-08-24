@@ -212,7 +212,12 @@ class TestBuyFillSync:
         fill = {"filled_quantity": 1, "average_fill_price": 100.0}
         er.sync_buy_fills(conn, fills_for=lambda row: fill, now=T0)
         again = er.sync_buy_fills(conn, fills_for=lambda row: fill, now=T0)
-        assert again == [], "the row is no longer SUBMITTED"
+        # The row is now OPEN and is still re-read, because a BUY can
+        # fill in two parts and the second part would otherwise never be
+        # applied. Re-reading the SAME cumulative quantity changes
+        # nothing -- which is the property that matters.
+        assert [r["status"] for r in again] == ["NO_CHANGE"]
+        assert ps.load(conn, ps.load_live(conn)[0][0])["quantity"] == 1
 
     def test_no_answer_leaves_it_unconfirmed(self, conn):
         """Different from "reported as unfilled" -- only the latter is

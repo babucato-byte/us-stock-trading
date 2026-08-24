@@ -190,37 +190,19 @@ def _find_kis_fill_for_order(kis_broker, broker_order_id, *, now, since=None):
     late in the ET session already belongs to the previous UTC date. Over-
     fetching is harmless because rows are matched on the exact order
     number.
+
+    The parsing now lives in `brokers/kis_fill_inquiry.py` and is shared
+    with S6. Every detail above is preserved there -- the ODNO match, the
+    per-execution sum, the quantity-weighted price, the day-earlier
+    window -- and this returns the identical shape it always did, so S1's
+    caller is unchanged. A second copy of this reader would have been a
+    second idea of what a fill is, and the two would have diverged
+    exactly once, silently, on a partial.
     """
-    if not broker_order_id:
-        return None
-    start = now
-    if since is not None:
-        try:
-            start = min(since, now)
-        except TypeError:
-            start = now
-    start_date = (start - timedelta(days=1)).strftime("%Y%m%d")
-    try:
-        fills = kis_broker.get_fills(start_date=start_date, end_date=now.strftime("%Y%m%d"))
-    except Exception:
-        return None
-    cumulative_qty = 0.0
-    weighted_price_sum = 0.0
-    for fill in fills:
-        if fill.get("ODNO") != broker_order_id and fill.get("odno") != broker_order_id:
-            continue
-        try:
-            event_qty = float(fill.get("ft_ccld_qty") or fill.get("FT_CCLD_QTY") or 0)
-            event_price = float(fill.get("ft_ccld_unpr3") or fill.get("FT_CCLD_UNPR3") or 0)
-        except (TypeError, ValueError):
-            continue
-        if event_qty <= 0 or event_price <= 0:
-            continue
-        cumulative_qty += event_qty
-        weighted_price_sum += event_qty * event_price
-    if cumulative_qty <= 0:
-        return None
-    return {"filled_qty": cumulative_qty, "average_fill_price": weighted_price_sum / cumulative_qty}
+    from brokers import kis_fill_inquiry
+
+    return kis_fill_inquiry.find_fill(kis_broker, broker_order_id, now=now,
+                                      since=since)
 
 
 def _reconcile_account_and_orders(*, kis_broker, conn, open_positions, kis_positions, now):

@@ -309,19 +309,30 @@ class TestRouteCapabilityIsDerivedNotAssumed:
         assert cap.order_capable is False
         assert cap.buy.reason == session_capability.REASON_REGULAR_ONLY
 
-    def test_no_session_claims_a_fill_query_it_never_proved(self):
-        """The runtime returns None from both fill lookups."""
-        for session in ("REGULAR", "OVERNIGHT_DAYTIME", "PREMARKET",
-                        "AFTER_HOURS"):
-            cap = session_capability.capability(session)
-            assert cap.fill_query.verified is False
+    def test_the_fill_query_verdict_is_session_independent(self):
+        """An order id is an order id: the same inquiry answers for a
+        PREMARKET entry sold in REGULAR, so the verdict is the runtime's
+        rather than the session's."""
+        verdicts = {session_capability.capability(s).fill_query.status
+                    for s in ("REGULAR", "OVERNIGHT_DAYTIME", "PREMARKET",
+                              "AFTER_HOURS")}
+        assert len(verdicts) == 1
 
     def test_order_capable_requires_all_three_routes(self):
+        """A BUY that cannot be sold, or a fill that cannot be read back,
+        is not a tradeable session."""
+        from dataclasses import replace
+
         cap = session_capability.capability("REGULAR")
         assert cap.buy.verified and cap.sell.verified
-        assert cap.fill_query.verified is False
-        assert cap.order_capable is False, (
-            "a BUY that cannot be read back is not a tradeable session")
+        assert cap.fill_query.verified
+        assert cap.order_capable is True
+
+        unreadable = session_capability.RouteVerdict(
+            session_capability.NOT_VERIFIED,
+            session_capability.REASON_FILL_QUERY_UNWIRED, "")
+        assert replace(cap, fill_query=unreadable).order_capable is False
+        assert replace(cap, sell=unreadable).order_capable is False
 
     def test_an_unknown_session_fails_closed(self):
         cap = session_capability.capability("NOT_A_SESSION")
@@ -361,14 +372,29 @@ class TestVariantStates:
             variant_state.FAIL
 
     def test_ready_requires_every_check(self):
-        """Even with all three observations, a missing fill query blocks."""
-        states = variant_state.evaluate(observations={
-            "regular_market_tick_verified": True,
-            "regular_candidate_freshness_verified": True,
-            "regular_common_stock_dry_run_verified": True})
-        state = states["S6-R"]
-        assert state.mode == variant_state.DISCOVERY_ONLY
-        assert "regular_fill_query_verified" in state.blocking
+        """All six -> READY. Any one missing -> not READY."""
+        full = {"regular_market_tick_verified": True,
+                "regular_candidate_freshness_verified": True,
+                "regular_common_stock_dry_run_verified": True}
+        state = variant_state.evaluate(observations=full)["S6-R"]
+        assert state.mode == variant_state.READY_FOR_LIMITED_LIVE
+        assert state.blocking == []
+
+        for dropped in list(full):
+            partial = {k: v for k, v in full.items() if k != dropped}
+            weaker = variant_state.evaluate(observations=partial)["S6-R"]
+            assert weaker.mode == variant_state.DISCOVERY_ONLY
+            assert dropped in weaker.blocking
+
+    def test_ready_is_not_permission_to_trade(self):
+        """READY means a human MAY promote. It must not itself order."""
+        full = {"regular_market_tick_verified": True,
+                "regular_candidate_freshness_verified": True,
+                "regular_common_stock_dry_run_verified": True}
+        state = variant_state.evaluate(observations=full)["S6-R"]
+        assert state.mode == variant_state.READY_FOR_LIMITED_LIVE
+        assert state.may_order is False
+        assert slm.SCANNER_LIVE_MODE["orb"] == slm.MODE_DISCOVERY_ONLY
 
     def test_it_promotes_nothing(self):
         import ast

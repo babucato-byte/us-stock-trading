@@ -160,37 +160,49 @@ def _regular_only(rollout=None) -> bool:
     return bool(getattr(config, "regular_session_only", True))
 
 
-def _fill_query_verdict(session: str) -> RouteVerdict:
-    """Can a fill be read back in this session?
+def runtime_ready() -> RouteVerdict:
+    """Is the fill inquiry IMPLEMENTED and callable? (§11)
 
-    Answered from the runtime's wiring: `run_s6_runtime._buy_fill_lookup`
-    and `_sell_fill_lookup` both return None pending the live step, so no
-    session can currently confirm a fill. That is reported as
-    NOT_VERIFIED for every session including REGULAR -- claiming REGULAR
-    can read fills because REGULAR can place orders is the assumption §7
-    forbids.
+    Separate from `actual_fill_observed`, and the split matters. This
+    asks whether the code exists, imports, and is wired into the runtime
+    -- a question with an answer today, before any S6 order has ever been
+    placed. Whether a REAL S6 fill was read back is a production
+    observation that only a real order can supply, and it stays
+    NOT_MEASURED until one does.
+
+    Answered by inspecting the runtime's own wiring rather than by a
+    flag, so removing the wiring makes this go NOT_VERIFIED by itself.
     """
     try:
         import inspect
 
+        from brokers import kis_fill_inquiry  # noqa: F401
         from scripts import run_s6_runtime
 
-        source = inspect.getsource(run_s6_runtime._buy_fill_lookup) + \
-            inspect.getsource(run_s6_runtime._sell_fill_lookup)
+        source = (inspect.getsource(run_s6_runtime._fill_lookup)
+                  + inspect.getsource(run_s6_runtime._order_id_for))
     except Exception as exc:  # noqa: BLE001
         return RouteVerdict(NOT_VERIFIED, REASON_FILL_QUERY_UNWIRED,
                             f"fill lookup could not be inspected: {exc}")
 
-    # A lookup whose only behaviour is `return None` has not been wired.
-    if "return None" in source and "broker" not in source.replace(
-            "def lookup", "").replace("broker)", ""):
+    if "kis_fill_inquiry.inquire" not in source:
         return RouteVerdict(
             NOT_VERIFIED, REASON_FILL_QUERY_UNWIRED,
-            "run_s6_runtime returns None from both fill lookups; the "
-            "broker fill report is wired in the live step")
+            "the runtime's fill lookup does not call the KIS inquiry")
     return RouteVerdict(
-        NOT_VERIFIED, REASON_FILL_QUERY_UNWIRED,
-        "no session has demonstrated a fill read-back yet")
+        VERIFIED, None,
+        "run_s6_runtime resolves the broker order id from the order "
+        "ledgers and reads it through brokers.kis_fill_inquiry")
+
+
+def _fill_query_verdict(session: str) -> RouteVerdict:
+    """Can a fill be read back in this session?
+
+    Session-independent: the inquiry is keyed on an order id, so a
+    PREMARKET entry sold in REGULAR uses the same read. The verdict is
+    therefore the runtime's, not the session's.
+    """
+    return runtime_ready()
 
 
 def capability(session, *, rollout=None) -> SessionCapability:
