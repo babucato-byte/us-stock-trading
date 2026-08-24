@@ -815,25 +815,39 @@ def _cash_gate(broker, symbol, price=None, snapshot=None) -> Dict[str, str]:
         return _result(NOT_MEASURED,
                        f"{_orderability_reason(exc)}: {str(exc)[:140]}")
 
-    if available is None:
+    # "Unknown cash" and "not enough cash" are opposite findings, and only
+    # one of them is a fact about the account. `whole_shares_affordable`
+    # answers 0 for BOTH -- deliberately, so a sizing helper never raises
+    # inside a candidate loop -- so the unusable figures have to be
+    # separated out HERE, before that 0 is read as poverty. A NaN, a
+    # negative, a string or a None is a read that did not land; reporting
+    # it as ORDERABILITY_ZERO would put a made-up account fact on the one
+    # page an operator reads before promoting S6.
+    from domain.cash_sizing import is_usable_amount, whole_shares_affordable
+
+    if not is_usable_amount(available):
         return _result(NOT_MEASURED,
                        f"{ORDERABILITY_PARSE_ERROR}: KIS returned no usable "
-                       f"orderable amount")
+                       f"orderable amount ({available!r})")
     try:
-        from domain.cash_sizing import whole_shares_affordable
-
         shares = whole_shares_affordable(available, limit)
     except Exception as exc:  # noqa: BLE001
         return _result(NOT_MEASURED,
                        f"{ORDERABILITY_PARSE_ERROR}: {str(exc)[:120]}")
+
     if shares < 1:
-        # A real, parsed answer: there IS no money for a whole share.
-        # That is a BLOCK, not an absence of measurement.
+        # A real, parsed answer: the account HAS money and it is not
+        # enough for one whole share. Whole shares only -- no fractional
+        # path exists to fall back to, so this is the end of the road for
+        # this candidate at this price, and it is a BLOCK rather than an
+        # absence of measurement.
         return _result(BLOCK,
-                       f"{ORDERABILITY_ZERO}: orderable {available:.2f} USD "
-                       f"affords 0 whole shares at {limit:.2f}")
-    return _result(PASS, f"{ORDERABILITY_OK}: orderable {available:.2f} USD "
-                         f"affords {shares} whole share(s) at {limit:.2f}")
+                       f"{ORDERABILITY_ZERO}: orderable {float(available):.2f} "
+                       f"USD affords 0 whole shares at {limit:.2f} "
+                       f"(whole shares only; fractional is OFF)")
+    return _result(PASS,
+                   f"{ORDERABILITY_OK}: orderable {float(available):.2f} USD "
+                   f"affords {shares} whole share(s) at {limit:.2f}")
 
 
 def _reconciliation_gate(conn, broker, snapshot=None) -> Dict[str, str]:
