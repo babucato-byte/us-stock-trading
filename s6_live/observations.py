@@ -58,30 +58,84 @@ def is_production(report: Optional[Dict[str, Any]]) -> bool:
     return report.get("origin") == s6_snapshot.ORIGIN_PRODUCTION
 
 
+#: Session -> the observation-name prefix that session's evidence uses.
+#: Kept identical to `variant_state.PREFIX` so a supplier and a consumer
+#: of the same fact cannot disagree about its name.
+SESSION_PREFIX = {
+    "OVERNIGHT_DAYTIME": "overnight",
+    "PREMARKET": "premarket",
+    "REGULAR": "regular",
+    "AFTER_HOURS": "afterhours",
+}
+
+
+def market_tick_for_session(session, final_check: Optional[Dict[str, Any]]
+                            ) -> Optional[bool]:
+    """Did a real scan tick complete in THIS session? One rule, four sessions.
+
+    The conditions are the same for every variant and none of them is
+    "the REGULAR market is open" -- that is CLOSED for three of the four
+    sessions and using it would make three variants permanently
+    unobservable. What is required is that the calendar allowed a scan,
+    the scan actually ran to completion, and the publisher wrote it:
+
+        origin == PRODUCTION_RUN        (validated deployment)
+        calendar_trading_day           not a weekend, not a holiday
+        scan_allowed                   this session was scannable
+        scan_ran                       a producer actually ran
+        scan_in_progress is False      it finished
+        last scan status == OK         and finished cleanly
+        publisher_verified             and the hand-off was written
+        session matches                evidence is never shared
+
+    REGULAR carries ONE extra condition, because REGULAR is the session
+    whose own market state is meaningful: `market_open_verified`. A
+    closed REGULAR market yields None -- the absence of the conditions to
+    observe a tick, not a failure of one.
+
+    Returns None (NOT_MEASURED) when the window did not exist or the
+    evidence is missing, and False (FAIL) only when a scan genuinely
+    failed.
+    """
+    from scanners.base import scan_session
+
+    wanted = scan_session.normalize(session)
+    if wanted is None or not is_production(final_check):
+        return None
+
+    # Evidence is per session and is never borrowed. An OVERNIGHT tick
+    # says nothing about REGULAR.
+    if final_check.get("session") != wanted:
+        return None
+
+    if final_check.get("calendar_trading_day") is not True:
+        return None                                   # weekend / holiday
+    if final_check.get("scan_allowed") is not True:
+        return None                                   # window did not exist
+
+    status = final_check.get("last_scan_status")
+    if status is not None and str(status) != "OK":
+        return False                                  # the scan FAILED
+
+    if not final_check.get("scan_ran"):
+        return None                                   # producer never ran
+    if final_check.get("scan_in_progress"):
+        return None                                   # not finished yet
+    if not final_check.get("publisher_verified"):
+        return None
+
+    if wanted == "REGULAR":
+        # The one session whose own market state is the right question.
+        if not final_check.get("market_open_verified"):
+            return None
+
+    return bool(final_check.get("scanner_tick_verified"))
+
+
 def regular_market_tick(final_check: Optional[Dict[str, Any]]
                         ) -> Optional[bool]:
-    """Did a REGULAR-session scan tick actually complete with the market open?
-
-    True requires BOTH: the market was open at report time, and a scan
-    ran to completion for that session. Either one alone is the kind of
-    half-answer that reads as a pass -- a scan that ran on a holiday, or
-    an open market with no producer behind it.
-    """
-    if not is_production(final_check):
-        return None
-    if final_check.get("session") != "REGULAR":
-        # A report from another session is not evidence about REGULAR.
-        # Absent, not failing.
-        return None
-    open_verified = final_check.get("market_open_verified")
-    tick_verified = final_check.get("scanner_tick_verified")
-    if open_verified is None or tick_verified is None:
-        return None
-    if not open_verified:
-        # The market was not open. That is not a failure of the tick --
-        # it is the absence of the conditions to observe one.
-        return None
-    return bool(tick_verified)
+    """REGULAR's tick. Kept as a named entry point; one implementation."""
+    return market_tick_for_session("REGULAR", final_check)
 
 
 def candidate_freshness(final_check: Optional[Dict[str, Any]]
@@ -136,6 +190,71 @@ def common_stock_dry_run(snapshot: Optional[Dict[str, Any]]) -> Optional[bool]:
     return bool(snapshot.get("symbol") and snapshot.get("security_type"))
 
 
+def candidate_freshness_for_session(session, final_check
+                                    ) -> Optional[bool]:
+    """This session's freshness. Same rule, never shared across sessions."""
+    from scanners.base import scan_session
+
+    wanted = scan_session.normalize(session)
+    if wanted is None or not is_production(final_check):
+        return None
+    if final_check.get("session") != wanted:
+        return None
+    return candidate_freshness(final_check)
+
+
+def common_stock_dry_run_for_session(session, final_check
+                                     ) -> Optional[bool]:
+    """Did a real COMMON_STOCK candidate clear every CANDIDATE gate?
+
+    Reads `common_stock_candidate_dry_run`, which deliberately excludes
+    the session's order policy -- a shadow session can fully observe a
+    candidate while still refusing to trade it. `order_policy_ready` is
+    the separate answer and is what actually gates a promotion.
+    """
+    from scanners.base import scan_session
+
+    wanted = scan_session.normalize(session)
+    if wanted is None or not is_production(final_check):
+        return None
+    if final_check.get("session") != wanted:
+        return None
+    verdict = (final_check.get("common_stock_candidate_dry_run") or {}).get(
+        "status")
+    if verdict == "PASS":
+        return True
+    return None
+
+
+def for_session(session, final_check=None, snapshot=None) -> Dict[str, Any]:
+    """Every observation this session can supply, under its own names."""
+    from scanners.base import scan_session
+
+    wanted = scan_session.normalize(session)
+    prefix = SESSION_PREFIX.get(wanted or "")
+    if prefix is None:
+        return {}
+    out = {
+        f"{prefix}_market_tick_verified":
+            market_tick_for_session(wanted, final_check),
+        f"{prefix}_candidate_freshness_verified":
+            candidate_freshness_for_session(wanted, final_check),
+        f"{prefix}_common_stock_dry_run_verified":
+            common_stock_dry_run_for_session(wanted, final_check),
+    }
+    if wanted == "REGULAR":
+        # The activation gate's own three names are REGULAR's.
+        out["regular_market_tick_verified"] = out[
+            "regular_market_tick_verified"]
+        out["candidate_freshness_verified"] = out[
+            "regular_candidate_freshness_verified"]
+        out["common_stock_dry_run_verified"] = (
+            common_stock_dry_run(snapshot)
+            if snapshot is not None else
+            out["regular_common_stock_dry_run_verified"])
+    return out
+
+
 def collect(*, final_check=None, snapshot=None, extra=None) -> Dict[str, Any]:
     """The three market-dependent observations, ready for `evaluate()`.
 
@@ -145,9 +264,16 @@ def collect(*, final_check=None, snapshot=None, extra=None) -> Dict[str, Any]:
     """
     observed: Dict[str, Any] = {
         "regular_market_tick_verified": regular_market_tick(final_check),
-        "candidate_freshness_verified": candidate_freshness(final_check),
+        "candidate_freshness_verified": candidate_freshness_for_session(
+            "REGULAR", final_check),
         "common_stock_dry_run_verified": common_stock_dry_run(snapshot),
     }
+    # Whatever session the report actually came from also supplies its
+    # own prefixed observations, so a variant table can show the evidence
+    # that session produced without any of it leaking into another's.
+    if final_check is not None:
+        observed.update(for_session(final_check.get("session"), final_check,
+                                    snapshot))
     for key, value in (extra or {}).items():
         observed[key] = value
     return observed

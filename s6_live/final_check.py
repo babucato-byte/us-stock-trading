@@ -244,7 +244,19 @@ def _scan_facts(day: str, session: str) -> Dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         publisher_error = str(exc)
 
+    # §2: the window facts an observation must check, carried on the
+    # report so a supplier never has to re-derive them.
+    from scanners.base import scan_window
+
+    window = scan_window.evaluate()
+
     return {
+        "calendar_trading_day": window.calendar_trading_day,
+        "scan_allowed": window.scan_allowed,
+        "scan_window_reason": window.reason,
+        "scan_window_session": window.session,
+        "scan_ran": ran,
+        "regular_market_state": window.regular_market_state,
         "scanner_tick_verified": bool(ran and not state.running),
         "scan_in_progress": state.running,
         "scan_state": state.as_dict(),
@@ -355,11 +367,24 @@ def _candidate_facts(day, session, variant, *, modes, conn, broker, rollout,
             "buy_gates": _gates_for(
                 symbol, offered=offered, qualification=qualification,
                 conn=conn, broker=broker, rollout=rollout, session=session,
-                blocked_before_gates=blocked_before_gates),
+                blocked_before_gates=blocked_before_gates,
+                price=row.get("price")),
         })
     facts["candidates"] = rows
 
     facts["buy_gates"] = _cycle_gates(rows, blocked_before_gates)
+
+    # §6: the CANDIDATE's own quality and the SESSION's order policy are
+    # different questions and are answered separately.
+    #
+    # S6-O's real candidates pass instrument, qualify, freshness,
+    # reconciliation, duplicate and the KIS price sanity check. The only
+    # thing refusing them is `risk_matrix`, because OVERNIGHT_DAYTIME is
+    # REALTIME_SHADOW -- a statement about the SESSION, not about the
+    # candidate. Letting that one policy answer erase the candidate
+    # observation would discard evidence the pipeline genuinely produced.
+    facts["common_stock_candidate_dry_run"] = _candidate_dry_run(rows)
+    facts["order_policy_ready"] = _order_policy_ready(rows, session, modes)
     # The boundary is reached only when some candidate cleared the source,
     # qualified, and left no gate BLOCKing. NOT_MEASURED does not reach
     # it: an unasked gate is not a passed one.
@@ -369,6 +394,68 @@ def _candidate_facts(day, session, variant, *, modes, conn, broker, rollout,
         for row in rows)
     facts["broker_submit_count"] = 0
     return facts
+
+
+#: Gates that describe the CANDIDATE. `risk_matrix` is absent on
+#: purpose: it answers whether the SESSION may order, which is
+#: `order_policy_ready`'s question.
+CANDIDATE_GATES = ("instrument", "cash_orderability", "reconciliation",
+                   "duplicate_protection", "kis_execution_sanity")
+
+
+def _candidate_dry_run(rows) -> Dict[str, Any]:
+    """Did a real COMMON_STOCK candidate clear every CANDIDATE gate?
+
+    Order policy is deliberately excluded -- see `order_policy_ready`. A
+    candidate that is a supported-exchange common stock, qualifies, is
+    fresh, reconciles, is not a duplicate and sits inside KIS's own
+    trading-day range has been fully observed, whether or not the session
+    it arrived in may trade.
+    """
+    eligible = [r for r in rows
+                if r.get("live_eligible") and r.get("qualify_verified")]
+    if not eligible:
+        return {"status": NOT_MEASURED, "symbols": [],
+                "detail": "no COMMON_STOCK candidate qualified this cycle"}
+
+    passed, blocked = [], []
+    for row in eligible:
+        gates = row.get("buy_gates") or {}
+        verdicts = {g: (gates.get(g) or {}).get("status") for g in CANDIDATE_GATES}
+        if all(v == PASS for v in verdicts.values()):
+            passed.append(row["symbol"])
+        else:
+            blocked.append(
+                f"{row['symbol']}: " + ", ".join(
+                    f"{g}={v}" for g, v in verdicts.items() if v != PASS))
+    if passed:
+        return {"status": PASS, "symbols": passed,
+                "detail": f"{len(passed)} candidate(s) cleared every "
+                          f"candidate gate"}
+    return {"status": NOT_MEASURED, "symbols": [],
+            "detail": "; ".join(blocked[:3])}
+
+
+def _order_policy_ready(rows, session, modes) -> Dict[str, Any]:
+    """May this session actually place the order? Policy only.
+
+    Separate from the candidate observation so a shadow session can
+    record a fully-observed candidate AND an honest BLOCK at once.
+    """
+    from config import scanner_live_mode
+
+    reasons = []
+    if not s6_sessions.orders_allowed(session):
+        reasons.append(f"session {session} is {s6_sessions.mode_for(session)}")
+    if not scanner_live_mode.is_limited_live(s6_sessions.SCANNER_NAME, modes):
+        reasons.append("S6 is DISCOVERY_ONLY")
+    risk = [(r.get("buy_gates") or {}).get("risk_matrix", {}) for r in rows]
+    blocked = [d.get("detail") for d in risk if d.get("status") == BLOCK]
+    if blocked:
+        reasons.append(blocked[0])
+    if reasons:
+        return {"status": BLOCK, "detail": "; ".join(dict.fromkeys(reasons))}
+    return {"status": PASS, "detail": "session and live mode both permit orders"}
 
 
 def _cycle_gates(rows, blocked_before_gates) -> Dict[str, Dict[str, str]]:
@@ -398,7 +485,8 @@ def _cycle_gates(rows, blocked_before_gates) -> Dict[str, Dict[str, str]]:
 
 
 def _gates_for(symbol, *, offered, qualification, conn, broker, rollout,
-               session, blocked_before_gates) -> Dict[str, Dict[str, str]]:
+               session, blocked_before_gates, price=None
+               ) -> Dict[str, Dict[str, str]]:
     """One candidate through each gate, in cycle order.
 
     The offline gates are evaluated even for a candidate the source
@@ -423,7 +511,7 @@ def _gates_for(symbol, *, offered, qualification, conn, broker, rollout,
                                                         broker=None)
         return gates
 
-    gates["cash_orderability"] = _cash_gate(broker, symbol)
+    gates["cash_orderability"] = _cash_gate(broker, symbol, price)
     gates["reconciliation"] = _reconciliation_gate(conn, broker)
     gates["duplicate_protection"] = _duplicate_gate(conn, symbol, broker=broker)
     gates["kis_execution_sanity"] = _execution_gate(broker, symbol)
@@ -524,14 +612,18 @@ def _duplicate_gate(conn, symbol, *, broker) -> Dict[str, str]:
     return _result(PASS, "no S6 position and no open broker order")
 
 
-def _cash_gate(broker, symbol) -> Dict[str, str]:
+def _cash_gate(broker, symbol, price=None) -> Dict[str, str]:
     """Orderable cash, read the way the BUY cycle reads it.
 
-    Deliberately NOT a sizing decision. The cycle asks KIS per (symbol,
-    exchange, limit price) at the exact price the intent is built with,
-    and this report has no intent -- so it reports the account read
-    succeeding or failing and stops there rather than inventing a price
-    to ask about.
+    `get_orderable_usd` is the inquire-psamount READ (TTTS3007R). It is
+    not an order endpoint and submits nothing -- so it can be evaluated
+    here for real, using the candidate's own published price as the limit
+    KIS is asked about. This used to return NOT_MEASURED on the reasoning
+    that the report "builds no order", which conflated building an order
+    with asking a question about one.
+
+    Without a price there is nothing to ask KIS about, and the account
+    read alone is reported instead.
     """
     try:
         snapshot = broker.get_account_snapshot()
@@ -539,10 +631,38 @@ def _cash_gate(broker, symbol) -> Dict[str, str]:
         return _result(BLOCK, f"KIS account read failed: {exc}")
     if snapshot is None:
         return _result(BLOCK, "KIS returned no account snapshot")
-    return _result(NOT_MEASURED,
-                   "the account is readable; orderable cash is asked per "
-                   "(symbol, exchange, limit price) at order time and this "
-                   "report builds no order")
+
+    limit = None
+    try:
+        limit = float(price) if price is not None else None
+    except (TypeError, ValueError):
+        limit = None
+    if limit is None or limit <= 0:
+        return _result(NOT_MEASURED,
+                       "the account is readable; no usable candidate price "
+                       "to ask orderable cash about")
+
+    try:
+        from market_data.exchange_registry import build_kis_instrument
+
+        instrument, _record = build_kis_instrument(symbol)
+        available = broker.get_orderable_usd(instrument, limit)
+    except Exception as exc:  # noqa: BLE001
+        return _result(NOT_MEASURED,
+                       f"orderable-amount read unavailable: {str(exc)[:120]}")
+
+    try:
+        from domain.cash_sizing import whole_shares_affordable
+
+        shares = whole_shares_affordable(available, limit)
+    except Exception:  # noqa: BLE001
+        shares = int(available // limit) if limit else 0
+    if shares < 1:
+        return _result(BLOCK,
+                       f"orderable {available:.2f} USD affords 0 whole shares "
+                       f"at {limit:.2f}")
+    return _result(PASS, f"orderable {available:.2f} USD affords {shares} "
+                         f"whole share(s) at {limit:.2f}")
 
 
 def _reconciliation_gate(conn, broker) -> Dict[str, str]:
@@ -683,9 +803,10 @@ def format_report(report: Dict[str, Any]) -> str:
             f"     security type    : {_fmt(row.get('security_type'))} "
             f"(live_eligible={_fmt(row.get('live_eligible'))})",
             f"     generated at     : {_fmt(row.get('generated_at'))}",
-            f"     read at          : {_fmt(row.get('read_at'))}",
-            f"     consumed at      : {_fmt(row.get('consumed_at'))}",
-            f"     age at consume   : {_fmt(row.get('candidate_age_seconds'))}s",
+            f"     observed at      : {_fmt(row.get('read_at'))}",
+            f"     age at observation: {_fmt(row.get('candidate_age_seconds'))}s",
+            f"     consumed at      : {_fmt(row.get('consumed_at'))}"
+            f"   (live LIMITED_LIVE consumer)",
             f"     source_verified  : {_fmt(row.get('source_verified'))}"
             + (f"  ({row['source_detail']})" if row.get("source_detail") else ""),
             f"     qualify_verified : {_fmt(row.get('qualify_verified'))}"
