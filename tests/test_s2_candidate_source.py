@@ -300,12 +300,25 @@ class TestTheHandoffDirectoryMustBeShared:
     both reported success.
     """
 
-    def test_a_release_with_no_shared_store_is_refused(self, monkeypatch):
+    def test_a_release_with_no_shared_store_is_refused(self, monkeypatch,
+                                                       tmp_path):
+        """The release path is a tmp_path, not the real production one.
+
+        This used to name `/home/ubuntu/releases/us-stock-trading/abc123`
+        literally. On a laptop that resolves to nothing and the refusal
+        fires; on the production host its sibling
+        `.../shared/state/candidates` genuinely EXISTS, so `candidate_dir`
+        correctly returned it and the test failed on the one machine
+        whose layout it was describing. A test that asserts "there is no
+        shared store here" has to own the directory it is talking about.
+        """
         monkeypatch.delenv(publisher.CANDIDATE_DIR_ENV, raising=False)
         monkeypatch.delenv("SCANNER_ANALYTICS_DIR", raising=False)
-        monkeypatch.setenv(
-            "TRADING_PROJECT_ROOT",
-            "/home/ubuntu/releases/us-stock-trading/abc123")
+        release = tmp_path / "releases" / "us-stock-trading" / "abc123"
+        release.mkdir(parents=True)
+        assert not release.parent.joinpath(
+            *publisher.SHARED_STATE_PARTS).exists()
+        monkeypatch.setenv("TRADING_PROJECT_ROOT", str(release))
         with pytest.raises(publisher.CandidateHandoffMisconfigured,
                            match="no shared store"):
             publisher.candidate_dir()

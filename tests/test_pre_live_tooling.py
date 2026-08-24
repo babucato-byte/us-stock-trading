@@ -139,6 +139,118 @@ class TestTheCheckerBlocksInTheCurrentPosture:
         result = _run(CHECK, env={var: "5"})
         assert f"{var}_NOT_1" in result.stdout
 
+class TestTheCheckerSurvivesEveryCommitPosture:
+    """The checker must REPORT a mismatch, not die on the branch whose
+    whole job is reporting it.
+
+    `${DEPLOYED_COMMIT:0:8}` carries no default, and substring expansion
+    of an unset variable under `set -u` is an unbound-variable error --
+    in bash 4.4 and later. The dev machines run bash 3.2, where the same
+    expansion quietly yields empty, so every behaviour test here passed
+    while the production host (bash 5.1) killed the script at that line:
+    two lines of header, no RESULT, no reason codes, on the last gate
+    before a real order.
+
+    So there are two kinds of test below. The behaviour matrix proves the
+    script reports rather than aborts, and `test_every_substring_...`
+    proves it statically -- because on bash 3.2 the behaviour matrix
+    cannot fail, and the static one can.
+    """
+
+    #: Every commit posture the checker can be run in.
+    POSTURES = {
+        "mismatch": {"DEPLOYED_COMMIT": "deadbeefdeadbeef",
+                     "VALIDATED_COMMIT": "deadbeefdeadbeef"},
+        "deployed_unset": {"VALIDATED_COMMIT": "deadbeefdeadbeef"},
+        "validated_unset": {"DEPLOYED_COMMIT": "deadbeefdeadbeef"},
+        "both_unset": {},
+        "deployed_empty": {"DEPLOYED_COMMIT": "", "VALIDATED_COMMIT": ""},
+        "half_matching": {"DEPLOYED_COMMIT": "deadbeefdeadbeef"},
+    }
+
+    def _run_posture(self, name, tmp_path=None):
+        import os
+
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("DEPLOYED_COMMIT", "VALIDATED_COMMIT")}
+        env.update({"TRADING_PROJECT_ROOT": str(REPO_ROOT),
+                    "PYTHON_BIN": sys.executable})
+        env.update(self.POSTURES[name])
+        return subprocess.run(["bash", str(CHECK)], capture_output=True,
+                              text=True, timeout=180, env=env,
+                              cwd=str(REPO_ROOT))
+
+    @pytest.mark.parametrize("posture", sorted(POSTURES))
+    def test_it_never_aborts_on_an_unset_commit(self, posture):
+        result = self._run_posture(posture)
+        assert "unbound variable" not in result.stderr, result.stderr[-800:]
+
+    @pytest.mark.parametrize("posture", sorted(POSTURES))
+    def test_it_always_reaches_a_verdict(self, posture):
+        result = self._run_posture(posture)
+        assert "RESULT:" in result.stdout, result.stdout[-1500:]
+
+    @pytest.mark.parametrize("posture", sorted(POSTURES))
+    def test_a_mismatch_is_named_as_a_blocking_reason(self, posture):
+        result = self._run_posture(posture)
+        assert "BLOCKING REASON CODES" in result.stdout, result.stdout[-1500:]
+        assert "COMMIT_MISMATCH" in result.stdout, result.stdout[-1500:]
+
+    @pytest.mark.parametrize("posture", sorted(POSTURES))
+    def test_a_mismatch_exits_non_zero(self, posture):
+        """Non-zero is the policy. Dying at line 44 also exits non-zero,
+        which is exactly why the exit code alone never caught this."""
+        assert self._run_posture(posture).returncode != 0
+
+    def test_an_unreadable_head_is_reported_not_fatal(self, tmp_path):
+        import os
+
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("DEPLOYED_COMMIT", "VALIDATED_COMMIT")}
+        env.update({"TRADING_PROJECT_ROOT": str(tmp_path),
+                    "PYTHON_BIN": sys.executable})
+        result = subprocess.run(["bash", str(CHECK)], capture_output=True,
+                                text=True, timeout=180, env=env,
+                                cwd=str(tmp_path))
+        assert "unbound variable" not in result.stderr, result.stderr[-800:]
+        assert "COMMIT_UNREADABLE" in result.stdout, result.stdout[-1500:]
+        assert "RESULT:" in result.stdout
+        assert result.returncode != 0
+
+    def test_every_substring_expansion_reads_a_locally_assigned_name(self):
+        """The one that works on bash 3.2.
+
+        `${NAME:offset:length}` on a name the script did not assign is an
+        unbound-variable error on any bash the production host runs. The
+        fix is not `set +u` -- a safety script that stops checking its
+        own inputs is worse than one that aborts loudly. It is to default
+        once into a local name and read only that.
+        """
+        import re
+
+        # A name is "assigned" if the script binds it: plain assignment,
+        # a `read` target, or a `for` loop variable. All three are set by
+        # the time the body runs; an env-supplied name is not.
+        assigned = set(re.findall(r"^\s*([A-Za-z_][A-Za-z0-9_]*)=",
+                                  CHECK_CODE, re.MULTILINE))
+        assigned |= set(re.findall(r"\bread\b(?:\s+-[A-Za-z]+)*\s+"
+                                   r"([A-Za-z_][A-Za-z0-9_]*)", CHECK_CODE))
+        assigned |= set(re.findall(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\b",
+                                   CHECK_CODE))
+        used = re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*):[0-9]",
+                          CHECK_CODE)
+        unguarded = sorted({n for n in used if n not in assigned})
+        assert not unguarded, (
+            f"substring-expanded without a local default: {unguarded}. "
+            "Assign NAME_SAFE=\"${NAME:-}\" first and expand that.")
+
+    def test_set_u_is_still_on(self):
+        """The fix must not be a weakening. `set -u` is what makes an
+        unset variable a fault instead of an empty string."""
+        assert "set -uo pipefail" in CHECK_CODE
+        assert "set +u" not in CHECK_CODE
+
+
     def test_an_unparseable_check_line_is_treated_as_a_failure(self):
         """Unknown is not ready -- the parser must not skip a line it
         cannot classify."""

@@ -36,12 +36,26 @@ printf 'FINAL PRE-LIVE CHECK\n  release: %s\n\n' "${RELEASE_ROOT}"
 # -- 1. release identity ------------------------------------------------
 cd "${RELEASE_ROOT}" || { echo "RELEASE_ROOT unreadable"; exit 1; }
 HEAD_SHA="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+
+# Defaulted ONCE, here, and every later use reads these -- never the raw
+# names. `set -u` is deliberate and stays on, but `${DEPLOYED_COMMIT:0:8}`
+# carries no default: substring expansion of an unset variable is an
+# unbound-variable error, so the mismatch branch killed the script before
+# it printed RESULT or a single reason code. That is the one branch whose
+# entire job is to report the mismatch, and an operator reading a
+# two-line header saw no verdict at all rather than COMMIT_MISMATCH.
+# Blank stays blank in the message -- `<unset>` would be a claim the
+# variable was checked and found empty, which is a different fact.
+DEPLOYED_SAFE="${DEPLOYED_COMMIT:-}"
+VALIDATED_SAFE="${VALIDATED_COMMIT:-}"
+
 if [ "${HEAD_SHA}" = "unknown" ]; then
     fail COMMIT_UNREADABLE
-elif [ "${HEAD_SHA}" = "${DEPLOYED_COMMIT:-}" ] && [ "${HEAD_SHA}" = "${VALIDATED_COMMIT:-}" ]; then
+elif [ "${HEAD_SHA}" = "${DEPLOYED_SAFE}" ] && [ "${HEAD_SHA}" = "${VALIDATED_SAFE}" ]; then
     pass "commit HEAD==DEPLOYED==VALIDATED (${HEAD_SHA:0:8})"
 else
-    fail COMMIT_MISMATCH "HEAD=${HEAD_SHA:0:8} DEPLOYED=${DEPLOYED_COMMIT:0:8} VALIDATED=${VALIDATED_COMMIT:0:8}"
+    fail COMMIT_MISMATCH \
+        "HEAD=${HEAD_SHA:0:8} DEPLOYED=${DEPLOYED_SAFE:0:8} VALIDATED=${VALIDATED_SAFE:0:8}"
 fi
 
 if [ -z "$(git status --porcelain 2>/dev/null)" ]; then
