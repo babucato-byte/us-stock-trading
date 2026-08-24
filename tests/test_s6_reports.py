@@ -160,11 +160,22 @@ def master(monkeypatch):
 
 
 def publish(symbols, *, day=DAY, session="REGULAR", variant="S6-R",
-            status=scan_cycle.STATUS_OK, run_id="run-1"):
+            status=scan_cycle.STATUS_OK, run_id="run-1", generated_at=None):
+    """Publish rows stamped relative to T0, never to the wall clock.
+
+    `generated_at` used to be left to the publisher, which stamps
+    `now()`. Every report here is then read with a frozen `now=T0`
+    (14:00 UTC on DAY), so the candidate's age is `T0 - wall clock` --
+    positive all morning and NEGATIVE from 14:00 UTC onwards on the one
+    day DAY names. A freshness assertion that inverts partway through
+    its own trading day is measuring the test runner's clock, not the
+    handoff.
+    """
+    stamp = generated_at or (T0 - timedelta(seconds=90)).isoformat()
     rows = publisher.publish([Signal(s) for s in symbols],
                              strategy_id=s6_sessions.STRATEGY_ID,
                              trading_day=day, session=session, variant=variant,
-                             run_id=run_id)
+                             run_id=run_id, generated_at=stamp)
     publisher.mark_run(day, session, strategy_id=s6_sessions.STRATEGY_ID,
                        candidates=len(symbols), run_id=run_id, status=status,
                        started_at=(T0 - timedelta(seconds=90)).isoformat(),
@@ -1146,3 +1157,103 @@ class TestTheSnapshotCannotTrade:
         assert report["broker_submit_count"] == 0
         assert not any(name.startswith("submit") or name.startswith("place")
                        for name in broker.calls)
+
+
+# ====================================================================
+#  FUNDING IS A FACT ABOUT THE ACCOUNT, NOT AN ABSENCE OF MEASUREMENT
+# ====================================================================
+class TestNotEnoughCashIsABlockAndNotAnUnknown:
+    """The live account holds 74.01 USD orderable. S6 buys whole shares
+    only, one at a time, and fractional is OFF -- so a candidate priced
+    above the orderable figure cannot be bought at all.
+
+    That is a measured fact about the account and must read BLOCK /
+    ORDERABILITY_ZERO. It must NOT read NOT_MEASURED, which would say the
+    question went unanswered, and it must not read PASS. The opposite
+    error matters just as much: a read that did not land is NOT_MEASURED
+    and must never be dressed up as poverty, because
+    `whole_shares_affordable` returns 0 for an unusable figure exactly as
+    it does for a genuinely empty account.
+    """
+
+    #: The real production numbers, so this test fails if either the
+    #: sizing rule or the classification drifts.
+    ORDERABLE = 74.01
+    UNAFFORDABLE = 309.49   # UNP, the S6-R candidate on 2026-08-24
+    AFFORDABLE = 70.00
+
+    def _gate(self, orderable, price):
+        return final_check._cash_gate(
+            CountingBroker(orderable=orderable), "AAPL", price,
+            ReportBrokerSnapshotStub())
+
+    def test_a_share_priced_above_the_cash_is_a_block(self):
+        gate = self._gate(self.ORDERABLE, self.UNAFFORDABLE)
+        assert gate["status"] == final_check.BLOCK
+        assert final_check.ORDERABILITY_ZERO in gate["detail"]
+        assert "74.01" in gate["detail"]
+
+    def test_that_block_is_not_an_unknown(self):
+        gate = self._gate(self.ORDERABLE, self.UNAFFORDABLE)
+        assert gate["status"] != final_check.NOT_MEASURED
+        assert gate["status"] != final_check.PASS
+
+    def test_a_share_priced_within_the_cash_passes(self):
+        gate = self._gate(self.ORDERABLE, self.AFFORDABLE)
+        assert gate["status"] == final_check.PASS
+        assert final_check.ORDERABILITY_OK in gate["detail"]
+        assert "1 whole share" in gate["detail"]
+
+    def test_the_boundary_is_one_whole_share_not_a_fraction(self):
+        """At 74.02 the account affords 0.999... of a share. There is no
+        fractional path to fall back to, so it is a block."""
+        assert self._gate(self.ORDERABLE, 74.01)["status"] == final_check.PASS
+        assert self._gate(self.ORDERABLE, 74.02)["status"] == final_check.BLOCK
+
+    def test_the_count_is_a_floor_never_a_round(self):
+        """floor(74.01/40) == 1, not 2."""
+        gate = self._gate(self.ORDERABLE, 40.00)
+        assert gate["status"] == final_check.PASS
+        assert "1 whole share" in gate["detail"]
+
+    @pytest.mark.parametrize("unusable", [
+        None, float("nan"), float("inf"), -1.0, "74.01", True])
+    def test_an_unusable_figure_is_not_measured_never_zero(self, unusable):
+        gate = self._gate(lambda *_: unusable, self.UNAFFORDABLE)
+        assert gate["status"] == final_check.NOT_MEASURED, unusable
+        assert final_check.ORDERABILITY_ZERO not in gate["detail"]
+
+    def test_a_failed_read_is_not_measured_never_zero(self):
+        def boom(instrument, limit):
+            raise RuntimeError("KIS orderable-amount response unusable "
+                               "(output_missing)")
+
+        gate = self._gate(boom, self.UNAFFORDABLE)
+        assert gate["status"] == final_check.NOT_MEASURED
+        assert final_check.ORDERABILITY_ZERO not in gate["detail"]
+
+    def test_a_genuinely_empty_account_is_still_a_block(self):
+        """Zero cash is measured, not unknown."""
+        gate = self._gate(0.0, self.AFFORDABLE)
+        assert gate["status"] == final_check.BLOCK
+        assert final_check.ORDERABILITY_ZERO in gate["detail"]
+
+    def test_the_block_says_whole_shares_only(self):
+        """The operator reading this must not have to remember that
+        fractional is off before deciding the number looks wrong."""
+        detail = self._gate(self.ORDERABLE, self.UNAFFORDABLE)["detail"]
+        assert "whole shares only" in detail
+        assert "fractional is OFF" in detail
+
+
+class ReportBrokerSnapshotStub:
+    """A snapshot whose account read succeeded and holds no errors."""
+
+    def __init__(self):
+        self.positions, self.open_orders = [], []
+        self.account = {"cash": 74.01}
+        self.errors = {}
+        self.calls = {}
+
+    def count(self, name):
+        self.calls[name] = self.calls.get(name, 0) + 1
