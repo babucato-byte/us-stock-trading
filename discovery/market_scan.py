@@ -55,6 +55,11 @@ BATCH_PAUSE_SECONDS = 1.5
 #: "these symbols do not trade" are opposite findings and the ranking
 #: cannot tell them apart afterwards.
 MAX_BATCH_RETRIES = 3
+
+#: Ceiling on the adaptive interval. Beyond this a pass would not finish
+#: inside its hourly window, and a manifest that arrives after the next
+#: one was due is worth less than a partial one that arrives on time.
+MAX_PAUSE_SECONDS = 20.0
 RETRY_BACKOFF_SECONDS = 20.0
 
 #: Below this fraction of the universe priced, the pass is reported as
@@ -142,9 +147,23 @@ def fetch_today(symbols, *, trading_day, download=None,
 
         batches = list(_chunks(pending, batch_size))
         missing: List[str] = []
+        # Adaptive, because the degradation is not linear in pass length:
+        # 800 symbols priced 89% and 2,000 priced 91%, both at a fixed
+        # pause, while 12,886 priced 57%. The provider tolerates a burst
+        # and then throttles a sustained one, so a pause chosen for a
+        # short pass is the wrong pause for a long one -- and a pass
+        # that starts fine and degrades halfway is exactly what a fixed
+        # interval cannot notice.
+        #
+        # An empty batch is the observable signal, the same one the
+        # retry keys off. Consecutive empties widen the interval; a
+        # batch that comes back normally narrows it again, so a single
+        # unlucky batch does not slow the rest of the pass.
+        current_pause = float(pause)
+        empty_streak = 0
         for index, batch in enumerate(batches):
             if index:
-                time.sleep(float(pause))
+                time.sleep(current_pause)
             try:
                 bundle = download(batch)
             except Exception:  # noqa: BLE001 - one batch must not end the scan
@@ -153,12 +172,24 @@ def fetch_today(symbols, *, trading_day, download=None,
                                exc_info=True)
                 missing.extend(batch)
                 continue
+            found = 0
             for symbol in batch:
                 row = _measure(bundle, symbol, trading_day)
                 if row is None:
                     missing.append(symbol)
                 else:
                     out[symbol] = row
+                    found += 1
+
+            if found == 0 and batch:
+                empty_streak += 1
+                current_pause = min(current_pause * 2 or 1.0, MAX_PAUSE_SECONDS)
+                if empty_streak == 1:
+                    logger.info("market scan: a batch came back empty; "
+                                "widening the interval to %.1fs", current_pause)
+            elif found:
+                empty_streak = 0
+                current_pause = max(float(pause), current_pause / 2)
         pending = missing
     return out
 

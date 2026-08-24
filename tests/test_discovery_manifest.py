@@ -410,3 +410,79 @@ class TestAThrottledPassIsLabelledNotHidden:
     def test_the_batch_size_reflects_what_a_full_pass_sustains(self):
         """400 was fastest in isolation and throttled a real full pass."""
         assert market_scan.BATCH_SIZE < 400
+
+
+class TestThePacingRespondsToThrottling:
+    """Degradation is not linear in pass length: 800 symbols priced 89%
+    and 2,000 priced 91% at a fixed interval, while 12,886 priced 57%.
+    The provider tolerates a burst and throttles a sustained one, so an
+    interval chosen for a short pass is wrong for a long one -- and a
+    pass that starts healthy and degrades halfway is precisely what a
+    fixed interval cannot notice."""
+
+    def _download(self, empty_after=None):
+        import pandas as pd
+        state = {"calls": 0}
+
+        def download(tickers):
+            state["calls"] += 1
+            if empty_after is not None and state["calls"] > empty_after:
+                return {}
+            return {t: pd.DataFrame(
+                {"Close": [10.0], "Volume": [1_000_000]},
+                index=pd.to_datetime([DAY])) for t in tickers}
+
+        return download, state
+
+    def test_an_empty_batch_widens_the_interval(self, monkeypatch):
+        slept = []
+        monkeypatch.setattr(market_scan.time, "sleep", slept.append)
+        download, _ = self._download(empty_after=1)
+
+        market_scan.fetch_today([f"S{i}" for i in range(6)], trading_day=DAY,
+                                download=download, batch_size=1, pause=1.0,
+                                backoff=0, max_rounds=1)
+        assert any(s > 1.0 for s in slept), f"interval never widened: {slept}"
+
+    def test_a_healthy_batch_narrows_it_again(self, monkeypatch):
+        """One unlucky batch must not slow the rest of the pass."""
+        import pandas as pd
+        slept = []
+        monkeypatch.setattr(market_scan.time, "sleep", slept.append)
+        state = {"calls": 0}
+
+        def download(tickers):
+            state["calls"] += 1
+            if state["calls"] == 2:
+                return {}
+            return {t: pd.DataFrame(
+                {"Close": [10.0], "Volume": [1_000_000]},
+                index=pd.to_datetime([DAY])) for t in tickers}
+
+        market_scan.fetch_today([f"S{i}" for i in range(6)], trading_day=DAY,
+                                download=download, batch_size=1, pause=1.0,
+                                backoff=0, max_rounds=1)
+        assert slept[-1] <= slept[0] * 2, f"stayed widened: {slept}"
+
+    def test_the_interval_is_capped(self, monkeypatch):
+        """A pass that never finishes inside its hourly window is worth
+        less than a partial one that arrives on time."""
+        slept = []
+        monkeypatch.setattr(market_scan.time, "sleep", slept.append)
+        download, _ = self._download(empty_after=0)
+
+        market_scan.fetch_today([f"S{i}" for i in range(20)],
+                                trading_day=DAY, download=download,
+                                batch_size=1, pause=1.0, backoff=0,
+                                max_rounds=1)
+        assert max(slept) <= market_scan.MAX_PAUSE_SECONDS
+
+    def test_a_healthy_pass_keeps_the_base_interval(self, monkeypatch):
+        slept = []
+        monkeypatch.setattr(market_scan.time, "sleep", slept.append)
+        download, _ = self._download()
+
+        market_scan.fetch_today([f"S{i}" for i in range(5)], trading_day=DAY,
+                                download=download, batch_size=1, pause=1.0,
+                                backoff=0, max_rounds=1)
+        assert set(slept) == {1.0}, slept
