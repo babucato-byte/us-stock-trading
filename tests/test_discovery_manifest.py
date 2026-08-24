@@ -317,3 +317,74 @@ class TestTheScannerNodeCannotTrade:
             for secret in ("KIS_APP_KEY", "APP_SECRET", "ACCOUNT_NO",
                            "ALPACA_API_KEY", "access_token"):
                 assert secret not in text, f"{relative} mentions {secret}"
+
+
+class TestAThrottledPassIsLabelledNotHidden:
+    """A 12,886-name run priced 4,038 before the provider answered
+    YFRateLimitError for the rest. The top 600 of an arbitrary third is
+    not the market's top 600, and a manifest that did not say so would
+    carry that sampling bias with no way to see it."""
+
+    def test_a_partial_pass_is_usable_but_marked(self):
+        doc = _doc(coverage=0.31, complete=False)
+        v = mf.validate(doc, trading_day=DAY, now=NOW)
+        assert v["status"] == mf.PARTIAL
+        assert v["symbols"], "a partial ranking is still usable"
+        assert "31%" in v["detail"]
+
+    def test_a_complete_pass_is_valid(self):
+        v = mf.validate(_doc(coverage=0.94, complete=True),
+                        trading_day=DAY, now=NOW)
+        assert v["status"] == mf.VALID
+        assert "94%" in v["detail"]
+
+    def test_partial_is_not_refused(self):
+        """Refusing it would send the trading node back to the previous
+        day's ranking -- the staleness this whole split replaces."""
+        assert mf.PARTIAL != mf.STALE
+        assert mf.validate(_doc(coverage=0.2, complete=False),
+                           trading_day=DAY, now=NOW)["symbols"]
+
+    def test_coverage_is_computed_from_what_was_priced(self):
+        measured = {f"S{i}": {"price": 10.0, "volume": 1_000_000,
+                              "dollar_volume": 10_000_000.0,
+                              "avg_volume": 1e6, "relative_volume": 1.0}
+                    for i in range(2)}
+
+        def download(tickers):
+            import pandas as pd
+            return {t: pd.DataFrame(
+                {"Close": [10.0], "Volume": [1_000_000]},
+                index=pd.to_datetime([DAY])) for t in tickers[:2]}
+
+        doc = market_scan.run(["A", "B", "C", "D"], trading_day=DAY,
+                              session="REGULAR", download=download)
+        assert doc["universe_size"] == 4
+        assert doc["coverage"] == 0.5
+        assert doc["complete"] is False
+
+    def test_a_throttled_batch_is_retried_before_being_given_up(self, monkeypatch):
+        monkeypatch.setattr(market_scan, "RETRY_BACKOFF_SECONDS", 0.0)
+        monkeypatch.setattr(market_scan, "BATCH_PAUSE_SECONDS", 0.0)
+        attempts = []
+
+        class YFRateLimitError(Exception):
+            pass
+
+        def download(tickers):
+            attempts.append(tickers)
+            if len(attempts) < 2:
+                raise YFRateLimitError("Too Many Requests. Rate limited.")
+            import pandas as pd
+            return {t: pd.DataFrame(
+                {"Close": [10.0], "Volume": [1_000_000]},
+                index=pd.to_datetime([DAY])) for t in tickers}
+
+        measured = market_scan.fetch_today(["A"], trading_day=DAY,
+                                           download=download)
+        assert len(attempts) == 2, "the throttled batch was not retried"
+        assert "A" in measured
+
+    def test_the_batch_size_reflects_what_a_full_pass_sustains(self):
+        """400 was fastest in isolation and throttled a real full pass."""
+        assert market_scan.BATCH_SIZE < 400

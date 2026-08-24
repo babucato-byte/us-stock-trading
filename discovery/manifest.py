@@ -51,6 +51,9 @@ SCHEMA_MISMATCH = "SCHEMA_MISMATCH"
 WRONG_TRADING_DAY = "WRONG_TRADING_DAY"
 STALE = "STALE"
 DUPLICATE_SYMBOLS = "DUPLICATE_SYMBOLS"
+#: Usable, but drawn from a sample of the market rather than all
+#: of it -- the provider throttled part of the pass.
+PARTIAL = "PARTIAL"
 EMPTY = "EMPTY"
 
 #: How old a manifest may be and still inform a NEW entry.
@@ -85,7 +88,8 @@ def _as_utc(value) -> Optional[datetime]:
 
 def build(*, trading_day, session, symbols, scanner_commit=None,
           scan_id=None, universe_size=None, evaluated=None,
-          duration_seconds=None, generated_at=None) -> Dict[str, Any]:
+          duration_seconds=None, generated_at=None, coverage=None,
+          complete=None) -> Dict[str, Any]:
     """The canonical document. Pure -- writes nothing."""
     return {
         "schema_version": SCHEMA_VERSION,
@@ -99,6 +103,11 @@ def build(*, trading_day, session, symbols, scanner_commit=None,
         "first_stage_evaluated": evaluated,
         "first_stage_passed": len(symbols),
         "scan_duration_seconds": duration_seconds,
+        # What fraction of the universe was actually priced. A provider
+        # that throttles halfway leaves a ranking drawn from a sample,
+        # and the reader must be able to see that rather than infer it.
+        "coverage": coverage,
+        "complete": complete,
         "symbols": list(symbols),
     }
 
@@ -198,5 +207,16 @@ def validate(document, *, trading_day, now=None,
                 "detail": f"{len(names) - len(set(names))} duplicate symbol(s)",
                 "symbols": [], "age_seconds": age}
 
-    return {"status": VALID, "detail": f"{len(rows)} symbols, {age:.0f}s old",
-            "symbols": rows, "age_seconds": age}
+    coverage = document.get("coverage")
+    detail = f"{len(rows)} symbols, {age:.0f}s old"
+    if coverage is not None:
+        detail += f", coverage {float(coverage) * 100:.0f}%"
+    if document.get("complete") is False:
+        # VALID, not refused: a partial ranking still beats yesterday's,
+        # and refusing it would send the trading node back to the very
+        # staleness this replaces. Labelled so the manifest cannot be
+        # read as a complete market sweep.
+        return {"status": PARTIAL, "detail": detail, "symbols": rows,
+                "age_seconds": age, "coverage": coverage}
+    return {"status": VALID, "detail": detail, "symbols": rows,
+            "age_seconds": age, "coverage": coverage}

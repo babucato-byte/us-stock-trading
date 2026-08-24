@@ -454,7 +454,13 @@ def run_scanners(
         report.manifest_status = verdict["status"]
         report.manifest_detail = verdict["detail"]
         report.manifest_age_seconds = verdict.get("age_seconds")
-        if verdict["status"] == manifest_module.VALID:
+        # PARTIAL is usable. The provider throttles a full-market pass
+        # part-way, and a ranking from part of today's market is still a
+        # better answer than all of yesterday's -- which is the exact
+        # staleness the manifest exists to replace. It is labelled, not
+        # refused, so the run record shows what it was drawn from.
+        if verdict["status"] in (manifest_module.VALID,
+                                 manifest_module.PARTIAL):
             symbols = [str(r["symbol"]).upper() for r in verdict["symbols"]]
             report.universe_type = UNIVERSE_MANIFEST
             logger.info("manifest universe: %s symbols (%s)",

@@ -38,9 +38,29 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-#: Symbols per provider call. 400 measured fastest per symbol; larger
-#: batches start losing names to partial responses.
-BATCH_SIZE = 400
+#: Symbols per provider call. 400 was fastest per symbol in isolation
+#: and is NOT what a full pass can sustain: a 12,886-name run at 400
+#: priced only 4,038 (31%) before the provider answered
+#: YFRateLimitError for the rest. A manifest built from whichever third
+#: arrived first is not "the market's top 600" -- it is the top 600 of
+#: an arbitrary sample, and it would carry that bias silently.
+BATCH_SIZE = 150
+
+#: Seconds to wait between batches. The limiter is per-window, not
+#: per-request, so pacing is what keeps a long pass inside it; going
+#: faster does not finish sooner when the tail is refused.
+BATCH_PAUSE_SECONDS = 1.5
+
+#: A rate-limited batch is retried, because "we were throttled" and
+#: "these symbols do not trade" are opposite findings and the ranking
+#: cannot tell them apart afterwards.
+MAX_BATCH_RETRIES = 3
+RETRY_BACKOFF_SECONDS = 20.0
+
+#: Below this fraction of the universe priced, the pass is reported as
+#: PARTIAL. The trading node then knows the ranking it is reading was
+#: drawn from a sample rather than the market.
+MIN_COVERAGE_FOR_COMPLETE = 0.80
 
 #: A share the account cannot buy whole at qty 1 is not worth a
 #: precision scan. Not a strategy threshold -- an execution fact.
@@ -94,12 +114,30 @@ def fetch_today(symbols, *, trading_day, download=None,
                                progress=False, threads=True)
 
     out: Dict[str, Dict[str, float]] = {}
-    for batch in _chunks(list(symbols), batch_size):
-        try:
-            bundle = download(batch)
-        except Exception:  # noqa: BLE001 - one batch must not end the scan
-            logger.warning("market scan: a batch of %d failed", len(batch),
-                           exc_info=True)
+    batches = list(_chunks(list(symbols), batch_size))
+    for index, batch in enumerate(batches):
+        if index:
+            time.sleep(BATCH_PAUSE_SECONDS)
+        bundle = None
+        for attempt in range(1, MAX_BATCH_RETRIES + 1):
+            try:
+                bundle = download(batch)
+                break
+            except Exception as exc:  # noqa: BLE001 - one batch must not end the scan
+                throttled = "ratelimit" in type(exc).__name__.lower() \
+                    or "too many requests" in str(exc).lower()
+                if throttled and attempt < MAX_BATCH_RETRIES:
+                    wait = RETRY_BACKOFF_SECONDS * attempt
+                    logger.warning("market scan: throttled on batch %d/%d, "
+                                   "waiting %.0fs (attempt %d)",
+                                   index + 1, len(batches), wait, attempt)
+                    time.sleep(wait)
+                    continue
+                logger.warning("market scan: batch %d/%d of %d failed (%s)",
+                               index + 1, len(batches), len(batch),
+                               type(exc).__name__)
+                break
+        if bundle is None:
             continue
         for symbol in batch:
             frame = _frame_for(bundle, symbol)
@@ -191,11 +229,22 @@ def run(symbols, *, trading_day, session, scanner_commit=None,
                 max_symbols=max_symbols)
     duration = round(time.monotonic() - started, 3)
 
-    logger.info("market scan: universe=%s priced=%s passed=%s in %.1fs",
-                len(universe), len(measured), len(rows), duration)
+    coverage = (len(measured) / len(universe)) if universe else 0.0
+    complete = coverage >= MIN_COVERAGE_FOR_COMPLETE
+    if not complete:
+        # Said out loud. A ranking drawn from a third of the market is
+        # not the market's ranking, and the trading node has to be able
+        # to tell the difference -- a quiet "top 600" would carry the
+        # sampling bias with no way to see it.
+        logger.warning("market scan PARTIAL: only %.0f%% of the universe was "
+                       "priced; the ranking is drawn from a sample",
+                       coverage * 100)
+    logger.info("market scan: universe=%s priced=%s (%.0f%%) passed=%s in %.1fs",
+                len(universe), len(measured), coverage * 100, len(rows), duration)
     return manifest_module.build(
         trading_day=trading_day, session=session, symbols=rows,
         scanner_commit=scanner_commit, scan_id=scan_id,
         universe_size=len(universe), evaluated=len(measured),
-        duration_seconds=duration,
+        duration_seconds=duration, coverage=round(coverage, 4),
+        complete=complete,
         generated_at=datetime.now(timezone.utc).isoformat())
