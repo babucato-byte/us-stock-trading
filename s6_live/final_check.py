@@ -71,6 +71,40 @@ GATES = (
 #: broker connection and is NOT_MEASURED without one.
 OFFLINE_GATES = frozenset({"instrument", "risk_matrix"})
 
+#: Why the orderable-cash read ended the way it did. One NOT_MEASURED
+#: covering all of these hid the difference between "KIS refused the
+#: call" and "the account has no money", which need opposite responses.
+ORDERABILITY_OK = "ORDERABILITY_OK"
+ORDERABILITY_ZERO = "ORDERABILITY_ZERO"
+ORDERABILITY_SESSION_UNAVAILABLE = "ORDERABILITY_SESSION_UNAVAILABLE"
+ORDERABILITY_RATE_LIMITED = "ORDERABILITY_RATE_LIMITED"
+ORDERABILITY_API_ERROR = "ORDERABILITY_API_ERROR"
+ORDERABILITY_AUTH_ERROR = "ORDERABILITY_AUTH_ERROR"
+ORDERABILITY_PARSE_ERROR = "ORDERABILITY_PARSE_ERROR"
+ORDERABILITY_EXCHANGE_MAPPING_ERROR = "ORDERABILITY_EXCHANGE_MAPPING_ERROR"
+ORDERABILITY_PRICE_INVALID = "ORDERABILITY_PRICE_INVALID"
+ORDERABILITY_UNKNOWN = "ORDERABILITY_UNKNOWN"
+
+
+def _orderability_reason(exc) -> str:
+    """Classify a failed orderable-cash read from the exception itself."""
+    name = type(exc).__name__
+    text = str(exc).lower()
+    if "unavailable" in name.lower() or "KISOrderableCashUnavailable" in name:
+        return ORDERABILITY_PARSE_ERROR
+    if "rate" in text or "limit" in text or "429" in text or "초당" in text:
+        return ORDERABILITY_RATE_LIMITED
+    if "token" in text or "auth" in text or "401" in text or "403" in text:
+        return ORDERABILITY_AUTH_ERROR
+    if "session" in text or "장운영" in text or "거래시간" in text:
+        return ORDERABILITY_SESSION_UNAVAILABLE
+    if "timeout" in text or "connection" in text or "http" in text \
+            or "500" in text or "502" in text or "503" in text:
+        return ORDERABILITY_API_ERROR
+    if "Broker" in name or "KIS" in name:
+        return ORDERABILITY_API_ERROR
+    return ORDERABILITY_UNKNOWN
+
 
 def _strategy_live_mode(modes=None) -> str:
     """Whether S6 ITSELF is promoted -- not what its session permits."""
@@ -334,6 +368,18 @@ def _candidate_facts(day, session, variant, *, modes, conn, broker, rollout,
     # and "the gates were never reached".
     blocked_before_gates = described.get("refusal")
 
+    # Gates are evaluated ONCE PER SYMBOL, not once per published row.
+    #
+    # The store is append-only, so fifteen scans of the same session hold
+    # fifteen rows for the same two symbols. Evaluating per row made
+    # fifteen times the necessary KIS calls -- the orderable-amount read,
+    # the price-detail read and the open-order read, each rate-limited --
+    # and the limiter then refused the later ones, so `cash_orderability`
+    # and `kis_execution_sanity` came back NOT_MEASURED for candidates
+    # that were perfectly answerable. A report that degrades its own
+    # answers by asking too often is worse than a slow one.
+    gate_cache: Dict[str, Dict[str, Dict[str, str]]] = {}
+
     rows: List[Dict[str, Any]] = []
     for row in enriched:
         symbol = str(row.get("symbol") or "").upper()
@@ -364,11 +410,11 @@ def _candidate_facts(day, session, variant, *, modes, conn, broker, rollout,
                 (qualification.reason_code or qualification.detail)
                 if qualification is not None and not qualification.qualified
                 else None),
-            "buy_gates": _gates_for(
+            "buy_gates": gate_cache.setdefault(symbol, _gates_for(
                 symbol, offered=offered, qualification=qualification,
                 conn=conn, broker=broker, rollout=rollout, session=session,
                 blocked_before_gates=blocked_before_gates,
-                price=row.get("price")),
+                price=row.get("price"))),
         })
     facts["candidates"] = rows
 
@@ -637,32 +683,46 @@ def _cash_gate(broker, symbol, price=None) -> Dict[str, str]:
         limit = float(price) if price is not None else None
     except (TypeError, ValueError):
         limit = None
-    if limit is None or limit <= 0:
+    if limit is None or limit <= 0 or limit != limit:
         return _result(NOT_MEASURED,
-                       "the account is readable; no usable candidate price "
-                       "to ask orderable cash about")
+                       f"{ORDERABILITY_PRICE_INVALID}: no usable candidate "
+                       f"price ({price!r}) to ask orderable cash about")
 
     try:
         from market_data.exchange_registry import build_kis_instrument
 
         instrument, _record = build_kis_instrument(symbol)
-        available = broker.get_orderable_usd(instrument, limit)
     except Exception as exc:  # noqa: BLE001
-        return _result(NOT_MEASURED,
-                       f"orderable-amount read unavailable: {str(exc)[:120]}")
+        return _result(BLOCK,
+                       f"{ORDERABILITY_EXCHANGE_MAPPING_ERROR}: {str(exc)[:120]}")
 
+    try:
+        available = broker.get_orderable_usd(instrument, limit)
+    except Exception as exc:  # noqa: BLE001 - an unanswered question is
+        # never "no cash". Classified so a rate limit, an auth failure and
+        # a genuinely empty account are three different findings.
+        return _result(NOT_MEASURED,
+                       f"{_orderability_reason(exc)}: {str(exc)[:140]}")
+
+    if available is None:
+        return _result(NOT_MEASURED,
+                       f"{ORDERABILITY_PARSE_ERROR}: KIS returned no usable "
+                       f"orderable amount")
     try:
         from domain.cash_sizing import whole_shares_affordable
 
         shares = whole_shares_affordable(available, limit)
-    except Exception:  # noqa: BLE001
-        shares = int(available // limit) if limit else 0
+    except Exception as exc:  # noqa: BLE001
+        return _result(NOT_MEASURED,
+                       f"{ORDERABILITY_PARSE_ERROR}: {str(exc)[:120]}")
     if shares < 1:
+        # A real, parsed answer: there IS no money for a whole share.
+        # That is a BLOCK, not an absence of measurement.
         return _result(BLOCK,
-                       f"orderable {available:.2f} USD affords 0 whole shares "
-                       f"at {limit:.2f}")
-    return _result(PASS, f"orderable {available:.2f} USD affords {shares} "
-                         f"whole share(s) at {limit:.2f}")
+                       f"{ORDERABILITY_ZERO}: orderable {available:.2f} USD "
+                       f"affords 0 whole shares at {limit:.2f}")
+    return _result(PASS, f"{ORDERABILITY_OK}: orderable {available:.2f} USD "
+                         f"affords {shares} whole share(s) at {limit:.2f}")
 
 
 def _reconciliation_gate(conn, broker) -> Dict[str, str]:

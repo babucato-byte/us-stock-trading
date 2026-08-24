@@ -219,3 +219,109 @@ class TestNothingHerePromotes:
             variant_state.PASS
         assert state.may_order is False
         assert state.mode == variant_state.BLOCKED_ORDER_ROUTE
+
+
+class TestOrderabilityIsClassified:
+    """§2/§7: "KIS refused the call" and "the account has no money" need
+    opposite responses, so one NOT_MEASURED must not cover both."""
+
+    class Broker:
+        def __init__(self, amount=None, error=None):
+            self._amount, self._error = amount, error
+
+        def get_account_snapshot(self):
+            class S:
+                account_id = "acct"
+            return S()
+
+        def get_orderable_usd(self, instrument, limit):
+            if self._error:
+                raise self._error
+            return self._amount
+
+        def submit_order(self, *a, **k):
+            raise AssertionError("a dry-run must never place an order")
+
+    def _gate(self, broker, price=16.39, symbol="AAPL"):
+        from s6_live import final_check
+
+        return final_check._cash_gate(broker, symbol, price)
+
+    def test_a_real_amount_that_affords_a_share_passes(self):
+        from s6_live import final_check
+
+        v = self._gate(self.Broker(amount=74.01))
+        assert v["status"] == final_check.PASS
+        assert final_check.ORDERABILITY_OK in v["detail"]
+
+    def test_zero_cash_is_a_block_not_an_absence(self):
+        from s6_live import final_check
+
+        v = self._gate(self.Broker(amount=0.0))
+        assert v["status"] == final_check.BLOCK
+        assert final_check.ORDERABILITY_ZERO in v["detail"]
+
+    def test_too_little_for_one_whole_share_is_a_block(self):
+        from s6_live import final_check
+
+        v = self._gate(self.Broker(amount=5.0), price=16.39)
+        assert v["status"] == final_check.BLOCK
+        assert final_check.ORDERABILITY_ZERO in v["detail"]
+
+    def test_a_rate_limited_read_is_not_measured_and_says_so(self):
+        from s6_live import final_check
+
+        v = self._gate(self.Broker(error=RuntimeError("rate limit exceeded")))
+        assert v["status"] == final_check.NOT_MEASURED
+        assert final_check.ORDERABILITY_RATE_LIMITED in v["detail"]
+
+    def test_an_auth_failure_is_its_own_reason(self):
+        from s6_live import final_check
+
+        v = self._gate(self.Broker(error=RuntimeError("token expired 401")))
+        assert v["status"] == final_check.NOT_MEASURED
+        assert final_check.ORDERABILITY_AUTH_ERROR in v["detail"]
+
+    def test_a_none_response_is_a_parse_error_not_zero_cash(self):
+        from s6_live import final_check
+
+        v = self._gate(self.Broker(amount=None))
+        assert v["status"] == final_check.NOT_MEASURED
+        assert final_check.ORDERABILITY_PARSE_ERROR in v["detail"]
+
+    def test_an_unusable_price_is_never_a_broker_call(self):
+        from s6_live import final_check
+
+        broker = self.Broker(error=AssertionError("must not be called"))
+        v = final_check._cash_gate(broker, "AAPL", None)
+        assert v["status"] == final_check.NOT_MEASURED
+        assert final_check.ORDERABILITY_PRICE_INVALID in v["detail"]
+
+    def test_an_unmappable_symbol_blocks(self):
+        from s6_live import final_check
+
+        v = self._gate(self.Broker(amount=74.01), symbol="NOT A REAL SYMBOL")
+        assert v["status"] in (final_check.BLOCK, final_check.NOT_MEASURED)
+
+    def test_a_failed_read_never_becomes_a_pass(self):
+        from s6_live import final_check
+
+        for err in (RuntimeError("boom"), ValueError("nope"),
+                    RuntimeError("503 upstream")):
+            assert self._gate(self.Broker(error=err))["status"] != \
+                final_check.PASS
+
+
+class TestGatesAreEvaluatedOncePerSymbol:
+    """The append-only store holds many rows per symbol; evaluating
+    broker gates per ROW made 15x the rate-limited KIS calls and the
+    limiter then refused the later ones."""
+
+    def test_the_report_caches_gates_by_symbol(self):
+        import inspect
+
+        from s6_live import final_check
+
+        source = inspect.getsource(final_check._candidate_facts)
+        assert "gate_cache" in source
+        assert "gate_cache.setdefault(symbol" in source
