@@ -131,6 +131,15 @@ PROFILE_UNIVERSE = {
 
 UNIVERSE_FULL = "full"
 UNIVERSE_ACTIVE = "active"
+#: Symbols chosen by the SCANNER NODE from today's whole-market data.
+#: See discovery/manifest.py. Falls back to the active ranking when the
+#: manifest is missing, stale or malformed -- the trading node must not
+#: take a laptop's uptime as a dependency of its own discovery.
+UNIVERSE_MANIFEST = "manifest"
+
+#: Where the trading node looks for the scanner node's manifest. The
+#: scanner node writes it here over scp; nothing else writes to it.
+MANIFEST_DEFAULT_PATH = "shared/state/discovery/manifest.json"
 
 
 @dataclass
@@ -183,6 +192,11 @@ class RunReport:
     #: On the manifest so a shrinking universe is a number in the record
     #: rather than something reconstructed from a log line.
     universe_selection: Dict[str, Any] = field(default_factory=dict)
+    #: How the scanner node's manifest was judged this run, and how old
+    #: it was. On the manifest so "we fell back" is a recorded fact.
+    manifest_status: Optional[str] = None
+    manifest_detail: Optional[str] = None
+    manifest_age_seconds: Optional[float] = None
     eligibility_summary: Dict[str, Any] = field(default_factory=dict)
     required_history_bars: int = 0
 
@@ -281,6 +295,9 @@ class RunReport:
             "duration_seconds": round(self.duration_seconds, 3),
             "skipped_reason": self.skipped_reason,
             "universe_selection": dict(self.universe_selection),
+            "manifest_status": self.manifest_status,
+            "manifest_detail": self.manifest_detail,
+            "manifest_age_seconds": self.manifest_age_seconds,
             "scanners": [outcome.summary() for outcome in self.outcomes],
         }
 
@@ -345,6 +362,7 @@ def run_scanners(
     universe_type: Optional[str] = None,
     active_pool_size: int = act.DEFAULT_POOL_SIZE,
     supplement_size: int = intraday_supplement.DEFAULT_SUPPLEMENT_SIZE,
+    manifest_path: Optional[str] = None,
     publish: bool = False,
 ) -> RunReport:
     """Run the requested scanners over the requested symbols.
@@ -426,6 +444,30 @@ def run_scanners(
                          if use_eligibility
                          else elig.NullEligibilityStore(report.provider))
     universe_selection = None
+
+    if symbols is None and selected_universe == UNIVERSE_MANIFEST:
+        from discovery import manifest as manifest_module
+
+        verdict = manifest_module.validate(
+            manifest_module.read(manifest_path or MANIFEST_DEFAULT_PATH),
+            trading_day=day)
+        report.manifest_status = verdict["status"]
+        report.manifest_detail = verdict["detail"]
+        report.manifest_age_seconds = verdict.get("age_seconds")
+        if verdict["status"] == manifest_module.VALID:
+            symbols = [str(r["symbol"]).upper() for r in verdict["symbols"]]
+            report.universe_type = UNIVERSE_MANIFEST
+            logger.info("manifest universe: %s symbols (%s)",
+                        len(symbols), verdict["detail"])
+        else:
+            # Every non-VALID verdict falls back to the server's own
+            # ranking. A stale laptop must degrade this scan to what it
+            # would have been anyway, never stop it -- and never let it
+            # trade on symbols nobody re-derived today.
+            logger.warning("manifest unusable (%s: %s); falling back to the "
+                           "active ranking", verdict["status"], verdict["detail"])
+            selected_universe = UNIVERSE_ACTIVE
+            report.universe_type = UNIVERSE_ACTIVE
 
     if symbols is None:
         if selected_universe == UNIVERSE_ACTIVE:
@@ -837,9 +879,14 @@ def parse_args(argv=None):
                         help="evaluate and print without writing to the analytics store")
     parser.add_argument("--ignore-market-calendar", action="store_true",
                         help="run even when the US market is closed (backfill/testing)")
-    parser.add_argument("--universe", choices=[UNIVERSE_FULL, UNIVERSE_ACTIVE], default=None,
+    parser.add_argument("--universe",
+                        choices=[UNIVERSE_FULL, UNIVERSE_ACTIVE,
+                                 UNIVERSE_MANIFEST], default=None,
                         help="which universe to draw from; defaults to the profile's "
                              "own (daily=full, premarket/open=active)")
+    parser.add_argument("--manifest-path", default=None,
+                        help="the scanner node's candidate manifest; used "
+                             "with --universe manifest")
     parser.add_argument("--supplement-size", type=int,
                         default=intraday_supplement.DEFAULT_SUPPLEMENT_SIZE,
                         help="how many intraday-active names may join the "
@@ -1084,6 +1131,7 @@ def _run_and_report(args, *, names, symbols, day, session) -> int:
         # "explicitly disabled" produce an identical scan.
         supplement_size=getattr(args, "supplement_size",
                                 intraday_supplement.DEFAULT_SUPPLEMENT_SIZE),
+        manifest_path=getattr(args, "manifest_path", None),
         use_eligibility=not args.no_eligibility,
         # Publication happens inside the run now, before the manifest is
         # written, so the record of what was handed over is part of the
