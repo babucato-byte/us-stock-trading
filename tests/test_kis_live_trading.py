@@ -367,3 +367,223 @@ class TestPerSymbolOutcomes:
         results = klt.run_live_buy_entry_cycle(broker=broker, live_rollout=_rollout(), now=NOW)
         assert results["submitted"] == []
         assert broker.submit_calls == []
+
+
+# ====================================================================
+#  A CANDIDATE-SPECIFIC REFUSAL SKIPS THAT CANDIDATE, NOT THE CYCLE
+# ====================================================================
+class _RankedBroker(_FakeBroker):
+    """Per-symbol price and orderable cash, so one candidate can be
+    unaffordable while a lower-ranked one is not."""
+
+    def __init__(self, prices, orderable, **kw):
+        super().__init__(**kw)
+        self._prices = dict(prices)
+        self._orderable = orderable
+
+    def get_current_price(self, instrument):
+        self.call_log.append(f"get_current_price:{instrument.symbol}")
+        value = self._prices.get(instrument.symbol)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def get_orderable_usd(self, instrument, limit_price_usd):
+        self.call_log.append(f"get_orderable_usd:{instrument.symbol}@{limit_price_usd}")
+        value = self._orderable
+        if callable(value):
+            value = value(instrument.symbol)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+
+def _refusals(results):
+    """Every per-candidate refusal, whichever bucket it landed in.
+
+    The cycle distinguishes them: `skipped` is "never in the allow-list"
+    and `blocked` is "evaluated and refused". Both are candidate-scoped
+    and neither may end the cycle, which is what these tests assert.
+    """
+    return dict(list(results["skipped"]) + list(results["blocked"]))
+
+
+def _priced(prices):
+    """analyze_stock stub whose signal price matches the KIS quote."""
+    def analyze(symbol):
+        row = dict(_high_score_result(symbol))
+        row["price"] = prices[symbol]
+        return row
+    return analyze
+
+
+class TestRankedFallbackOnCandidateSpecificRefusals:
+    """The account holds 74 USD. Rank 1 costs 300 a share and rank 2
+    costs 20. Whole shares only, no fractional -- so rank 1 cannot be
+    bought and rank 2 can.
+
+    A cycle that stopped at rank 1 would let one unaffordable name
+    silence every candidate behind it, and on the live account (74.01
+    USD orderable against a 310 USD rank-1 candidate) that is not a
+    hypothetical. The refusal is a fact about ONE symbol, so it must
+    skip that symbol and keep going.
+
+    The opposite must also hold: an account- or system-level failure is
+    not candidate-specific and must stop the whole cycle. Those are
+    covered by TestStructuralBlocks, which asserts each one RAISES
+    before any candidate is looked at.
+    """
+
+    PRICES = {"UNP": 300.0, "F": 20.0}
+    ORDERABLE = 74.0
+
+    def _run(self, monkeypatch, broker, tickers=("UNP", "F"),
+             prices=None, **rollout_kw):
+        prices = prices or self.PRICES
+        _patch_common(monkeypatch, tickers=tickers, analyze=_priced(prices))
+        return klt.run_live_buy_entry_cycle(
+            broker=broker,
+            live_rollout=_rollout(allowed_symbols=frozenset(tickers),
+                                  **rollout_kw),
+            now=NOW)
+
+    def test_the_unaffordable_rank_one_does_not_end_the_cycle(self, monkeypatch):
+        broker = _RankedBroker(self.PRICES, self.ORDERABLE)
+        results = self._run(monkeypatch, broker)
+
+        assert results["submitted"] == ["F"], results
+        assert len(broker.submit_calls) == 1
+        assert broker.submit_calls[0][1].symbol == "F"
+
+    def test_the_skip_reason_names_the_cash(self, monkeypatch):
+        broker = _RankedBroker(self.PRICES, self.ORDERABLE)
+        results = self._run(monkeypatch, broker)
+
+        refusals = _refusals(results)
+        assert "UNP" in refusals
+        assert "orderable cash" in refusals["UNP"]
+
+    def test_rank_two_was_actually_evaluated_not_merely_listed(self, monkeypatch):
+        """The cheap name must reach the cash read, which only happens
+        if the loop continued past rank 1."""
+        broker = _RankedBroker(self.PRICES, self.ORDERABLE)
+        self._run(monkeypatch, broker)
+        assert any(c.startswith("get_orderable_usd:F") for c in broker.call_log)
+
+    def test_a_symbol_data_failure_also_only_skips_that_symbol(self, monkeypatch):
+        """A quote that cannot be fetched is a fact about one ticker."""
+        prices = {"INTC": KISBrokerError("no quote for this symbol"),
+                  "F": 20.0}
+        broker = _RankedBroker(prices, self.ORDERABLE)
+        results = self._run(monkeypatch, broker, tickers=("INTC", "F"),
+                            prices=prices)
+
+        assert results["submitted"] == ["F"], results
+        assert "INTC" in _refusals(results)
+
+    def test_an_unreadable_cash_figure_skips_only_that_symbol(self, monkeypatch):
+        """NOT_MEASURED for one symbol is not a verdict on the next."""
+        def orderable(symbol):
+            if symbol == "UNP":
+                return KISBrokerError("orderable-amount response unusable")
+            return self.ORDERABLE
+
+        broker = _RankedBroker(self.PRICES, orderable)
+        results = self._run(monkeypatch, broker)
+
+        assert results["submitted"] == ["F"], results
+        assert "UNP" in _refusals(results)
+
+    def test_a_symbol_outside_the_allowlist_skips_only_itself(self, monkeypatch):
+        broker = _RankedBroker(self.PRICES, self.ORDERABLE)
+        _patch_common(monkeypatch, tickers=("UNP", "F"),
+                      analyze=_priced(self.PRICES))
+        results = klt.run_live_buy_entry_cycle(
+            broker=broker,
+            live_rollout=_rollout(allowed_symbols=frozenset({"F"})),
+            now=NOW)
+
+        assert results["submitted"] == ["F"], results
+        assert "UNP" in _refusals(results)
+
+    def test_nothing_affordable_submits_nothing_and_still_completes(self, monkeypatch):
+        """Every candidate refused for its own reason is an empty cycle,
+        not an exception: the account is fine, the names are not."""
+        broker = _RankedBroker({"UNP": 300.0, "NVDA": 400.0},
+                               self.ORDERABLE)
+        results = self._run(monkeypatch, broker,
+                            tickers=("UNP", "NVDA"),
+                            prices={"UNP": 300.0, "NVDA": 400.0})
+
+        assert results["submitted"] == []
+        assert len(broker.submit_calls) == 0
+        assert len(_refusals(results)) == 2
+
+    def test_the_first_affordable_candidate_wins_not_the_highest_scored(
+            self, monkeypatch):
+        """Selection is 'first in rank order that clears every gate',
+        which is not the same as 'best score'. Rank 1 here is the one
+        that cannot be executed."""
+        broker = _RankedBroker(
+            {"UNP": 300.0, "PFE": 60.0, "F": 20.0}, self.ORDERABLE)
+        results = self._run(
+            monkeypatch, broker, tickers=("UNP", "PFE", "F"),
+            prices={"UNP": 300.0, "PFE": 60.0, "F": 20.0})
+
+        # PFE at 60 is affordable at 74 and comes before F at 20.
+        assert results["submitted"] == ["PFE"], results
+        assert _refusals(results).get("UNP")
+
+
+class TestSystemWideFailuresStillStopEverything:
+    """The mirror of the above. These are not facts about a symbol, so
+    the cycle must fail closed before any candidate is evaluated -- and
+    with two candidates queued, neither may be submitted."""
+
+    PRICES = {"UNP": 300.0, "F": 20.0}
+
+    def _two_candidates(self, monkeypatch):
+        _patch_common(monkeypatch, tickers=("UNP", "F"),
+                      analyze=_priced(self.PRICES))
+        return _RankedBroker(self.PRICES, 74.0)
+
+    def test_a_commit_mismatch_stops_the_whole_cycle(self, monkeypatch):
+        broker = self._two_candidates(monkeypatch)
+        monkeypatch.setenv("DEPLOYED_COMMIT", "different")
+        with pytest.raises(klt.KISLiveTradingError, match="commit"):
+            klt.run_live_buy_entry_cycle(
+                broker=broker,
+                live_rollout=_rollout(allowed_symbols=frozenset(self.PRICES)),
+                now=NOW)
+        assert broker.submit_calls == []
+
+    def test_a_halt_stops_the_whole_cycle(self, monkeypatch):
+        broker = self._two_candidates(monkeypatch)
+        ops_kill_switch.set_halt(True, reason="test", actor="tester")
+        with pytest.raises(klt.KISLiveTradingError, match="HALT"):
+            klt.run_live_buy_entry_cycle(
+                broker=broker,
+                live_rollout=_rollout(allowed_symbols=frozenset(self.PRICES)),
+                now=NOW)
+        assert broker.submit_calls == []
+
+    def test_entry_off_stops_the_whole_cycle(self, monkeypatch):
+        broker = self._two_candidates(monkeypatch)
+        import kill_switch_state
+        kill_switch_state.activate(kill_switch_state.ENTRY_DISABLED, "test", "tester")
+        with pytest.raises(klt.KISLiveTradingError, match="ENTRY_OFF"):
+            klt.run_live_buy_entry_cycle(
+                broker=broker,
+                live_rollout=_rollout(allowed_symbols=frozenset(self.PRICES)),
+                now=NOW)
+        assert broker.submit_calls == []
+
+    def test_a_missing_allowed_account_stops_the_whole_cycle(self, monkeypatch):
+        broker = self._two_candidates(monkeypatch)
+        monkeypatch.delenv("KIS_ALLOWED_ACCOUNT_NO", raising=False)
+        with pytest.raises(klt.KISLiveTradingError, match="KIS_ALLOWED_ACCOUNT_NO"):
+            klt.run_live_buy_entry_cycle(
+                broker=broker,
+                live_rollout=_rollout(allowed_symbols=frozenset(self.PRICES)),
+                now=NOW)
+        assert broker.submit_calls == []
