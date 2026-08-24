@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- S6 first-stage discovery on the SCANNER NODE (this laptop).
+
+     launchd rather than cron: macOS gates crontab behind Full Disk
+     Access, which cannot be granted from a script, and a LaunchAgent is
+     the supported mechanism on this platform anyway.
+
+     Hourly at :45 from 13:45 to 19:45 UTC. The first useful pass is
+     after the 09:30-09:45 ET opening range exists -- before that there
+     is nothing for the trading node's ORB15 to evaluate, so an earlier
+     manifest would spend thirty minutes of provider time producing rows
+     that cannot yet qualify. The script re-checks the session itself
+     and exits quietly outside a trading window.
+
+     Install:
+       cp deploy/launchd/com.ustrading.s6discovery.plist ~/Library/LaunchAgents/
+       launchctl load ~/Library/LaunchAgents/com.ustrading.s6discovery.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ustrading.s6discovery</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/jihoonhan/Projects/us-stock-trading/deploy/cron/laptop_market_discovery.sh</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>45</integer></dict>
+        <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>45</integer></dict>
+        <dict><key>Hour</key><integer>11</integer><key>Minute</key><integer>45</integer></dict>
+        <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>45</integer></dict>
+        <dict><key>Hour</key><integer>13</integer><key>Minute</key><integer>45</integer></dict>
+        <dict><key>Hour</key><integer>14</integer><key>Minute</key><integer>45</integer></dict>
+        <dict><key>Hour</key><integer>15</integer><key>Minute</key><integer>45</integer></dict>
+    </array>
+    <key>StandardOutPath</key>
+    <string>/Users/jihoonhan/Projects/us-stock-trading/logs/discovery/launchd.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/jihoonhan/Projects/us-stock-trading/logs/discovery/launchd.err</string>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
