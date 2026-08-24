@@ -44,6 +44,7 @@ here to an order.
 """
 
 import argparse
+import json
 import logging
 import sys
 import time
@@ -601,6 +602,7 @@ def run_scanners(
     if store:
         for outcome in report.outcomes:
             report.stored_signals += _store_safely(outcome, day)
+            _record_rejects_safely(outcome, day, report.session)
         # Publication happens BEFORE the manifest, so its outcome is IN
         # the manifest. One row per run: appending a second, amended row
         # would double-count in every reader that tallies run statuses.
@@ -628,6 +630,40 @@ def _store_safely(outcome: ScanOutcome, trading_day: str) -> int:
         outcome.failure_reason = f"storage failed: {type(exc).__name__}: {exc}"
         logger.exception("could not store signals for %s", outcome.scanner_name)
         return 0
+
+
+def _record_rejects_safely(outcome: ScanOutcome, trading_day: str,
+                           session: Optional[str]) -> None:
+    """Persist why each symbol was refused; never let that failure spread.
+
+    The scan itself is unaffected by whether this succeeds -- an
+    observability write that could fail a trading-day scan would be a
+    strictly worse trade than the blindness it fixes.
+
+    One line per rejected symbol, and the line is short by design:
+    symbol, the gate code, and the two numbers behind it. A 202-symbol
+    scan every 15 minutes over a 6.5-hour session is roughly 5,000
+    rows a day at about 70 bytes each -- a third of a megabyte, readable
+    with grep. Writing the intermediate calculations instead would be
+    megabytes an hour and would answer no question these fields do not.
+    """
+    rows = getattr(outcome, "first_rejects", None)
+    if not rows:
+        return
+    try:
+        stamp = datetime.now(timezone.utc).isoformat()
+        directory = result_store.analytics_dir() / "rejects"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{trading_day}.jsonl"
+        with path.open("a", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(
+                    {"timestamp": stamp, "session": session,
+                     "scanner": outcome.scanner_name, **row},
+                    separators=(",", ":")) + "\n")
+    except Exception:  # noqa: BLE001 - never costs the scan its results
+        logger.warning("could not record reject reasons for %s",
+                       outcome.scanner_name, exc_info=True)
 
 
 def _publish_safely(report: RunReport) -> None:

@@ -42,6 +42,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
 from scanners.base.config import ScannerConfig, load_config
+from scanners.base import reject_reasons
 from scanners.base.features import SymbolFeatures, build_features, minimum_daily_bars
 from scanners.base.market_data_provider import SymbolData
 from scanners.base.models import ScannerDataError, ScannerSignal
@@ -79,6 +80,31 @@ class ScanOutcome:
     consecutive_error_peak: int = 0
     circuit_breaker_triggered: bool = False
     circuit_breaker_reason: Optional[str] = None
+
+    #: One row per rejected symbol: the FIRST gate that refused it, and
+    #: the two numbers behind that gate. First, not every: the gates are
+    #: evaluated in order and stop at the first failure, so "what else
+    #: would have refused this" was never computed and reporting it
+    #: would mean running the remaining gates purely to log them.
+    first_rejects: List[Dict[str, Any]] = field(default_factory=list)
+
+    def note_first_reject(self, symbol, code, *, observed=None,
+                          threshold=None, detail=None) -> None:
+        """Record why this symbol was refused, once.
+
+        `detail` is kept only for UNCLASSIFIED rows -- for a recognised
+        code the sentence adds nothing the code and the two numbers do
+        not already carry, and 202 sentences every 15 minutes is how a
+        useful record becomes a log nobody opens.
+        """
+        row: Dict[str, Any] = {"symbol": str(symbol).upper(), "reason": code}
+        if observed is not None:
+            row["observed"] = round(float(observed), 4)
+        if threshold is not None:
+            row["threshold"] = round(float(threshold), 4)
+        if detail is not None and code == reject_reasons.UNCLASSIFIED:
+            row["detail"] = str(detail)[:160]
+        self.first_rejects.append(row)
 
     @property
     def status(self) -> str:
@@ -285,8 +311,13 @@ class BaseScanner(ABC):
         timestamp: Optional[str] = None,
         run_id: Optional[str] = None,
         shared_features: Optional[SymbolFeatures] = None,
+        reject_sink=None,
     ) -> Optional[ScannerSignal]:
         """One symbol. A signal, or None if it did not qualify.
+
+        `reject_sink(symbol, reason)` is called when a GATE refuses the
+        symbol -- not when the bars were unusable, which the caller
+        already distinguishes by catching `ScannerDataError`.
 
         Raises `ScannerDataError` when the bars were unusable, which the
         caller treats differently from a rejection: "we could not judge
@@ -302,6 +333,15 @@ class BaseScanner(ABC):
         except Rejected as rejection:
             log_decision(self.log, scanner=self.scanner_name, version=self.version,
                          symbol=data.symbol, result="FAIL", reason=str(rejection))
+            # The reason used to die here. `evaluate` returns None for a
+            # gate rejection, so `evaluate_into` could only count that
+            # SOMETHING refused the symbol -- which is why a 202-symbol
+            # scan reported 202 rejections and an empty
+            # `top_reject_reasons` every run, and why month-one
+            # calibration had nothing to calibrate against. The sink is
+            # optional so every existing caller is unaffected.
+            if reject_sink is not None:
+                reject_sink(data.symbol, str(rejection))
             return None
 
         raw_score = self.score(features, data, context)
@@ -406,12 +446,23 @@ class BaseScanner(ABC):
         rule, and a fix to it cannot reach one caller and miss the other.
         """
         outcome.symbols_seen += 1
+
+        def _rejected(symbol, reason):
+            """One gate refusal: tallied for the summary, recorded once."""
+            code, observed, threshold = reject_reasons.classify(reason)
+            count_reject_reason(outcome.reject_reasons, code)
+            outcome.note_first_reject(symbol, code, observed=observed,
+                                      threshold=threshold, detail=reason)
+
         try:
             signal = self.evaluate(data, trading_day=trading_day, timestamp=timestamp,
-                                   run_id=run_id, shared_features=shared_features)
+                                   run_id=run_id, shared_features=shared_features,
+                                   reject_sink=_rejected)
         except ScannerDataError as exc:
             outcome.data_errors += 1
-            count_reject_reason(outcome.reject_reasons, "insufficient_or_stale_data")
+            count_reject_reason(outcome.reject_reasons, reject_reasons.DATA_ERROR)
+            outcome.note_first_reject(data.symbol, reject_reasons.DATA_ERROR,
+                                      detail=str(exc))
             log_decision(self.log, scanner=self.scanner_name, version=self.version,
                          symbol=data.symbol, result="FAIL", reason=str(exc))
             return None
