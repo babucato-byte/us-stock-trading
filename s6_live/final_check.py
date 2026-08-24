@@ -150,6 +150,68 @@ def _observed_freshness(rows, read_at) -> Dict[str, Any]:
             "age_seconds": _age(newest, read_at)}
 
 
+class ReportBrokerSnapshot:
+    """The account-level KIS reads, taken ONCE for the whole report.
+
+    Positions, open orders and the account snapshot do not vary by
+    symbol, but they were read inside the candidate loop -- so a report
+    over two symbols made them twice, each sweeping three exchanges, and
+    a report over more made them more. Under that load KIS answered the
+    orderable-amount call with a body carrying no `output`, and the gate
+    honestly reported that it could not measure a question it had already
+    answered correctly on a cold call in 0.2s.
+
+    Failures are isolated per field. One unreadable list must not turn
+    every gate into the same NOT_MEASURED: a failed open-order read says
+    nothing about reconciliation, and neither says anything about whether
+    KIS calls the symbol a common stock.
+
+    Read-only by construction: it holds three lists and has no method
+    that could place an order.
+    """
+
+    def __init__(self, broker=None):
+        self.positions = None
+        self.open_orders = None
+        self.account = None
+        self.errors: Dict[str, str] = {}
+        self.calls: Dict[str, int] = {
+            "positions_calls": 0, "open_orders_calls": 0,
+            "account_snapshot_calls": 0, "orderable_usd_calls": 0,
+            "price_detail_calls": 0,
+        }
+        self.fetched_at = datetime.now(timezone.utc).isoformat()
+        if broker is None:
+            return
+        for field, method, counter in (
+                ("positions", "get_positions", "positions_calls"),
+                ("open_orders", "get_open_orders", "open_orders_calls"),
+                ("account", "get_account_snapshot", "account_snapshot_calls")):
+            # Resolved per field, inside the guard: a broker that does not
+            # implement one of the three must cost that one field, not the
+            # whole snapshot.
+            try:
+                call = getattr(broker, method)
+                self.calls[counter] += 1
+                setattr(self, field, call())
+            except Exception as exc:  # noqa: BLE001 - isolated per field
+                self.errors[field] = f"{type(exc).__name__}: {str(exc)[:140]}"
+                logger.warning("S6 final check: %s read failed", field,
+                               exc_info=True)
+
+    def count(self, name: str) -> None:
+        self.calls[name] = self.calls.get(name, 0) + 1
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {"fetched_at": self.fetched_at, "errors": dict(self.errors),
+                "calls": dict(self.calls),
+                "positions": (len(self.positions)
+                              if self.positions is not None else None),
+                "open_orders": (len(self.open_orders)
+                                if self.open_orders is not None else None),
+                "account_readable": self.account is not None}
+
+
 def _result(status: str, detail: str = "") -> Dict[str, str]:
     return {"status": status, "detail": detail}
 
@@ -218,10 +280,15 @@ def build(*, conn=None, broker=None, trading_day=None, session=None,
                            exc_info=True)
             report["errors"].append(f"{name}: {exc}")
 
+    # The account-level reads, taken once, before the candidate loop --
+    # so every symbol in the loop shares the same three answers instead
+    # of asking KIS for them again.
+    snapshot = ReportBrokerSnapshot(broker)
+
     try:
         report.update(_candidate_facts(
             day, resolved_session, variant, modes=modes, conn=conn,
-            broker=broker, rollout=rollout, now=moment))
+            broker=broker, rollout=rollout, now=moment, snapshot=snapshot))
     except Exception as exc:  # noqa: BLE001
         logger.warning("S6 final check: candidate facts failed", exc_info=True)
         report["errors"].append(f"candidates: {exc}")
@@ -230,6 +297,11 @@ def build(*, conn=None, broker=None, trading_day=None, session=None,
         report.setdefault("common_stock_count", None)
         report.setdefault("buy_gates", _unmeasured(f"report error: {exc}"))
         report.setdefault("submit_boundary_reached", False)
+
+    # §6: the call counts are part of the report, not a log line. A
+    # regression that reintroduces a per-symbol account read shows up
+    # here as a number greater than one, which a test can assert on.
+    report["broker_reads"] = snapshot.as_dict()
 
     return report
 
@@ -310,7 +382,7 @@ def _scan_facts(day: str, session: str) -> Dict[str, Any]:
 
 
 def _candidate_facts(day, session, variant, *, modes, conn, broker, rollout,
-                     now) -> Dict[str, Any]:
+                     now, snapshot=None) -> Dict[str, Any]:
     """Every candidate, its provenance, and each BUY gate's answer."""
     from s6_live import candidate_source as source_module
     from s6_live import qualification as qualification_module
@@ -410,11 +482,12 @@ def _candidate_facts(day, session, variant, *, modes, conn, broker, rollout,
                 (qualification.reason_code or qualification.detail)
                 if qualification is not None and not qualification.qualified
                 else None),
-            "buy_gates": gate_cache.setdefault(symbol, _gates_for(
-                symbol, offered=offered, qualification=qualification,
-                conn=conn, broker=broker, rollout=rollout, session=session,
+            "buy_gates": _cached_gates(
+                gate_cache, symbol, offered=offered,
+                qualification=qualification, conn=conn, broker=broker,
+                rollout=rollout, session=session,
                 blocked_before_gates=blocked_before_gates,
-                price=row.get("price"))),
+                price=row.get("price"), snapshot=snapshot),
         })
     facts["candidates"] = rows
 
@@ -530,8 +603,25 @@ def _cycle_gates(rows, blocked_before_gates) -> Dict[str, Dict[str, str]]:
     return summary
 
 
+def _cached_gates(cache, symbol, **kw) -> Dict[str, Dict[str, str]]:
+    """`_gates_for` at most once per symbol -- and only for a MISS.
+
+    Written out rather than `cache.setdefault(symbol, _gates_for(...))`,
+    which reads like a cache and is not one: Python evaluates the default
+    argument before setdefault is entered, so every row paid for a full
+    gate evaluation and the cache only ever discarded the result. That is
+    what made a report over 32 rows for 2 symbols take 1060 seconds and
+    hand KIS 32 orderable-amount reads, until the rate limiter answered
+    with a body carrying no `output` and the gate honestly said
+    NOT_MEASURED.
+    """
+    if symbol not in cache:
+        cache[symbol] = _gates_for(symbol, **kw)
+    return cache[symbol]
+
+
 def _gates_for(symbol, *, offered, qualification, conn, broker, rollout,
-               session, blocked_before_gates, price=None
+               session, blocked_before_gates, price=None, snapshot=None
                ) -> Dict[str, Dict[str, str]]:
     """One candidate through each gate, in cycle order.
 
@@ -557,10 +647,18 @@ def _gates_for(symbol, *, offered, qualification, conn, broker, rollout,
                                                         broker=None)
         return gates
 
-    gates["cash_orderability"] = _cash_gate(broker, symbol, price)
-    gates["reconciliation"] = _reconciliation_gate(conn, broker)
-    gates["duplicate_protection"] = _duplicate_gate(conn, symbol, broker=broker)
-    gates["kis_execution_sanity"] = _execution_gate(broker, symbol)
+    # A caller that did not bring the report's snapshot gets its own, so
+    # the gates are answered from the same three reads either way. The
+    # report always brings one; this is the direct-call path.
+    if snapshot is None:
+        snapshot = ReportBrokerSnapshot(broker)
+
+    gates["cash_orderability"] = _cash_gate(broker, symbol, price, snapshot)
+    gates["reconciliation"] = _reconciliation_gate(conn, broker, snapshot)
+    gates["duplicate_protection"] = _duplicate_gate(conn, symbol,
+                                                    broker=broker,
+                                                    snapshot=snapshot)
+    gates["kis_execution_sanity"] = _execution_gate(broker, symbol, snapshot)
     return gates
 
 
@@ -621,7 +719,7 @@ def _risk_matrix_gate(conn, *, rollout, session) -> Dict[str, str]:
                          f"positions={held}/{config.max_open_positions}")
 
 
-def _duplicate_gate(conn, symbol, *, broker) -> Dict[str, str]:
+def _duplicate_gate(conn, symbol, *, broker, snapshot=None) -> Dict[str, str]:
     """Both halves: our own store, and the broker's open orders.
 
     PASS requires both. The internal half alone is the half that survives
@@ -647,10 +745,17 @@ def _duplicate_gate(conn, symbol, *, broker) -> Dict[str, str]:
                        "symbol; the broker's open orders were not read"
                        if conn is not None else
                        "neither the internal store nor the broker was read")
-    try:
-        open_orders = broker.get_open_orders() or []
-    except Exception as exc:  # noqa: BLE001
-        return _result(NOT_MEASURED, f"open-order read failed: {exc}")
+    if snapshot is not None:
+        if snapshot.errors.get("open_orders"):
+            return _result(NOT_MEASURED,
+                           f"open-order read failed: "
+                           f"{snapshot.errors['open_orders']}")
+        open_orders = snapshot.open_orders or []
+    else:
+        try:
+            open_orders = broker.get_open_orders() or []
+        except Exception as exc:  # noqa: BLE001
+            return _result(NOT_MEASURED, f"open-order read failed: {exc}")
     clash = [o for o in open_orders
              if str(o.get("pdno") or o.get("PDNO") or "").upper() == symbol]
     if clash:
@@ -658,7 +763,7 @@ def _duplicate_gate(conn, symbol, *, broker) -> Dict[str, str]:
     return _result(PASS, "no S6 position and no open broker order")
 
 
-def _cash_gate(broker, symbol, price=None) -> Dict[str, str]:
+def _cash_gate(broker, symbol, price=None, snapshot=None) -> Dict[str, str]:
     """Orderable cash, read the way the BUY cycle reads it.
 
     `get_orderable_usd` is the inquire-psamount READ (TTTS3007R). It is
@@ -671,12 +776,16 @@ def _cash_gate(broker, symbol, price=None) -> Dict[str, str]:
     Without a price there is nothing to ask KIS about, and the account
     read alone is reported instead.
     """
-    try:
-        snapshot = broker.get_account_snapshot()
-    except Exception as exc:  # noqa: BLE001
-        return _result(BLOCK, f"KIS account read failed: {exc}")
-    if snapshot is None:
-        return _result(BLOCK, "KIS returned no account snapshot")
+    # The account read is the REPORT's, taken once. Re-reading it per
+    # symbol is what amplified the call volume.
+    if snapshot is not None:
+        if snapshot.errors.get("account"):
+            return _result(NOT_MEASURED,
+                           f"{ORDERABILITY_API_ERROR}: account read failed: "
+                           f"{snapshot.errors['account']}")
+        if snapshot.account is None:
+            return _result(NOT_MEASURED,
+                           f"{ORDERABILITY_API_ERROR}: no account snapshot")
 
     limit = None
     try:
@@ -697,6 +806,8 @@ def _cash_gate(broker, symbol, price=None) -> Dict[str, str]:
                        f"{ORDERABILITY_EXCHANGE_MAPPING_ERROR}: {str(exc)[:120]}")
 
     try:
+        if snapshot is not None:
+            snapshot.count("orderable_usd_calls")
         available = broker.get_orderable_usd(instrument, limit)
     except Exception as exc:  # noqa: BLE001 - an unanswered question is
         # never "no cash". Classified so a rate limit, an auth failure and
@@ -725,13 +836,19 @@ def _cash_gate(broker, symbol, price=None) -> Dict[str, str]:
                          f"affords {shares} whole share(s) at {limit:.2f}")
 
 
-def _reconciliation_gate(conn, broker) -> Dict[str, str]:
+def _reconciliation_gate(conn, broker, snapshot=None) -> Dict[str, str]:
     if conn is None:
         return _result(NOT_MEASURED, "no database connection")
+    if snapshot is not None and snapshot.errors.get("positions"):
+        # Isolated: an unreadable position list says nothing about the
+        # other gates, and they are answered independently.
+        return _result(NOT_MEASURED,
+                       f"position read failed: {snapshot.errors['positions']}")
     try:
         from reconciliation import internal_holdings
 
-        positions = broker.get_positions() or []
+        positions = (snapshot.positions if snapshot is not None
+                     else broker.get_positions()) or []
         account = [{"symbol": p.symbol, "venue": getattr(p, "venue", None),
                     "quantity": p.quantity} for p in positions]
         summary = internal_holdings.summary(conn, account)
@@ -742,7 +859,7 @@ def _reconciliation_gate(conn, broker) -> Dict[str, str]:
     return _result(PASS, "; ".join(summary.get("attribution") or []))
 
 
-def _execution_gate(broker, symbol) -> Dict[str, str]:
+def _execution_gate(broker, symbol, snapshot=None) -> Dict[str, str]:
     """The day-range execution-price check S6 now inherits as a strategy
     source. Before `STRATEGY_SOURCES` named S6, this candidate would have
     been given the legacy previous-close 0.30% check instead."""
@@ -752,6 +869,8 @@ def _execution_gate(broker, symbol) -> Dict[str, str]:
         # `instrument=None` lets it resolve the KIS instrument the same
         # way it does for S1, rather than this report building a second
         # one that could disagree about the exchange.
+        if snapshot is not None:
+            snapshot.count("price_detail_calls")
         verdict = execution_price.evaluate_symbol(symbol, broker=broker)
     except Exception as exc:  # noqa: BLE001
         return _result(NOT_MEASURED, f"execution-price check unavailable: {exc}")
@@ -854,6 +973,22 @@ def format_report(report: Dict[str, Any]) -> str:
     ]
     if report.get("source_refusal"):
         lines.append(f"  source refusal   : {report['source_refusal']}")
+
+    reads = report.get("broker_reads") or {}
+    if reads.get("calls"):
+        calls = reads["calls"]
+        # Printed because the count IS the finding: an account call above
+        # one means the loop started re-reading it again.
+        lines += [
+            "",
+            f"  KIS reads        : positions={calls.get('positions_calls')} "
+            f"open_orders={calls.get('open_orders_calls')} "
+            f"account={calls.get('account_snapshot_calls')} "
+            f"orderable={calls.get('orderable_usd_calls')} "
+            f"price_detail={calls.get('price_detail_calls')}",
+        ]
+        if reads.get("errors"):
+            lines.append(f"  KIS read errors  : {reads['errors']}")
 
     for row in report.get("candidates") or []:
         lines += [

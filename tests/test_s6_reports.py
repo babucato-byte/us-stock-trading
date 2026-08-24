@@ -916,3 +916,233 @@ class TestCapabilityIsNotPromotion:
             now=T0)
         assert capable_not_promoted["orders_allowed"] is False
         assert promoted_not_capable["orders_allowed"] is False
+
+
+# ====================================================================
+# §1-§9  THE ACCOUNT READS ARE THE REPORT'S, NOT EACH SYMBOL'S
+# ====================================================================
+class CountingBroker:
+    """A read-only broker that records how often each call was made.
+
+    Enough of one to answer every gate, and nothing that could submit.
+    """
+
+    def __init__(self, *, orderable=1000.0, fail=(), positions=None,
+                 open_orders=None):
+        self.calls = {}
+        self._orderable = orderable
+        self._fail = set(fail)
+        self._positions = positions if positions is not None else []
+        self._open_orders = open_orders if open_orders is not None else []
+
+    def _count(self, name):
+        self.calls[name] = self.calls.get(name, 0) + 1
+        if name in self._fail:
+            raise RuntimeError(f"{name} unavailable")
+
+    def get_positions(self):
+        self._count("get_positions")
+        return list(self._positions)
+
+    def get_open_orders(self):
+        self._count("get_open_orders")
+        return list(self._open_orders)
+
+    def get_account_snapshot(self):
+        self._count("get_account_snapshot")
+        return {"cash": 1000.0}
+
+    def get_orderable_usd(self, instrument, limit):
+        self._count("get_orderable_usd")
+        if callable(self._orderable):
+            return self._orderable(instrument, limit)
+        return self._orderable
+
+    def get_price_detail(self, instrument):
+        self._count("get_price_detail")
+        return {"last": 100.0, "high": 101.0, "low": 99.0,
+                "previous_close": 99.5}
+
+
+def _many_rows(symbols, *, n=8, session="REGULAR", variant="S6-R"):
+    """The real shape of the store: one append per scan, same symbols."""
+    for i in range(n):
+        publish(symbols, session=session, variant=variant,
+                run_id=f"run-{i}")
+
+
+class TestAccountReadsAreTakenOncePerReport:
+    """Positions, open orders and the account snapshot do not vary by
+    symbol, but they were read inside the candidate loop. Over 32 stored
+    rows for two symbols that made KIS answer the same three questions
+    again and again, each sweeping three exchanges -- and under that load
+    the orderable-amount call came back with a body carrying no `output`,
+    so `cash_orderability` reported NOT_MEASURED for a question it
+    answers correctly in 0.2s on a cold call."""
+
+    def test_account_level_reads_happen_at_most_once(self, handoff, master,
+                                                     conn):
+        _many_rows(["AAPL", "IEFA"], n=16)
+        broker = CountingBroker()
+        report = final_check.build(conn=conn, broker=broker, trading_day=DAY,
+                                   session="REGULAR", now=T0)
+
+        assert report["published_rows"] == 32
+        assert broker.calls.get("get_positions", 0) == 1
+        assert broker.calls.get("get_open_orders", 0) == 1
+        assert broker.calls.get("get_account_snapshot", 0) == 1
+
+    def test_symbol_level_reads_happen_once_per_distinct_symbol(
+            self, handoff, master, conn):
+        _many_rows(["AAPL", "IEFA"], n=16)
+        broker = CountingBroker()
+        final_check.build(conn=conn, broker=broker, trading_day=DAY,
+                          session="REGULAR", now=T0)
+
+        # Two distinct symbols across 32 rows: the per-row cache holds.
+        assert broker.calls.get("get_orderable_usd", 0) <= 2
+        assert broker.calls.get("get_price_detail", 0) <= 2
+
+    def test_the_report_publishes_its_own_call_counts(self, handoff, master,
+                                                      conn):
+        _many_rows(["AAPL"], n=4)
+        broker = CountingBroker()
+        report = final_check.build(conn=conn, broker=broker, trading_day=DAY,
+                                   session="REGULAR", now=T0)
+
+        counts = report["broker_reads"]["calls"]
+        assert counts["positions_calls"] == 1
+        assert counts["open_orders_calls"] == 1
+        assert counts["account_snapshot_calls"] == 1
+        assert counts["orderable_usd_calls"] <= 1
+        assert counts["price_detail_calls"] <= 1
+        assert report["broker_reads"]["fetched_at"]
+
+    def test_a_report_with_no_broker_makes_no_calls(self, handoff, master,
+                                                    conn):
+        publish(["AAPL"])
+        report = final_check.build(conn=conn, trading_day=DAY,
+                                   session="REGULAR", now=T0)
+        assert report["broker_reads"]["calls"] == {
+            "positions_calls": 0, "open_orders_calls": 0,
+            "account_snapshot_calls": 0, "orderable_usd_calls": 0,
+            "price_detail_calls": 0}
+
+
+class TestOneFailedReadDoesNotSinkTheOthers:
+    """§5. A snapshot is three independent reads. An unreadable open-order
+    list says nothing about reconciliation, and neither says anything
+    about whether KIS calls the symbol a common stock -- so one failure
+    must cost exactly one gate."""
+
+    def _gates(self, conn, broker):
+        report = final_check.build(conn=conn, broker=broker, trading_day=DAY,
+                                   session="REGULAR", now=T0)
+        return report, report["candidates"][0]["buy_gates"]
+
+    def test_a_failed_position_read_costs_only_reconciliation(
+            self, handoff, master, conn):
+        publish(["AAPL"])
+        report, gates = self._gates(conn, CountingBroker(
+            fail={"get_positions"}))
+
+        assert gates["reconciliation"]["status"] == final_check.NOT_MEASURED
+        assert gates["duplicate_protection"]["status"] == final_check.PASS
+        assert gates["cash_orderability"]["status"] == final_check.PASS
+        assert gates["instrument"]["status"] == final_check.PASS
+        assert report["broker_reads"]["errors"].keys() == {"positions"}
+
+    def test_a_failed_open_order_read_costs_only_duplicate_protection(
+            self, handoff, master, conn):
+        publish(["AAPL"])
+        _report, gates = self._gates(conn, CountingBroker(
+            fail={"get_open_orders"}))
+
+        assert gates["duplicate_protection"]["status"] == final_check.NOT_MEASURED
+        assert gates["reconciliation"]["status"] == final_check.PASS
+        assert gates["cash_orderability"]["status"] == final_check.PASS
+
+    def test_a_failed_account_read_costs_only_cash_orderability(
+            self, handoff, master, conn):
+        publish(["AAPL"])
+        _report, gates = self._gates(conn, CountingBroker(
+            fail={"get_account_snapshot"}))
+
+        assert gates["cash_orderability"]["status"] == final_check.NOT_MEASURED
+        assert gates["reconciliation"]["status"] == final_check.PASS
+        assert gates["duplicate_protection"]["status"] == final_check.PASS
+
+    def test_a_failed_account_read_is_never_a_pass(self, handoff, master,
+                                                   conn):
+        publish(["AAPL"])
+        _report, gates = self._gates(conn, CountingBroker(
+            fail={"get_account_snapshot"}))
+        assert gates["cash_orderability"]["status"] != final_check.PASS
+        assert final_check.ORDERABILITY_API_ERROR in \
+            gates["cash_orderability"]["detail"]
+
+
+class TestOrderableCashIsStillAskedPerSymbol:
+    """§3/§4. The account snapshot is not orderable USD and cannot stand
+    in for it: KIS answers the second from a separate read that takes the
+    symbol, its venue and the limit price. Reusing the cached account
+    figure would be an estimate wearing a measurement's name."""
+
+    def test_the_orderable_read_still_happens(self, handoff, master, conn):
+        publish(["AAPL"])
+        broker = CountingBroker()
+        final_check.build(conn=conn, broker=broker, trading_day=DAY,
+                          session="REGULAR", now=T0)
+        assert broker.calls.get("get_orderable_usd", 0) == 1
+
+    def test_zero_orderable_is_a_block_not_an_absence(self, handoff, master,
+                                                      conn):
+        publish(["AAPL"])
+        report = final_check.build(conn=conn, broker=CountingBroker(
+            orderable=1.0), trading_day=DAY, session="REGULAR", now=T0)
+        gate = report["candidates"][0]["buy_gates"]["cash_orderability"]
+        assert gate["status"] == final_check.BLOCK
+        assert final_check.ORDERABILITY_ZERO in gate["detail"]
+
+    def test_an_unusable_body_is_not_measured_and_is_not_zero(
+            self, handoff, master, conn):
+        publish(["AAPL"])
+
+        def unusable(instrument, limit):
+            raise RuntimeError(
+                "KIS orderable-amount response unusable (output_missing)")
+
+        report = final_check.build(conn=conn, broker=CountingBroker(
+            orderable=unusable), trading_day=DAY, session="REGULAR", now=T0)
+        gate = report["candidates"][0]["buy_gates"]["cash_orderability"]
+        assert gate["status"] == final_check.NOT_MEASURED
+        assert "0 whole shares" not in gate["detail"]
+
+    def test_none_is_not_converted_to_zero_usd(self, handoff, master, conn):
+        publish(["AAPL"])
+        report = final_check.build(conn=conn, broker=CountingBroker(
+            orderable=lambda *_: None), trading_day=DAY, session="REGULAR",
+            now=T0)
+        gate = report["candidates"][0]["buy_gates"]["cash_orderability"]
+        assert gate["status"] == final_check.NOT_MEASURED
+        assert final_check.ORDERABILITY_PARSE_ERROR in gate["detail"]
+
+
+class TestTheSnapshotCannotTrade:
+    """§1. It holds three lists. There is no method on it that could
+    place an order, and the module it lives in is already asserted
+    against its own parsed call graph."""
+
+    def test_it_exposes_only_reads(self):
+        public = {n for n in dir(final_check.ReportBrokerSnapshot)
+                  if not n.startswith("_")}
+        assert public == {"count", "as_dict"}
+
+    def test_the_report_still_submits_nothing(self, handoff, master, conn):
+        _many_rows(["AAPL", "IEFA"], n=8)
+        broker = CountingBroker()
+        report = final_check.build(conn=conn, broker=broker, trading_day=DAY,
+                                   session="REGULAR", now=T0)
+        assert report["broker_submit_count"] == 0
+        assert not any(name.startswith("submit") or name.startswith("place")
+                       for name in broker.calls)

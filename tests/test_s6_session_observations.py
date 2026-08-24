@@ -317,11 +317,28 @@ class TestGatesAreEvaluatedOncePerSymbol:
     broker gates per ROW made 15x the rate-limited KIS calls and the
     limiter then refused the later ones."""
 
-    def test_the_report_caches_gates_by_symbol(self):
-        import inspect
-
+    def test_the_cache_is_a_miss_check_not_a_setdefault(self):
+        """`cache.setdefault(k, f(...))` reads like a cache and is not
+        one: Python evaluates `f(...)` before setdefault is entered, so
+        every row paid for a full gate evaluation and the cache only ever
+        threw the result away. This test used to assert that exact line
+        was present -- a source-string check that pinned the bug in
+        place. It now counts the calls instead."""
         from s6_live import final_check
 
-        source = inspect.getsource(final_check._candidate_facts)
-        assert "gate_cache" in source
-        assert "gate_cache.setdefault(symbol" in source
+        calls = []
+
+        def spy(symbol, **kw):
+            calls.append(symbol)
+            return {}
+
+        original = final_check._gates_for
+        final_check._gates_for = spy
+        try:
+            cache = {}
+            for symbol in ["AAPL", "AAPL", "IEFA", "AAPL", "IEFA"]:
+                final_check._cached_gates(cache, symbol)
+        finally:
+            final_check._gates_for = original
+
+        assert calls == ["AAPL", "IEFA"]
