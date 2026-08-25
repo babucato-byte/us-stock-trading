@@ -152,6 +152,72 @@ TR_ID_ORDER_US = {
 # previously (incorrectly) reused for both.
 TR_ID_CANCEL = {"live": "TTTT1004U", "paper": "VTTT1004U"}
 
+# -- US daytime trading (미국주간거래), the OVERNIGHT_DAYTIME session ----
+#
+# A SEPARATE endpoint and TR family, not a variant of the regular order.
+# Verified against the official reference repo:
+#   examples_llm/overseas_stock/daytime_order/daytime_order.py
+#     [v1_해외주식-026]  /uapi/overseas-stock/v1/trading/daytime-order
+#     buy TTTS6036U, sell TTTS6037U
+#   examples_llm/overseas_stock/daytime_order_rvsecncl/...py
+#     [v1_해외주식-027]  /uapi/overseas-stock/v1/trading/daytime-order-rvsecncl
+#     TTTS6038U
+#
+# OVRS_EXCG_CD is NASD/NYSE/AMEX -- the SAME code space the regular order
+# uses. This module previously recorded BAQ/BAY/BAA as the daytime order
+# codes and refused the session on that basis; those three are the
+# real-time QUOTE stream's tr_key values (delayed_ccnl.py), a different
+# API entirely. The mistake cost S6-O its order route for no reason.
+#
+# The payload is the regular one minus SLL_TYPE, which the daytime
+# endpoint does not take.
+DAYTIME_ORDER_PATH = "/uapi/overseas-stock/v1/trading/daytime-order"
+DAYTIME_CANCEL_PATH = "/uapi/overseas-stock/v1/trading/daytime-order-rvsecncl"
+TR_ID_DAYTIME_ORDER_US = {("live", "buy"): "TTTS6036U",
+                          ("live", "sell"): "TTTS6037U"}
+TR_ID_DAYTIME_CANCEL = {"live": "TTTS6038U"}
+
+#: Sessions whose order route the official specification defines.
+#:
+#: REGULAR uses the standard US order; OVERNIGHT_DAYTIME uses the
+#: daytime family above. PREMARKET and AFTER_HOURS are ABSENT on
+#: purpose: the overseas API exposes no US extended-hours order route.
+#: The complete set of US order TRs in the reference is TTTT1002U/1006U,
+#: TTTT1004U and the three daytime ones -- ORD_DVSN's LOO/LOC/MOO/MOC
+#: values are at-the-open and at-the-close types WITHIN the regular
+#: session, not extended-hours trading. A session with no specified
+#: route stays refused rather than being served a guessed one.
+ROUTED_SESSIONS = frozenset({"REGULAR", "OVERNIGHT_DAYTIME"})
+
+
+def order_route_for(session, env_key, side):
+    """`(path, tr_id)` for this session, or raise.
+
+    Sessions are never assumed to share a route. Serving OVERNIGHT with
+    the REGULAR TR would be a real order sent to an endpoint that does
+    not run at that hour, and the failure mode is a rejected or
+    mis-booked live order rather than an error anyone sees in testing.
+    """
+    # Only None means "not specified". An empty or blank string means a
+    # caller COMPUTED a session and got nothing, which is a fault -- and
+    # on a live-order path a fault must not resolve to a working route.
+    name = "REGULAR" if session is None else str(session).strip().upper()
+    if name == "REGULAR":
+        tr_id = TR_ID_ORDER_US.get((env_key, side))
+        path = ORDER_PATH
+    elif name == "OVERNIGHT_DAYTIME":
+        tr_id = TR_ID_DAYTIME_ORDER_US.get((env_key, side))
+        path = DAYTIME_ORDER_PATH
+    else:
+        raise KISBrokerError(
+            f"no KIS order route is specified for session {name!r}; "
+            "the overseas API defines US order endpoints for the regular "
+            "session and for daytime trading only")
+    if tr_id is None:
+        raise KISBrokerError(
+            f"no order TR_ID for session={name!r} env={env_key!r} side={side!r}")
+    return path, tr_id
+
 # EXCD (3-letter) is the quotations-API exchange code (price/quote
 # endpoint); OVRS_EXCG_CD (4-letter, order/balance endpoints) is a
 # DIFFERENT code space -- verified against the reference repo's order.py
@@ -276,6 +342,41 @@ VERIFICATION_MATRIX = (
         "cancel_price_field_rule", "OVRS_ORD_UNPR=0", REFERENCE_VERIFIED,
         LIVE_RESPONSE_PENDING,
         "order_rvsecncl.py docstring: 취소주문 시, '0' 입력",
+        required_for=_ARMED_ONLY,
+    ),
+    # US daytime trading (OVERNIGHT_DAYTIME). REFERENCE_VERIFIED against
+    # [v1_해외주식-026] and [v1_해외주식-027] in the official repo; no live
+    # response has confirmed them, exactly as for the regular route.
+    # Listing them here is what keeps "the constant exists" from being
+    # mistaken for "the wire has been exercised".
+    WireValueVerification(
+        "daytime_order_path", DAYTIME_ORDER_PATH, REFERENCE_VERIFIED,
+        LIVE_RESPONSE_PENDING,
+        "examples_llm/overseas_stock/daytime_order/daytime_order.py",
+        required_for=_ARMED_ONLY,
+    ),
+    WireValueVerification(
+        "daytime_order_tr_id_live_buy", TR_ID_DAYTIME_ORDER_US[("live", "buy")],
+        REFERENCE_VERIFIED, LIVE_RESPONSE_PENDING,
+        "examples_llm/overseas_stock/daytime_order/daytime_order.py",
+        required_for=_ARMED_ONLY,
+    ),
+    WireValueVerification(
+        "daytime_order_tr_id_live_sell", TR_ID_DAYTIME_ORDER_US[("live", "sell")],
+        REFERENCE_VERIFIED, LIVE_RESPONSE_PENDING,
+        "examples_llm/overseas_stock/daytime_order/daytime_order.py",
+        required_for=_ARMED_ONLY,
+    ),
+    WireValueVerification(
+        "daytime_cancel_path", DAYTIME_CANCEL_PATH, REFERENCE_VERIFIED,
+        LIVE_RESPONSE_PENDING,
+        "examples_llm/overseas_stock/daytime_order_rvsecncl/daytime_order_rvsecncl.py",
+        required_for=_ARMED_ONLY,
+    ),
+    WireValueVerification(
+        "daytime_cancel_tr_id_live", TR_ID_DAYTIME_CANCEL["live"],
+        REFERENCE_VERIFIED, LIVE_RESPONSE_PENDING,
+        "examples_llm/overseas_stock/daytime_order_rvsecncl/daytime_order_rvsecncl.py",
         required_for=_ARMED_ONLY,
     ),
     # Confirmed by a REAL live-account read, not by documentation:
@@ -1202,6 +1303,13 @@ class KISBroker:
 
     # -- order submission ---------------------------------------------
 
+    #: Session used when an order_intent does not carry one. REGULAR is
+    #: the only safe default: it is the route this system has always
+    #: used, so an existing caller that knows nothing about sessions
+    #: keeps its exact previous behaviour rather than silently acquiring
+    #: a different endpoint.
+    _session_hint = "REGULAR"
+
     def submit_order(self, order_intent: OrderIntent, instrument, *, authorization=None,
                      bootstrap_capability=None) -> ExecutionRecord:
         """The ONLY method in this codebase that places a real KIS order.
@@ -1231,9 +1339,13 @@ class KISBroker:
             bootstrap_capability=bootstrap_capability, order_intent=order_intent)
         if order_intent.order_type != "limit":
             raise KISBrokerError("only limit orders are permitted in this pilot")
-        tr_id = TR_ID_ORDER_US.get((self._env_key(), order_intent.side))
-        if tr_id is None:
-            raise KISBrokerError(f"no order TR_ID for env={self._env_key()!r} side={order_intent.side!r}")
+        # The route is chosen from the SESSION, not assumed. REGULAR and
+        # daytime trading are different endpoints with different TR
+        # families, and a session the specification does not cover is
+        # refused here rather than served the regular route.
+        path, tr_id = order_route_for(
+            getattr(order_intent, "session", None) or self._session_hint,
+            self._env_key(), order_intent.side)
         excg = _order_excg_for(order_intent.exchange)
         payload = {
             "CANO": self.config.account_no, "ACNT_PRDT_CD": self.config.account_product_cd,
@@ -1248,7 +1360,7 @@ class KISBroker:
             category=kis_rate_limiter.CATEGORY_ORDER)
         try:
             response = self.session.request(
-                "POST", f"{self.config.base_url}{ORDER_PATH}", headers=self._auth_headers(tr_id),
+                "POST", f"{self.config.base_url}{path}", headers=self._auth_headers(tr_id),
                 json=payload, timeout=10,
             )
         except requests.exceptions.RequestException as exc:
