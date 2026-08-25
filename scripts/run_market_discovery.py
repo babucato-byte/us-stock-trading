@@ -85,6 +85,26 @@ def main() -> int:
         max_symbols=args.max_symbols, min_price=args.min_price,
         min_dollar_volume=args.min_dollar_volume,
         raw_universe_count=raw_count)
+    # An empty result BEFORE the open is not a market observation.
+    #
+    # `fetch_today` requires each symbol's latest daily bar to carry the
+    # trading day. Between the ET rollover and the open no symbol has one
+    # yet, so a scan in that window prices nothing and passes nothing --
+    # and writing that over a good manifest is how a 600-symbol input
+    # became 0, which the trading node then correctly rejected as EMPTY
+    # and fell back to its own 300-name ranking for the rest of the
+    # night. The candidates did not fail a strategy gate; they stopped
+    # being offered.
+    #
+    # So an empty document never replaces a non-empty one for the same
+    # trading day. It is still written when there is nothing to lose.
+    existing = manifest_module.read(args.out)
+    if not document["symbols"] and existing and existing.get("symbols"):
+        print(f"REFUSED to overwrite {len(existing['symbols'])} symbols with "
+              f"an empty scan (priced {document['first_stage_evaluated']} of "
+              f"{document['universe_size']}); keeping the previous manifest")
+        return 0
+
     path = manifest_module.write(document, args.out)
 
     print(f"eligible scanned    : {document['universe_size']}")

@@ -486,3 +486,70 @@ class TestThePacingRespondsToThrottling:
                                 download=download, batch_size=1, pause=1.0,
                                 backoff=0, max_rounds=1)
         assert set(slept) == {1.0}, slept
+
+
+class TestAnEmptyScanNeverDestroysAGoodManifest:
+    """A 0-symbol result before the open is not a market observation.
+
+    `fetch_today` requires each symbol's latest daily bar to carry the
+    trading day -- the guard that stops Friday's volume being ranked as
+    today's. Between the ET midnight rollover and the open, no symbol has
+    a bar for the new day, so a scan in that window prices nothing. On
+    2026-08-25 the hourly agent fired at 05:12 ET, priced 0 of 5,624, and
+    overwrote a good 600-symbol manifest. The trading node then correctly
+    rejected it as EMPTY and fell back to its 300-name server ranking for
+    the rest of the night.
+
+    No strategy gate rejected those candidates. They stopped being
+    offered.
+    """
+
+    def _run(self, tmp_path, symbols, existing=None):
+        """The publish decision, as run_market_discovery makes it."""
+        path = tmp_path / "manifest.json"
+        if existing is not None:
+            mf.write(_doc(symbols=existing), path)
+        document = _doc(symbols=symbols)
+        current = mf.read(path)
+        if not document["symbols"] and current and current.get("symbols"):
+            return "PRESERVED", mf.read(path)
+        mf.write(document, path)
+        return "WROTE", mf.read(path)
+
+    def test_an_empty_scan_preserves_the_existing_manifest(self, tmp_path):
+        action, kept = self._run(tmp_path, symbols=[], existing=_rows(600))
+        assert action == "PRESERVED"
+        assert len(kept["symbols"]) == 600
+
+    def test_a_real_scan_replaces_it(self, tmp_path):
+        action, written = self._run(tmp_path, symbols=_rows(7),
+                                    existing=_rows(600))
+        assert action == "WROTE"
+        assert len(written["symbols"]) == 7
+
+    def test_an_empty_scan_with_nothing_to_lose_is_recorded(self, tmp_path):
+        action, written = self._run(tmp_path, symbols=[], existing=None)
+        assert action == "WROTE"
+        assert written["symbols"] == []
+
+    def test_a_preserved_manifest_is_still_judged_on_its_own_freshness(self):
+        """Preserving it is not blessing it. A stale manifest that
+        survived an empty scan must still read STALE, not VALID --
+        otherwise the guard would quietly extend its life."""
+        old = _doc(generated_at=(NOW - timedelta(hours=3)).isoformat())
+        assert mf.validate(old, trading_day=DAY, now=NOW)["status"] == mf.STALE
+
+    def test_the_empty_verdict_is_distinct_from_missing(self):
+        """"ran and found nothing" and "did not run" need different
+        responses, and the fallback log must be able to say which."""
+        assert mf.EMPTY != mf.MISSING
+        assert mf.validate(_doc(symbols=[]), trading_day=DAY,
+                           now=NOW)["status"] == mf.EMPTY
+
+    def test_the_preserved_file_is_byte_identical(self, tmp_path):
+        """No partial rewrite, no touched timestamp."""
+        path = tmp_path / "manifest.json"
+        mf.write(_doc(symbols=_rows(600)), path)
+        before = path.read_bytes()
+        self._run(tmp_path, symbols=[], existing=None)  # file already there
+        assert path.read_bytes() == before
