@@ -234,7 +234,7 @@ def find_existing(conn, *, internal_order_id, signal_id, symbol, side, trading_d
 
 
 def register(conn, *, internal_order_id, signal_id, symbol, side, trading_date, status="CREATED",
-              requested_quantity=None, commit=True):
+              requested_quantity=None, strategy_id=None, commit=True):
     """Atomically records a new order attempt. Raises
     DuplicateOrderAttemptError (via the table's UNIQUE constraints) if
     either key already exists -- callers must call this BEFORE
@@ -243,7 +243,13 @@ def register(conn, *, internal_order_id, signal_id, symbol, side, trading_date, 
     `requested_quantity` (CODEX-045) is recorded so a later broker-order-
     status lookup can tell "fully filled" apart from "partially filled"
     -- without it, any nonzero fill looks indistinguishable from a full
-    fill."""
+    fill.
+
+    `strategy_id` is what makes the per-strategy position cap countable
+    (execution/entry_limits.py). It is optional here rather than
+    required because sells and the legacy paths have no strategy to
+    give; the entry path always supplies one, and a buy row without it
+    is counted against EVERY strategy rather than none."""
     existing = find_existing(
         conn, internal_order_id=internal_order_id, signal_id=signal_id,
         symbol=symbol, side=side, trading_date=trading_date,
@@ -260,9 +266,10 @@ def register(conn, *, internal_order_id, signal_id, symbol, side, trading_date, 
         conn.execute(
             "INSERT INTO kis_order_idempotency "
             "(internal_order_id, signal_id, symbol, side, trading_date, broker_order_id, "
-            "status, created_at, updated_at, requested_quantity, version) "
-            "VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 0)",
-            (internal_order_id, signal_id, symbol, side, trading_date, status, now, now, requested_quantity),
+            "status, created_at, updated_at, requested_quantity, strategy_id, version) "
+            "VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, 0)",
+            (internal_order_id, signal_id, symbol, side, trading_date, status, now, now,
+             requested_quantity, strategy_id),
         )
         # CODEX-047: the creation event is written in the SAME transaction
         # as the row, so an order can never exist without the durable
@@ -316,14 +323,19 @@ def count_unknown_orders(conn):
 
 def list_orders_by_status(conn, statuses):
     """Every order attempt currently in one of `statuses` -- the internal
-    side of reconciliation/snapshot.py's open-order comparison."""
+    side of reconciliation/snapshot.py's open-order comparison.
+
+    `version` is selected because the settlement pass
+    (scripts/run_reconciliation.py) compare-and-sets these rows forward,
+    and a CAS without the caller's expected version is not a CAS."""
     statuses = tuple(statuses)
     if not statuses:
         return []
     placeholders = ",".join("?" for _ in statuses)
     return _read(
         conn,
-        "SELECT internal_order_id, broker_order_id, symbol, side, status, requested_quantity "
+        "SELECT internal_order_id, broker_order_id, symbol, side, status, "
+        "requested_quantity, version "
         f"FROM kis_order_idempotency WHERE status IN ({placeholders})",
         statuses,
     )

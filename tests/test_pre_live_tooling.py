@@ -133,11 +133,25 @@ class TestTheCheckerBlocksInTheCurrentPosture:
         assert "KIS_ENV_NOT_LIVE" in result.stdout
 
     @pytest.mark.parametrize("var", [
-        "LIVE_ROLLOUT_MAX_POSITIONS", "LIVE_ROLLOUT_MAX_DAILY_ENTRIES",
-        "LIVE_ROLLOUT_MAX_QUANTITY"])
+        "LIVE_ROLLOUT_MAX_POSITIONS_PER_STRATEGY",
+        "LIVE_ROLLOUT_MAX_DAILY_ENTRIES", "LIVE_ROLLOUT_MAX_QUANTITY"])
     def test_a_widened_limit_is_a_block(self, var):
         result = _run(CHECK, env={var: "5"})
         assert f"{var}_NOT_1" in result.stdout
+
+    def test_a_global_cap_beyond_two_is_a_block(self):
+        """One position each for S1 and S6 is the authorised ceiling.
+        Two is therefore allowed and three is not -- the global cap is
+        no longer pinned to 1, but it is not unbounded either."""
+        result = _run(CHECK, env={"LIVE_ROLLOUT_MAX_POSITIONS": "3"})
+        assert "LIVE_ROLLOUT_MAX_POSITIONS_NOT_1_OR_2" in result.stdout
+
+    def test_a_per_strategy_cap_above_the_global_one_is_a_block(self):
+        """Two numbers that are both meant to be enforced must not
+        contradict each other."""
+        result = _run(CHECK, env={"LIVE_ROLLOUT_MAX_POSITIONS": "1",
+                                  "LIVE_ROLLOUT_MAX_POSITIONS_PER_STRATEGY": "2"})
+        assert "PER_STRATEGY_CAP_EXCEEDS_GLOBAL" in result.stdout
 
 class TestTheCheckerSurvivesEveryCommitPosture:
     """The checker must REPORT a mismatch, not die on the branch whose
@@ -622,6 +636,7 @@ class TestReadyForLiveBootstrapIsActuallyReachable:
             "VALIDATED_COMMIT": head,
             "KIS_ENV": "live",
             "LIVE_ROLLOUT_MAX_POSITIONS": "1",
+            "LIVE_ROLLOUT_MAX_POSITIONS_PER_STRATEGY": "1",
             "LIVE_ROLLOUT_MAX_DAILY_ENTRIES": "1",
             "LIVE_ROLLOUT_MAX_QUANTITY": "1",
             "LIVE_ROLLOUT_ALLOWED_SYMBOLS": "AAPL",

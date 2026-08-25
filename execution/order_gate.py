@@ -23,6 +23,7 @@ from typing import FrozenSet, Optional
 from domain.instrument import Instrument
 from domain.order_intent import OrderIntent
 from domain.signal import Signal
+from config import strategy_registry
 from execution import entry_limits
 from execution.entry_limits import EntryLimitState
 from execution.secret_redaction import mask_account_number
@@ -248,6 +249,54 @@ def _check_entry_limits(ctx):
             f"({limits.open_position_count} held, {limits.pending_entry_count} in flight)",
             code=entry_limits.MAX_OPEN_POSITIONS,
         )
+
+    # -- the candidate's own strategy, inside the account's room.
+    #
+    # Inline rather than delegated: all three capacity caps are one
+    # decision -- "may this candidate take a slot?" -- and the drift
+    # detector in tests/test_observe_cash_path_probe.py reads THIS
+    # function's source to prove BUY_GATE_SEQUENCE still matches the
+    # order the gate actually runs. A cap raised from a helper is a cap
+    # that report cannot see.
+    #
+    # The strategy comes from the ORDER INTENT, which is what gets
+    # written to the idempotency ledger and therefore what every future
+    # count will attribute this order to. The signal carries it too, and
+    # the two must agree: checking one while recording the other would
+    # let them drift apart silently.
+    intent_strategy = getattr(ctx.order_intent, "strategy_id", None)
+    signal_strategy = getattr(ctx.signal, "strategy_id", None)
+    slot = strategy_registry.slot_for(intent_strategy)
+    if slot != strategy_registry.slot_for(signal_strategy):
+        raise OrderGateBlockedError(
+            f"order intent strategy {intent_strategy!r} and signal strategy "
+            f"{signal_strategy!r} resolve to different strategies -- this order's "
+            "slot cannot be attributed",
+            code=entry_limits.STRATEGY_ATTRIBUTION_UNKNOWN,
+        )
+    # No name, no slot, no cap. Blocking is the only honest answer:
+    # "unknown strategy" must not be the one input that skips a limit.
+    if slot is None:
+        raise OrderGateBlockedError(
+            f"the candidate's strategy {intent_strategy!r} is not a known live "
+            "strategy, so its per-strategy position cap cannot be enforced",
+            code=entry_limits.STRATEGY_ATTRIBUTION_UNKNOWN,
+        )
+    in_use = limits.strategy_effective_count(slot)
+    if in_use >= limits.max_positions_per_strategy:
+        detail = f"{slot} holds/has in flight {sorted(limits.strategy_symbols_for(slot))}"
+        if limits.unattributed_symbols:
+            # Said explicitly: a block caused by a row nobody could
+            # attribute looks, in a log, exactly like one caused by the
+            # strategy really being full -- and the fix for the first is
+            # reconciliation, not waiting.
+            detail += (f"; {sorted(limits.unattributed_symbols)} could not be "
+                       "attributed to a strategy and counts against every one")
+        raise OrderGateBlockedError(
+            f"per-strategy position cap reached for {slot}: {in_use} of "
+            f"{limits.max_positions_per_strategy} slot(s) in use ({detail})",
+            code=entry_limits.MAX_STRATEGY_POSITIONS,
+        )
     if limits.daily_entry_count >= limits.max_daily_entries:
         raise OrderGateBlockedError(
             f"daily-entry cap reached for {limits.trading_day}: "
@@ -269,7 +318,8 @@ BUY_GATE_SEQUENCE = (
     # this one. Both are listed so a report can name whichever refused.
     "EXECUTION_PRICE",
     "CASH", "OPEN_ORDER", "DUPLICATE_SIGNAL", "SYMBOL", "INSTRUMENT", "RECONCILIATION",
-    entry_limits.MAX_OPEN_POSITIONS, entry_limits.MAX_DAILY_ENTRIES,
+    entry_limits.MAX_OPEN_POSITIONS, entry_limits.MAX_STRATEGY_POSITIONS,
+    entry_limits.MAX_DAILY_ENTRIES,
 )
 
 # The one gate that expresses LIVE ORDER AUTHORIZATION rather than a fact

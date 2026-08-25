@@ -20,7 +20,7 @@ DEFAULT_TRADING_DAY = "2026-07-29"
 
 
 def unlimited(trading_day=DEFAULT_TRADING_DAY):
-    """Room in both caps, so neither can be the reason a gate blocks."""
+    """Room in every cap, so none can be the reason a gate blocks."""
     return EntryLimitState(
         max_open_positions=99,
         max_daily_entries=99,
@@ -28,4 +28,10 @@ def unlimited(trading_day=DEFAULT_TRADING_DAY):
         pending_entry_symbols=frozenset(),
         daily_entry_count=0,
         trading_day=trading_day,
+        # The per-strategy cap is a third limit on the same gate and
+        # needs the same treatment: permissive here, measured in
+        # tests/test_entry_limits.py and tests/test_entry_limit_gate.py.
+        max_positions_per_strategy=99,
+        strategy_symbols={},
+        unattributed_symbols=frozenset(),
     )

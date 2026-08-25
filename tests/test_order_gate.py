@@ -42,7 +42,7 @@ def _instrument(**overrides):
 
 def _signal(**overrides):
     kwargs = dict(
-        strategy_id="strat-1", strategy_version="v1", config_version="cfg-1",
+        strategy_id="S1_HMA_EARLY_TREND_V1", strategy_version="v1", config_version="cfg-1",
         code_commit="abc123", symbol="AAPL", exchange="NASDAQ", signal_price=100.0,
         score=90.0, entry_reason="breakout", valid_for_seconds=300, now=NOW,
     )
@@ -52,7 +52,7 @@ def _signal(**overrides):
 
 def _order_intent(**overrides):
     kwargs = dict(
-        internal_order_id="ord-1", signal_id="sig-1", strategy_id="strat-1",
+        internal_order_id="ord-1", signal_id="sig-1", strategy_id="S1_HMA_EARLY_TREND_V1",
         symbol="AAPL", exchange="NASDAQ", side="buy", quantity=1, order_type="limit",
         limit_price=100.0, stop_price=95.0, target_price=110.0, created_at=NOW,
     )

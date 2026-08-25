@@ -143,8 +143,11 @@ class TestItPromotesNothing:
 
         before = scanner_live_mode.SCANNER_LIVE_MODE["orb"]
         r.evaluate(crontab=CRON, observations=all_observed())
+        # The invariant is that evaluating changes NOTHING -- not what
+        # the mode happens to be. Asserting the literal made this a
+        # second copy of the posture, and it broke on a promotion it was
+        # never about.
         assert scanner_live_mode.SCANNER_LIVE_MODE["orb"] == before
-        assert before == "DISCOVERY_ONLY"
 
     def test_it_writes_no_configuration(self):
         """Local dicts are fine -- the evaluator builds its own result.

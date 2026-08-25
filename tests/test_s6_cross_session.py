@@ -345,8 +345,20 @@ class TestVariantStates:
         for variant in ("S6-P", "S6-A", "S6-O"):
             assert states[variant].mode == variant_state.BLOCKED_ORDER_ROUTE
 
-    def test_regular_is_discovery_only_today(self):
+    def test_regular_reflects_the_promoted_strategy(self):
+        """S6-R is the one variant whose order route is open AND whose
+        strategy has been promoted, so it is the one that reports
+        LIMITED_LIVE. The other three stay blocked on their route."""
         assert variant_state.evaluate()["S6-R"].mode == \
+            variant_state.LIMITED_LIVE
+
+    def test_holding_the_strategy_down_returns_regular_to_discovery(self):
+        """Promotion is a separate condition from the route: stand the
+        strategy down and S6-R stops being live without any session
+        change."""
+        stood_down = dict(slm.SCANNER_LIVE_MODE)
+        stood_down["orb"] = slm.MODE_DISCOVERY_ONLY
+        assert variant_state.evaluate(modes=stood_down)["S6-R"].mode == \
             variant_state.DISCOVERY_ONLY
 
     def test_a_closed_market_supplies_no_observation(self):
@@ -372,29 +384,47 @@ class TestVariantStates:
             variant_state.FAIL
 
     def test_ready_requires_every_check(self):
-        """All six -> READY. Any one missing -> not READY."""
+        """All six -> READY. Any one missing -> not READY.
+
+        Evaluated with the strategy held DOWN, because READY means
+        "a human may now promote this" -- a state only reachable while
+        it has not been promoted. Reading the production table here
+        would make the test assert today's posture instead of the
+        readiness rule.
+        """
+        stood_down = dict(slm.SCANNER_LIVE_MODE)
+        stood_down["orb"] = slm.MODE_DISCOVERY_ONLY
         full = {"regular_market_tick_verified": True,
                 "regular_candidate_freshness_verified": True,
                 "regular_common_stock_dry_run_verified": True}
-        state = variant_state.evaluate(observations=full)["S6-R"]
+        state = variant_state.evaluate(
+            observations=full, modes=stood_down)["S6-R"]
         assert state.mode == variant_state.READY_FOR_LIMITED_LIVE
         assert state.blocking == []
 
         for dropped in list(full):
             partial = {k: v for k, v in full.items() if k != dropped}
-            weaker = variant_state.evaluate(observations=partial)["S6-R"]
+            weaker = variant_state.evaluate(
+                observations=partial, modes=stood_down)["S6-R"]
             assert weaker.mode == variant_state.DISCOVERY_ONLY
             assert dropped in weaker.blocking
 
     def test_ready_is_not_permission_to_trade(self):
-        """READY means a human MAY promote. It must not itself order."""
+        """READY means a human MAY promote. It must not itself order.
+
+        The invariant survives the promotion: with the strategy held
+        down, every observation passing still yields READY and
+        may_order False. Evidence never promotes itself.
+        """
+        stood_down = dict(slm.SCANNER_LIVE_MODE)
+        stood_down["orb"] = slm.MODE_DISCOVERY_ONLY
         full = {"regular_market_tick_verified": True,
                 "regular_candidate_freshness_verified": True,
                 "regular_common_stock_dry_run_verified": True}
-        state = variant_state.evaluate(observations=full)["S6-R"]
+        state = variant_state.evaluate(
+            observations=full, modes=stood_down)["S6-R"]
         assert state.mode == variant_state.READY_FOR_LIMITED_LIVE
         assert state.may_order is False
-        assert slm.SCANNER_LIVE_MODE["orb"] == slm.MODE_DISCOVERY_ONLY
 
     def test_it_promotes_nothing(self):
         import ast
@@ -424,7 +454,8 @@ class TestS1IsUnaffected:
     def test_the_live_modes_are_unchanged(self):
         assert slm.SCANNER_LIVE_MODE["hma_early_trend"] == slm.MODE_LIMITED_LIVE
         assert slm.SCANNER_LIVE_MODE["accumulation"] == slm.MODE_DISCOVERY_ONLY
-        assert slm.SCANNER_LIVE_MODE["orb"] == slm.MODE_DISCOVERY_ONLY
+        # `orb` is deliberately absent: S6 is promoted now, and the
+        # subject of this test is that S1 was not touched by it.
 
     def test_s6_live_sessions_holds_only_routed_sessions(self):
         assert s6_sessions.LIVE_SESSIONS == frozenset(

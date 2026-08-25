@@ -79,9 +79,31 @@ check_limit() {
         fail "${name}_NOT_${expected}" "got '${actual:-<unset>}'"
     fi
 }
-check_limit LIVE_ROLLOUT_MAX_POSITIONS 1
+# The GLOBAL cap is no longer pinned to 1: with S1 and S6 both live at
+# one position each, the account cap is their sum. What must stay at 1
+# is the PER-STRATEGY cap and the per-order quantity -- those are the
+# numbers that decide how much a single mistake can cost.
+check_limit LIVE_ROLLOUT_MAX_POSITIONS_PER_STRATEGY 1
 check_limit LIVE_ROLLOUT_MAX_DAILY_ENTRIES 1
 check_limit LIVE_ROLLOUT_MAX_QUANTITY 1
+
+GLOBAL_MAX="${LIVE_ROLLOUT_MAX_POSITIONS:-}"
+PER_STRATEGY_MAX="${LIVE_ROLLOUT_MAX_POSITIONS_PER_STRATEGY:-}"
+if [ "${GLOBAL_MAX}" = "1" ] || [ "${GLOBAL_MAX}" = "2" ]; then
+    pass "LIVE_ROLLOUT_MAX_POSITIONS=${GLOBAL_MAX}"
+else
+    fail LIVE_ROLLOUT_MAX_POSITIONS_NOT_1_OR_2 "got '${GLOBAL_MAX:-<unset>}'"
+fi
+# Enforced here as well as in config.validate(), because this checker is
+# read by an operator deciding whether to place a real order and must
+# not require them to trust that a second file agrees.
+if [ -n "${GLOBAL_MAX}" ] && [ -n "${PER_STRATEGY_MAX}" ] \
+   && [ "${PER_STRATEGY_MAX}" -le "${GLOBAL_MAX}" ] 2>/dev/null; then
+    pass "per-strategy cap (${PER_STRATEGY_MAX}) <= global cap (${GLOBAL_MAX})"
+else
+    fail PER_STRATEGY_CAP_EXCEEDS_GLOBAL \
+        "per_strategy=${PER_STRATEGY_MAX:-<unset>} global=${GLOBAL_MAX:-<unset>}"
+fi
 
 # The one symbol a first limited-live order may touch. Empty is the
 # correct read-only posture AND a hard block on going live.
@@ -131,6 +153,7 @@ try:
         REQUIRED_FOR_ARMED, REQUIRED_FOR_OBSERVE, KISBroker,
         matrix_entries_for, pending_items_for,
     )
+    from config import strategy_registry
     from config.live_rollout_config import LiveRolloutConfig
     from execution import entry_limits, idempotency
     from execution.secret_redaction import mask_account_number
@@ -268,7 +291,14 @@ try:
           f"account={mask_account_number(snapshot_account.account_id)}")
 
     positions = [p for p in broker.get_positions() if getattr(p, "quantity", 0) > 0]
-    check("POSITIONS_NOT_ZERO", len(positions) == 0, f"open positions={len(positions)}")
+    # NOT "zero positions anywhere" any more. That was the right question
+    # while one strategy was live under one global slot; with S1 and S6
+    # both live it made the S6 bootstrap unreachable for as long as S1
+    # held anything, which is a scheduling accident rather than a safety
+    # property. What matters is that the account has ROOM -- the
+    # per-strategy check below is what stops a strategy doubling up.
+    check("ACCOUNT_AT_POSITION_CAP", len(positions) < rollout.max_open_positions,
+          f"open positions={len(positions)}/{rollout.max_open_positions}")
 
     open_orders = broker.get_open_orders()
     check("OPEN_ORDERS_NOT_ZERO", len(open_orders) == 0, f"open orders={len(open_orders)}")
@@ -295,10 +325,30 @@ try:
         limits = entry_limits.collect(broker=broker, conn=conn, rollout=rollout)
     finally:
         conn.close()
-    check("DAILY_ENTRIES_ALREADY_USED", limits.daily_entry_count == 0,
+    check("DAILY_ENTRIES_ALREADY_USED",
+          limits.daily_entry_count < limits.max_daily_entries,
           f"daily entries={limits.daily_entry_count}/{limits.max_daily_entries}")
-    check("POSITION_SLOTS_ALREADY_USED", limits.effective_position_count == 0,
-          f"effective positions={limits.effective_position_count}/{limits.max_open_positions}")
+    check("POSITION_SLOTS_ALREADY_USED",
+          limits.effective_position_count < limits.max_open_positions,
+          f"effective positions={limits.effective_position_count}/"
+          f"{limits.max_open_positions}")
+
+    # Per-strategy occupancy, reported for EVERY live strategy rather
+    # than only the one about to trade. An operator reading this is
+    # deciding whether to place a real order, and "S1 1/1, S6 0/1" is
+    # the fact that decision turns on.
+    for slot in strategy_registry.LIVE_SLOTS:
+        used = limits.strategy_effective_count(slot)
+        check(f"STRATEGY_SLOT_FULL_{slot}",
+              used < limits.max_positions_per_strategy,
+              f"{slot}={used}/{limits.max_positions_per_strategy} "
+              f"{sorted(limits.strategy_symbols_for(slot))}")
+    # A held or in-flight symbol nobody can attribute counts against
+    # EVERY strategy (execution/entry_limits.py), so it silently makes
+    # all of the above look full. Naming it separately is the difference
+    # between "wait for an exit" and "run reconciliation".
+    check("UNATTRIBUTED_POSITIONS", not limits.unattributed_symbols,
+          f"unattributed={sorted(limits.unattributed_symbols)}")
 except Exception as exc:  # noqa: BLE001
     check("KIS_ACCOUNT_READ_FAILED", False, type(exc).__name__)
 

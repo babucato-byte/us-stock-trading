@@ -111,7 +111,10 @@ class TestLiveModeConfiguration:
         """
         assert scanner_live_mode.is_limited_live(S1) is True
         assert scanner_live_mode.require_limited_live(S1) == S1
-        assert len(scanner_live_mode.discovery_only_scanners()) == 5
+        # Four now: `orb` was promoted to LIMITED_LIVE beside S1, which
+        # is exactly the situation this test says the publisher must
+        # survive -- it asks for S1 by NAME, not for "the only live one".
+        assert len(scanner_live_mode.discovery_only_scanners()) == 4
 
     def test_s1s_publisher_refuses_when_s1_itself_is_not_live(self):
         """The failure that still matters. A second strategy going live

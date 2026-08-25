@@ -16,7 +16,7 @@ from state_store.schema import (
     MIGRATION_11_STATEMENTS, MIGRATION_12_STATEMENTS,
     MIGRATION_13_STATEMENTS, MIGRATION_14_STATEMENTS,
     MIGRATION_15_STATEMENTS, MIGRATION_16_STATEMENTS,
-    MIGRATION_17_STATEMENTS,
+    MIGRATION_17_STATEMENTS, MIGRATION_18_STATEMENTS,
 )
 
 MIGRATIONS = [
@@ -54,6 +54,9 @@ MIGRATIONS = [
     (17, "S6 TRADE TIMELINE: s6_positions.trough_price and .exit_price -- "
          "MAE and realised P&L cannot be recomputed after the fact",
      MIGRATION_17_STATEMENTS),
+    (18, "PER-STRATEGY CAPS: kis_order_idempotency.strategy_id -- a global "
+         "count cannot answer whose slot is in use",
+     MIGRATION_18_STATEMENTS),
 ]
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1][0]

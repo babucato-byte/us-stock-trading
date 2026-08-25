@@ -189,6 +189,20 @@ def live_modes():
     return modes
 
 
+def discovery_modes():
+    """S6 stood down, whatever the production table currently says.
+
+    The DISCOVERY_ONLY half of these reports used to come free from the
+    production default. `orb` is promoted now, so a test whose subject
+    is "what an unpromoted strategy reports" has to say so explicitly --
+    otherwise it is asserting today's posture rather than the reporting
+    rule it was written for.
+    """
+    modes = dict(slm.SCANNER_LIVE_MODE)
+    modes["orb"] = slm.MODE_DISCOVERY_ONLY
+    return modes
+
+
 # ====================================================================
 # §2  S6-R FINAL CHECK
 # ====================================================================
@@ -252,7 +266,8 @@ class TestFinalCheckReportsWhatItMeasured:
     def test_discovery_only_never_reaches_the_submit_boundary(self, handoff,
                                                               master):
         publish(["AAPL"])
-        report = final_check.build(trading_day=DAY, session="REGULAR", now=T0)
+        report = final_check.build(trading_day=DAY, session="REGULAR",
+                                   modes=discovery_modes(), now=T0)
         assert report["submit_boundary_reached"] is False
         assert report["broker_submit_count"] == 0
         assert "not LIMITED_LIVE" in (report["source_refusal"] or "")
@@ -260,7 +275,8 @@ class TestFinalCheckReportsWhatItMeasured:
     def test_the_source_refusal_is_stated_once_at_the_top(self, handoff,
                                                           master):
         publish(["AAPL"])
-        report = final_check.build(trading_day=DAY, session="REGULAR", now=T0)
+        report = final_check.build(trading_day=DAY, session="REGULAR",
+                                   modes=discovery_modes(), now=T0)
         assert report["candidates"][0]["source_verified"] is False
         assert "not LIMITED_LIVE" in (report["source_refusal"] or "")
 
@@ -276,7 +292,8 @@ class TestFinalCheckReportsWhatItMeasured:
         have made it measurable.
         """
         publish(["AAPL"])
-        report = final_check.build(trading_day=DAY, session="REGULAR", now=T0)
+        report = final_check.build(trading_day=DAY, session="REGULAR",
+                                   modes=discovery_modes(), now=T0)
         row = report["candidates"][0]
         assert row["source_verified"] is False
         assert row["qualify_verified"] is True
@@ -284,7 +301,8 @@ class TestFinalCheckReportsWhatItMeasured:
     def test_freshness_is_measured_at_read_without_order_permission(
             self, handoff, master):
         publish(["AAPL"])
-        report = final_check.build(trading_day=DAY, session="REGULAR", now=T0)
+        report = final_check.build(trading_day=DAY, session="REGULAR",
+                                   modes=discovery_modes(), now=T0)
         # Measured: the observation path read real rows at a real moment.
         assert report["candidate_generated_at"]
         assert report["candidate_read_at"] == T0.isoformat()
@@ -296,7 +314,8 @@ class TestFinalCheckReportsWhatItMeasured:
 
     def test_the_observation_path_still_cannot_order(self, handoff, master):
         publish(["AAPL"])
-        report = final_check.build(trading_day=DAY, session="REGULAR", now=T0)
+        report = final_check.build(trading_day=DAY, session="REGULAR",
+                                   modes=discovery_modes(), now=T0)
         assert report["broker_submit_count"] == 0
         assert report["submit_boundary_reached"] is False
         assert report["strategy_live_mode"] == slm.MODE_DISCOVERY_ONLY
@@ -491,7 +510,8 @@ class TestCommonStockSnapshot:
 class TestSessionReport:
     def test_an_unrouted_session_expects_shadow(self, handoff, conn):
         report = session_report.build(conn=conn, trading_day=DAY,
-                                      session="PREMARKET", now=T0)
+                                      session="PREMARKET",
+                                      modes=discovery_modes(), now=T0)
         assert report["variant"] == "S6-P"
         assert report["session_mode"] == s6_sessions.MODE_REALTIME_SHADOW
         assert report["strategy_live_mode"] == slm.MODE_DISCOVERY_ONLY
@@ -857,8 +877,9 @@ class TestTheGateStillRefusesToday:
         from s6_live import readiness
 
         readiness.evaluate(observations={})
+        # Immutability is the invariant; the value is not. Asserting the
+        # literal made this a second copy of the posture.
         assert slm.SCANNER_LIVE_MODE == before
-        assert slm.SCANNER_LIVE_MODE["orb"] == slm.MODE_DISCOVERY_ONLY
 
 
 class TestS6GetsTheStrategyGates:
@@ -902,7 +923,8 @@ class TestCapabilityIsNotPromotion:
 
     def test_the_final_check_separates_them(self, handoff, master):
         publish(["AAPL"])
-        report = final_check.build(trading_day=DAY, session="REGULAR", now=T0)
+        report = final_check.build(trading_day=DAY, session="REGULAR",
+                                   modes=discovery_modes(), now=T0)
         assert report["session_mode"] == s6_sessions.MODE_LIMITED_LIVE
         assert report["strategy_live_mode"] == slm.MODE_DISCOVERY_ONLY
         assert report["order_capable"] is True
@@ -925,7 +947,8 @@ class TestCapabilityIsNotPromotion:
         # specified KIS order route and is session-permitted, while
         # PREMARKET has none and cannot become one.
         report = session_report.build(conn=conn, trading_day=DAY,
-                                      session="PREMARKET", now=T0)
+                                      session="PREMARKET",
+                                      modes=discovery_modes(), now=T0)
         assert report["session_mode"] == s6_sessions.MODE_REALTIME_SHADOW
         assert report["strategy_live_mode"] == slm.MODE_DISCOVERY_ONLY
         assert report["orders_allowed"] is False
@@ -933,7 +956,8 @@ class TestCapabilityIsNotPromotion:
     def test_orders_allowed_needs_both(self, handoff, master):
         """Neither alone is enough, in either direction."""
         capable_not_promoted = final_check.build(
-            trading_day=DAY, session="REGULAR", now=T0)
+            trading_day=DAY, session="REGULAR",
+            modes=discovery_modes(), now=T0)
         promoted_not_capable = final_check.build(
             trading_day=DAY, session="PREMARKET", modes=live_modes(),
             now=T0)

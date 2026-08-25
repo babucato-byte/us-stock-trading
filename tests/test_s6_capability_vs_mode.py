@@ -1,13 +1,18 @@
 """Session capability and strategy mode are two conditions, not one.
 
-The confusion this guards against is available right now: REGULAR
-reports `order_capable=True` while S6 is DISCOVERY_ONLY. Reading either
-one alone gives the wrong answer -- the session says orders are possible
-here, the mode says this strategy may not place them, and a real order
-needs BOTH.
+Reading either one alone gives the wrong answer -- the session says
+orders are possible here, the mode says whether this strategy may place
+them, and a real order needs BOTH.
 
 Getting it wrong in the permissive direction means a strategy that was
 never promoted trades because its session happened to be open.
+
+These tests INJECT the mode they are reasoning about rather than reading
+the production table, because the two are genuinely independent and a
+test that asserted today's table would have to be rewritten every time a
+strategy is promoted -- which is exactly what happened when `orb` moved
+to LIMITED_LIVE. The independence is the invariant; the current value is
+not.
 """
 
 import sys
@@ -30,17 +35,26 @@ def live_modes():
     return modes
 
 
+def discovery_modes():
+    """S6 stood down, whatever the production table currently says."""
+    modes = dict(slm.SCANNER_LIVE_MODE)
+    modes[s6.SCANNER_NAME] = slm.MODE_DISCOVERY_ONLY
+    return modes
+
+
 class TestTheTwoConditionsAreIndependent:
-    def test_today_regular_is_capable_while_s6_is_not_live(self):
-        """The exact state that makes reading one alone dangerous."""
+    def test_a_capable_session_and_a_stood_down_strategy_coexist(self):
+        """The exact state that makes reading one alone dangerous: the
+        session route is open while the strategy is not promoted."""
         assert s6.orders_allowed("REGULAR") is True
-        assert slm.SCANNER_LIVE_MODE[s6.SCANNER_NAME] == "DISCOVERY_ONLY"
+        assert slm.is_limited_live(s6.SCANNER_NAME, discovery_modes()) is False
 
     def test_a_capable_session_alone_offers_nothing(self):
         """Capability without promotion must yield no symbols at all --
         not a refusal downstream, but an empty source."""
         source = cs.S6CandidateSource(trading_day="2026-08-21",
-                                      session="REGULAR")
+                                      session="REGULAR",
+                                      modes=discovery_modes())
         assert source.symbols() == []
         assert "not LIMITED_LIVE" in source.describe()["refusal"]
 
@@ -65,7 +79,8 @@ class TestTheTwoConditionsAreIndependent:
         """So a stood-down strategy in a shadow session reports the
         reason an operator can act on first."""
         source = cs.S6CandidateSource(trading_day="2026-08-21",
-                                      session="PREMARKET")
+                                      session="PREMARKET",
+                                      modes=discovery_modes())
         assert "not LIMITED_LIVE" in source.describe()["refusal"]
 
     def test_both_together_are_required_and_sufficient(self):
@@ -96,22 +111,27 @@ class TestCapabilityIsNotPromotion:
         about the session's order route, not about whether S6 has been
         promoted. Conflating them is the whole hazard."""
         assert s6.mode_for("REGULAR") == "LIMITED_LIVE"
-        assert slm.SCANNER_LIVE_MODE[s6.SCANNER_NAME] != "LIMITED_LIVE"
+        # The session says LIMITED_LIVE regardless of the strategy mode:
+        # hold the strategy down and the session route does not move.
+        assert slm.is_limited_live(s6.SCANNER_NAME, discovery_modes()) is False
+        assert s6.mode_for("REGULAR") == "LIMITED_LIVE"
 
     def test_the_scan_set_is_wider_than_the_order_set(self):
         assert s6.LIVE_SESSIONS < s6.SCAN_SESSIONS
 
 
-class TestNothingCanSubmitToday:
-    def test_the_risk_matrix_still_admits_s6(self):
-        """The limit is not what is stopping it -- the mode is. Worth
-        asserting so a later reader does not mistake one for the other."""
+class TestAStoodDownStrategyCannotSubmit:
+    def test_the_risk_matrix_is_not_what_stops_it(self):
+        """The limit is not what stops an unpromoted strategy -- the
+        mode is. Worth asserting so a later reader does not mistake one
+        for the other."""
         from config import position_limits as pl
 
         assert pl.check_entry("S6_ORB_BREAKOUT_V1", {}).allowed is True
 
-    def test_but_the_source_yields_nothing_to_submit(self):
+    def test_the_source_yields_nothing_to_submit(self):
         source = cs.S6CandidateSource(trading_day="2026-08-21",
-                                      session="REGULAR")
+                                      session="REGULAR",
+                                      modes=discovery_modes())
         assert source.allowed_symbols() == frozenset()
         assert source.qualify("ANY").qualified is False

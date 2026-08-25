@@ -77,7 +77,7 @@ class _Broker:
 def _rollout(**overrides):
     kwargs = dict(
         enabled=True, allowed_symbols=frozenset({"AAPL"}), max_quantity_per_order=1,
-        max_open_positions=1, max_daily_entries=1, regular_session_only=True,
+        max_open_positions=1, max_positions_per_strategy=1, max_daily_entries=1, regular_session_only=True,
         allow_fractional=False, allow_market_order=False, allow_extended_hours=False,
         allow_leverage=False, allow_inverse=False, allow_short=False, allow_margin=False,
         max_price_deviation_percent=0.30,
@@ -413,7 +413,12 @@ class TestAuditPayload:
         payload = state.as_audit_payload()
         assert set(payload) == {
             "max_open_positions", "open_positions", "pending_entries",
-            "effective_positions", "max_daily_entries", "daily_entries", "trading_day"}
+            "effective_positions", "max_daily_entries", "daily_entries",
+            "trading_day",
+            # Added with the per-strategy cap. An operator reading this
+            # payload to decide whether an entry is possible needs to
+            # know WHOSE slots are in use, not only how many.
+            "max_positions_per_strategy", "strategy_positions", "unattributed"}
         assert payload["trading_day"] == TODAY
 
     def test_the_payload_carries_no_identifiers(self):
@@ -430,7 +435,7 @@ class TestAuditPayload:
 class TestStateArithmetic:
     def _state(self, **overrides):
         kwargs = dict(
-            max_open_positions=1, max_daily_entries=1,
+            max_open_positions=1, max_positions_per_strategy=1, max_daily_entries=1,
             open_position_symbols=frozenset(), pending_entry_symbols=frozenset(),
             daily_entry_count=0, trading_day=TODAY)
         kwargs.update(overrides)

@@ -19,13 +19,17 @@ Nothing here is retried. Not the order, not the cancel, not on any exit
 code.
 """
 
+import argparse
 import logging
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from datetime import datetime, timezone  # noqa: E402
+
 from brokers.kis_broker import KISBroker  # noqa: E402
+from config.live_rollout_config import LiveRolloutConfig  # noqa: E402
 from live_pilot import bootstrap  # noqa: E402
 from state_store import db as state_db  # noqa: E402
 
@@ -38,8 +42,20 @@ def _print_block(title, mapping):
         print(f"  {key}: {value}")
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="One-shot LIMITED LIVE bootstrap: one real BUY of one share")
+    # Which STRATEGY's candidate source is asked. Not which symbol -- the
+    # symbol is still the single allow-list entry and still cannot be
+    # passed in. A bootstrap that took a symbol from the command line
+    # would be testing the operator rather than the pipeline.
+    parser.add_argument("--strategy", default="s1",
+                        choices=sorted(bootstrap.SOURCE_FACTORIES),
+                        help="which strategy's candidate source to use")
+    args = parser.parse_args(argv)
+
     print("LIMITED LIVE BOOTSTRAP -- one real BUY of one share, or nothing")
+    print(f"  strategy (candidate source): {args.strategy}")
     print(f"  quantity (fixed in code): {bootstrap.BOOTSTRAP_QUANTITY}")
     print(f"  side / type (fixed in code): {bootstrap.BOOTSTRAP_SIDE} / "
           f"{bootstrap.BOOTSTRAP_ORDER_TYPE}")
@@ -47,9 +63,13 @@ def main():
 
     broker = KISBroker()
     conn = state_db.open_db()
+    now = datetime.now(timezone.utc)
+    rollout = LiveRolloutConfig.from_env()
+    source = bootstrap.SOURCE_FACTORIES[args.strategy](rollout=rollout, now=now)
     try:
         try:
-            result = bootstrap.run_bootstrap_buy(broker=broker, conn=conn)
+            result = bootstrap.run_bootstrap_buy(
+                broker=broker, conn=conn, rollout=rollout, now=now, source=source)
         except bootstrap.BootstrapBlocked as exc:
             _print_block("BLOCKED -- no order was placed", {
                 "reason_codes": ", ".join(exc.reason_codes) or "unspecified",

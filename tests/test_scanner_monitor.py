@@ -343,11 +343,25 @@ class TestRunnerWiring:
         assert "VWAP: 12.10" in sent[0]
 
     def test_the_live_mode_is_reported_per_scanner(self, monkeypatch):
+        """Each scanner reports ITS OWN mode, not a shared one.
+
+        Uses a live strategy and a discovery-only one, so the test
+        stays about per-scanner reporting rather than about which
+        strategies happen to be promoted. `orb` used to be the
+        discovery-only example and is now live, which is precisely why
+        the pair is chosen for the property and not for the posture.
+        """
         sent = self.capture(monkeypatch)
         monitor.notify_run(self.Report([
-            self.Outcome("hma_early_trend", []), self.Outcome("orb", [])]))
-        assert "운영 모드: 제한 실거래" in sent[0], "S1 is the live strategy"
-        assert "운영 모드: 분석 전용" in sent[1], "S6 is discovery only"
+            self.Outcome("hma_early_trend", []),
+            self.Outcome("accumulation", [])]))
+        assert "운영 모드: 제한 실거래" in sent[0], "S1 is a live strategy"
+        assert "운영 모드: 분석 전용" in sent[1], "S2 is discovery only"
+
+    def test_a_promoted_scanner_reports_limited_live(self, monkeypatch):
+        sent = self.capture(monkeypatch)
+        monitor.notify_run(self.Report([self.Outcome("orb", [])]))
+        assert "운영 모드: 제한 실거래" in sent[0], "S6 is promoted"
 
     def test_a_broken_report_cannot_fail_a_scan(self, monkeypatch):
         self.capture(monkeypatch)

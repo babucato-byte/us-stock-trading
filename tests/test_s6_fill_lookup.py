@@ -466,4 +466,7 @@ class TestFillQueryRuntimeReady:
             variant_state.PASS
         assert regular.checks["regular_market_tick_verified"] == \
             variant_state.NOT_MEASURED
-        assert regular.mode == variant_state.DISCOVERY_ONLY
+        # The subject is that a code-readiness check is NOT a production
+        # observation -- so the observation stays NOT_MEASURED above.
+        # The variant mode reflects the (separate) promotion decision
+        # and is deliberately not asserted here.

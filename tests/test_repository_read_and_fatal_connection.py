@@ -74,7 +74,7 @@ def _instrument():
 
 def _order_intent(**overrides):
     kwargs = dict(
-        internal_order_id="ord-1", signal_id="sig-1", strategy_id="strat-1", symbol="AAPL",
+        internal_order_id="ord-1", signal_id="sig-1", strategy_id="S1_HMA_EARLY_TREND_V1", symbol="AAPL",
         exchange="NASDAQ", side="buy", quantity=1, order_type="limit", limit_price=100.0,
         stop_price=95.0, target_price=110.0, created_at=NOW,
     )
@@ -89,7 +89,7 @@ def _buy_ctx_builder(order_intent):
             validated_commit="c1", deployed_commit="c1", kis_account_no=ACCOUNT_ID,
             allowed_account_no=ACCOUNT_ID, order_intent=order_intent, instrument=_instrument(),
             signal=build_signal(
-                strategy_id="strat-1", strategy_version="v1", config_version="cfg-1",
+                strategy_id="S1_HMA_EARLY_TREND_V1", strategy_version="v1", config_version="cfg-1",
                 code_commit="abc", symbol="AAPL", exchange="NASDAQ", signal_price=100.0,
                 score=90.0, entry_reason="breakout", valid_for_seconds=300, now=NOW,
             ),

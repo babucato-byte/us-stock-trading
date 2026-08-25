@@ -523,7 +523,9 @@ class TestS2IsUnchanged:
             "breakout_ready": slm.MODE_DISCOVERY_ONLY,
             "premarket_momentum": slm.MODE_DISCOVERY_ONLY,
             "gap_pullback": slm.MODE_DISCOVERY_ONLY,
-            "orb": slm.MODE_DISCOVERY_ONLY,
+            # `orb` was promoted to LIMITED_LIVE beside S1. Pinned to the
+            # intended posture so an ACCIDENTAL change still trips here.
+            "orb": slm.MODE_LIMITED_LIVE,
         }
 
     def test_the_rollout_limits_are_unchanged(self):

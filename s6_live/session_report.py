@@ -51,13 +51,18 @@ SHADOW_MODE = s6_sessions.MODE_REALTIME_SHADOW
 
 
 def build(*, conn=None, trading_day=None, session=None, now=None,
-          runtime_report=None) -> Dict[str, Any]:
+          runtime_report=None, modes=None) -> Dict[str, Any]:
     """The report for one session. Never raises.
 
     `runtime_report` is the dict `scripts/run_s6_runtime.py` produced on
     this tick, when the caller has one. Without it the runtime row is
     NOT_MEASURED rather than assumed healthy -- a tick that did not run
     and a tick that ran cleanly are different facts.
+
+    `modes` overrides the scanner live-mode table, exactly as
+    `s6_live.final_check.build` already allowed. Promotion and session
+    capability are independent, and a report that could only ever be
+    read against the deployed table could not demonstrate that.
     """
     moment = now or datetime.now(timezone.utc)
     from market_hours import EASTERN, get_market_state, us_trading_day
@@ -84,11 +89,11 @@ def build(*, conn=None, trading_day=None, session=None, now=None,
         # under a promoted strategy read the same as a promoted session
         # under a shadow strategy.
         "session_mode": s6_sessions.mode_for(resolved),
-        "strategy_live_mode": _strategy_live_mode(),
+        "strategy_live_mode": _strategy_live_mode(modes),
         "order_capable": s6_sessions.orders_allowed(resolved),
         "orders_allowed": (market != "CLOSED"
                            and s6_sessions.orders_allowed(resolved)
-                           and _strategy_is_live()),
+                           and _strategy_is_live(modes)),
         "order_route_verified": scan_session.order_route_verified(resolved),
         "broker_submit_count": 0,
         "errors": [],

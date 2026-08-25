@@ -84,7 +84,7 @@ class _Recorder:
 
 def _order_intent(side="buy", symbol="AAPL", quantity=1):
     return OrderIntent(
-        internal_order_id=f"ord-{side}-1", signal_id="sig-1", strategy_id="S",
+        internal_order_id=f"ord-{side}-1", signal_id="sig-1", strategy_id="S1_HMA_EARLY_TREND_V1",
         symbol=symbol, exchange="NASDAQ", side=side, quantity=quantity,
         order_type="limit", limit_price=100.0, stop_price=None, target_price=None,
         created_at=NOW)
@@ -107,7 +107,7 @@ def _snapshot(symbol="AAPL"):
 def _buy_ctx_builder(order_intent):
     def _build(reconciliation):
         signal = build_signal(
-            strategy_id="S", strategy_version="v1", config_version="c", code_commit="c1",
+            strategy_id="S1_HMA_EARLY_TREND_V1", strategy_version="v1", config_version="c", code_commit="c1",
             symbol=order_intent.symbol, exchange="NASDAQ", signal_price=100.0, score=99,
             entry_reason="test", valid_for_seconds=300, now=NOW)
         return order_gate.BuyGateContext(

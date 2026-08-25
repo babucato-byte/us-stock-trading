@@ -867,6 +867,26 @@ MIGRATION_17_STATEMENTS = [
     S6_POSITIONS_EXIT_PRICE,
 ]
 
+# Migration 18: which strategy an entry attempt belongs to.
+#
+# The global position cap could always be counted without this: the
+# union of held symbols and in-flight symbols needs no attribution. A
+# PER-STRATEGY cap cannot. With S1 and S6 both live under one global cap
+# of 2, "may S6 enter?" is not answerable from a count of 1 -- the
+# answer depends on whose slot that 1 is.
+#
+# Nullable on purpose. Rows written before this migration have no
+# strategy, and back-filling one would be inventing attribution for
+# orders whose signal is long gone. `execution/entry_limits.py` treats
+# an unattributed in-flight row as consuming EVERY strategy's slot, so
+# the missing value fails closed rather than silently freeing capacity.
+KIS_ORDER_IDEMPOTENCY_STRATEGY_ID = (
+    "ALTER TABLE kis_order_idempotency ADD COLUMN strategy_id TEXT")
+
+MIGRATION_18_STATEMENTS = [
+    KIS_ORDER_IDEMPOTENCY_STRATEGY_ID,
+]
+
 # Every table this schema version creates -- used by export.py's
 # export_all() and by tests asserting the full table set exists.
 ALL_TABLES = [

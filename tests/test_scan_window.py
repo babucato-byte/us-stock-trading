@@ -195,7 +195,10 @@ class TestScanningIsNotOrdering:
     def test_the_live_modes_are_untouched(self):
         from config import scanner_live_mode as slm
 
-        assert slm.SCANNER_LIVE_MODE["orb"] == slm.MODE_DISCOVERY_ONLY
+        # Pinned to the INTENDED posture so this stays a tripwire on an
+        # accidental change. `orb` moved to LIMITED_LIVE as a reviewed
+        # promotion; S2 has not been promoted and S1 was not touched.
+        assert slm.SCANNER_LIVE_MODE["orb"] == slm.MODE_LIMITED_LIVE
         assert slm.SCANNER_LIVE_MODE["accumulation"] == slm.MODE_DISCOVERY_ONLY
         assert slm.SCANNER_LIVE_MODE["hma_early_trend"] == slm.MODE_LIMITED_LIVE
 

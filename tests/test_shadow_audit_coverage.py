@@ -45,7 +45,7 @@ def _isolate(tmp_path, monkeypatch):
 def _rollout(**overrides):
     kwargs = dict(
         enabled=True, allowed_symbols=frozenset({"AAPL"}), max_quantity_per_order=1,
-        max_open_positions=1, max_daily_entries=1, regular_session_only=True,
+        max_open_positions=1, max_positions_per_strategy=1, max_daily_entries=1, regular_session_only=True,
         allow_fractional=False, allow_market_order=False, allow_extended_hours=False,
         allow_leverage=False, allow_inverse=False, allow_short=False, allow_margin=False,
         max_price_deviation_percent=0.30,

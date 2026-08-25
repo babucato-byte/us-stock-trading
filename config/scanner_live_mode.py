@@ -34,7 +34,16 @@ SCANNER_LIVE_MODE = {
     "breakout_ready": MODE_DISCOVERY_ONLY,
     "premarket_momentum": MODE_DISCOVERY_ONLY,
     "gap_pullback": MODE_DISCOVERY_ONLY,
-    "orb": MODE_DISCOVERY_ONLY,
+    # S6. Promoted from DISCOVERY_ONLY as a reviewed decision, not a
+    # config drift: the ORB scanner publishes a per-session breakout row
+    # carrying its own range, `s6_live` has the qualification, position
+    # store and exit policy behind it, and the entry it can now reach is
+    # bounded by a per-strategy cap of one position and a per-order
+    # quantity of one share (config/live_rollout_config.py). Ordering is
+    # still restricted to the sessions `config/s6_sessions.py` marks
+    # LIMITED_LIVE -- scanning happens in every session, ordering does
+    # not, and this table does not widen that.
+    "orb": MODE_LIMITED_LIVE,
 }
 
 

@@ -334,6 +334,12 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
                 signal_id=order_intent.signal_id, symbol=order_intent.symbol,
                 side=order_intent.side, trading_date=trading_date,
                 requested_quantity=order_intent.quantity,
+                # Recorded HERE, before the gate and before any network
+                # call, for the same reason the row itself is: the
+                # per-strategy cap counts this row as in flight, and a
+                # row that arrived without its owner would be counted
+                # against every strategy (execution/entry_limits.py).
+                strategy_id=getattr(order_intent, "strategy_id", None),
             )
         except idempotency.DuplicateOrderAttemptError as exc:
             raise ExecutionEngineError(

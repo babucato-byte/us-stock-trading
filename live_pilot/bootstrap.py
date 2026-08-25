@@ -41,13 +41,21 @@ Only restrictions:
   with the same facts the gate itself sees. A failure there blocks the
   order through the ordinary gate path, so transport count stays zero.
 
-The candidate is real
----------------------
-`select_candidate()` runs the production scanner (`paper_strategy_order.
-analyze_stock`) at the production threshold and builds a production
-`Signal` and `Instrument`. No threshold is lowered and no symbol can be
-passed in from a command line: a bootstrap that ordered whatever it was
-told would be testing the operator, not the pipeline.
+The candidate is real, and it is its own strategy's
+---------------------------------------------------
+`select_candidate()` asks a CANDIDATE SOURCE (live_pilot/
+candidate_sources.py) what the allow-listed symbol looks like at that
+strategy's own production threshold, and builds a production `Signal`
+and `Instrument` from the answer. No threshold is lowered and no symbol
+can be passed in from a command line: a bootstrap that ordered whatever
+it was told would be testing the operator, not the pipeline.
+
+Only the source varies. S1 reads its published store and re-scores with
+`paper_strategy_order.analyze_stock`; S6 reads its own published
+breakout row for the current session and variant. Everything below the
+selection -- price re-check, cash, sizing, gate, transport, UNKNOWN
+contract, verification, cancel -- is shared, which is the point: a
+second strategy must not get a second, less-exercised execution path.
 
 UNKNOWN is terminal
 -------------------
@@ -70,20 +78,19 @@ import shadow_audit
 from brokers.kis_broker import (
     KISAmbiguousResponseError, KISBrokerError, KISOrderableCashUnavailableError,
 )
+from config import strategy_registry
 from config.live_rollout_config import LiveRolloutConfig, LiveRolloutConfigError
 from domain.cash_sizing import (
     INSUFFICIENT_CASH, ORDERABLE_CASH_UNAVAILABLE, whole_shares_affordable,
 )
-from domain.instrument import InstrumentError
 from domain.order_intent import OrderIntent, OrderIntentError
-from domain.signal import SignalError, build_signal
 from execution import bootstrap_capability as capability_mod
 from execution import entry_limits, execution_engine, idempotency, order_gate
 from execution.execution_engine import ExecutionEngineError
+from live_pilot import candidate_sources
 from live_pilot import posture as posture_mod
 from market_data.base import MarketDataProviderError
-from market_data import candidate_store
-from market_data.exchange_registry import ExchangeResolutionError, build_kis_instrument
+from market_data.exchange_registry import build_kis_instrument
 from market_data.kis_validation_provider import KISValidationProvider
 from market_hours import us_trading_day
 from operations import kill_switch as ops_kill_switch
@@ -116,6 +123,11 @@ HALT_ACTIVE = "HALT_ACTIVE"
 ENTRY_NOT_ALLOWED = "ENTRY_NOT_ALLOWED"
 ROLLOUT_LIMIT_NOT_ONE = "ROLLOUT_LIMIT_NOT_ONE"
 POSITIONS_NOT_ZERO = "POSITIONS_NOT_ZERO"
+#: The bootstrap's OWN strategy already holds or has in flight a
+#: position. Distinct from POSITIONS_NOT_ZERO, which now means the
+#: account as a whole is at its cap: with two strategies live, "S6 is
+#: already trading" and "the account is full" need different responses.
+STRATEGY_POSITIONS_NOT_ZERO = "STRATEGY_POSITIONS_NOT_ZERO"
 OPEN_ORDERS_NOT_ZERO = "OPEN_ORDERS_NOT_ZERO"
 DAILY_ENTRIES_NOT_ZERO = "DAILY_ENTRIES_NOT_ZERO"
 UNRESOLVED_UNKNOWN_ORDERS = "UNRESOLVED_UNKNOWN_ORDERS"
@@ -350,7 +362,19 @@ def final_safety_recheck(*, broker, conn, rollout, order_intent, now, env=None):
         reasons.append(SAFETY_STATE_UNREADABLE)
 
     # -- rollout limits pinned at 1
-    if (rollout.max_open_positions != 1 or rollout.max_daily_entries != 1
+    #
+    # The GLOBAL position cap is deliberately not pinned here any more.
+    # It is the sum across live strategies, so pinning it to 1 pinned
+    # the number of live strategies to one -- which is a posture
+    # decision, not a property of a one-share bootstrap, and it silently
+    # blocked the second strategy the day it was authorised.
+    #
+    # What this one-shot genuinely requires is unchanged and still
+    # pinned: one share per order, one entry for the day, and one
+    # position for the strategy placing it. Those are the numbers that
+    # bound what a single mistake here can cost.
+    if (getattr(rollout, "max_positions_per_strategy", None) != 1
+            or rollout.max_daily_entries != 1
             or rollout.max_quantity_per_order != 1):
         reasons.append(ROLLOUT_LIMIT_NOT_ONE)
 
@@ -369,9 +393,25 @@ def final_safety_recheck(*, broker, conn, rollout, order_intent, now, env=None):
             broker=broker, conn=conn, rollout=rollout, now=now,
             exclude_internal_order_id=order_intent.internal_order_id,
         )
-        if limits.effective_position_count != 0:
+        # "An empty book" used to mean the whole account: zero positions
+        # anywhere. That was right while one strategy was live and one
+        # global slot existed, and wrong the moment a second strategy
+        # was authorised beside the first -- it made S6's bootstrap
+        # unreachable for as long as S1 held anything, which is most of
+        # the time and is not a safety property anybody chose.
+        #
+        # What the bootstrap actually requires is that THIS strategy is
+        # not already trading (so the one order it places cannot be a
+        # second entry for it) and that the account has room. Both are
+        # still checked; neither is relaxed.
+        slot = strategy_registry.slot_for(order_intent.strategy_id)
+        if slot is None:
+            reasons.append(entry_limits.STRATEGY_ATTRIBUTION_UNKNOWN)
+        elif limits.strategy_effective_count(slot) != 0:
+            reasons.append(STRATEGY_POSITIONS_NOT_ZERO)
+        if limits.effective_position_count >= limits.max_open_positions:
             reasons.append(POSITIONS_NOT_ZERO)
-        if limits.daily_entry_count != 0:
+        if limits.daily_entry_count >= limits.max_daily_entries:
             reasons.append(DAILY_ENTRIES_NOT_ZERO)
     except Exception:  # noqa: BLE001
         logger.exception("bootstrap: entry limit state unreadable")
@@ -440,14 +480,45 @@ class BootstrapCandidate:
         }
 
 
-def select_candidate(*, broker, rollout, deployed_commit, now):
-    """Run the production scanner on the single allow-listed symbol.
+def default_source(*, rollout=None, now=None, session=None):
+    """The S1 source -- what `select_candidate` used before it had any.
 
-    Raises BootstrapBlocked with a reason code rather than returning a
-    partial candidate. The scanner threshold is `SCORE_THRESHOLD`, the
-    same value the live cycle uses -- a bootstrap that lowered it to
-    guarantee itself a candidate would be verifying a path that never
-    runs in production.
+    Kept as the default so every existing caller behaves exactly as it
+    did. A bootstrap for another strategy passes its own source rather
+    than changing this one.
+    """
+    return candidate_sources.S1CandidateSource(
+        strategy_id=BOOTSTRAP_STRATEGY_ID, score_threshold=SCORE_THRESHOLD,
+        valid_for_seconds=SIGNAL_VALID_SECONDS,
+        # Read HERE, at selection time, from this module's own reference
+        # -- so the analyser the bootstrap uses is the one the bootstrap
+        # can be seen to be using.
+        analyze=pso.analyze_stock,
+    )
+
+
+def s6_source(*, rollout, now, session=None):
+    """S6's own published breakout row for the current session."""
+    from market_hours import us_trading_day
+    from scanners.base import scan_session
+
+    return candidate_sources.S6CandidateSource(
+        trading_day=us_trading_day(now),
+        session=session or scan_session.session_at(),
+        rollout=rollout, valid_for_seconds=SIGNAL_VALID_SECONDS,
+    )
+
+
+#: Bootstrap routes by name, for the entry point's `--strategy` flag.
+SOURCE_FACTORIES = {"s1": default_source, "s6": s6_source}
+
+
+def allowlisted_symbol(rollout):
+    """The single allow-listed symbol, or block.
+
+    Exactly one, always. Zero means the read-only posture is still in
+    force; more than one means the operator authorised a set rather than
+    a symbol, and this one-shot has no rule for choosing between them.
     """
     allowed = sorted(frozenset(rollout.allowed_symbols or ()))
     if len(allowed) != 1:
@@ -455,69 +526,32 @@ def select_candidate(*, broker, rollout, deployed_commit, now):
             f"live allow-list must hold exactly one symbol, holds {len(allowed)}",
             reason_codes=(LIVE_ALLOWLIST_NOT_EXACTLY_ONE,),
         )
-    symbol = allowed[0]
+    return allowed[0]
 
-    # The published candidate set must be TODAY's and must actually
-    # contain this symbol. Without this, a stale file left in the shared
-    # store from a previous session would let the bootstrap trade on
-    # yesterday's reasoning -- and the live re-score below would not
-    # catch it, because a symbol can still score well on a day the
-    # scanner never nominated it.
-    try:
-        # `now` is threaded through so the age check uses the same
-        # clock as every other decision in this function, rather
-        # than wall-clock time.
-        rows, manifest = candidate_store.load_verified(
-            trading_day=us_trading_day(now), now=now)
-    except candidate_store.CandidatesStale as exc:
-        raise BootstrapBlocked(
-            f"published candidates are not usable: {exc}",
-            reason_codes=(STALE_CANDIDATE,),
-        ) from exc
-    except candidate_store.CandidatesUnavailable as exc:
-        # CandidateStoreUnresolved subclasses this and carries its own
-        # code: "the store is misconfigured" needs a different operator
-        # response from "the scanner nominated nobody today".
-        raise BootstrapBlocked(
-            f"no published candidates: {exc}",
-            reason_codes=(getattr(exc, "reason_code", NO_CANDIDATE),),
-        ) from exc
 
-    if candidate_store.find(symbol, rows=rows) is None:
-        raise BootstrapBlocked(
-            f"{symbol} is allow-listed but today's scanner did not nominate it "
-            f"(published: {[r.get('symbol') for r in rows]})",
-            reason_codes=(CANDIDATE_SYMBOL_NOT_PUBLISHED,),
-        )
+def select_candidate(*, broker, rollout, deployed_commit, now, source=None):
+    """The one allow-listed symbol, as ITS OWN strategy sees it.
 
-    analysis = pso.analyze_stock(symbol)
-    if analysis is None or analysis.get("score", 0) < SCORE_THRESHOLD:
-        score = None if analysis is None else analysis.get("score")
-        raise BootstrapBlocked(
-            f"{symbol} does not meet the production score threshold "
-            f"({score} < {SCORE_THRESHOLD}); the threshold is not lowered for the bootstrap",
-            reason_codes=(NO_QUALIFYING_CANDIDATE,),
-        )
+    `source` decides which strategy is asked and at which threshold;
+    everything below the call -- the KIS price re-check, the orderable
+    cash read and whole-share sizing -- is common, and is the reason a
+    second strategy does not get a second bootstrap.
+
+    Raises BootstrapBlocked with a reason code rather than returning a
+    partial candidate. No source lowers its threshold here: a bootstrap
+    that did would be verifying a path that never runs in production.
+    """
+    symbol = allowlisted_symbol(rollout)
+    source = source or default_source(rollout=rollout, now=now)
 
     try:
-        # The venue is RESOLVED from the registry, never assumed -- KIS
-        # answers a wrong-exchange quote with rt_cd=0 and an empty price,
-        # so a hardcoded NASDAQ would make every NYSE/AMEX name silently
-        # unpriceable.
-        instrument, _record = build_kis_instrument(symbol)
-        signal = build_signal(
-            strategy_id=BOOTSTRAP_STRATEGY_ID, strategy_version="v1",
-            config_version="live_rollout_v1", code_commit=deployed_commit,
-            symbol=symbol, exchange=instrument.exchange,
-            signal_price=analysis["price"], score=analysis["score"],
-            entry_reason="score_threshold_breakout",
-            valid_for_seconds=SIGNAL_VALID_SECONDS, now=now,
-        )
-    except (InstrumentError, SignalError, ExchangeResolutionError) as exc:
-        raise BootstrapBlocked(
-            f"signal/instrument construction failed: {exc}",
-            reason_codes=("INSTRUMENT_INVALID",),
-        ) from exc
+        selection = source.select(symbol, deployed_commit=deployed_commit, now=now)
+    except candidate_sources.CandidateSourceBlocked as exc:
+        raise BootstrapBlocked(str(exc), reason_codes=exc.reason_codes) from exc
+
+    instrument = selection.instrument
+    signal = selection.signal
+    analysis = selection.analysis
 
     validation = KISValidationProvider(
         broker, instrument_lookup=lambda s: build_kis_instrument(s)[0],
@@ -584,7 +618,7 @@ class BootstrapResult:
         return getattr(self.execution_result, "status", None)
 
 
-def run_bootstrap_buy(*, broker, conn, rollout=None, now=None, env=None):
+def run_bootstrap_buy(*, broker, conn, rollout=None, now=None, env=None, source=None):
     """Place at most one real 1-share BUY through the production engine.
 
     Returns a `BootstrapResult` on success. Raises `BootstrapBlocked`
@@ -612,6 +646,7 @@ def run_bootstrap_buy(*, broker, conn, rollout=None, now=None, env=None):
 
     candidate = select_candidate(
         broker=broker, rollout=rollout, deployed_commit=deployed_commit, now=current,
+        source=source,
     )
 
     try:

@@ -244,10 +244,30 @@ class TestTheBootstrapRefusesUnusableCandidates:
         made before the candidate gate, these tests would AttributeError
         instead of raising BootstrapBlocked."""
         from live_pilot import bootstrap
-        source = (REPO_ROOT / "live_pilot" / "bootstrap.py").read_text(encoding="utf-8")
-        body = source.split("def select_candidate", 1)[1].split("\ndef ", 1)[0]
-        assert body.index("load_verified") < body.index("analyze_stock")
-        assert body.index("load_verified") < body.index("get_orderable_usd")
+
+        # S1 candidate selection moved to live_pilot/candidate_sources.py
+        # when the bootstrap gained a second (S6) source. The ORDER is
+        # what this test is about and it is unchanged: the published-set
+        # check runs before the re-score, so a symbol today's scanner did
+        # not nominate is refused without any broker or analyser work.
+        source = (REPO_ROOT / "live_pilot" / "candidate_sources.py").read_text(
+            encoding="utf-8")
+        cls = source.split("class S1CandidateSource", 1)[1].split(
+            "\nclass ", 1)[0]
+        # `select` itself, not the whole class: the analyser is reached
+        # through an injected callable whose fallback names
+        # `analyze_stock` in a helper ABOVE this method, so scanning the
+        # class would compare against the wrong occurrence.
+        body = cls.split("def select", 1)[1]
+        assert body.index("load_verified") < body.index("_analyzer()")
+        # The cash read now lives in the bootstrap's shared tail, which
+        # runs only AFTER the source has returned a candidate -- so the
+        # ordering is checked where the two now sit together.
+        bootstrap_source = (REPO_ROOT / "live_pilot" / "bootstrap.py").read_text(
+            encoding="utf-8")
+        select = bootstrap_source.split("def select_candidate", 1)[1].split(
+            "\ndef ", 1)[0]
+        assert select.index("source.select(") < select.index("get_orderable_usd")
         assert bootstrap.NO_CANDIDATE == "NO_CANDIDATE"
 
 
@@ -441,8 +461,10 @@ class TestTheLegacyWatchlistPathStillWorks:
         assert "raise" in strict or "read_manifest()" in strict
 
     def test_the_bootstrap_uses_the_strict_read(self):
-        source = (REPO_ROOT / "live_pilot" / "bootstrap.py").read_text(encoding="utf-8")
-        body = source.split("def select_candidate", 1)[1].split("\ndef ", 1)[0]
+        source = (REPO_ROOT / "live_pilot" / "candidate_sources.py").read_text(
+            encoding="utf-8")
+        body = source.split("class S1CandidateSource", 1)[1].split(
+            "\nclass ", 1)[0]
         assert "load_verified" in body
         assert "candidate_store.symbols()" not in body
 

@@ -55,9 +55,10 @@ count of zero is the single most dangerous wrong answer a limit checker
 can give, because it reads exactly like "nothing is open yet".
 """
 
-from dataclasses import dataclass
-from typing import FrozenSet
+from dataclasses import dataclass, field
+from typing import FrozenSet, Mapping
 
+from config import strategy_registry
 from execution.order_repository import FatalRepositoryConnectionError
 from market_hours import us_trading_day
 
@@ -69,6 +70,14 @@ DAILY_ENTRY_STATE_UNKNOWN = "DAILY_ENTRY_STATE_UNKNOWN"
 
 MAX_OPEN_POSITIONS = "MAX_OPEN_POSITIONS"
 MAX_DAILY_ENTRIES = "MAX_DAILY_ENTRIES"
+#: The candidate's own strategy is already using its slot, even though
+#: the account has room. Distinct from MAX_OPEN_POSITIONS on purpose:
+#: "the account is full" and "S6 already holds one" are different facts
+#: and lead to different operator actions.
+MAX_STRATEGY_POSITIONS = "MAX_STRATEGY_POSITIONS"
+#: Something is in flight or held that cannot be attributed to a
+#: strategy, so no per-strategy cap can be enforced honestly.
+STRATEGY_ATTRIBUTION_UNKNOWN = "STRATEGY_ATTRIBUTION_UNKNOWN"
 
 # An entry attempt stops holding a slot only when the broker definitively
 # never saw it. Anything that reached (or may have reached) the wire keeps
@@ -99,6 +108,16 @@ class EntryLimitState:
     pending_entry_symbols: FrozenSet[str]
     daily_entry_count: int
     trading_day: str
+    #: Per-strategy slot cap, and the symbols each slot is using.
+    #: Defaulted so every existing constructor call keeps working; a
+    #: context built without them enforces the global cap exactly as
+    #: before and reports the per-strategy one as unenforceable.
+    max_positions_per_strategy: int = 1
+    strategy_symbols: Mapping[str, FrozenSet[str]] = field(
+        default_factory=dict)
+    #: Symbols held or in flight that no strategy could be named for.
+    #: Never empty-by-assumption: see `strategy_effective_count`.
+    unattributed_symbols: FrozenSet[str] = frozenset()
 
     @property
     def open_position_count(self):
@@ -114,6 +133,21 @@ class EntryLimitState:
         has already become a position must not be counted twice."""
         return len(self.open_position_symbols | self.pending_entry_symbols)
 
+    def strategy_symbols_for(self, slot) -> FrozenSet[str]:
+        """What `slot` is holding or has in flight, including anything
+        unattributed.
+
+        Unattributed symbols are added to EVERY slot rather than to
+        none. A symbol nobody can claim might be this strategy's, and a
+        cap that resolves that doubt in favour of trading is not a cap.
+        In the normal case the set is empty and this is the plain count.
+        """
+        own = frozenset(self.strategy_symbols.get(slot, frozenset()))
+        return own | frozenset(self.unattributed_symbols)
+
+    def strategy_effective_count(self, slot) -> int:
+        return len(self.strategy_symbols_for(slot))
+
     def as_audit_payload(self):
         """Operator-facing observability. Symbols and counts only: no
         account number, no order id, no price."""
@@ -125,6 +159,12 @@ class EntryLimitState:
             "max_daily_entries": self.max_daily_entries,
             "daily_entries": self.daily_entry_count,
             "trading_day": self.trading_day,
+            "max_positions_per_strategy": self.max_positions_per_strategy,
+            "strategy_positions": {
+                slot: self.strategy_effective_count(slot)
+                for slot in strategy_registry.LIVE_SLOTS
+            },
+            "unattributed": sorted(self.unattributed_symbols),
         }
 
 
@@ -196,6 +236,88 @@ def _never_reached_the_broker(row):
     return row["status"] == _PRE_TRANSPORT_REJECTION and not row["broker_order_id"]
 
 
+def _held_symbols_by_slot(conn):
+    """What each strategy's own position store says it is holding.
+
+    The broker is the authority on WHETHER a position exists -- that is
+    `_open_position_symbols` above and it is what the global cap counts.
+    It cannot be the authority on WHOSE it is: KIS returns a symbol and
+    a quantity, not a strategy. Attribution can only come from the store
+    that opened the position, so that is what is read here.
+
+    A store that cannot be read raises. A slot silently counted as empty
+    is the same dangerous wrong answer as a zero position count, and for
+    the same reason.
+    """
+    from config import strategy_registry as registry
+
+    held = {}
+    for slot, table in registry.POSITION_TABLES.items():
+        placeholders = ",".join("?" * len(registry.HOLDING_STATUSES))
+        statuses = sorted(registry.HOLDING_STATUSES)
+        try:
+            rows = conn.execute(
+                f"SELECT symbol FROM {table} WHERE status IN ({placeholders})",
+                statuses,
+            ).fetchall()
+        except FatalRepositoryConnectionError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise EntryLimitStateUnavailable(
+                f"{table} is unreadable, so {slot}'s slot usage cannot be "
+                f"established: {type(exc).__name__}",
+                reason_code=POSITION_LIMIT_STATE_UNKNOWN,
+            ) from exc
+        held[slot] = frozenset(
+            str(row["symbol"]).upper() for row in rows if row["symbol"])
+    return held
+
+
+def _pending_symbols_by_slot(conn, *, exclude_internal_order_id):
+    """In-flight entry attempts, grouped by the strategy that made them.
+
+    Returns `(by_slot, unattributed)`. A row whose `strategy_id` is NULL
+    or unrecognised goes into `unattributed` rather than being dropped:
+    rows written before migration 18 have no strategy, and inventing one
+    for them -- or ignoring them -- would free capacity that is really
+    in use.
+    """
+    from config import strategy_registry as registry
+    from execution.order_state_machine import TERMINAL_STATES
+
+    try:
+        rows = conn.execute(
+            "SELECT internal_order_id, symbol, status, broker_order_id, strategy_id "
+            "FROM kis_order_idempotency WHERE side = 'buy'"
+        ).fetchall()
+    except FatalRepositoryConnectionError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise EntryLimitStateUnavailable(
+            f"durable order state is unreadable: {type(exc).__name__}",
+            reason_code=POSITION_LIMIT_STATE_UNKNOWN,
+        ) from exc
+
+    by_slot = {slot: set() for slot in registry.LIVE_SLOTS}
+    unattributed = set()
+    for row in rows:
+        if exclude_internal_order_id and row["internal_order_id"] == exclude_internal_order_id:
+            continue
+        status = row["status"]
+        if status in TERMINAL_STATES and status != _PRE_TRANSPORT_REJECTION:
+            continue
+        if _never_reached_the_broker(row):
+            continue
+        symbol = str(row["symbol"]).upper()
+        slot = registry.slot_for(row["strategy_id"])
+        if slot is None:
+            unattributed.add(symbol)
+        else:
+            by_slot.setdefault(slot, set()).add(symbol)
+    return ({slot: frozenset(symbols) for slot, symbols in by_slot.items()},
+            frozenset(unattributed))
+
+
 def _daily_entry_count(conn, *, trading_day, exclude_internal_order_id):
     try:
         rows = conn.execute(
@@ -248,14 +370,46 @@ def collect(*, broker, conn, rollout, now=None, exclude_internal_order_id=None):
                              else DAILY_ENTRY_STATE_UNKNOWN),
             )
 
+    max_per_strategy = getattr(rollout, "max_positions_per_strategy", 1)
+    if isinstance(max_per_strategy, bool) or not isinstance(max_per_strategy, int) \
+            or max_per_strategy < 1:
+        raise EntryLimitStateUnavailable(
+            f"rollout max_positions_per_strategy is not a positive int: "
+            f"{max_per_strategy!r}",
+            reason_code=POSITION_LIMIT_STATE_UNKNOWN,
+        )
+
+    open_symbols = _open_position_symbols(broker)
+    pending_symbols = _pending_entry_symbols(
+        conn, exclude_internal_order_id=exclude_internal_order_id)
+    held_by_slot = _held_symbols_by_slot(conn)
+    pending_by_slot, unattributed_pending = _pending_symbols_by_slot(
+        conn, exclude_internal_order_id=exclude_internal_order_id)
+
+    strategy_symbols = {
+        slot: frozenset(held_by_slot.get(slot, frozenset()))
+        | frozenset(pending_by_slot.get(slot, frozenset()))
+        for slot in strategy_registry.LIVE_SLOTS
+    }
+
+    # A position the broker reports that no strategy store claims. It
+    # counts globally already; leaving it out of the per-strategy view
+    # would let a strategy open a second name beside a position that may
+    # well be its own. `strategy_symbols_for` folds this into every slot.
+    claimed = frozenset().union(*strategy_symbols.values()) if strategy_symbols else frozenset()
+    unattributed = (open_symbols | pending_symbols) - claimed
+    unattributed |= unattributed_pending
+
     return EntryLimitState(
         max_open_positions=max_positions,
         max_daily_entries=max_entries,
-        open_position_symbols=_open_position_symbols(broker),
-        pending_entry_symbols=_pending_entry_symbols(
-            conn, exclude_internal_order_id=exclude_internal_order_id),
+        open_position_symbols=open_symbols,
+        pending_entry_symbols=pending_symbols,
         daily_entry_count=_daily_entry_count(
             conn, trading_day=trading_day,
             exclude_internal_order_id=exclude_internal_order_id),
         trading_day=trading_day,
+        max_positions_per_strategy=max_per_strategy,
+        strategy_symbols=strategy_symbols,
+        unattributed_symbols=frozenset(unattributed),
     )

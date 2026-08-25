@@ -42,12 +42,21 @@ from execution.order_repository import (  # noqa: E402
     FatalRepositoryConnectionError,
 )
 from execution.secret_redaction import install_logging_redaction  # noqa: E402
+from reconciliation import fill_window  # noqa: E402
 from reconciliation import reconciliation_state  # noqa: E402
 from reconciliation import snapshot as reconciliation_snapshot  # noqa: E402
-from reconciliation.order_reconciler import reconcile_unknown_order  # noqa: E402
+from reconciliation.order_reconciler import (  # noqa: E402
+    reconcile_unknown_order, settle_live_order,
+)
 from state_store import db as state_db  # noqa: E402
 
 logger = logging.getLogger("reconciliation")
+
+#: Non-terminal statuses that KIS's own history can move forward.
+#: CANCEL_PENDING is deliberately absent: a cancel in flight is resolved
+#: by the cancel lifecycle, and settling it from fill history alone
+#: would race that path.
+SETTLEABLE_STATUSES = ("ACCEPTED", "PARTIALLY_FILLED")
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -86,9 +95,7 @@ def resolve_unknown_orders(conn, broker, *, now):
     a direct status write, and never a re-submission."""
     try:
         kis_open_orders = broker.get_open_orders()
-        kis_fills = broker.get_fills(
-            start_date=now.strftime("%Y%m%d"), end_date=now.strftime("%Y%m%d"),
-        )
+        kis_fills = fill_window.read_fills(broker, conn, now=now)
     except Exception as exc:
         logger.warning("cannot resolve UNKNOWN orders this pass: %s", exc)
         return []
@@ -120,6 +127,63 @@ def resolve_unknown_orders(conn, broker, *, now):
     return resolved
 
 
+def settle_live_orders(conn, broker, *, now):
+    """Advance ACCEPTED / PARTIALLY_FILLED rows that KIS says are done.
+
+    Nothing used to do this. `resolve_unknown_orders` above only ever
+    touched UNKNOWN, so an order that was ACCEPTED and then filled kept
+    its ACCEPTED row for ever. Two things follow from that row, and both
+    are severe:
+
+      * `execution/entry_limits.py` counts a non-terminal row as an
+        entry in flight, so it holds a position slot permanently;
+      * `reconciliation/snapshot.py` reports it as "live at KIS but KIS
+        has no record of it" from the next session onward, which makes
+        the snapshot permanently dirty and blocks EVERY buy, for every
+        strategy, until a human intervenes.
+
+    Order 0030469882 did exactly this: filled 1 @ 53.68 on 2026-08-18,
+    ledger never advanced, 1,040 entry attempts rejected.
+
+    Same discipline as the UNKNOWN path: compare-and-set through the
+    repository, KIS's own history as the only evidence, and an order
+    that cannot be confirmed is left exactly as it is.
+    """
+    try:
+        kis_open_orders = broker.get_open_orders()
+        kis_fills = fill_window.read_fills(broker, conn, now=now)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("cannot settle live orders this pass: %s", exc)
+        return []
+
+    settled = []
+    for row in idempotency.list_orders_by_status(conn, SETTLEABLE_STATUSES):
+        outcome = settle_live_order(
+            row["internal_order_id"], row["broker_order_id"], row["status"],
+            kis_open_orders, kis_fills, requested_quantity=row["requested_quantity"],
+        )
+        if not outcome.resolved:
+            logger.info("order %s stays %s: %s",
+                        row["internal_order_id"], row["status"], outcome.reason)
+            continue
+        try:
+            order_repository.compare_and_set_state(
+                conn, order_id=row["internal_order_id"], expected_state=row["status"],
+                next_state=outcome.confirmed_status, event_type="ORDER_SETTLED",
+                event_payload={"reason": outcome.reason}, expected_version=row["version"],
+                now=now,
+            )
+        except FatalRepositoryConnectionError:
+            raise
+        except order_repository.OrderRepositoryError as exc:
+            logger.warning("CAS conflict settling %s: %s", row["internal_order_id"], exc)
+            continue
+        logger.info("order %s settled %s -> %s (%s)", row["internal_order_id"],
+                    row["status"], outcome.confirmed_status, outcome.reason)
+        settled.append((row["internal_order_id"], outcome.confirmed_status))
+    return settled
+
+
 def run_once(*, broker=None, now=None, conn=None, account_id=None):
     current = now or datetime.now(timezone.utc)
     broker = broker or KISBroker()
@@ -127,6 +191,12 @@ def run_once(*, broker=None, now=None, conn=None, account_id=None):
     conn = conn or state_db.open_db()
     try:
         resolved = resolve_unknown_orders(conn, broker, now=current)
+        # Before the snapshot, deliberately. Settling clears rows that
+        # would otherwise make the snapshot dirty, so a pass that fixes
+        # the ledger and a pass that judges it must happen in that
+        # order -- otherwise the first clean result is always one pass
+        # late, and the gates read the stale dirty one in between.
+        settled = settle_live_orders(conn, broker, now=current)
         try:
             snapshot = reconciliation_snapshot.build_snapshot(
                 broker=broker, conn=conn,
@@ -137,7 +207,8 @@ def run_once(*, broker=None, now=None, conn=None, account_id=None):
             # Record NOTHING: a failed read must never refresh the clean
             # timestamp the order gates read (CODEX-044).
             logger.error("reconciliation could not be performed: %s", exc)
-            return {"status": "kis_unavailable", "resolved": resolved, "snapshot": None}
+            return {"status": "kis_unavailable", "resolved": resolved,
+                    "settled": settled, "snapshot": None}
 
         try:
             from operations import kill_switch
@@ -157,7 +228,7 @@ def run_once(*, broker=None, now=None, conn=None, account_id=None):
         purged_files = shadow_mode.purge_old_files(now=current)
         return {
             "status": "clean" if snapshot.is_clean() else "mismatch",
-            "resolved": resolved, "snapshot": snapshot,
+            "resolved": resolved, "settled": settled, "snapshot": snapshot,
             "purged_audit_rows": purged_rows, "purged_log_files": len(purged_files),
         }
     finally:
@@ -191,9 +262,9 @@ def main(argv=None):
     if result["status"] == "kis_unavailable":
         return EXIT_KIS_UNAVAILABLE
     logger.info(
-        "reconciliation %s; resolved=%d purged_audit_rows=%s purged_log_files=%s",
-        result["status"], len(result["resolved"]), result.get("purged_audit_rows"),
-        result.get("purged_log_files"),
+        "reconciliation %s; resolved=%d settled=%d purged_audit_rows=%s purged_log_files=%s",
+        result["status"], len(result["resolved"]), len(result.get("settled") or ()),
+        result.get("purged_audit_rows"), result.get("purged_log_files"),
     )
     return EXIT_OK
 

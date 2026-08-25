@@ -50,7 +50,7 @@ def _instrument():
 
 def _order_intent(**overrides):
     kwargs = dict(
-        internal_order_id="ord-1", signal_id="sig-1", strategy_id="strat-1", symbol="AAPL",
+        internal_order_id="ord-1", signal_id="sig-1", strategy_id="S1_HMA_EARLY_TREND_V1", symbol="AAPL",
         exchange="NASDAQ", side="buy", quantity=1, order_type="limit", limit_price=100.0,
         stop_price=95.0, target_price=110.0, created_at=NOW,
     )
@@ -61,7 +61,7 @@ def _order_intent(**overrides):
 def _signal():
     from domain.signal import build_signal
     return build_signal(
-        strategy_id="strat-1", strategy_version="v1", config_version="cfg-1", code_commit="abc",
+        strategy_id="S1_HMA_EARLY_TREND_V1", strategy_version="v1", config_version="cfg-1", code_commit="abc",
         symbol="AAPL", exchange="NASDAQ", signal_price=100.0, score=90.0,
         entry_reason="breakout", valid_for_seconds=300, now=NOW,
     )
@@ -380,7 +380,7 @@ def _jsonl_writer(log_path, index):
     target = __import__("pathlib").Path(log_path)
     for step in range(10):
         record = sm.build_record(
-            signal_id=f"p{index}-{step}", strategy_id="s", strategy_version="v1",
+            signal_id=f"p{index}-{step}", strategy_id="S1_HMA_EARLY_TREND_V1", strategy_version="v1",
             code_commit="c", symbol=f"SYM{index}", risk_gate_result="BLOCKED",
             rejection_reason="concurrent rotation test",
         )
@@ -397,7 +397,7 @@ class TestJsonlDurability:
         target = tmp_path / "SHADOW.jsonl"
         shadow_mode.persist(
             shadow_mode.build_record(
-                signal_id="s1", strategy_id="s", strategy_version="v1", code_commit="c",
+                signal_id="s1", strategy_id="S1_HMA_EARLY_TREND_V1", strategy_version="v1", code_commit="c",
                 symbol="AAPL", risk_gate_result="BLOCKED", rejection_reason="r", now=NOW,
             ),
             path=target,
@@ -410,7 +410,7 @@ class TestJsonlDurability:
         for index in range(5):
             shadow_mode.persist(
                 shadow_mode.build_record(
-                    signal_id=f"s{index}", strategy_id="s", strategy_version="v1",
+                    signal_id=f"s{index}", strategy_id="S1_HMA_EARLY_TREND_V1", strategy_version="v1",
                     code_commit="c", symbol="AAPL", risk_gate_result="BLOCKED",
                     rejection_reason="rotation", now=NOW,
                 ),
@@ -444,7 +444,7 @@ class TestJsonlDurability:
         target = tmp_path / "SHADOW.jsonl"
         shadow_mode.persist(
             shadow_mode.build_record(
-                signal_id="s1", strategy_id="s", strategy_version="v1", code_commit="c",
+                signal_id="s1", strategy_id="S1_HMA_EARLY_TREND_V1", strategy_version="v1", code_commit="c",
                 symbol="AAPL", risk_gate_result="BLOCKED", rejection_reason="r", now=NOW,
             ),
             path=target,
@@ -488,7 +488,7 @@ class TestRedactionAtBothStores:
         target = tmp_path / "SHADOW.jsonl"
         shadow_mode.persist(
             shadow_mode.build_record(
-                signal_id="s1", strategy_id="s", strategy_version="v1", code_commit="c",
+                signal_id="s1", strategy_id="S1_HMA_EARLY_TREND_V1", strategy_version="v1", code_commit="c",
                 symbol="AAPL", risk_gate_result="BLOCKED",
                 rejection_reason=f"account 60606060 appsecret={secret}", now=NOW,
             ),

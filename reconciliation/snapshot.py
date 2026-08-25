@@ -43,6 +43,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, Tuple
 
+from reconciliation import fill_window
+
 DEFAULT_MAX_AGE_SECONDS = 30
 
 
@@ -220,9 +222,15 @@ def build_snapshot(*, broker, conn, account_id, symbol=None, now=None,
     except Exception as exc:
         raise _unavailable("KIS open-order read failed", exc) from exc
     try:
-        kis_fills = broker.get_fills(
-            start_date=current.strftime("%Y%m%d"), end_date=current.strftime("%Y%m%d"),
-        )
+        # Not today-only. `_check_open_orders` below reports an
+        # internally-live order that appears in neither KIS's open
+        # orders nor its fills, and an order that filled on a PREVIOUS
+        # session can never appear in today's fill list -- so a
+        # today-only window made that mismatch permanent and blocked
+        # every BUY for every strategy from the next morning onward.
+        # The window is derived from the oldest order still believed
+        # live (reconciliation/fill_window.py).
+        kis_fills = fill_window.read_fills(broker, conn, now=current)
     except Exception as exc:
         raise _unavailable("KIS fill-history read failed", exc) from exc
 

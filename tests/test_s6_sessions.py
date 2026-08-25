@@ -105,8 +105,13 @@ class TestOrderingIsTheSpecifiedSessions:
             assert scan_session.order_route_verified(session) is True
             assert s6.orders_allowed(session) is True
 
-        # ...and yet nothing can trade.
-        assert slm.SCANNER_LIVE_MODE["orb"] == slm.MODE_DISCOVERY_ONLY
+        # ...and a verified route is STILL not permission on its own:
+        # hold the strategy down and both capable sessions go quiet
+        # without any session change. Route, session permission and
+        # promotion remain three gates.
+        stood_down = dict(slm.SCANNER_LIVE_MODE)
+        stood_down["orb"] = slm.MODE_DISCOVERY_ONLY
+        assert slm.is_limited_live("orb", stood_down) is False
 
     def test_session_permission_is_not_bootstrap_evidence(self):
         """A session may be permitted while its wire values have never
@@ -204,11 +209,17 @@ class TestTheStrategyTransition:
         assert pl.PROPOSED_STRATEGY_MAX[S6] == 1
         assert pl.effective_limits() == (2, {S1: 1, S6: 1})
 
-    def test_s6_is_not_live_until_its_machinery_exists(self):
+    def test_s6_went_live_only_after_its_machinery_existed(self):
         """§25 Phase 1 puts LIMITED_LIVE after the lifecycle is built.
         Flipping the mode first would mark a strategy tradeable while
-        nothing could manage a position it opened."""
-        assert slm.SCANNER_LIVE_MODE["orb"] == "DISCOVERY_ONLY"
+        nothing could manage a position it opened -- so the promotion is
+        asserted TOGETHER with the machinery that justifies it."""
+        import importlib
+
+        for module in ("s6_live.qualification", "s6_live.position_store",
+                       "s6_live.exit_policy", "s6_live.exit_runtime"):
+            assert importlib.import_module(module) is not None
+        assert slm.SCANNER_LIVE_MODE["orb"] == "LIMITED_LIVE"
 
 
 class TestTheApprovedRiskCases:

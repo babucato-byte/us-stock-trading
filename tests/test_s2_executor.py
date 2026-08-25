@@ -135,8 +135,11 @@ class TestNothingIsSubmittedWhileS2IsDiscoveryOnly:
 
         assert scanner_live_mode.SCANNER_LIVE_MODE["hma_early_trend"] == \
             "LIMITED_LIVE"
+        # `orb` is deliberately absent: S6 has since been promoted to
+        # LIMITED_LIVE. S2 standing down is unaffected by that, which is
+        # what this test is about.
         for name in ("accumulation", "breakout_ready", "premarket_momentum",
-                     "gap_pullback", "orb"):
+                     "gap_pullback"):
             assert scanner_live_mode.SCANNER_LIVE_MODE[name] == "DISCOVERY_ONLY"
         assert executor.s2_is_limited_live() is False
 

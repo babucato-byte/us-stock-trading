@@ -136,8 +136,13 @@ class TestTheSessionMatrixIsHonoured:
             assert s6.orders_allowed(session) is False
             assert s6.mode_for(session) == s6.MODE_REALTIME_SHADOW
 
-    def test_s6_is_still_not_live(self):
-        """§11: the mode goes up only once the whole lifecycle exists."""
+    def test_s6_is_live_only_now_that_its_lifecycle_exists(self):
+        """§11: the mode goes up only once the whole lifecycle exists.
+
+        It now does -- qualification, position store, exit policy and
+        runtime -- so `orb` is LIMITED_LIVE. Pinned rather than removed,
+        so an accidental change to either strategy still trips.
+        """
         from config import scanner_live_mode
 
-        assert scanner_live_mode.SCANNER_LIVE_MODE["orb"] == "DISCOVERY_ONLY"
+        assert scanner_live_mode.SCANNER_LIVE_MODE["orb"] == "LIMITED_LIVE"

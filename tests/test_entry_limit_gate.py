@@ -60,11 +60,11 @@ _DEFAULT = object()
 def _ctx(*, limits=_DEFAULT, symbol="AAPL", side="buy", quantity=1):
     instrument = build_instrument(symbol, exchange="NASDAQ")
     signal = build_signal(
-        strategy_id="S", strategy_version="v1", config_version="c", code_commit="c1",
+        strategy_id="S1_HMA_EARLY_TREND_V1", strategy_version="v1", config_version="c", code_commit="c1",
         symbol=symbol, exchange="NASDAQ", signal_price=100.0, score=99,
         entry_reason="test", valid_for_seconds=300, now=NOW)
     intent = OrderIntent(
-        internal_order_id="ord-1", signal_id=signal.signal_id, strategy_id="S",
+        internal_order_id="ord-1", signal_id=signal.signal_id, strategy_id="S1_HMA_EARLY_TREND_V1",
         symbol=symbol, exchange="NASDAQ", side=side, quantity=quantity,
         order_type="limit", limit_price=100.0, stop_price=None, target_price=None,
         created_at=NOW)

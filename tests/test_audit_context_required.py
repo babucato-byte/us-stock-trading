@@ -55,7 +55,7 @@ def _instrument():
 
 def _order_intent(**overrides):
     kwargs = dict(
-        internal_order_id="ord-1", signal_id="sig-1", strategy_id="strat-1", symbol="AAPL",
+        internal_order_id="ord-1", signal_id="sig-1", strategy_id="S1_HMA_EARLY_TREND_V1", symbol="AAPL",
         exchange="NASDAQ", side="buy", quantity=1, order_type="limit", limit_price=100.0,
         stop_price=95.0, target_price=110.0, created_at=NOW,
     )
@@ -70,7 +70,7 @@ def _buy_ctx_builder(order_intent):
             validated_commit="c1", deployed_commit="c1", kis_account_no=ACCOUNT_ID,
             allowed_account_no=ACCOUNT_ID, order_intent=order_intent, instrument=_instrument(),
             signal=build_signal(
-                strategy_id="strat-1", strategy_version="v1", config_version="cfg-1",
+                strategy_id="S1_HMA_EARLY_TREND_V1", strategy_version="v1", config_version="cfg-1",
                 code_commit="abc", symbol="AAPL", exchange="NASDAQ", signal_price=100.0,
                 score=90.0, entry_reason="breakout", valid_for_seconds=300, now=NOW,
             ),
@@ -282,7 +282,7 @@ class TestValidAuditContextFlowsThroughTheLifecycle:
         })
         rollout = LiveRolloutConfig(
             enabled=True, allowed_symbols=frozenset({"AAPL"}), max_quantity_per_order=1,
-            max_open_positions=1, max_daily_entries=1, regular_session_only=True,
+            max_open_positions=1, max_positions_per_strategy=1, max_daily_entries=1, regular_session_only=True,
             allow_fractional=False, allow_market_order=False, allow_extended_hours=False,
             allow_leverage=False, allow_inverse=False, allow_short=False, allow_margin=False,
             max_price_deviation_percent=0.30,
@@ -308,7 +308,7 @@ class TestValidAuditContextFlowsThroughTheLifecycle:
         from positions import lifecycle
 
         record = kpm.create_kis_position_after_buy(
-            strategy_id="T", strategy_version="v1", symbol="AAPL", quantity=5,
+            strategy_id="S1_HMA_EARLY_TREND_V1", strategy_version="v1", symbol="AAPL", quantity=5,
             client_order_id="seed", broker_order_id="kis-seed", now=NOW,
         )
         lifecycle.record_fill(record["position_id"], 5, 100.0)

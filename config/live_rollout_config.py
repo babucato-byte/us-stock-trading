@@ -70,6 +70,15 @@ class LiveRolloutConfig:
     allowed_symbols: FrozenSet[str]
     max_quantity_per_order: int
     max_open_positions: int
+    #: The cap EACH live strategy gets inside `max_open_positions`.
+    #:
+    #: The global cap alone cannot express the posture that is actually
+    #: authorised. With S1 and S6 both live and a global cap of 2, a
+    #: global-only limit permits S1 holding two names, which is a
+    #: different and larger risk than one name each. Both caps are
+    #: enforced and neither substitutes for the other: a strategy is
+    #: blocked at its own cap even when the account has a free slot.
+    max_positions_per_strategy: int
     max_daily_entries: int
     regular_session_only: bool
     allow_fractional: bool
@@ -89,6 +98,8 @@ class LiveRolloutConfig:
             allowed_symbols=_env_symbol_set(mapping, "LIVE_ROLLOUT_ALLOWED_SYMBOLS", frozenset()),
             max_quantity_per_order=_env_int(mapping, "LIVE_ROLLOUT_MAX_QUANTITY", 1),
             max_open_positions=_env_int(mapping, "LIVE_ROLLOUT_MAX_POSITIONS", 1),
+            max_positions_per_strategy=_env_int(
+                mapping, "LIVE_ROLLOUT_MAX_POSITIONS_PER_STRATEGY", 1),
             max_daily_entries=_env_int(mapping, "LIVE_ROLLOUT_MAX_DAILY_ENTRIES", 1),
             regular_session_only=_env_bool(mapping, "REGULAR_SESSION_ONLY", True),
             allow_fractional=_env_bool(mapping, "ALLOW_FRACTIONAL", False),
@@ -111,6 +122,22 @@ class LiveRolloutConfig:
         if isinstance(self.max_open_positions, bool) or not isinstance(self.max_open_positions, int) \
                 or self.max_open_positions < 1:
             raise LiveRolloutConfigError(f"max_open_positions must be a positive int, got {self.max_open_positions!r}")
+        if isinstance(self.max_positions_per_strategy, bool) \
+                or not isinstance(self.max_positions_per_strategy, int) \
+                or self.max_positions_per_strategy < 1:
+            raise LiveRolloutConfigError(
+                f"max_positions_per_strategy must be a positive int, got "
+                f"{self.max_positions_per_strategy!r}")
+        # A per-strategy cap above the global one is not a stricter
+        # setting that happens to be unreachable -- it is a contradiction
+        # between two numbers that are both meant to be enforced, and
+        # the operator cannot be assumed to have meant either. Refusing
+        # is the only reading that does not silently pick one.
+        if self.max_positions_per_strategy > self.max_open_positions:
+            raise LiveRolloutConfigError(
+                f"max_positions_per_strategy ({self.max_positions_per_strategy}) exceeds "
+                f"max_open_positions ({self.max_open_positions}) -- a single strategy may "
+                "never be allowed more slots than the whole account has")
         if isinstance(self.max_daily_entries, bool) or not isinstance(self.max_daily_entries, int) \
                 or self.max_daily_entries < 1:
             raise LiveRolloutConfigError(f"max_daily_entries must be a positive int, got {self.max_daily_entries!r}")

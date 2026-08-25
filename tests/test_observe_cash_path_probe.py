@@ -227,14 +227,27 @@ class TestGateSequenceMatchesTheGate:
         for code in codes:
             if not deduped or deduped[-1] != code:
                 deduped.append(code)
-        # RECONCILIATION and the two capacity caps are raised by the two
+        # RECONCILIATION and the capacity caps are raised by the two
         # helpers the gate calls last, so they are not among
         # evaluate_buy_gate's own literals. The caps are read from the
-        # helper's source rather than hard-coded, so adding a third cap
+        # helper's source rather than hard-coded, so adding another cap
         # fails here instead of silently going unreported.
+        #
+        # The *_UNKNOWN codes are excluded: they mean "this limit could
+        # not be established", which is a state fault rather than a
+        # position in the sequence. GATE_SEQUENCE reports how far an
+        # evaluation got, and "the state was unreadable" is not a
+        # further stage of getting there.
+        state_faults = {entry_limits_module.POSITION_LIMIT_STATE_UNKNOWN,
+                        entry_limits_module.STRATEGY_ATTRIBUTION_UNKNOWN}
         caps = self._helper_codes_in_source_order("_check_entry_limits")
-        caps = [c for c in caps
-                if c != entry_limits_module.POSITION_LIMIT_STATE_UNKNOWN]
+        deduped_caps = []
+        for code in caps:
+            if code in state_faults:
+                continue
+            if not deduped_caps or deduped_caps[-1] != code:
+                deduped_caps.append(code)
+        caps = deduped_caps
         expected = tuple(deduped) + ("RECONCILIATION",) + tuple(caps)
         assert probe.GATE_SEQUENCE == expected, (
             "GATE_SEQUENCE drifted from order_gate.evaluate_buy_gate")

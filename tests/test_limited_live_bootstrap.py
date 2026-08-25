@@ -37,7 +37,7 @@ if str(REPO_ROOT) not in sys.path:
 from brokers.kis_broker import KISAmbiguousResponseError, KISBrokerError  # noqa: E402
 from config.live_rollout_config import LiveRolloutConfig  # noqa: E402
 from domain.order_intent import OrderIntent  # noqa: E402
-from live_pilot import bootstrap  # noqa: E402
+from live_pilot import bootstrap, candidate_sources  # noqa: E402
 from live_pilot import posture as posture_mod  # noqa: E402
 
 NOW = datetime(2026, 8, 10, 15, 0, tzinfo=timezone.utc)
@@ -97,7 +97,7 @@ class _FakeBroker:
 def _rollout(**overrides):
     base = dict(
         enabled=False, allowed_symbols=frozenset({SYMBOL}), max_quantity_per_order=1,
-        max_open_positions=1, max_daily_entries=1,
+        max_open_positions=2, max_positions_per_strategy=1, max_daily_entries=1,
     )
     base.update(overrides)
     return types.SimpleNamespace(
@@ -113,10 +113,21 @@ def _order_intent(symbol=SYMBOL, quantity=1, side="buy", order_type="limit"):
         stop_price=None, target_price=None, created_at=NOW)
 
 
-def _limits(*, positions=0, entries=0):
+def _limits(*, positions=0, entries=0, strategy_positions=0):
+    """The account as the bootstrap re-check sees it.
+
+    `positions` is the GLOBAL occupancy and `strategy_positions` is this
+    strategy's own -- two different caps since S1 and S6 both went live,
+    and the whole point of the split is that S1 holding one no longer
+    blocks S6.
+    """
     return types.SimpleNamespace(
         effective_position_count=positions, daily_entry_count=entries,
-        max_open_positions=1, max_daily_entries=1)
+        max_open_positions=2, max_positions_per_strategy=1,
+        max_daily_entries=1,
+        strategy_effective_count=lambda slot: strategy_positions,
+        strategy_symbols_for=lambda slot: frozenset(),
+        unattributed_symbols=frozenset())
 
 
 SAFE_ENV = {
@@ -364,9 +375,9 @@ class TestQuantityIsNotConfigurable:
             return {"score": 99, "price": 10.0}
 
         monkeypatch.setattr(bootstrap.pso, "analyze_stock", _fake_analyze)
-        monkeypatch.setattr(bootstrap, "build_kis_instrument",
+        monkeypatch.setattr(candidate_sources, "build_kis_instrument",
                             lambda s: (types.SimpleNamespace(exchange="NASDAQ", symbol=s), None))
-        monkeypatch.setattr(bootstrap, "build_signal", lambda **kw: types.SimpleNamespace(
+        monkeypatch.setattr(candidate_sources, "build_signal", lambda **kw: types.SimpleNamespace(
             signal_id="sig-1", strategy_id=kw["strategy_id"], signal_price=kw["signal_price"],
             entry_reason=kw["entry_reason"]))
 
@@ -402,9 +413,27 @@ class TestEachPreconditionBlocksOnItsOwn:
         assert bootstrap.DAILY_ENTRIES_NOT_ZERO in _recheck()
 
     def test_I_a_position_already_held_blocks(self, all_clear):
+        """The ACCOUNT being full blocks -- global occupancy at the cap."""
         all_clear.setattr(bootstrap.entry_limits, "collect",
-                          lambda **kw: _limits(positions=1))
+                          lambda **kw: _limits(positions=2))
         assert bootstrap.POSITIONS_NOT_ZERO in _recheck()
+
+    def test_I2_this_strategy_already_trading_blocks(self, all_clear):
+        """Distinct from the account being full: the account has room,
+        but this strategy already holds its one position, so the
+        bootstrap would be its SECOND entry rather than its first."""
+        all_clear.setattr(bootstrap.entry_limits, "collect",
+                          lambda **kw: _limits(positions=1, strategy_positions=1))
+        assert bootstrap.STRATEGY_POSITIONS_NOT_ZERO in _recheck()
+
+    def test_I3_another_strategy_holding_one_does_not_block(self, all_clear):
+        """The regression this split exists to prevent: S1 holding TX
+        must not make the S6 bootstrap unreachable."""
+        all_clear.setattr(bootstrap.entry_limits, "collect",
+                          lambda **kw: _limits(positions=1, strategy_positions=0))
+        reasons = _recheck()
+        assert bootstrap.POSITIONS_NOT_ZERO not in reasons
+        assert bootstrap.STRATEGY_POSITIONS_NOT_ZERO not in reasons
 
     @pytest.mark.parametrize("symbols", [frozenset(), frozenset({"AAPL", "MSFT"})])
     def test_J_an_allowlist_that_is_not_exactly_one_blocks(self, all_clear, symbols):
@@ -426,9 +455,9 @@ class TestEachPreconditionBlocksOnItsOwn:
     def test_K_insufficient_cash_blocks_with_zero_transport(self, monkeypatch, published):
         monkeypatch.setattr(bootstrap.pso, "analyze_stock",
                             lambda s: {"score": 99, "price": 500.0})
-        monkeypatch.setattr(bootstrap, "build_kis_instrument",
+        monkeypatch.setattr(candidate_sources, "build_kis_instrument",
                             lambda s: (types.SimpleNamespace(exchange="NASDAQ", symbol=s), None))
-        monkeypatch.setattr(bootstrap, "build_signal", lambda **kw: types.SimpleNamespace(
+        monkeypatch.setattr(candidate_sources, "build_signal", lambda **kw: types.SimpleNamespace(
             signal_id="sig-1", strategy_id=kw["strategy_id"], signal_price=kw["signal_price"],
             entry_reason=kw["entry_reason"]))
 
@@ -484,8 +513,24 @@ class TestEachPreconditionBlocksOnItsOwn:
         assert bootstrap.KIS_ENV_NOT_LIVE in _recheck({"KIS_ENV": "paper"})
 
     def test_a_widened_rollout_limit_blocks(self, all_clear):
-        assert bootstrap.ROLLOUT_LIMIT_NOT_ONE in _recheck(
-            rollout=_rollout(max_open_positions=3))
+        """The limits this one-shot pins: one share, one entry today,
+        one position for the strategy placing it.
+
+        The GLOBAL cap is deliberately not among them -- it is the sum
+        across live strategies, so pinning it would pin the number of
+        live strategies to one.
+        """
+        for widened in ({"max_positions_per_strategy": 2},
+                        {"max_daily_entries": 2},
+                        {"max_quantity_per_order": 2}):
+            assert bootstrap.ROLLOUT_LIMIT_NOT_ONE in _recheck(
+                rollout=_rollout(**widened)), widened
+
+    def test_a_wider_global_cap_alone_does_not_block(self, all_clear):
+        """Two strategies live at one position each is the authorised
+        posture, not a widened limit."""
+        assert bootstrap.ROLLOUT_LIMIT_NOT_ONE not in _recheck(
+            rollout=_rollout(max_open_positions=2))
 
     def test_every_unreadable_fact_is_a_block_not_a_pass(self, all_clear):
         """Fail-closed: an exception while reading a safety fact must
