@@ -79,9 +79,17 @@ class TestTheTwoConditionsAreIndependent:
 
 
 class TestCapabilityIsNotPromotion:
-    def test_the_session_matrix_says_capable_for_regular_only(self):
-        assert s6.LIVE_SESSIONS == {"REGULAR"}
+    def test_the_session_matrix_says_capable_for_the_routed_sessions(self):
+        """Capable, not promoted. Both sessions whose KIS order route the
+        specification defines report LIMITED_LIVE as a statement about
+        the SESSION; the two with no route report shadow and cannot be
+        widened, because there is no endpoint to widen to."""
+        assert s6.LIVE_SESSIONS == {"REGULAR", "OVERNIGHT_DAYTIME"}
         assert s6.mode_for("REGULAR") == s6.MODE_LIMITED_LIVE
+        assert s6.mode_for("OVERNIGHT_DAYTIME") == s6.MODE_LIMITED_LIVE
+        for unrouted in ("PREMARKET", "AFTER_HOURS"):
+            assert s6.mode_for(unrouted) == s6.MODE_REALTIME_SHADOW
+            assert s6.orders_allowed(unrouted) is False
 
     def test_mode_for_describes_the_SESSION_not_the_strategy(self):
         """`mode_for("REGULAR")` returning LIMITED_LIVE is a statement
