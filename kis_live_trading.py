@@ -82,11 +82,13 @@ from market_data.kis_validation_provider import (
     compute_price_deviation_percent,
 )
 from market_data.base import MarketDataProviderError
-from market_hours import us_trading_day
+from market_hours import EASTERN, us_trading_day
 from operations import kill_switch as ops_kill_switch
 from s1_live import candidate_source as s1_candidate_source
 from s2_live import candidate_source as s2_candidate_source
 from s6_live import candidate_source as s6_candidate_source
+from scanners.base import scan_session
+from config import s6_sessions
 from s1_live import execution_price as s1_execution_price
 from s1_live import security_type as s1_security_type
 from state_store import db as state_db
@@ -261,6 +263,37 @@ def is_strategy_source(source) -> bool:
     return getattr(source, "name", None) in STRATEGY_SOURCES
 
 
+def _session_permitted(source, rollout) -> bool:
+    """May THIS strategy order in the session we are actually in?
+
+    Per strategy, because `rollout.regular_session_only` is one global
+    flag consumed by a buy cycle three strategies share. Turning it off
+    to let S6 trade the daytime session would have removed the
+    regular-hours restriction from S1's live orders at the same time --
+    S1 is LIMITED_LIVE with a real open position, and nothing about
+    enabling an S6 session is a reason to widen S1's trading hours.
+
+    So S6 answers from its OWN session policy, which lists only sessions
+    whose KIS order route the specification defines, and every other
+    strategy keeps the global flag exactly as before.
+
+    Every name used here is bound at module import. The first version
+    imported `scanners.base.scan_session` and `s6_live.candidate_source`
+    lazily, inside the cycle, and that cost seven order-intent-ledger
+    tests: importing mid-cycle re-initialised module state the tests had
+    already patched, so a ledger that should have refused a duplicate
+    accepted it. A hot path in the order cycle is the worst possible
+    place to import anything.
+    """
+    if getattr(source, "name", None) == s6_candidate_source.SOURCE_S6:
+        current = scan_session.session_at(
+            datetime.now(timezone.utc).astimezone(EASTERN))
+        return bool(s6_sessions.orders_allowed(current))
+
+    return pso.get_us_market_session() == "regular" \
+        if rollout.regular_session_only else True
+
+
 def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                              candidate_source=None):
     """Returns a results dict: {"submitted": [...], "blocked": [(symbol, reason)], "skipped": [...]}.
@@ -390,7 +423,7 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
         _audit_cycle_block(cycle_run_id, shadow_audit.CONFIG_BLOCKED, "ACCOUNT_UNCONFIGURED", reason, now=current)
         raise KISLiveTradingError(reason)
 
-    is_regular_session = pso.get_us_market_session() == "regular" if rollout.regular_session_only else True
+    is_regular_session = _session_permitted(candidate_source, rollout)
 
     # Resolved AFTER every structural precondition above, so a cycle that
     # was going to refuse anyway never reads a candidate file.

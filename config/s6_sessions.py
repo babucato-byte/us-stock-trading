@@ -46,14 +46,28 @@ VARIANT_BY_SESSION: Dict[str, str] = {
 #: Scanned and measured everywhere.
 SCAN_SESSIONS: FrozenSet[str] = frozenset(VARIANT_BY_SESSION)
 
-#: Real orders. REGULAR only, for now.
+#: Sessions in which a real order may be attempted.
 #:
-#: OVERNIGHT_DAYTIME is route-verified and deliberately NOT here: §25
-#: puts it behind a completed REGULAR lifecycle, and a verified route is
-#: a precondition rather than a decision. PREMARKET and AFTER_HOURS have
-#: no verified immediate-fill route at all -- a reserved order is an
-#: instruction to trade later, not a fill.
-LIVE_SESSIONS: FrozenSet[str] = frozenset({"REGULAR"})
+#: REGULAR and OVERNIGHT_DAYTIME, because those are the two whose KIS
+#: order route the official specification defines:
+#:
+#:   REGULAR            /trading/order          TTTT1002U / TTTT1006U
+#:   OVERNIGHT_DAYTIME  /trading/daytime-order  TTTS6036U / TTTS6037U
+#:
+#: PREMARKET and AFTER_HOURS are absent because no US extended-hours
+#: order endpoint exists in the overseas API -- the complete set of US
+#: order TRs is those four plus the two cancels. ORD_DVSN carries
+#: LOO/LOC/MOO/MOC, but those are at-the-open and at-the-close types
+#: WITHIN the regular session, not extended-hours trading. They are not
+#: waiting on a decision here; there is nothing to enable.
+#:
+#: Membership is not permission on its own. Each session still needs its
+#: own wire values confirmed by a real response -- REGULAR's five are the
+#: ARMED set, OVERNIGHT_DAYTIME's five are REQUIRED_FOR_DAYTIME -- and
+#: they are deliberately disjoint so neither session's pending evidence
+#: can block the other. The S6 family limit of one position spans all
+#: four variants regardless.
+LIVE_SESSIONS: FrozenSet[str] = frozenset({"REGULAR", "OVERNIGHT_DAYTIME"})
 
 MODE_LIMITED_LIVE = "LIMITED_LIVE"
 MODE_REALTIME_SHADOW = "REALTIME_SHADOW"

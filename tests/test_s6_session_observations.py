@@ -210,7 +210,9 @@ class TestNothingHerePromotes:
 
         assert slm.SCANNER_LIVE_MODE["orb"] == slm.MODE_DISCOVERY_ONLY
         assert slm.SCANNER_LIVE_MODE["hma_early_trend"] == slm.MODE_LIMITED_LIVE
-        assert s6_sessions.LIVE_SESSIONS == frozenset({"REGULAR"})
+        # Widened to the two specified routes; S6 stays DISCOVERY_ONLY,
+        # so nothing here can order. Capability, not promotion.
+        assert s6_sessions.LIVE_SESSIONS == frozenset({"REGULAR", "OVERNIGHT_DAYTIME"})
 
     def test_a_passing_observation_does_not_make_a_variant_orderable(self):
         observed = observations.collect(final_check=report("OVERNIGHT_DAYTIME"))
