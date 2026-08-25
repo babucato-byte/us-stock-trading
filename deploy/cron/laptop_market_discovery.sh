@@ -23,6 +23,33 @@ LOCAL="$ROOT/logs/discovery/manifest.json"
 cd "$ROOT" || exit 1
 mkdir -p "$(dirname "$LOG")"
 
+# One scan at a time. A pass takes ten minutes and the schedule fires
+# hourly, so overlap should not happen -- but it did: a scheduled run
+# landed on top of a manual one and the pair produced 1,508
+# NETWORK_RESOURCE_ERROR and 65 LOCAL_DB_ERROR, halving coverage to 53%
+# and overwriting a 75% manifest with the degraded result. Both are
+# local-resource faults from two processes sharing the provider's cache
+# and thread budget, and neither is visible as anything but "missing
+# data" in the output.
+# `mkdir`, not flock: flock does not exist on macOS, and a lock that
+# silently does nothing is worse than no lock -- it reads as protection
+# in the script while overlap happens anyway. mkdir is atomic on every
+# POSIX filesystem and needs no helper binary.
+LOCK="$ROOT/logs/discovery/.scan.lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+    # A stale directory from a killed run would block every scan
+    # afterwards, so an old one is reclaimed rather than obeyed.
+    if [ -d "$LOCK" ] && [ -z "$(find "$LOCK" -maxdepth 0 -mmin -45 2>/dev/null)" ]; then
+        echo "$(date -u +%FT%TZ) reclaiming a stale scan lock" >> "$LOG"
+        rmdir "$LOCK" 2>/dev/null
+        mkdir "$LOCK" 2>/dev/null || { echo "$(date -u +%FT%TZ) skipped=LOCK_UNAVAILABLE" >> "$LOG"; exit 0; }
+    else
+        echo "$(date -u +%FT%TZ) skipped=SCAN_ALREADY_RUNNING" >> "$LOG"
+        exit 0
+    fi
+fi
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT INT TERM
+
 # A scan is only meaningful once the opening range exists. Before that
 # there is nothing for the trading node's ORB15 to evaluate, so an
 # earlier manifest would cost twelve minutes of fetches to produce rows
