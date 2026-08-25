@@ -426,5 +426,23 @@ class TestS1IsUnaffected:
         assert slm.SCANNER_LIVE_MODE["accumulation"] == slm.MODE_DISCOVERY_ONLY
         assert slm.SCANNER_LIVE_MODE["orb"] == slm.MODE_DISCOVERY_ONLY
 
-    def test_s6_live_sessions_is_unchanged(self):
-        assert s6_sessions.LIVE_SESSIONS == frozenset({"REGULAR"})
+    def test_s6_live_sessions_holds_only_routed_sessions(self):
+        assert s6_sessions.LIVE_SESSIONS == frozenset(
+            {"REGULAR", "OVERNIGHT_DAYTIME"})
+        assert "PREMARKET" not in s6_sessions.LIVE_SESSIONS
+        assert "AFTER_HOURS" not in s6_sessions.LIVE_SESSIONS
+
+    def test_s1_keeps_its_own_session_policy(self):
+        """The S6 session gate is per strategy. Widening S6's sessions
+        must not widen S1's -- S1 is LIMITED_LIVE with a real open
+        position, and enabling an S6 session is no reason to extend its
+        trading hours."""
+        import kis_live_trading as klt
+
+        legacy = type("Legacy", (), {"name": "legacy_watchlist"})()
+        strict = type("R", (), {"regular_session_only": True})()
+        assert klt._session_permitted(legacy, strict) == (
+            klt.pso.get_us_market_session() == "regular")
+
+        loose = type("R", (), {"regular_session_only": False})()
+        assert klt._session_permitted(legacy, loose) is True

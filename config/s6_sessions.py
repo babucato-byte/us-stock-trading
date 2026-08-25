@@ -67,19 +67,26 @@ SCAN_SESSIONS: FrozenSet[str] = frozenset(VARIANT_BY_SESSION)
 #: they are deliberately disjoint so neither session's pending evidence
 #: can block the other. The S6 family limit of one position spans all
 #: four variants regardless.
-#: NOT widened yet. Adding OVERNIGHT_DAYTIME here is a one-line change
-#: and it fails fourteen guards that encode "REGULAR is the only
-#: ordering session" -- test_a_verified_route_is_not_permission_to_trade,
-#: test_scan_allowed_never_widens_what_may_be_ordered, and
-#: test_only_regular_may_order among them. Those are the deliberate
-#: safety surface, not stale fixtures, and each one has to be re-stated
-#: for two ordering sessions rather than switched off.
+#: Sessions in which a real order may be ATTEMPTED -- REGULAR and
+#: OVERNIGHT_DAYTIME, the two whose KIS order route the official
+#: specification defines:
 #:
-#: Everything else the daytime session needs is in place: the route
-#: (TTTS6036U/6037U/6038U), its own disjoint wire-value set
-#: (REQUIRED_FOR_DAYTIME), and a per-strategy session gate so enabling
-#: it cannot widen S1's hours. This line is what remains.
-LIVE_SESSIONS: FrozenSet[str] = frozenset({"REGULAR"})
+#:   REGULAR            /trading/order          TTTT1002U / TTTT1006U
+#:   OVERNIGHT_DAYTIME  /trading/daytime-order  TTTS6036U / TTTS6037U
+#:
+#: PREMARKET and AFTER_HOURS are absent because the overseas API exposes
+#: no US extended-hours order endpoint at all. That is not a pending
+#: decision -- there is nothing to enable, and the REGULAR or daytime
+#: route must never be reused for them on the assumption that it will
+#: do.
+#:
+#: Membership is CAPABILITY, not permission. Three further gates stand
+#: between this set and an order, and each is separately tested:
+#:   * the session's own wire values, confirmed by a real KIS response
+#:     (ARMED five for REGULAR, REQUIRED_FOR_DAYTIME five for daytime)
+#:   * scanner_live_mode["orb"], which is DISCOVERY_ONLY
+#:   * the S6 family limit of one position across all four variants
+LIVE_SESSIONS: FrozenSet[str] = frozenset({"REGULAR", "OVERNIGHT_DAYTIME"})
 
 MODE_LIMITED_LIVE = "LIMITED_LIVE"
 MODE_REALTIME_SHADOW = "REALTIME_SHADOW"

@@ -169,9 +169,13 @@ class TestScanningIsNotOrdering:
 
         window = scan_window.evaluate(at(MON, hour))
         assert window.scan_allowed is True
-        # The order decision is unchanged and is asked elsewhere.
-        assert s6_sessions.LIVE_SESSIONS == frozenset({"REGULAR"})
-        if window.session != "REGULAR":
+        # The order decision is asked elsewhere, and scanning never
+        # widens it. Ordering is a STRICT SUBSET of scanning: every
+        # session here is scannable, and the two without a specified KIS
+        # route are still refused.
+        assert s6_sessions.LIVE_SESSIONS < s6_sessions.SCAN_SESSIONS
+        assert window.session in s6_sessions.SCAN_SESSIONS
+        if window.session in ("PREMARKET", "AFTER_HOURS"):
             assert s6_sessions.orders_allowed(window.session) is False
 
     def test_the_module_consults_no_order_policy(self):

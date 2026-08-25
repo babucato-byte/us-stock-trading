@@ -49,24 +49,93 @@ class TestScanningIsAllSession:
         assert s6.scans(None) is False
 
 
-class TestOrderingIsOneSession:
-    def test_only_regular_may_order(self):
-        assert s6.LIVE_SESSIONS == {"REGULAR"}
-        assert s6.orders_allowed("REGULAR") is True
+class TestOrderingIsTheSpecifiedSessions:
+    """Ordering is permitted in the sessions whose KIS route the official
+    specification defines, and in no others.
 
-    @pytest.mark.parametrize("session", [
-        "OVERNIGHT_DAYTIME", "PREMARKET", "AFTER_HOURS", "CLOSED", None])
-    def test_every_other_session_is_shadow(self, session):
+    This class used to read "REGULAR only". The invariant it protects was
+    never the number one -- it is that ORDERING IS A STRICT SUBSET OF
+    SCANNING, chosen by evidence rather than by convenience. Widening it
+    to two required re-stating every assertion for two, not deleting any
+    of them: PREMARKET and AFTER_HOURS must still be refused, a verified
+    route must still not imply permission, and scanning must still not
+    imply ordering.
+    """
+
+    ORDER_CAPABLE = {"REGULAR", "OVERNIGHT_DAYTIME"}
+    NEVER_ORDER_CAPABLE = ("PREMARKET", "AFTER_HOURS", "CLOSED", None)
+
+    def test_exactly_the_specified_sessions_may_order(self):
+        assert s6.LIVE_SESSIONS == self.ORDER_CAPABLE
+        assert s6.orders_allowed("REGULAR") is True
+        assert s6.orders_allowed("OVERNIGHT_DAYTIME") is True
+
+    @pytest.mark.parametrize("session", NEVER_ORDER_CAPABLE)
+    def test_an_unrouted_session_is_shadow(self, session):
+        """PREMARKET and AFTER_HOURS have no US extended-hours order
+        endpoint in the overseas API. They are not awaiting a decision;
+        there is nothing to enable."""
         assert s6.orders_allowed(session) is False
         assert s6.mode_for(session) == s6.MODE_REALTIME_SHADOW
 
-    def test_a_verified_route_is_not_permission_to_trade(self):
-        """OVERNIGHT_DAYTIME's route IS verified and it still may not
-        order. §25 puts it behind a completed REGULAR lifecycle."""
+    @pytest.mark.parametrize("session", ["PREMARKET", "AFTER_HOURS"])
+    def test_an_unrouted_session_is_refused_by_the_broker_too(self, session):
+        """Refused at the route resolver as well as by policy. Two
+        independent refusals, because a policy list can be edited and
+        the absence of an endpoint cannot."""
+        from brokers.kis_broker import KISBrokerError, order_route_for
+
+        with pytest.raises(KISBrokerError):
+            order_route_for(session, "live", "buy")
+
+    def test_a_verified_route_is_still_not_permission_to_trade(self):
+        """The property that mattered when this said REGULAR-only, and
+        still matters now that two sessions are routed.
+
+        Both routed sessions have a verified route AND are in
+        LIVE_SESSIONS, and neither may place an order today: S6 is
+        DISCOVERY_ONLY, and each session's wire values are separately
+        unconfirmed. Route, session permission and promotion are three
+        gates, not one.
+        """
+        from config import scanner_live_mode as slm
         from scanners.base import scan_session
 
-        assert scan_session.order_route_verified("OVERNIGHT_DAYTIME") is True
-        assert s6.orders_allowed("OVERNIGHT_DAYTIME") is False
+        for session in sorted(self.ORDER_CAPABLE):
+            assert scan_session.order_route_verified(session) is True
+            assert s6.orders_allowed(session) is True
+
+        # ...and yet nothing can trade.
+        assert slm.SCANNER_LIVE_MODE["orb"] == slm.MODE_DISCOVERY_ONLY
+
+    def test_session_permission_is_not_bootstrap_evidence(self):
+        """A session may be permitted while its wire values have never
+        been confirmed by a real response. Conflating the two would let
+        an edit to a policy list stand in for a KIS answer."""
+        from brokers.kis_broker import (
+            LIVE_RESPONSE_PENDING,
+            REQUIRED_FOR_ARMED,
+            REQUIRED_FOR_DAYTIME,
+            matrix_entries_for,
+        )
+
+        for posture in (REQUIRED_FOR_ARMED, REQUIRED_FOR_DAYTIME):
+            pending = [e for e in matrix_entries_for(posture)
+                       if e.live_status == LIVE_RESPONSE_PENDING]
+            assert pending, f"{posture} has no outstanding evidence"
+
+    def test_the_two_sessions_evidence_sets_are_disjoint(self):
+        """Neither session's pending evidence may block the other."""
+        from brokers.kis_broker import (
+            REQUIRED_FOR_ARMED,
+            REQUIRED_FOR_DAYTIME,
+            matrix_entries_for,
+        )
+
+        armed = {e.name for e in matrix_entries_for(REQUIRED_FOR_ARMED)}
+        daytime = {e.name for e in matrix_entries_for(REQUIRED_FOR_DAYTIME)}
+        assert armed and daytime
+        assert armed.isdisjoint(daytime)
 
     def test_scanning_and_ordering_are_not_the_same_set(self):
         """If these were ever equal, the separation would have collapsed
@@ -74,8 +143,9 @@ class TestOrderingIsOneSession:
         assert s6.SCAN_SESSIONS != s6.LIVE_SESSIONS
         assert s6.LIVE_SESSIONS < s6.SCAN_SESSIONS
 
-    def test_regular_reports_limited_live(self):
+    def test_the_routed_sessions_report_limited_live(self):
         assert s6.mode_for("REGULAR") == s6.MODE_LIMITED_LIVE
+        assert s6.mode_for("OVERNIGHT_DAYTIME") == s6.MODE_LIMITED_LIVE
 
 
 class TestTheRangeIsNotSilentlyCopied:

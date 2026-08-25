@@ -126,9 +126,13 @@ class TestAnUnformedRangeIsNotARejection:
 
 
 class TestTheSessionMatrixIsHonoured:
-    def test_only_regular_may_order(self):
-        assert s6.orders_allowed("REGULAR") is True
-        for session in ("OVERNIGHT_DAYTIME", "PREMARKET", "AFTER_HOURS"):
+    def test_only_the_routed_sessions_may_order(self):
+        """REGULAR and OVERNIGHT_DAYTIME have a specified KIS order
+        route; the other two have none, so they stay shadow no matter
+        what the scanner finds in them."""
+        for session in ("REGULAR", "OVERNIGHT_DAYTIME"):
+            assert s6.orders_allowed(session) is True
+        for session in ("PREMARKET", "AFTER_HOURS"):
             assert s6.orders_allowed(session) is False
             assert s6.mode_for(session) == s6.MODE_REALTIME_SHADOW
 

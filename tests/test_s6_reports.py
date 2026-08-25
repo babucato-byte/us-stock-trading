@@ -313,9 +313,13 @@ class TestFinalCheckReportsWhatItMeasured:
 
     def test_the_risk_matrix_blocks_a_shadow_session(self, handoff, master,
                                                      conn):
-        publish(["AAPL"], session="OVERNIGHT_DAYTIME", variant="S6-O")
+        # PREMARKET is the shadow exemplar. OVERNIGHT_DAYTIME has a
+        # specified KIS order route and is session-permitted now;
+        # PREMARKET has none and cannot become one, so it is the session
+        # that still demonstrates a shadow refusal.
+        publish(["AAPL"], session="PREMARKET", variant="S6-P")
         report = final_check.build(conn=conn, trading_day=DAY,
-                                   session="OVERNIGHT_DAYTIME",
+                                   session="PREMARKET",
                                    modes=live_modes(), now=T0)
         gate = report["candidates"][0]["buy_gates"]["risk_matrix"]
         assert gate["status"] == final_check.BLOCK
@@ -485,10 +489,10 @@ class TestCommonStockSnapshot:
 # §4  S6-O SESSION REPORT
 # ====================================================================
 class TestSessionReport:
-    def test_the_overnight_session_expects_shadow(self, handoff, conn):
+    def test_an_unrouted_session_expects_shadow(self, handoff, conn):
         report = session_report.build(conn=conn, trading_day=DAY,
-                                      session="OVERNIGHT_DAYTIME", now=T0)
-        assert report["variant"] == "S6-O"
+                                      session="PREMARKET", now=T0)
+        assert report["variant"] == "S6-P"
         assert report["session_mode"] == s6_sessions.MODE_REALTIME_SHADOW
         assert report["strategy_live_mode"] == slm.MODE_DISCOVERY_ONLY
         assert report["order_capable"] is False
@@ -569,14 +573,19 @@ class TestSessionReport:
         """§4 asks for automatic generation on the tick."""
         import scripts.run_s6_runtime as runtime
 
-        report = {"session": "OVERNIGHT_DAYTIME"}
+        # The shadow report is for sessions that CANNOT order. S6-O now
+        # can, so it takes the final-check path like S6-R; PREMARKET is
+        # the session that still cannot and still gets this.
+        report = {"session": "PREMARKET"}
         runtime._attach_session_report(report, conn=conn,
-                                       session="OVERNIGHT_DAYTIME", now=T0)
-        assert report["session_report"]["variant"] == "S6-O"
+                                       session="PREMARKET", now=T0)
+        assert report["session_report"]["variant"] == "S6-P"
 
-    def test_the_runtime_does_not_generate_it_for_regular(self, handoff, conn):
-        """S6-R has the final check, which asks a different question and
-        needs a broker for most of it."""
+    def test_the_runtime_does_not_generate_it_for_an_ordering_session(
+            self, handoff, conn):
+        """An ordering session has the final check, which asks a
+        different question and needs a broker for most of it. That is
+        now true of OVERNIGHT_DAYTIME as well as REGULAR."""
         import scripts.run_s6_runtime as runtime
 
         report = {"session": "REGULAR"}
@@ -912,8 +921,11 @@ class TestCapabilityIsNotPromotion:
         assert report["strategy_live_mode"] == slm.MODE_LIMITED_LIVE
 
     def test_the_session_report_separates_them_too(self, handoff, conn):
+        # PREMARKET is the shadow exemplar now: OVERNIGHT_DAYTIME has a
+        # specified KIS order route and is session-permitted, while
+        # PREMARKET has none and cannot become one.
         report = session_report.build(conn=conn, trading_day=DAY,
-                                      session="OVERNIGHT_DAYTIME", now=T0)
+                                      session="PREMARKET", now=T0)
         assert report["session_mode"] == s6_sessions.MODE_REALTIME_SHADOW
         assert report["strategy_live_mode"] == slm.MODE_DISCOVERY_ONLY
         assert report["orders_allowed"] is False
@@ -923,7 +935,7 @@ class TestCapabilityIsNotPromotion:
         capable_not_promoted = final_check.build(
             trading_day=DAY, session="REGULAR", now=T0)
         promoted_not_capable = final_check.build(
-            trading_day=DAY, session="OVERNIGHT_DAYTIME", modes=live_modes(),
+            trading_day=DAY, session="PREMARKET", modes=live_modes(),
             now=T0)
         assert capable_not_promoted["orders_allowed"] is False
         assert promoted_not_capable["orders_allowed"] is False
