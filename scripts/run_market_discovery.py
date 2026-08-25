@@ -40,6 +40,8 @@ def main() -> int:
     parser.add_argument("--min-price", type=float, default=market_scan.MIN_PRICE)
     parser.add_argument("--min-dollar-volume", type=float,
                         default=market_scan.MIN_DOLLAR_VOLUME)
+    parser.add_argument("--no-eligibility-filter", action="store_true",
+                        help="scan the raw universe (measurement only)")
     parser.add_argument("--trading-day", default=None)
     parser.add_argument("--session", default=None)
     args = parser.parse_args()
@@ -56,16 +58,42 @@ def main() -> int:
     day = args.trading_day or str(us_trading_day(now))
     session = args.session or scan_session.session_at(now.astimezone(EASTERN))
 
-    symbols = load_symbols(limit=args.limit)
+    from discovery import eligible_universe, provider_health
+
+    # A project-local provider cache. Two scans sharing the default one
+    # have produced "unable to open database file", which is a local
+    # resource fault that arrives looking like a data fault.
+    provider_health.use_project_cache("logs/discovery/yfinance-cache")
+
+    raw = load_symbols(limit=args.limit)
+    if args.no_eligibility_filter:
+        symbols, raw_count = raw, len(raw)
+    else:
+        # Cached, because security type and listing venue are not
+        # intraday facts. Rebuilt at most once a day, or whenever
+        # universe.csv changes underneath it.
+        cache = eligible_universe.load_or_build()
+        keep = set(cache["symbols"])
+        symbols = [s for s in raw if s in keep]
+        raw_count = len(raw)
+        print(f"raw universe        : {raw_count}")
+        print(f"eligible universe   : {len(symbols)}")
+        print(f"excluded            : {cache['exclude_reason_counts']}")
+
     document = market_scan.run(
         symbols, trading_day=day, session=session, scanner_commit=_commit(),
         max_symbols=args.max_symbols, min_price=args.min_price,
-        min_dollar_volume=args.min_dollar_volume)
+        min_dollar_volume=args.min_dollar_volume,
+        raw_universe_count=raw_count)
     path = manifest_module.write(document, args.out)
 
-    print(f"universe            : {document['universe_size']}")
+    print(f"eligible scanned    : {document['universe_size']}")
     print(f"first-stage priced  : {document['first_stage_evaluated']}")
     print(f"first-stage passed  : {document['first_stage_passed']}")
+    print(f"failed              : {document['failed_count']}")
+    print(f"failure reasons     : {document['failure_reason_counts']}")
+    print(f"eligible coverage   : {document['eligible_market_coverage']}")
+    print(f"raw mkt coverage    : {document['raw_market_coverage']}")
     print(f"scan duration       : {document['scan_duration_seconds']}s")
     print(f"trading day/session : {day} / {session}")
     print(f"manifest            : {path}")

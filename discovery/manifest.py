@@ -89,7 +89,8 @@ def _as_utc(value) -> Optional[datetime]:
 def build(*, trading_day, session, symbols, scanner_commit=None,
           scan_id=None, universe_size=None, evaluated=None,
           duration_seconds=None, generated_at=None, coverage=None,
-          complete=None) -> Dict[str, Any]:
+          complete=None, raw_universe_count=None, failed_count=None,
+          failure_reason_counts=None) -> Dict[str, Any]:
     """The canonical document. Pure -- writes nothing."""
     return {
         "schema_version": SCHEMA_VERSION,
@@ -108,6 +109,20 @@ def build(*, trading_day, session, symbols, scanner_commit=None,
         # and the reader must be able to see that rather than infer it.
         "coverage": coverage,
         "complete": complete,
+        # Two denominators, because they answer different questions.
+        # `eligible_market_coverage` is how much of what we MEANT to
+        # fetch we got, which is the scan's own health.
+        # `raw_market_coverage` is how much of the listed market that
+        # represents, which stops "90% coverage" from reading as "90% of
+        # the market" once a static filter has removed two thirds of it.
+        "eligible_universe_count": universe_size,
+        "raw_universe_count": raw_universe_count,
+        "eligible_market_coverage": coverage,
+        "raw_market_coverage": (
+            round(evaluated / raw_universe_count, 4)
+            if raw_universe_count and evaluated is not None else None),
+        "failed_count": failed_count,
+        "failure_reason_counts": failure_reason_counts or {},
         "symbols": list(symbols),
     }
 

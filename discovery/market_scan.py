@@ -60,6 +60,13 @@ MAX_BATCH_RETRIES = 3
 #: inside its hourly window, and a manifest that arrives after the next
 #: one was due is worth less than a partial one that arrives on time.
 MAX_PAUSE_SECONDS = 20.0
+
+#: Provider worker threads. Bounded rather than `threads=True`, which
+#: lets the library size the pool from the batch: an unbounded pool over
+#: a long pass produced "can't start new thread" and getaddrinfo
+#: failures, which are local-resource faults that look exactly like data
+#: faults in the results.
+MAX_WORKERS = 8
 RETRY_BACKOFF_SECONDS = 20.0
 
 #: Below this fraction of the universe priced, the pass is reported as
@@ -118,7 +125,7 @@ def fetch_today(symbols, *, trading_day, download=None,
         def download(tickers):
             return yf.download(" ".join(tickers), period="5d", interval="1d",
                                group_by="ticker", auto_adjust=False,
-                               progress=False, threads=True)
+                               progress=False, threads=MAX_WORKERS)
 
     out: Dict[str, Dict[str, float]] = {}
     pending = list(symbols)
@@ -275,21 +282,29 @@ def run(symbols, *, trading_day, session, scanner_commit=None,
         download=None, max_symbols=DEFAULT_MAX_SYMBOLS,
         min_price=MIN_PRICE, min_dollar_volume=MIN_DOLLAR_VOLUME,
         pause=BATCH_PAUSE_SECONDS, backoff=RETRY_BACKOFF_SECONDS,
-        max_rounds=MAX_BATCH_RETRIES) -> Dict[str, Any]:
-    """One full-market first-stage scan. Returns the manifest document."""
+        max_rounds=MAX_BATCH_RETRIES, raw_universe_count=None
+        ) -> Dict[str, Any]:
+    """One first-stage scan. Returns the manifest document."""
     from discovery import manifest as manifest_module
+    from discovery import provider_health
 
     started = time.monotonic()
     scan_id = f"{trading_day}-{session}-{uuid.uuid4().hex[:8]}"
     universe = list(symbols)
-    measured = fetch_today(universe, trading_day=trading_day,
-                           download=download, pause=pause, backoff=backoff,
-                           max_rounds=max_rounds)
+
+    # Counted from the provider's own log, which is the only place the
+    # difference between "throttled" and "delisted" exists.
+    with provider_health.capture() as failures:
+        measured = fetch_today(universe, trading_day=trading_day,
+                               download=download, pause=pause,
+                               backoff=backoff, max_rounds=max_rounds)
+    failure_counts = failures.summary()
     rows = rank(measured, min_price=min_price,
                 min_dollar_volume=min_dollar_volume,
                 max_symbols=max_symbols)
     duration = round(time.monotonic() - started, 3)
 
+    missing = [s for s in universe if s not in measured]
     coverage = (len(measured) / len(universe)) if universe else 0.0
     complete = coverage >= MIN_COVERAGE_FOR_COMPLETE
     if not complete:
@@ -308,4 +323,7 @@ def run(symbols, *, trading_day, session, scanner_commit=None,
         universe_size=len(universe), evaluated=len(measured),
         duration_seconds=duration, coverage=round(coverage, 4),
         complete=complete,
+        raw_universe_count=raw_universe_count,
+        failed_count=len(missing),
+        failure_reason_counts=failure_counts,
         generated_at=datetime.now(timezone.utc).isoformat())
