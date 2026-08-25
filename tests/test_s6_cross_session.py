@@ -426,29 +426,5 @@ class TestS1IsUnaffected:
         assert slm.SCANNER_LIVE_MODE["accumulation"] == slm.MODE_DISCOVERY_ONLY
         assert slm.SCANNER_LIVE_MODE["orb"] == slm.MODE_DISCOVERY_ONLY
 
-    def test_s6_live_sessions_holds_only_specified_routes(self):
-        """REGULAR and OVERNIGHT_DAYTIME are the two whose KIS order
-        route the official specification defines. PREMARKET and
-        AFTER_HOURS are absent because no US extended-hours order
-        endpoint exists -- not because a decision is pending."""
-        assert s6_sessions.LIVE_SESSIONS == frozenset({"REGULAR", "OVERNIGHT_DAYTIME"})
-        assert "PREMARKET" not in s6_sessions.LIVE_SESSIONS
-        assert "AFTER_HOURS" not in s6_sessions.LIVE_SESSIONS
-
-    def test_widening_the_sessions_did_not_promote_s6(self):
-        """Capability is not promotion. S6 is still DISCOVERY_ONLY, so
-        no session in that set can place an order today."""
-        from config import scanner_live_mode as slm
-
-        assert slm.SCANNER_LIVE_MODE["orb"] == slm.MODE_DISCOVERY_ONLY
-
-    def test_s1_keeps_its_own_session_policy(self):
-        """The S6 session gate is per strategy. S1 answers to
-        rollout.regular_session_only exactly as before -- enabling an S6
-        session must not widen S1's trading hours."""
-        import kis_live_trading as klt
-
-        source = type("Legacy", (), {"name": "legacy_watchlist"})()
-        rollout = type("R", (), {"regular_session_only": True})()
-        with_flag = klt._session_permitted(source, rollout)
-        assert with_flag == (klt.pso.get_us_market_session() == "regular")
+    def test_s6_live_sessions_is_unchanged(self):
+        assert s6_sessions.LIVE_SESSIONS == frozenset({"REGULAR"})

@@ -67,7 +67,19 @@ SCAN_SESSIONS: FrozenSet[str] = frozenset(VARIANT_BY_SESSION)
 #: they are deliberately disjoint so neither session's pending evidence
 #: can block the other. The S6 family limit of one position spans all
 #: four variants regardless.
-LIVE_SESSIONS: FrozenSet[str] = frozenset({"REGULAR", "OVERNIGHT_DAYTIME"})
+#: NOT widened yet. Adding OVERNIGHT_DAYTIME here is a one-line change
+#: and it fails fourteen guards that encode "REGULAR is the only
+#: ordering session" -- test_a_verified_route_is_not_permission_to_trade,
+#: test_scan_allowed_never_widens_what_may_be_ordered, and
+#: test_only_regular_may_order among them. Those are the deliberate
+#: safety surface, not stale fixtures, and each one has to be re-stated
+#: for two ordering sessions rather than switched off.
+#:
+#: Everything else the daytime session needs is in place: the route
+#: (TTTS6036U/6037U/6038U), its own disjoint wire-value set
+#: (REQUIRED_FOR_DAYTIME), and a per-strategy session gate so enabling
+#: it cannot widen S1's hours. This line is what remains.
+LIVE_SESSIONS: FrozenSet[str] = frozenset({"REGULAR"})
 
 MODE_LIMITED_LIVE = "LIMITED_LIVE"
 MODE_REALTIME_SHADOW = "REALTIME_SHADOW"
