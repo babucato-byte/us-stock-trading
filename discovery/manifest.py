@@ -90,7 +90,8 @@ def build(*, trading_day, session, symbols, scanner_commit=None,
           scan_id=None, universe_size=None, evaluated=None,
           duration_seconds=None, generated_at=None, coverage=None,
           complete=None, raw_universe_count=None, failed_count=None,
-          failure_reason_counts=None) -> Dict[str, Any]:
+          failure_reason_counts=None, baseline_daily_bar_date=None
+          ) -> Dict[str, Any]:
     """The canonical document. Pure -- writes nothing."""
     return {
         "schema_version": SCHEMA_VERSION,
@@ -115,6 +116,12 @@ def build(*, trading_day, session, symbols, scanner_commit=None,
         # `raw_market_coverage` is how much of the listed market that
         # represents, which stops "90% coverage" from reading as "90% of
         # the market" once a static filter has removed two thirds of it.
+        # The operational trading day and the bar the ranking rests on
+        # are different facts and are never merged. A PREMARKET manifest
+        # is stamped with TODAY and baselined on the last completed
+        # session; writing yesterday into trading_day would make the
+        # trading node reject it as the wrong day.
+        "baseline_daily_bar_date": baseline_daily_bar_date,
         "eligible_universe_count": universe_size,
         "raw_universe_count": raw_universe_count,
         "eligible_market_coverage": coverage,

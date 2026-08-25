@@ -223,9 +223,12 @@ class TestAStaleBarIsNeverRankedAsToday:
         import pandas as pd
 
         def download(tickers):
+            # A week old. 2026-08-21 would now be the legitimate
+            # baseline for 2026-08-24 -- the previous completed session
+            # -- so the stale example has to be older than that.
             return {"OLD": pd.DataFrame(
                 {"Close": [10.0], "Volume": [1_000_000]},
-                index=pd.to_datetime(["2026-08-21"]))}
+                index=pd.to_datetime(["2026-08-14"]))}
 
         measured = market_scan.fetch_today(["OLD"], trading_day=DAY,
                                            download=download, pause=0,
@@ -553,3 +556,110 @@ class TestAnEmptyScanNeverDestroysAGoodManifest:
         before = path.read_bytes()
         self._run(tmp_path, symbols=[], existing=None)  # file already there
         assert path.read_bytes() == before
+
+
+class TestPremarketCanActuallyProduceAManifest:
+    """The defect that collapsed 600 symbols to 300.
+
+    `_measure` required each symbol's latest daily bar to equal
+    `trading_day`. That equality merged three separate facts -- the
+    operational trading day, the last COMPLETED session's bar, and
+    current-session data -- which coincide during REGULAR and diverge
+    everywhere else. Between the ET rollover and the open no symbol has
+    a bar for the new day, so a 05:12 ET run priced 0 of 5,624 and the
+    trading node fell back to its 300-name ranking for the night.
+
+    The original intent is preserved: a bar older than the acceptable
+    set is still refused. What changed is that "acceptable" is decided
+    by the trading calendar instead of assumed to be today.
+    """
+
+    def _bars(self, date_str):
+        import pandas as pd
+        return {"AAA": pd.DataFrame(
+            {"Close": [10.0, 12.0], "Volume": [1_000_000, 5_000_000]},
+            index=pd.to_datetime(["2026-08-20", date_str]))}
+
+    def test_a_previous_session_bar_is_usable_before_the_open(self):
+        """The whole fix. At 05:12 ET on the 25th, the newest bar any
+        symbol has is the 24th's."""
+        measured = market_scan.fetch_today(
+            ["AAA"], trading_day="2026-08-25",
+            download=lambda t: self._bars("2026-08-24"),
+            pause=0, backoff=0, max_rounds=1)
+        assert measured, "the universe was emptied by the date guard"
+        assert measured["AAA"]["bar_date"] == "2026-08-24"
+
+    def test_todays_bar_is_still_preferred_once_it_exists(self):
+        measured = market_scan.fetch_today(
+            ["AAA"], trading_day="2026-08-25",
+            download=lambda t: self._bars("2026-08-25"),
+            pause=0, backoff=0, max_rounds=1)
+        assert measured["AAA"]["bar_date"] == "2026-08-25"
+
+    def test_a_genuinely_stale_bar_is_still_refused(self):
+        """Last week's volume must never rank as today's -- the reason
+        the original guard existed."""
+        measured = market_scan.fetch_today(
+            ["AAA"], trading_day="2026-08-25",
+            download=lambda t: self._bars("2026-08-18"),
+            pause=0, backoff=0, max_rounds=1)
+        assert measured == {}
+
+    def test_monday_baselines_on_friday_not_sunday(self):
+        """§7: the trading calendar, never calendar-day arithmetic."""
+        allowed = market_scan.acceptable_bar_dates("2026-08-24")
+        assert "2026-08-21" in allowed        # Friday
+        assert "2026-08-23" not in allowed    # Sunday
+        assert "2026-08-22" not in allowed    # Saturday
+
+    @pytest.mark.parametrize("day,expected_baseline", [
+        ("2026-08-25", "2026-08-24"),
+        ("2026-08-24", "2026-08-21"),
+    ])
+    def test_the_baseline_comes_from_the_calendar(self, day, expected_baseline):
+        assert expected_baseline in market_scan.acceptable_bar_dates(day)
+
+    def test_the_manifest_separates_trading_day_from_baseline(self):
+        """§9: a PREMARKET manifest is stamped TODAY and baselined on the
+        last completed session. Writing yesterday into trading_day would
+        make the trading node reject it as the wrong day."""
+        doc = market_scan.run(
+            ["AAA"], trading_day="2026-08-25", session="PREMARKET",
+            download=lambda t: self._bars("2026-08-24"),
+            min_dollar_volume=0.0, pause=0, backoff=0, max_rounds=1)
+        assert doc["trading_day"] == "2026-08-25"
+        assert doc["baseline_daily_bar_date"] == "2026-08-24"
+        assert doc["session"] == "PREMARKET"
+        assert doc["first_stage_passed"] == 1
+
+    def test_a_premarket_manifest_validates_as_today(self):
+        """The end-to-end property: it must survive the trading node's
+        own trading-day check."""
+        doc = market_scan.run(
+            ["AAA"], trading_day="2026-08-25", session="PREMARKET",
+            download=lambda t: self._bars("2026-08-24"),
+            min_dollar_volume=0.0, pause=0, backoff=0, max_rounds=1)
+        verdict = mf.validate(doc, trading_day="2026-08-25")
+        assert verdict["status"] in (mf.VALID, mf.PARTIAL)
+        assert verdict["symbols"]
+
+    def test_the_rollover_no_longer_empties_the_universe(self):
+        """§11 regression: fresh manifest, ET rollover, premarket scan.
+        Must not yield 0 symbols and hand the night to the 300-name
+        server fallback."""
+        universe = [f"S{i}" for i in range(50)]
+        import pandas as pd
+
+        def download(tickers):
+            return {t: pd.DataFrame(
+                {"Close": [10.0, 11.0], "Volume": [1_000_000, 2_000_000]},
+                index=pd.to_datetime(["2026-08-20", "2026-08-24"]))
+                for t in tickers}
+
+        doc = market_scan.run(universe, trading_day="2026-08-25",
+                              session="PREMARKET", download=download,
+                              min_dollar_volume=0.0, pause=0, backoff=0,
+                              max_rounds=1)
+        assert doc["first_stage_passed"] == 50
+        assert doc["first_stage_evaluated"] == 50

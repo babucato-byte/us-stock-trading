@@ -105,9 +105,32 @@ def _frame_for(bundle, symbol):
         return None
 
 
+def acceptable_bar_dates(trading_day, session=None) -> set:
+    """Which daily-bar dates count as current for this session.
+
+    REGULAR and later sessions have today's bar once trading has begun,
+    so today is accepted. Every session also accepts the last COMPLETED
+    session's bar, because that is the correct liquidity baseline before
+    today's exists -- and before the open it is the ONLY thing that
+    exists.
+
+    Resolved through the trading calendar, never by subtracting a day:
+    Monday premarket must baseline on Friday, and the day after a
+    holiday on the last session that actually traded.
+    """
+    from scanners.base.trading_calendar import previous_trading_day
+
+    dates = {str(trading_day)}
+    try:
+        dates.add(str(previous_trading_day(trading_day)))
+    except Exception:  # noqa: BLE001 - a calendar failure must not empty
+        pass                                          # the acceptable set
+    return dates
+
+
 def fetch_today(symbols, *, trading_day, download=None,
                 batch_size=BATCH_SIZE, pause=BATCH_PAUSE_SECONDS,
-                backoff=RETRY_BACKOFF_SECONDS,
+                backoff=RETRY_BACKOFF_SECONDS, session=None,
                 max_rounds=MAX_BATCH_RETRIES) -> Dict[str, Dict[str, float]]:
     """Today's price, volume and relative volume, per symbol.
 
@@ -128,6 +151,7 @@ def fetch_today(symbols, *, trading_day, download=None,
                                progress=False, threads=MAX_WORKERS)
 
     out: Dict[str, Dict[str, float]] = {}
+    acceptable = acceptable_bar_dates(trading_day, session)
     pending = list(symbols)
 
     # Retried on the MEASURED ABSENCE of rows, not on an exception.
@@ -181,7 +205,8 @@ def fetch_today(symbols, *, trading_day, download=None,
                 continue
             found = 0
             for symbol in batch:
-                row = _measure(bundle, symbol, trading_day)
+                row = _measure(bundle, symbol, trading_day,
+                              acceptable)
                 if row is None:
                     missing.append(symbol)
                 else:
@@ -201,18 +226,40 @@ def fetch_today(symbols, *, trading_day, download=None,
     return out
 
 
-def _measure(bundle, symbol, trading_day) -> Optional[Dict[str, float]]:
-    """One symbol's numbers from a batch, or None if it has no bar today.
+def _measure(bundle, symbol, trading_day, acceptable_dates=None
+             ) -> Optional[Dict[str, float]]:
+    """One symbol's numbers from a batch, or None if it has no usable bar.
 
-    None is returned for a stale bar as well as an absent one: ranking a
-    name on Friday's volume is the exact failure this scan exists to
-    remove, so a Friday bar is not a measurement of today.
+    `acceptable_dates` is the set of bar dates that count as CURRENT for
+    the session being scanned, and it is the whole point of this
+    signature. The check used to be `bar date == trading_day`, which
+    silently conflated three different things:
+
+        trading_day             the operational US trading day
+        baseline bar date       the last COMPLETED session's bar
+        current-session data    what is happening right now
+
+    Those coincide during REGULAR and diverge everywhere else. Between
+    the ET midnight rollover and the open, no symbol has a bar for the
+    new trading day, so the equality discarded the entire universe: a
+    05:12 ET run priced 0 of 5,624, wrote an empty manifest over a good
+    600-symbol one, and the trading node fell back to its 300-name
+    server ranking for the rest of the night. The candidates never
+    failed a gate; they stopped being offered.
+
+    The original intent stands and is preserved: a bar older than the
+    acceptable set is still refused, because ranking a name on last
+    week's volume is exactly the failure this scan exists to remove.
+    What changes is that "acceptable" is now decided by the session
+    rather than assumed to be today.
     """
     frame = _frame_for(bundle, symbol)
     if frame is None or len(frame) == 0:
         return None
     try:
-        if str(frame.index[-1])[:10] != str(trading_day):
+        stamp = str(frame.index[-1])[:10]
+        allowed = acceptable_dates or {str(trading_day)}
+        if stamp not in allowed:
             return None
         last = frame.iloc[-1]
         price = float(last["Close"])
@@ -229,6 +276,7 @@ def _measure(bundle, symbol, trading_day) -> Optional[Dict[str, float]]:
     except Exception:  # noqa: BLE001
         average = None
     return {
+        "bar_date": stamp,
         "price": price,
         "volume": volume,
         "dollar_volume": price * volume,
@@ -297,13 +345,21 @@ def run(symbols, *, trading_day, session, scanner_commit=None,
     with provider_health.capture() as failures:
         measured = fetch_today(universe, trading_day=trading_day,
                                download=download, pause=pause,
-                               backoff=backoff, max_rounds=max_rounds)
+                               backoff=backoff, max_rounds=max_rounds,
+                               session=session)
     failure_counts = failures.summary()
     rows = rank(measured, min_price=min_price,
                 min_dollar_volume=min_dollar_volume,
                 max_symbols=max_symbols)
     duration = round(time.monotonic() - started, 3)
 
+    # The oldest bar any measurement actually rested on. Recorded rather
+    # than assumed: before the open every row comes from the previous
+    # completed session, and a reader must be able to see that without
+    # inferring it from the clock.
+    bar_dates = {row.get("bar_date") for row in measured.values()
+                 if row.get("bar_date")}
+    baseline_date = min(bar_dates) if bar_dates else None
     missing = [s for s in universe if s not in measured]
     coverage = (len(measured) / len(universe)) if universe else 0.0
     complete = coverage >= MIN_COVERAGE_FOR_COMPLETE
@@ -324,6 +380,7 @@ def run(symbols, *, trading_day, session, scanner_commit=None,
         duration_seconds=duration, coverage=round(coverage, 4),
         complete=complete,
         raw_universe_count=raw_universe_count,
+        baseline_daily_bar_date=baseline_date,
         failed_count=len(missing),
         failure_reason_counts=failure_counts,
         generated_at=datetime.now(timezone.utc).isoformat())
