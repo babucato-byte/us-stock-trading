@@ -26,6 +26,7 @@ from brokers.kis_broker import (
     LIVE_RESPONSE_CONFIRMED,
     LIVE_RESPONSE_PENDING,
     REQUIRED_FOR_ARMED,
+    REQUIRED_FOR_DAYTIME,
     REQUIRED_FOR_OBSERVE,
     REQUIRED_FOR_PAPER,
     VERIFICATION_MATRIX,
@@ -64,7 +65,8 @@ class TestRequirementsAreSplitByPosture:
         for entry in VERIFICATION_MATRIX:
             assert entry.required_for, entry.name
             assert entry.required_for <= {
-                REQUIRED_FOR_OBSERVE, REQUIRED_FOR_ARMED, REQUIRED_FOR_PAPER}
+                REQUIRED_FOR_OBSERVE, REQUIRED_FOR_ARMED, REQUIRED_FOR_PAPER,
+                REQUIRED_FOR_DAYTIME}
 
     @pytest.mark.parametrize("name", OBSERVE_VALUES)
     def test_observe_values_are_required_by_both_postures(self, name):
@@ -83,8 +85,16 @@ class TestRequirementsAreSplitByPosture:
         observe = {e.name for e in matrix_entries_for(REQUIRED_FOR_OBSERVE)}
         armed = {e.name for e in matrix_entries_for(REQUIRED_FOR_ARMED)}
         assert observe < armed
-        # Everything except the paper-only values.
-        assert armed == {e.name for e in VERIFICATION_MATRIX} - set(PAPER_ONLY)
+        # Everything the live REGULAR path depends on -- which is now
+        # everything except the paper-only values AND the daytime ones.
+        # The daytime values are a third scope on purpose: no regular
+        # order can confirm them, so folding them in here would leave
+        # ARMED waiting forever on evidence about a route it never
+        # takes. See REQUIRED_FOR_DAYTIME.
+        daytime = {e.name for e in matrix_entries_for(REQUIRED_FOR_DAYTIME)}
+        assert armed == ({e.name for e in VERIFICATION_MATRIX}
+                         - set(PAPER_ONLY) - daytime)
+        assert daytime.isdisjoint(armed)
 
     def test_armed_is_not_relaxed(self):
         """ARMED must still require every value a LIVE order touches.
@@ -135,11 +145,74 @@ class TestClassificationMatchesTheSource:
                     found.add(node.name)
         return found
 
+    #: `order_route_for` may name the order constants because it only
+    #: SELECTS a route -- it is a module-level pure function with no
+    #: session, no client and no request. Keeping route selection in one
+    #: testable place is what makes "PREMARKET has no route" assertable
+    #: at all; inlining it back into submit_order would hide that branch
+    #: behind a live-order method nothing can call in a test.
+    #:
+    #: The property that matters is unchanged and is asserted below:
+    #: exactly one method can TRANSMIT.
+    ROUTE_SELECTORS = {"order_route_for"}
+
     @pytest.mark.parametrize("name", ["order_path", "order_tr_id_live_buy"])
     def test_order_values_are_referenced_only_by_submission(self, name):
         methods = self._methods_referencing(self._assigned_constant(name))
         assert methods, name
-        assert methods <= {"submit_order"}, f"{name} referenced by {methods}"
+        assert methods <= {"submit_order"} | self.ROUTE_SELECTORS, \
+            f"{name} referenced by {methods}"
+
+    def test_the_route_selector_cannot_transmit(self):
+        """It resolves a path and a TR id and returns them. If it could
+        also send, the containment above would mean nothing."""
+        import ast
+
+        tree = ast.parse(BROKER_SOURCE)
+        selector = next(
+            (n for n in ast.walk(tree)
+             if isinstance(n, ast.FunctionDef) and n.name == "order_route_for"),
+            None)
+        assert selector is not None, "order_route_for is gone; revisit this guard"
+
+        # Attribute access and calls only. A bare-name check trips on
+        # the function's own `session` PARAMETER, which is the thing it
+        # is supposed to take.
+        reached = set()
+        for child in ast.walk(selector):
+            if isinstance(child, ast.Attribute):
+                reached.add(child.attr)
+            elif isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
+                reached.add(child.func.id)
+        # Not "get": `TR_ID_ORDER_US.get(...)` is a dict lookup, and
+        # forbidding it would fail on the selector doing exactly its job.
+        for forbidden in ("request", "post", "urlopen", "_auth_headers",
+                          "_url_fetch", "send"):
+            assert forbidden not in reached, \
+                f"order_route_for reaches {forbidden!r}"
+
+    def test_submission_is_still_the_only_transmitter(self):
+        """Whoever resolves the route, exactly one method may send it."""
+        import ast
+
+        tree = ast.parse(BROKER_SOURCE)
+        senders = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            for child in ast.walk(node):
+                if (isinstance(child, ast.Call)
+                        and isinstance(child.func, ast.Attribute)
+                        and child.func.attr == "request"):
+                    for arg in child.args:
+                        if isinstance(arg, ast.Constant) and arg.value == "POST":
+                            senders.add(node.name)
+        # `_issue_token` also POSTs, to the auth endpoint. It is in the
+        # set because this asserts who can send AT ALL, and the order
+        # endpoints are reachable only from the two order methods --
+        # which is what the per-constant containment above pins.
+        assert "submit_order" in senders, senders
+        assert senders <= {"submit_order", "cancel_order", "_issue_token"}, senders
 
     @pytest.mark.parametrize("name", ["cancel_path", "cancel_tr_id_live",
                                       "cancel_tr_id_paper"])

@@ -279,6 +279,22 @@ _OBSERVE_AND_ARMED = frozenset({REQUIRED_FOR_OBSERVE, REQUIRED_FOR_ARMED})
 _ARMED_ONLY = frozenset({REQUIRED_FOR_ARMED})
 _PAPER_ONLY = frozenset({REQUIRED_FOR_PAPER})
 
+# A value only the US DAYTIME session's order path reads.
+#
+# Deliberately NOT an ARMED requirement. ARMED's outstanding set is the
+# five values one authorised REGULAR order confirms, and the bootstrap
+# is built to clear exactly those. The daytime values cannot be
+# confirmed by a regular order at all -- different endpoint, different
+# TR family, and a session that is closed while REGULAR is open -- so
+# folding them into ARMED would leave the gate waiting on ten values
+# that no single bootstrap could ever satisfy, and would block the
+# REGULAR session on evidence about a route it never takes.
+#
+# They gate the OVERNIGHT_DAYTIME session and nothing else. That session
+# gets its own bootstrap, in its own hours, against its own endpoint.
+REQUIRED_FOR_DAYTIME = "DAYTIME"
+_DAYTIME_ONLY = frozenset({REQUIRED_FOR_DAYTIME})
+
 
 class WireValueVerification(NamedTuple):
     """One wire-format value, how far its verification got, and which
@@ -353,31 +369,31 @@ VERIFICATION_MATRIX = (
         "daytime_order_path", DAYTIME_ORDER_PATH, REFERENCE_VERIFIED,
         LIVE_RESPONSE_PENDING,
         "examples_llm/overseas_stock/daytime_order/daytime_order.py",
-        required_for=_ARMED_ONLY,
+        required_for=_DAYTIME_ONLY,
     ),
     WireValueVerification(
         "daytime_order_tr_id_live_buy", TR_ID_DAYTIME_ORDER_US[("live", "buy")],
         REFERENCE_VERIFIED, LIVE_RESPONSE_PENDING,
         "examples_llm/overseas_stock/daytime_order/daytime_order.py",
-        required_for=_ARMED_ONLY,
+        required_for=_DAYTIME_ONLY,
     ),
     WireValueVerification(
         "daytime_order_tr_id_live_sell", TR_ID_DAYTIME_ORDER_US[("live", "sell")],
         REFERENCE_VERIFIED, LIVE_RESPONSE_PENDING,
         "examples_llm/overseas_stock/daytime_order/daytime_order.py",
-        required_for=_ARMED_ONLY,
+        required_for=_DAYTIME_ONLY,
     ),
     WireValueVerification(
         "daytime_cancel_path", DAYTIME_CANCEL_PATH, REFERENCE_VERIFIED,
         LIVE_RESPONSE_PENDING,
         "examples_llm/overseas_stock/daytime_order_rvsecncl/daytime_order_rvsecncl.py",
-        required_for=_ARMED_ONLY,
+        required_for=_DAYTIME_ONLY,
     ),
     WireValueVerification(
         "daytime_cancel_tr_id_live", TR_ID_DAYTIME_CANCEL["live"],
         REFERENCE_VERIFIED, LIVE_RESPONSE_PENDING,
         "examples_llm/overseas_stock/daytime_order_rvsecncl/daytime_order_rvsecncl.py",
-        required_for=_ARMED_ONLY,
+        required_for=_DAYTIME_ONLY,
     ),
     # Confirmed by a REAL live-account read, not by documentation:
     # scripts/verify_kis_observe_responses.py on the Oracle host,
