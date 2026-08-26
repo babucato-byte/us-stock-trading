@@ -207,8 +207,9 @@ def release_misattributed(conn, *, symbol, strategy_id, now=None,
                     result="INFO", symbol=wanted, side="buy",
                     internal_order_id=position_id,
                     reason_code=OWNERSHIP_CONFLICT,
-                    detail=(f"{position_id} released from {strategy_id}: "
-                            f"{wanted} belongs to {owner or ', '.join(others)}"),
+                    payload={"released_from": strategy_id,
+                             "belongs_to": owner or ", ".join(others),
+                             "position_id": position_id},
                     now=current)
             except Exception:  # noqa: BLE001 - the release is durable
                 # already; losing its audit row must not undo it.

@@ -122,6 +122,36 @@ def sync_buy_fills(conn, *, fills_for, now=None) -> List[Dict[str, Any]]:
     return applied
 
 
+def _settle_intent(conn, position_id, sold, *, done):
+    """Close the exit intent out once the fill that answers it is in.
+
+    The position book and the intent ledger are two records of one exit
+    and only the position book was being closed. The intent stayed
+    non-terminal forever -- which reads downstream as an exit still in
+    flight, one of the ambiguities that fails closed, on a position whose
+    shares are already gone.
+
+    Never fatal: the fill is applied and the position is closed by the
+    time this runs, and losing the ledger's copy of that must not undo
+    it. A missing or already-terminal intent is simply nothing to do.
+    """
+    from state_store import exit_intent_ledger as eil
+
+    try:
+        intent = eil.get_active_intent(conn, position_id)
+        if not intent:
+            return
+        if done:
+            eil.mark_confirmed(conn, intent["intent_id"],
+                               confirmed_filled_qty=sold)
+        else:
+            eil.update_progress(conn, intent["intent_id"], sold)
+    except Exception:  # noqa: BLE001
+        logger.warning("S6 could not settle the exit intent for %s; the "
+                       "position itself is closed", position_id,
+                       exc_info=True)
+
+
 def sync_sell_fills(conn, *, fills_for, now=None) -> List[Dict[str, Any]]:
     """EXIT_SUBMITTED -> CLOSED, or a reduced position on a partial.
 
@@ -159,6 +189,7 @@ def sync_sell_fills(conn, *, fills_for, now=None) -> List[Dict[str, Any]]:
             position_store.close_position(
                 conn, pid, reason=row.get("exit_reason"),
                 exit_price=fill.get("average_fill_price"), now=now)
+            _settle_intent(conn, pid, sold, done=True)
             results.append({"position_id": pid, "symbol": symbol,
                             "status": "CLOSED", "sold": sold,
                             "exit_price": fill.get("average_fill_price")})
@@ -169,6 +200,7 @@ def sync_sell_fills(conn, *, fills_for, now=None) -> List[Dict[str, Any]]:
                 "WHERE position_id = ?",
                 (remaining, position_store._now(now), pid))
             conn.commit()
+            _settle_intent(conn, pid, sold, done=False)
             results.append({"position_id": pid, "symbol": symbol,
                             "status": "PARTIALLY_SOLD", "sold": sold,
                             "remaining": remaining})

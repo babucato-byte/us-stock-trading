@@ -32,8 +32,17 @@ if not path:
     sys.exit(0)
 try:
     conn = sqlite3.connect(path)
+    # The store's own list, imported rather than copied. This guard was
+    # hand-written as ('OPEN','SUBMITTED','EXIT_PENDING') and drifted from
+    # LIVE_STATUSES when EXIT_SUBMITTED was added: the monitor then went
+    # quiet at the exact moment a SELL was live at the broker and the
+    # fill still had to be collected, reporting "flat" because the only
+    # position it had was mid-exit.
+    sys.path.insert(0, os.environ.get("TRADING_PROJECT_ROOT", ""))
+    from s6_live.position_store import LIVE_STATUSES
     row = conn.execute(
-        "SELECT COUNT(*) FROM s6_positions WHERE status IN ('OPEN','SUBMITTED','EXIT_PENDING')"
+        "SELECT COUNT(*) FROM s6_positions WHERE status IN (%s)"
+        % ",".join("?" * len(LIVE_STATUSES)), LIVE_STATUSES
     ).fetchone()
     print(int(row[0]) if row else 0)
 except Exception:

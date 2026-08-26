@@ -235,6 +235,23 @@ def _order_id_for(conn, row, *, side):
     ).fetchone()
     if found:
         return found["broker_order_id"], found["created_at"]
+
+    # The intent can exist without its broker id: the submitter records
+    # the id into the durable order ledger, and for a long time failed to
+    # write it back onto the intent. Fall back to that ledger on the
+    # intent's own client id -- exactly the fallback the buy branch above
+    # already makes -- so a SELL that reached KIS stays findable even
+    # when the intent row is incomplete. Without it the position sits in
+    # EXIT_SUBMITTED forever while the shares are already sold.
+    found = conn.execute(
+        "SELECT k.broker_order_id, k.created_at FROM exit_intents e "
+        "JOIN kis_order_idempotency k "
+        "  ON k.internal_order_id = e.client_order_id "
+        "WHERE e.position_id = ? AND k.broker_order_id IS NOT NULL "
+        "ORDER BY e.created_at DESC LIMIT 1", (row.get("position_id"),)
+    ).fetchone()
+    if found:
+        return found["broker_order_id"], found["created_at"]
     return None, row.get("updated_at")
 
 

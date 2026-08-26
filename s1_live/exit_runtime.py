@@ -85,6 +85,28 @@ class ExitOutcome:
         return dict(vars(self))
 
 
+def _broker_order_id(response):
+    """The KIS order id carried back on an accepted order.
+
+    Recorded onto the intent because the fill inquiry looks a SELL up by
+    it and by nothing else. Dropped, the order is live at the broker and
+    unreachable from the intent: the position stays EXIT_SUBMITTED and
+    the fill is never collected, which is how DT (KIS 0030785946) stalled
+    -- accepted, filled at the broker, and invisible to every tick.
+
+    Absence is returned as None rather than raised. The order has already
+    been accepted by the time this is read, and refusing to record the
+    submission because its id could not be parsed would be strictly worse
+    than recording it without one.
+    """
+    data = getattr(response, "data", None)
+    if isinstance(data, dict):
+        found = data.get("id")
+        if found:
+            return str(found)
+    return None
+
+
 def _submit_sell(conn, *, broker_adapter, position_id, row, reason, now=None,
                  store=None, prefix="s1exit") -> ExitOutcome:
     """Reserve the intent, place the order through the VERIFIED path, and
@@ -140,7 +162,8 @@ def _submit_sell(conn, *, broker_adapter, position_id, row, reason, now=None,
         return ExitOutcome(position_id, symbol, ACTION_BLOCKED, reason,
                            f"broker rejected: {getattr(response, 'text', '')}", status)
 
-    exit_intent_ledger.mark_submitted(conn, intent_id)
+    exit_intent_ledger.mark_submitted(
+        conn, intent_id, broker_order_id=_broker_order_id(response))
     store.mark_exit_submitted(conn, position_id, reason, now=now)
     logger.info("%s SELL submitted: %s %s qty=%d reason=%s",
                 prefix.upper(), position_id, symbol, quantity, reason)
