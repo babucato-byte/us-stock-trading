@@ -228,9 +228,14 @@ class TestPreflightGates:
         preflight.check_live_response_pending(
             report, "live", posture=posture_module.POSTURE_OBSERVE)
         assert not report.failures, report.render()
+        # The warning named what ARMED was still waiting on. The
+        # 2026-08-26 premarket bootstrap confirmed the general five from
+        # a real response, so there is nothing left to warn about --
+        # which is the outcome the warning was steering toward, not a
+        # weakening of it. OBSERVE was never blocked either way.
         warned = [r for r in report.warnings
                   if r["check"] == "armed_response_requirements"]
-        assert warned and warned[0]["reason_code"] == "BLOCKED_FOR_ARMED_ONLY"
+        assert warned == [], report.render()
 
     def test_unconfirmed_kis_values_do_not_block_a_paper_session(self, monkeypatch):
         from brokers import kis_broker

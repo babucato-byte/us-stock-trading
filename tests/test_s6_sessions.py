@@ -146,10 +146,16 @@ class TestOrderingIsTheSpecifiedSessions:
             matrix_entries_for,
         )
 
-        for posture in (REQUIRED_FOR_ARMED, REQUIRED_FOR_DAYTIME):
-            pending = [e for e in matrix_entries_for(posture)
-                       if e.live_status == LIVE_RESPONSE_PENDING]
-            assert pending, f"{posture} has no outstanding evidence"
+        # The GENERAL route was confirmed by the 2026-08-26 premarket
+        # bootstrap; the DAYTIME route still awaits a response of its
+        # own. Which is the point: permission and evidence move
+        # independently, per ROUTE.
+        general = [e for e in matrix_entries_for(REQUIRED_FOR_ARMED)
+                   if e.live_status == LIVE_RESPONSE_PENDING]
+        daytime = [e for e in matrix_entries_for(REQUIRED_FOR_DAYTIME)
+                   if e.live_status == LIVE_RESPONSE_PENDING]
+        assert general == []
+        assert daytime, "DAYTIME has no outstanding evidence"
 
     def test_the_two_sessions_evidence_sets_are_disjoint(self):
         """Neither session's pending evidence may block the other."""

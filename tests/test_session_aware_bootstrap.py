@@ -121,5 +121,10 @@ class TestEvidenceIsPerRoute:
         assert not (armed & daytime)
 
     def test_the_session_decides_which_set_is_asked_about(self):
+        # They ANSWER differently now, which is the sharpest possible
+        # demonstration that the question is per ROUTE: the general
+        # family was confirmed by the 2026-08-26 premarket bootstrap and
+        # the daytime family was not.
         assert bootstrap._route_awaiting_live_evidence("OVERNIGHT_DAYTIME") is True
-        assert bootstrap._route_awaiting_live_evidence("REGULAR") is True
+        assert bootstrap._route_awaiting_live_evidence("REGULAR") is False
+        assert bootstrap._route_awaiting_live_evidence("PREMARKET") is False

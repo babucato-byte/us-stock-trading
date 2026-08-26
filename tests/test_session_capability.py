@@ -392,10 +392,14 @@ class TestBothGatesAgreeAboutArmed:
         assert "unconfirmed wire values" in str(excinfo.value)
 
     def test_the_evidence_sets_are_asked_per_session(self):
+        """They now ANSWER differently, which is the sharpest possible
+        demonstration that the question is per route: the general
+        sessions are confirmed and daytime is not."""
         from config import session_capability as scap
 
         assert scap.route_awaiting_live_evidence("OVERNIGHT_DAYTIME") is True
-        assert scap.route_awaiting_live_evidence("REGULAR") is True
+        for general in ("PREMARKET", "REGULAR", "AFTER_HOURS"):
+            assert scap.route_awaiting_live_evidence(general) is False
 
     def test_clearing_the_live_flags_is_not_the_alternative(self):
         """Reaching LIMITED_LIVE_BOOTSTRAP by turning the live flags off
@@ -574,6 +578,9 @@ class TestEveryWindowRoutesToItsFamily:
         for session in ("PREMARKET", "REGULAR", "AFTER_HOURS"):
             assert sc.route_awaiting_live_evidence(session) is \
                 sc.route_awaiting_live_evidence(sc.FAMILY_GENERAL)
+        # And the general route is the one a live response has reached.
+        assert sc.route_awaiting_live_evidence(sc.FAMILY_GENERAL) is False
+        assert sc.route_awaiting_live_evidence(sc.FAMILY_DAYTIME) is True
 
 
 class TestOneNowThreadedThroughEverything:

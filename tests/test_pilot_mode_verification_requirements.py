@@ -324,15 +324,18 @@ class TestObserveIsAllowedWithArmedOnlyPending:
             report, "live", posture=posture_module.POSTURE_OBSERVE)
         assert report.failures == [], report.render()
 
-    def test_the_armed_gap_is_reported_as_a_warning(self, monkeypatch):
+    def test_the_armed_gap_is_closed_now_that_a_response_confirmed_it(
+            self, monkeypatch):
+        """The general five were what this warning existed to name, and
+        the 2026-08-26 premarket bootstrap confirmed them from a real
+        KIS response. With nothing outstanding there is nothing to warn
+        about, which is the outcome the warning was steering toward."""
         report = preflight.PreflightReport()
         preflight.check_live_response_pending(
             report, "live", posture=posture_module.POSTURE_OBSERVE)
         warned = [r for r in report.warnings
                   if r["check"] == "armed_response_requirements"]
-        assert warned, report.render()
-        assert warned[0]["reason_code"] == "BLOCKED_FOR_ARMED_ONLY"
-        assert "cancel_tr_id_live" in warned[0]["detail"]
+        assert warned == [], report.render()
 
     def test_the_warning_is_not_a_failure(self, monkeypatch):
         report = preflight.PreflightReport()
@@ -395,11 +398,14 @@ class TestArmedStaysBlocked:
             report, "live", posture=posture_module.POSTURE_ARMED)
         assert report.failures == [], report.render()
 
-    def test_the_shipped_matrix_blocks_armed_today(self, monkeypatch):
+    def test_the_shipped_matrix_no_longer_blocks_armed(self, monkeypatch):
+        """It blocked ARMED for exactly as long as the general route had
+        no live response. One real BUY and one real CANCEL, observed on
+        the wire, is what the block was waiting for."""
         report = preflight.PreflightReport()
         preflight.check_live_response_pending(
             report, "live", posture=posture_module.POSTURE_ARMED)
-        assert report.failures, "ARMED must still be blocked"
+        assert report.failures == [], report.render()
 
     def test_no_armed_warning_row_when_already_armed(self, monkeypatch):
         """The warning exists to tell an OBSERVE operator what arming

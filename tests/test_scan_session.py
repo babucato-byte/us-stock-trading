@@ -153,12 +153,14 @@ class TestScanningIsNotPermissionToTrade:
 
     def test_a_specified_route_is_not_a_confirmed_one(self):
         """Route SPECIFIED and wire values CONFIRMED BY A LIVE RESPONSE
-        are different facts. Conflating them would let an edit to a tuple
-        stand in for a KIS answer."""
+        are different facts, and the two families now DEMONSTRATE it by
+        differing: both have a specified route, only one has been
+        confirmed by a real KIS answer."""
         from config import session_capability as sc
 
-        for family in (sc.FAMILY_GENERAL, sc.FAMILY_DAYTIME):
-            assert sc.route_awaiting_live_evidence(family) is True
+        assert ss.order_route_verified(ss.OVERNIGHT_DAYTIME) is True
+        assert sc.route_awaiting_live_evidence(sc.FAMILY_DAYTIME) is True
+        assert sc.route_awaiting_live_evidence(sc.FAMILY_GENERAL) is False
 
     def test_a_specified_route_is_not_permission(self):
         """`s6_sessions.LIVE_SESSIONS` is the rollout, and

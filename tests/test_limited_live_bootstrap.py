@@ -588,20 +588,29 @@ class TestPendingWireValuesDoNotBlockTheBootstrap:
         armed_pending = set(pending_items_for(REQUIRED_FOR_ARMED))
         assert "cancel_tr_id_paper" not in armed_pending
 
-    def test_N_the_five_live_only_values_are_exactly_what_is_outstanding(self):
-        """N: LIVE_BOOTSTRAP_REQUIRED pending -> bootstrap possible,
-        ARMED not. If anything ELSE were pending the bootstrap would be
-        premature too."""
+    def test_N_the_general_route_has_nothing_outstanding(self):
+        """N, resolved. The five live-only values WERE what stood
+        between this deployment and ARMED, and the 2026-08-26 premarket
+        bootstrap confirmed them from a real response.
+
+        The property this protects is unchanged: nothing may be pending
+        BEYOND those five. It is asserted the same way -- if some other
+        general-route value were outstanding it would show up here.
+        """
         from brokers.kis_broker import REQUIRED_FOR_ARMED, pending_items_for
+
         live_only = {"order_path", "order_tr_id_live_buy", "cancel_path",
                      "cancel_tr_id_live", "cancel_price_field_rule"}
         pending = set(pending_items_for(REQUIRED_FOR_ARMED))
-        assert pending, "nothing pending means the bootstrap has no purpose"
         assert pending <= live_only, f"pending beyond the live-only five: {pending - live_only}"
+        assert pending == set(), f"unexpectedly still pending: {pending}"
 
-    def test_N_armed_is_not_reachable_while_they_are_pending(self):
-        from brokers.kis_broker import REQUIRED_FOR_ARMED, pending_items_for
-        assert list(pending_items_for(REQUIRED_FOR_ARMED))
+    def test_N_the_daytime_route_still_has_its_own_five(self):
+        """The bootstrap still has a purpose -- for the OTHER route. One
+        family's live response confirms nothing about the other's."""
+        from brokers.kis_broker import REQUIRED_FOR_DAYTIME, pending_items_for
+
+        assert list(pending_items_for(REQUIRED_FOR_DAYTIME))
 
 
 # ---------------------------------------------------------------------
@@ -1093,11 +1102,42 @@ class TestWireEvidenceIsNeverManufactured:
     LIVE_ONLY = ("order_path", "order_tr_id_live_buy", "cancel_path",
                  "cancel_tr_id_live", "cancel_price_field_rule")
 
-    def test_they_are_still_pending_because_no_response_has_shown_them(self):
-        from brokers.kis_broker import REQUIRED_FOR_ARMED, pending_items_for
-        pending = set(pending_items_for(REQUIRED_FOR_ARMED))
+    def test_they_are_confirmed_only_against_an_observed_response(self):
+        """A real response has now shown them, so "still pending" is no
+        longer the property to assert -- PROVENANCE is.
+
+        The temptation this closes is unchanged: the TR IDs sit in KIS's
+        documentation and in this repo's own constants, so confirming
+        them from a constant is one edit away and looks like progress.
+        So each of the five must be confirmed AND must cite what was
+        actually seen on the wire -- an order id -- rather than a path
+        into the reference repo.
+        """
+        from brokers.kis_broker import (
+            LIVE_RESPONSE_CONFIRMED, REQUIRED_FOR_ARMED, matrix_entries_for,
+        )
+
+        entries = {e.name: e for e in matrix_entries_for(REQUIRED_FOR_ARMED)}
         for name in self.LIVE_ONLY:
-            assert name in pending, f"{name} is marked confirmed without a live response"
+            entry = entries[name]
+            assert entry.live_status == LIVE_RESPONSE_CONFIRMED, name
+            # Observed, not documented.
+            assert "odno=" in entry.source, f"{name} cites no observed order"
+            assert "examples_" not in entry.source, \
+                f"{name} is confirmed from documentation, not a response"
+
+    def test_the_daytime_five_are_not_confirmed_by_the_general_response(self):
+        """One route's evidence is not another's. The daytime family is a
+        different endpoint and a different TR family, and confirming it
+        from a general-route response is the same error as confirming
+        from documentation -- evidence that does not exist."""
+        from brokers.kis_broker import REQUIRED_FOR_DAYTIME, pending_items_for
+
+        pending = set(pending_items_for(REQUIRED_FOR_DAYTIME))
+        assert pending == {
+            "daytime_order_path", "daytime_order_tr_id_live_buy",
+            "daytime_order_tr_id_live_sell", "daytime_cancel_path",
+            "daytime_cancel_tr_id_live"}
 
     def test_the_bootstrap_does_not_write_to_the_verification_matrix(self):
         source = (REPO_ROOT / "live_pilot" / "bootstrap.py").read_text(encoding="utf-8")

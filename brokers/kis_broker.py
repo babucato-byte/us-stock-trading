@@ -397,26 +397,46 @@ class WireValueVerification(NamedTuple):
     required_for: frozenset = _OBSERVE_AND_ARMED
 
 
+#: The GENERAL route's live evidence, observed rather than documented.
+#:
+#: LIMITED LIVE bootstrap, 2026-08-26, PREMARKET: a real qty-1 BUY of TPG
+#: at 52.88 was ACCEPTED as KIS order 0030661086, echoed back by the
+#: open-order read as NASD / 매수 / ft_ord_qty=1 / ft_ord_unpr3=52.88000000,
+#: and then CANCELLED with the cancel confirmed. Both transports were
+#: seen on the wire.
+#:
+#: Premarket, the regular session and the aftermarket all address this
+#: route, so one live response confirms these five for all three. It says
+#: nothing about the DAYTIME family: different endpoint, different TR
+#: family, and its five stay LIVE_RESPONSE_PENDING until a real daytime
+#: response of its own.
+BOOTSTRAP_GENERAL_EVIDENCE = (
+    "LIMITED LIVE bootstrap 2026-08-26 PREMARKET: BUY TPG qty=1 @52.88 "
+    "-> ACCEPTED odno=0030661086 (NASD, 매수, ft_ord_qty=1, "
+    "ft_ord_unpr3=52.88000000); CANCEL -> CONFIRMED"
+)
+
 VERIFICATION_MATRIX = (
     WireValueVerification(
-        "order_path", ORDER_PATH, REFERENCE_VERIFIED, LIVE_RESPONSE_PENDING,
-        "examples_user/overseas_stock/overseas_stock_functions.py::order()",
+        "order_path", ORDER_PATH, REFERENCE_VERIFIED, LIVE_RESPONSE_CONFIRMED,
+        BOOTSTRAP_GENERAL_EVIDENCE,
         required_for=_ARMED_ONLY,
     ),
     WireValueVerification(
         "order_tr_id_live_buy", TR_ID_ORDER_US[("live", "buy")], REFERENCE_VERIFIED,
-        LIVE_RESPONSE_PENDING,
-        "examples_user/overseas_stock/overseas_stock_functions.py::order()",
+        LIVE_RESPONSE_CONFIRMED,
+        BOOTSTRAP_GENERAL_EVIDENCE,
         required_for=_ARMED_ONLY,
     ),
     WireValueVerification(
-        "cancel_path", CANCEL_PATH, REFERENCE_VERIFIED, LIVE_RESPONSE_PENDING,
-        "examples_llm/overseas_stock/order_rvsecncl/order_rvsecncl.py",
+        "cancel_path", CANCEL_PATH, REFERENCE_VERIFIED, LIVE_RESPONSE_CONFIRMED,
+        BOOTSTRAP_GENERAL_EVIDENCE,
         required_for=_ARMED_ONLY,
     ),
     WireValueVerification(
-        "cancel_tr_id_live", TR_ID_CANCEL["live"], REFERENCE_VERIFIED, LIVE_RESPONSE_PENDING,
-        "examples_llm/overseas_stock/order_rvsecncl/order_rvsecncl.py",
+        "cancel_tr_id_live", TR_ID_CANCEL["live"], REFERENCE_VERIFIED,
+        LIVE_RESPONSE_CONFIRMED,
+        BOOTSTRAP_GENERAL_EVIDENCE,
         required_for=_ARMED_ONLY,
     ),
     # PAPER-only, and therefore not an ARMED requirement. `_env_key()`
@@ -437,8 +457,10 @@ VERIFICATION_MATRIX = (
     ),
     WireValueVerification(
         "cancel_price_field_rule", "OVRS_ORD_UNPR=0", REFERENCE_VERIFIED,
-        LIVE_RESPONSE_PENDING,
-        "order_rvsecncl.py docstring: 취소주문 시, '0' 입력",
+        LIVE_RESPONSE_CONFIRMED,
+        BOOTSTRAP_GENERAL_EVIDENCE + " -- the cancel that KIS confirmed "
+        "carried OVRS_ORD_UNPR=0 and RVSE_CNCL_DVSN_CD=02, so the rule is "
+        "observed rather than read from the reference docstring",
         required_for=_ARMED_ONLY,
     ),
     # US daytime trading (OVERNIGHT_DAYTIME). REFERENCE_VERIFIED against

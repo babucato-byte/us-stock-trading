@@ -151,10 +151,26 @@ class TestRunbookMatchesTheMatrix:
         assert "실계좌 주문으로 확인하지 않는다" in collapsed
 
     @pytest.mark.parametrize("item", ["cancel_tr_id_live", "order_tr_id_live_buy"])
-    def test_named_items_are_actually_pending_in_the_matrix(self, item):
-        """The live-only TR_IDs: no paper response and no document can
-        confirm these, so they stay pending until a sanctioned live
-        probe, and ARMED stays blocked."""
+    def test_named_items_were_confirmed_by_the_sanctioned_live_probe(self, item):
+        """The live-only TR_IDs: no paper response and no document could
+        confirm these, and a sanctioned live probe is exactly what did.
+
+        The 2026-08-26 premarket bootstrap placed one real BUY and one
+        real CANCEL, both observed on the wire. The rule the runbook
+        states is unchanged and still enforced below -- a paper response
+        or a document may not confirm them -- so what this asserts now is
+        that the confirmation cites the ORDER, not a source file."""
+        by_name = {e.name: e for e in kis_broker.VERIFICATION_MATRIX}
+        entry = by_name[item]
+        assert entry.live_status == kis_broker.LIVE_RESPONSE_CONFIRMED
+        assert "odno=" in entry.source
+        assert "examples_" not in entry.source
+
+    @pytest.mark.parametrize("item", ["daytime_order_tr_id_live_buy",
+                                      "daytime_cancel_tr_id_live"])
+    def test_the_daytime_ids_are_still_pending(self, item):
+        """A general-route response confirms nothing about the daytime
+        family: different endpoint, different TRs."""
         assert item in kis_broker.LIVE_RESPONSE_PENDING_ITEMS
 
     def test_the_observe_values_are_confirmed_by_a_real_response(self):
@@ -197,18 +213,22 @@ class TestRunbookMatchesTheMatrix:
                   if entry.live_status == kis_broker.LIVE_RESPONSE_CONFIRMED}
         assert kis_broker.TR_ID_PSAMOUNT["paper"] not in values
 
-    def test_armed_still_waits_on_exactly_the_live_order_and_cancel_values(self):
-        """Adding OBSERVE requirements must not quietly un-gate ARMED.
+    def test_armed_waited_on_exactly_those_values_and_they_are_confirmed(self):
+        """Adding OBSERVE requirements must not quietly un-gate ARMED --
+        and what un-gated it was a real response, not an edit.
 
         `cancel_tr_id_paper` is deliberately absent: it is the PAPER
         cancel TR, which no live path reads, so it is tracked under its
         own scope instead of gating live eligibility. Its evidence is
         still pending -- see the paper-scope test below."""
-        assert set(kis_broker.pending_items_for(kis_broker.REQUIRED_FOR_ARMED)) == {
-            "order_path", "order_tr_id_live_buy", "cancel_path",
-            "cancel_tr_id_live", "cancel_price_field_rule",
-        }
+        assert set(kis_broker.pending_items_for(kis_broker.REQUIRED_FOR_ARMED)) == set()
         assert kis_broker.pending_items_for(kis_broker.REQUIRED_FOR_OBSERVE) == ()
+        # The daytime family is a separate gate and is still closed.
+        assert set(kis_broker.pending_items_for(kis_broker.REQUIRED_FOR_DAYTIME)) == {
+            "daytime_order_path", "daytime_order_tr_id_live_buy",
+            "daytime_order_tr_id_live_sell", "daytime_cancel_path",
+            "daytime_cancel_tr_id_live",
+        }
 
     def test_the_paper_value_is_still_tracked_and_still_unconfirmed(self):
         assert set(kis_broker.pending_items_for(kis_broker.REQUIRED_FOR_PAPER)) == {

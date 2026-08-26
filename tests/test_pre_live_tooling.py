@@ -408,12 +408,16 @@ class TestLiveAndPaperRequirementsAreSeparate:
         assert list(kis_broker.pending_items_for(kis_broker.REQUIRED_FOR_PAPER)) == [
             "cancel_tr_id_paper"]
 
-    def test_armed_now_waits_on_exactly_the_five_live_only_values(self):
+    def test_armed_waits_on_nothing_now_that_a_response_confirmed_it(self):
+        """Those five were the whole outstanding set, and a real BUY and
+        CANCEL confirmed them. DAYTIME keeps its own five."""
         from brokers import kis_broker
 
-        assert set(kis_broker.pending_items_for(kis_broker.REQUIRED_FOR_ARMED)) == {
-            "order_path", "order_tr_id_live_buy", "cancel_path",
-            "cancel_tr_id_live", "cancel_price_field_rule"}
+        assert set(kis_broker.pending_items_for(kis_broker.REQUIRED_FOR_ARMED)) == set()
+        assert set(kis_broker.pending_items_for(kis_broker.REQUIRED_FOR_DAYTIME)) == {
+            "daytime_order_path", "daytime_order_tr_id_live_buy",
+            "daytime_order_tr_id_live_sell", "daytime_cancel_path",
+            "daytime_cancel_tr_id_live"}
 
     def test_observe_is_unaffected(self):
         from brokers import kis_broker
