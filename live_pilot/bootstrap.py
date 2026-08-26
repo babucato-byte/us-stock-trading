@@ -858,15 +858,35 @@ def run_bootstrap_buy(*, broker, conn, rollout=None, now=None, env=None, source=
     # order already reached KIS, and raising here would report a
     # successful order as failed.
     try:
-        import kis_position_manager
+        from s6_live import entry_lifecycle as s6_entry_lifecycle
 
-        kis_position_manager.create_kis_position_after_buy(
-            strategy_id=order_intent.strategy_id, strategy_version="v1",
-            symbol=candidate.symbol, quantity=order_intent.quantity,
-            client_order_id=order_intent.internal_order_id,
-            broker_order_id=getattr(result.execution_record, "broker_order_id", None),
-            now=current,
-        )
+        if s6_entry_lifecycle.is_s6(order_intent.strategy_id):
+            # The bootstrap is a SMALLER first order, not a SEPARATE
+            # lifecycle. It exists to hold the risk of a first live
+            # order down to one share while the route's wire values are
+            # observed -- not to create a second kind of position that
+            # the strategy's own runtime does not manage.
+            #
+            # Writing to `positions` instead meant exactly that: the row
+            # went to a store S6's exit runtime does not read, serviced
+            # by a cron gated to 09..15 ET, so a daytime bootstrap
+            # position had no exit until the next US regular session.
+            # It was also absent from `POSITION_TABLES`, so the cap could
+            # not attribute it and counted it against every slot.
+            s6_entry_lifecycle.record_entry_submission(
+                conn, symbol=candidate.symbol, session=order_intent.session,
+                client_order_id=order_intent.internal_order_id,
+                candidate_row=getattr(candidate, "row", None), now=current)
+        else:
+            import kis_position_manager
+
+            kis_position_manager.create_kis_position_after_buy(
+                strategy_id=order_intent.strategy_id, strategy_version="v1",
+                symbol=candidate.symbol, quantity=order_intent.quantity,
+                client_order_id=order_intent.internal_order_id,
+                broker_order_id=getattr(result.execution_record, "broker_order_id", None),
+                now=current,
+            )
     except Exception:  # noqa: BLE001
         logger.exception(
             "bootstrap: position tracking failed after a SUCCESSFUL buy of %s "

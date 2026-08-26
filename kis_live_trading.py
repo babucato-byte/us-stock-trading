@@ -87,6 +87,7 @@ from operations import kill_switch as ops_kill_switch
 from s1_live import candidate_source as s1_candidate_source
 from s2_live import candidate_source as s2_candidate_source
 from s6_live import candidate_source as s6_candidate_source
+from s6_live import entry_lifecycle as s6_entry_lifecycle
 from scanners.base import scan_session
 from config import s6_sessions, session_capability
 from s1_live import execution_price as s1_execution_price
@@ -261,6 +262,27 @@ def is_strategy_source(source) -> bool:
     never been tested with.
     """
     return getattr(source, "name", None) in STRATEGY_SOURCES
+
+
+def _s6_candidate_row(source, symbol):
+    """The published row this order was built from, or None.
+
+    Best-effort on purpose: the ORB measurements it carries make the
+    stored position describe the range it actually broke out of, but a
+    source that cannot produce the row must not be able to fail an order
+    that has already reached the broker. A missing row leaves those
+    columns NULL, which `exit_policy` reads as "not measured" -- unlike a
+    fabricated range, which would silently move the structural stop.
+    """
+    getter = getattr(source, "candidate_row", None)
+    if not callable(getter):
+        return None
+    try:
+        return getter(symbol)
+    except Exception:  # noqa: BLE001
+        logger.warning("S6 candidate row for %s unreadable; the position will "
+                       "carry no range measurements", symbol, exc_info=True)
+        return None
 
 
 def _session_permitted(source, rollout) -> bool:
@@ -827,11 +849,31 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                     # target/time/EOD exits (see kis_position_manager.py's
                     # module docstring for the full rationale).
                     try:
-                        kis_position_manager.create_kis_position_after_buy(
-                            strategy_id=order_intent.strategy_id, strategy_version="v1", symbol=symbol,
-                            quantity=order_intent.quantity, client_order_id=order_intent.internal_order_id,
-                            broker_order_id=result.execution_record.broker_order_id, now=current,
-                        )
+                        if s6_entry_lifecycle.is_s6(order_intent.strategy_id):
+                            # S6 records in ITS OWN canonical store and
+                            # nowhere else. `strategy_registry.
+                            # POSITION_TABLES` maps S6 to `s6_positions`,
+                            # which is what `entry_limits` reads to decide
+                            # whose a held position is -- a position absent
+                            # from it is `unattributed`, and unattributed
+                            # symbols count against EVERY slot.
+                            #
+                            # Not ALSO `positions`: that lifecycle runs its
+                            # own stop/target/time/EOD exits while S6 has
+                            # its own policy, and one position with two
+                            # exit engines is worse than either.
+                            s6_entry_lifecycle.record_entry_submission(
+                                conn, symbol=symbol,
+                                session=order_intent.session,
+                                client_order_id=order_intent.internal_order_id,
+                                candidate_row=_s6_candidate_row(source, symbol),
+                                now=current)
+                        else:
+                            kis_position_manager.create_kis_position_after_buy(
+                                strategy_id=order_intent.strategy_id, strategy_version="v1", symbol=symbol,
+                                quantity=order_intent.quantity, client_order_id=order_intent.internal_order_id,
+                                broker_order_id=result.execution_record.broker_order_id, now=current,
+                            )
                     except Exception as exc:
                         # Position tracking failure must never be treated as
                         # order failure -- the KIS order already succeeded.
@@ -855,6 +897,28 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                     outcome["result"] = shadow_audit.RESULT_ERROR
                     outcome["reason_code"] = "AMBIGUOUS_RESPONSE"
                     outcome["detail"] = str(exc)
+                    # An ambiguous response is the case this row exists
+                    # for. The order may be live at KIS; without a
+                    # SUBMITTED row there would be a share held against
+                    # nothing internal, invisible to the exit runtime and
+                    # unattributable by the cap. `sync_buy_fills` settles
+                    # it from broker evidence -- opening it if it filled,
+                    # abandoning it only if the broker positively reports
+                    # it never did. Nothing here re-sends the order.
+                    if s6_entry_lifecycle.is_s6(order_intent.strategy_id):
+                        try:
+                            s6_entry_lifecycle.record_entry_submission(
+                                conn, symbol=symbol,
+                                session=order_intent.session,
+                                client_order_id=order_intent.internal_order_id,
+                                candidate_row=_s6_candidate_row(source, symbol),
+                                now=current)
+                        except Exception:  # noqa: BLE001
+                            logger.exception(
+                                "S6 entry could not be recorded after an "
+                                "AMBIGUOUS response for %s -- reconcile "
+                                "against KIS order history before any "
+                                "further entry", symbol)
                 except KISBrokerError as exc:
                     results["blocked"].append((symbol, f"KIS order rejected: {exc}"))
                     shadow_mode.persist(_shadow_record("REJECTED", str(exc)))
