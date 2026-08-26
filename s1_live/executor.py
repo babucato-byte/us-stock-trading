@@ -190,6 +190,23 @@ def sync_fills(conn, broker, *, trading_day, now=None) -> List[Dict[str, Any]]:
         average = getattr(position, "average_fill_price", None)
         if not symbol or quantity < 1 or symbol in known:
             continue
+        # `known` can only ever contain S1's OWN rows, so a position
+        # another strategy opened looks unclaimed here. That is how S1
+        # adopted S6's DT: one share, two owners, two exit engines each
+        # believing they had to sell it.
+        #
+        # Ownership is asked of the ledger first (the order that produced
+        # the fill was signed by a strategy) and of every per-strategy
+        # book second. Anything ambiguous refuses -- an unattributed
+        # position is visible and reportable, a doubly-owned one is not.
+        from reconciliation import ownership
+
+        permitted, why = ownership.may_adopt(conn, symbol,
+                                             strategy_id=STRATEGY_ID)
+        if not permitted:
+            logger.warning(
+                "S1 will not adopt the broker holding of %s: %s", symbol, why)
+            continue
         if average is None or float(average) <= 0:
             logger.error("broker reports %s qty=%d with no usable average price "
                          "-- refusing to invent an entry price", symbol, quantity)

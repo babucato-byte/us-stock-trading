@@ -247,7 +247,15 @@ def build_snapshot(*, broker, conn, account_id, symbol=None, now=None,
             f"position mismatch for {mismatch.symbol}: internal={mismatch.internal_quantity!r} "
             f"KIS={mismatch.kis_quantity!r} ({mismatch.reason})"
         )
-    positions_match = not position_mismatches
+    # A symbol claimed by two strategies is a position disagreement even
+    # when the TOTAL agrees with the broker -- especially then, because
+    # matching totals are what make a double owner invisible. Folded into
+    # `positions_match` so it blocks orders exactly as any other position
+    # mismatch does.
+    conflict_detail = ownership_conflicts(conn)
+    detail.extend(conflict_detail)
+
+    positions_match = not position_mismatches and not conflict_detail
 
     open_orders_match, open_order_detail, internal_live_ids = _check_open_orders(
         conn, kis_open_orders, kis_fills,
@@ -315,9 +323,17 @@ def load_internal_positions(*, now=None, conn=None):
     if conn is None:
         return internal
 
-    # Per-strategy books. Deduplicated by symbol against the general
-    # store: S1 writes to both, and counting it twice would invent shares
-    # the account does not hold -- a mismatch in the other direction.
+    # Per-strategy books, deduplicated by symbol against the general
+    # store: S1 writes to BOTH, and counting it twice would invent shares
+    # the account does not hold -- a mismatch pointing the other way.
+    #
+    # Deduplication here is only ever between the two books of ONE
+    # strategy. It is deliberately NOT used to collapse a symbol claimed
+    # by two DIFFERENT strategies: that arithmetic would produce a total
+    # matching the broker and a reconciliation that reads PASS, while
+    # hiding the one condition that lets two exit engines sell the same
+    # share. `ownership_conflicts` reports those separately, and the
+    # caller fails closed on them.
     try:
         from reconciliation import internal_holdings
 
@@ -340,6 +356,30 @@ def load_internal_positions(*, now=None, conn=None):
                        "comparison used the general store only",
                        exc_info=True)
     return internal
+
+
+def ownership_conflicts(conn):
+    """Symbols claimed by more than one strategy, as mismatch detail.
+
+    A conflict is a reconciliation failure in its own right, independent
+    of whether the totals happen to agree with the broker. One share
+    owned twice means two exit engines each believe they must sell it,
+    and the totals matching is exactly what makes that invisible.
+    """
+    if conn is None:
+        return []
+    try:
+        from reconciliation import ownership
+
+        return [
+            f"{ownership.OWNERSHIP_CONFLICT}: {symbol} is claimed by "
+            f"{', '.join(owners)}"
+            for symbol, owners in ownership.conflicts(conn)
+        ]
+    except Exception:  # noqa: BLE001
+        logger.warning("ownership conflicts could not be evaluated",
+                       exc_info=True)
+        return []
 
 
 def verify_snapshot(snapshot, *, account_id, symbol=None, now=None, max_age=None):
