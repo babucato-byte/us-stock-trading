@@ -306,6 +306,32 @@ class TestTheBootstrapCannotRunByAccident:
             for forbidden in ("submit_order", "cancel_order", "submit_buy_order"):
                 assert forbidden not in line, f"{forbidden} in: {line.strip()}"
 
+    def test_it_forwards_arguments_so_every_strategy_is_reachable(self):
+        """The wrapper could only run the runner's DEFAULT, which is s1.
+
+        So an S6 bootstrap was not expressible through the one entry
+        point that delegates every precondition to final_pre_live_check.sh
+        and enforces the acknowledgement -- the only way to run one was to
+        call the runner directly, which skips that delegation. A safe path
+        that cannot express the thing you need is a path people go
+        around.
+        """
+        invocation = [l for l in BOOTSTRAP_CODE.splitlines()
+                      if "${PYTHON_BIN}" in l and "${RUNNER}" in l]
+        assert len(invocation) == 1
+        assert '"$@"' in invocation[0], invocation[0]
+
+    def test_forwarding_did_not_widen_what_can_be_asked_for(self):
+        """Side, quantity and order type stay fixed in Python, and no
+        symbol can be passed at all -- a bootstrap that took a symbol
+        from the command line would be testing the operator rather than
+        the pipeline."""
+        runner = (REPO_ROOT / "scripts" / "run_limited_live_bootstrap.py").read_text(
+            encoding="utf-8")
+        assert "--symbol" not in runner
+        assert "choices=sorted(bootstrap.SOURCE_FACTORIES)" in runner
+        assert "BOOTSTRAP_QUANTITY" in runner
+
     def test_it_invokes_the_runner_exactly_once_and_never_retries(self):
         """A second invocation after an ambiguous first is precisely the
         duplicate-order case the design exists to prevent."""

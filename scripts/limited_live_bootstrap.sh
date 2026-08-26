@@ -109,7 +109,21 @@ if [ ! -f "${RUNNER}" ]; then
 fi
 
 printf '\nSubmitting via execution_engine (one BUY, one share, no retry):\n'
-"${PYTHON_BIN}" "${RUNNER}"
+# Arguments are forwarded so the runner's `--strategy` can be reached.
+#
+# Without this the wrapper could only ever run the runner's DEFAULT,
+# which is s1 -- so an S6 bootstrap was not expressible through the one
+# entry point that delegates every precondition to
+# final_pre_live_check.sh and enforces the acknowledgement. The only way
+# to run one was to call the runner directly, which skips that
+# delegation. A safe path that cannot express the thing you need is a
+# path people go around.
+#
+# This forwards arguments; it does not widen what they can ask for. The
+# runner still fixes side, quantity and order type in code, still takes
+# no symbol, and `--strategy` is still constrained to the registered
+# source factories.
+"${PYTHON_BIN}" "${RUNNER}" "$@"
 RUNNER_STATUS=$?
 
 printf '\n'
