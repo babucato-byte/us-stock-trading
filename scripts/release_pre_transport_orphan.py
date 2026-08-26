@@ -24,7 +24,8 @@ declare a possibly-live order dead, free the entry slot, and invite a
 second order for the same signal. So this command does not take anyone's
 word for it -- not the caller's, not a log's:
 
-  * the row must still be SUBMITTING with a NULL broker_order_id;
+  * the row must still be in a pre-transport state (SUBMITTING,
+    VALIDATING or CREATED) with a NULL broker_order_id;
   * KIS itself must show no open order for the symbol;
   * KIS itself must show no position in the symbol;
   * KIS fill history for the trading day must contain no fill.
@@ -49,7 +50,18 @@ from execution import order_repository  # noqa: E402
 from execution.execution_engine import REASON_PRE_TRANSPORT_CONFIG  # noqa: E402
 from state_store import db as state_db  # noqa: E402
 
-RELEASABLE_STATE = "SUBMITTING"
+#: States a row may be released FROM.
+#:
+#: SUBMITTING is the hard case the evidence checks below exist for: the
+#: engine advances to it immediately BEFORE the transport call, so it
+#: means "may be in flight".
+#:
+#: CREATED and VALIDATING are strictly earlier than that boundary -- the
+#: engine has not reached the transport call at all -- so a row stuck in
+#: one of them cannot have reached the broker. They are released under
+#: the SAME evidence requirements anyway: the reads are cheap, and
+#: refusing on doubt is the entire point of this command.
+RELEASABLE_STATES = ("SUBMITTING", "VALIDATING", "CREATED")
 
 
 def _evidence(broker, symbol, trading_date):
@@ -105,8 +117,9 @@ def main():
         print(f"  broker_order_id   : {row['broker_order_id']!r}")
         print(f"  trading_date      : {row['trading_date']}")
 
-        if row["status"] != RELEASABLE_STATE:
-            print(f"REFUSED: status is {row['status']}, not {RELEASABLE_STATE}")
+        if row["status"] not in RELEASABLE_STATES:
+            print(f"REFUSED: status is {row['status']}, not one of "
+                  f"{', '.join(RELEASABLE_STATES)}")
             return 1
         if row["broker_order_id"]:
             print("REFUSED: a broker_order_id is present, so the order DID reach KIS")

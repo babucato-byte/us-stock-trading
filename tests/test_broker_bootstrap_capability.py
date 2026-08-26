@@ -324,9 +324,17 @@ class TestTheOrphanReleaseCommand:
 
         py_compile.compile(str(self.SCRIPT), doraise=True)
 
-    def test_J_it_refuses_anything_but_submitting_with_a_null_broker_id(self):
+    def test_J_it_refuses_anything_but_a_pre_transport_state_with_a_null_broker_id(self):
+        """The releasable set is the states that are at or before the
+        transport boundary, and nothing else. SUBMITTING is the ambiguous
+        one the evidence checks exist for; CREATED and VALIDATING are
+        strictly earlier and cannot have reached the broker. Behaviour is
+        covered directly in test_pre_transport_orphan_release.py -- this
+        keeps the set itself from quietly growing.
+        """
         source = self.SCRIPT.read_text(encoding="utf-8")
-        assert 'RELEASABLE_STATE = "SUBMITTING"' in source
+        assert ('RELEASABLE_STATES = ("SUBMITTING", "VALIDATING", "CREATED")'
+                in source)
         assert 'if row["broker_order_id"]:' in source
         assert "REFUSED" in source
 
