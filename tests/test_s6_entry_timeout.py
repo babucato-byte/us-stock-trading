@@ -340,3 +340,77 @@ def _stub_engine(monkeypatch, sent):
 
     monkeypatch.setattr("execution.execution_engine.submit_cancel",
                         _submit_cancel)
+
+
+class TestAStrategyPositionIsVisibleToReconciliation:
+    """A position the reconciler cannot see blocks its own exit.
+
+    `load_internal_positions` read only the general lifecycle store,
+    which was correct while every live position was written there. It
+    stopped being correct when S6 began recording into `s6_positions` and
+    nowhere else -- the right call, since POSITION_TABLES maps S6 there
+    and writing to both would put two exit engines on one position.
+
+    The reconciler was never told. So a filled S6 position read as
+    "exists at KIS but not tracked internally", and that mismatch blocked
+    the SELL: the position could be opened and then not closed. Invisible
+    is worse than unattributed -- unattributed costs capacity, invisible
+    costs the ability to leave.
+    """
+
+    def test_an_s6_position_is_counted_as_internally_held(self, conn):
+        from reconciliation import snapshot
+
+        pid = _submitted(conn)
+        ps.open_from_fill(conn, pid, quantity=1, average_fill_price=50.79,
+                          venue="NYSE")
+        held = snapshot.load_internal_positions(now=NOW, conn=conn)
+        assert [(p.symbol, p.quantity) for p in held] == [("DT", 1)]
+
+    def test_an_exiting_position_is_still_counted(self, conn):
+        """EXIT_PENDING still holds the shares -- that is exactly when
+        the comparison matters, because a blocked exit is the failure."""
+        from reconciliation import snapshot
+
+        pid = _submitted(conn)
+        ps.open_from_fill(conn, pid, quantity=1, average_fill_price=50.79)
+        ps.latch_pending_exit(conn, pid, "RANGE_REENTRY", now=NOW)
+        assert ps.load(conn, pid)["status"] == ps.EXIT_PENDING
+        held = snapshot.load_internal_positions(now=NOW, conn=conn)
+        assert [p.symbol for p in held] == ["DT"]
+
+    def test_an_unfilled_submission_is_not_counted_as_held(self, conn):
+        """The other direction. An unfilled order is a yes to "could
+        another position appear" and a no to "what do we hold";
+        reconciliation asks the second, and counting a submission would
+        report shares the account does not have."""
+        from reconciliation import snapshot
+
+        _submitted(conn)
+        assert snapshot.load_internal_positions(now=NOW, conn=conn) == []
+
+    def test_without_a_connection_it_falls_back_rather_than_guessing(self, conn):
+        from reconciliation import snapshot
+
+        pid = _submitted(conn)
+        ps.open_from_fill(conn, pid, quantity=1, average_fill_price=50.79)
+        assert snapshot.load_internal_positions(now=NOW) == []
+
+    def test_a_symbol_in_both_books_is_not_double_counted(self, conn, monkeypatch):
+        """S1 writes to the general store AND its own. Counting it twice
+        would invent shares the account does not hold -- a mismatch in
+        the opposite direction."""
+        from reconciliation import snapshot
+
+        pid = _submitted(conn)
+        ps.open_from_fill(conn, pid, quantity=1, average_fill_price=50.79)
+
+        class _Record(dict):
+            pass
+
+        monkeypatch.setattr(
+            "positions.store.load_non_terminal",
+            lambda: {"p1": {"symbol": "DT", "remaining_qty": 1,
+                            "average_fill_price": 50.79}})
+        held = snapshot.load_internal_positions(now=NOW, conn=conn)
+        assert [(p.symbol, p.quantity) for p in held] == [("DT", 1)]

@@ -37,11 +37,14 @@ codebase does not know the account's true exposure, which blocks every
 new order regardless of which symbol or side it is for.
 """
 
+import logging
 import math
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 from reconciliation import fill_window
 
@@ -235,7 +238,7 @@ def build_snapshot(*, broker, conn, account_id, symbol=None, now=None,
         raise _unavailable("KIS fill-history read failed", exc) from exc
 
     if internal_positions is None:
-        internal_positions = load_internal_positions(now=current)
+        internal_positions = load_internal_positions(now=current, conn=conn)
 
     detail = []
     position_mismatches = reconcile_positions(internal_positions, kis_positions)
@@ -268,25 +271,74 @@ def build_snapshot(*, broker, conn, account_id, symbol=None, now=None,
     )
 
 
-def load_internal_positions(*, now=None):
-    """The internal side of the position comparison, read from the
-    canonical positions store (positions/store.py). Imported lazily so
-    this module stays importable in contexts that never touch the
-    position store."""
+def load_internal_positions(*, now=None, conn=None):
+    """The internal side of the position comparison.
+
+    Reads BOTH the general lifecycle store (positions/store.py) and the
+    per-strategy stores, because they are different books and a strategy
+    lives in exactly one of them.
+
+    This used to read only the general store, which was correct while
+    every live position was written there. It stopped being correct when
+    S6 began recording into `s6_positions` and nowhere else -- the right
+    call, since `strategy_registry.POSITION_TABLES` maps S6 there and
+    writing to both would put two exit engines on one position. But the
+    reconciler was never told, so a filled S6 position read as
+    "exists at KIS but not tracked internally", and the mismatch BLOCKED
+    ITS OWN EXIT: the position could be opened and then not sold.
+
+    A position invisible here is worse than one that is merely
+    unattributed. Unattributed costs capacity; invisible costs the
+    ability to leave.
+
+    `conn` is optional so callers that already hold the state connection
+    do not open a second one; without it the per-strategy side is skipped
+    rather than guessed at.
+    """
     from domain.position import Position
     from positions import store
 
     current = now or datetime.now(timezone.utc)
     internal = []
+    seen = set()
     for record in store.load_non_terminal().values():
         remaining = record["remaining_qty"]
         if not remaining:
             continue
+        seen.add(str(record["symbol"]).upper())
         internal.append(Position(
             symbol=record["symbol"], quantity=remaining,
             average_fill_price=record["average_fill_price"] or 0.0,
             unrealized_pnl=0.0, realized_pnl=0.0, as_of=current, source="internal_store",
         ))
+
+    if conn is None:
+        return internal
+
+    # Per-strategy books. Deduplicated by symbol against the general
+    # store: S1 writes to both, and counting it twice would invent shares
+    # the account does not hold -- a mismatch in the other direction.
+    try:
+        from reconciliation import internal_holdings
+
+        for _strategy, rows in (internal_holdings.strategy_holdings(conn) or {}).items():
+            for symbol, _venue, quantity in rows or ():
+                name = str(symbol or "").upper()
+                if not name or not quantity or name in seen:
+                    continue
+                seen.add(name)
+                internal.append(Position(
+                    symbol=name, quantity=int(quantity),
+                    average_fill_price=0.0, unrealized_pnl=0.0,
+                    realized_pnl=0.0, as_of=current,
+                    source="strategy_store",
+                ))
+    except Exception:  # noqa: BLE001 - a strategy book that cannot be
+        # read must not turn a healthy reconciliation into a mismatch;
+        # it is logged by `strategy_holdings` itself.
+        logger.warning("per-strategy holdings unreadable; the position "
+                       "comparison used the general store only",
+                       exc_info=True)
     return internal
 
 
