@@ -106,27 +106,49 @@ class TestTheDaytimeSessionRoute:
             assert to_kis_order_exchange_code(venue) not in ("BAQ", "BAY", "BAA")
 
 
-class TestAnUnspecifiedSessionIsRefused:
-    """The rule that keeps a guess from becoming a live order."""
+class TestTheGeneralFamilyServesThreeSessions:
+    """Premarket, regular and aftermarket SHARE one endpoint and one TR
+    family -- the overseas order API documents US orders in all three.
 
-    @pytest.mark.parametrize("session", ["PREMARKET", "AFTER_HOURS"])
-    def test_it_raises_rather_than_falling_back(self, session):
+    These were previously asserted to be unroutable, on the reasoning
+    that no premarket-specific TR exists. That inverted what the absence
+    meant: having no session-specific TR is what sharing a route looks
+    like, and the mistake cost S6 half the sessions it scans.
+    """
+
+    @pytest.mark.parametrize("session", ["PREMARKET", "REGULAR", "AFTER_HOURS"])
+    def test_they_all_resolve_to_the_general_route(self, session):
+        assert order_route_for(session, "live", "buy") == (
+            "/uapi/overseas-stock/v1/trading/order", "TTTT1002U")
+        assert order_route_for(session, "live", "sell") == (
+            "/uapi/overseas-stock/v1/trading/order", "TTTT1006U")
+
+    @pytest.mark.parametrize("session", ["PREMARKET", "REGULAR", "AFTER_HOURS"])
+    def test_their_cancel_is_the_general_cancel(self, session):
+        from brokers.kis_broker import cancel_route_for
+
+        assert cancel_route_for(session, "live") == (
+            "/uapi/overseas-stock/v1/trading/order-rvsecncl", "TTTT1004U")
+
+    def test_daytime_keeps_its_own_family(self):
+        """Sharing a route between the general sessions is not licence to
+        share one with daytime: different endpoint, different TRs, and an
+        hour at which the general endpoint does not run."""
+        assert order_route_for("OVERNIGHT_DAYTIME", "live", "buy") == (
+            "/uapi/overseas-stock/v1/trading/daytime-order", "TTTS6036U")
+        assert order_route_for("OVERNIGHT_DAYTIME", "live", "sell") == (
+            "/uapi/overseas-stock/v1/trading/daytime-order", "TTTS6037U")
+
+    def test_the_four_sessions_are_routed_and_nothing_else(self):
+        assert ROUTED_SESSIONS == {
+            "PREMARKET", "REGULAR", "AFTER_HOURS", "OVERNIGHT_DAYTIME"}
+
+    def test_the_aftermarket_extension_is_not_a_routed_session(self):
+        """It is gated behind a per-customer application, so API support
+        does not follow from the published schedule. Refused rather than
+        assumed either way."""
         with pytest.raises(KISBrokerError, match="no KIS order route"):
-            order_route_for(session, "live", "buy")
-
-    @pytest.mark.parametrize("session", ["PREMARKET", "AFTER_HOURS"])
-    def test_it_never_returns_the_regular_route(self, session):
-        """Falling back would place an extended-hours order on the
-        regular endpoint -- the single most expensive way to be wrong
-        here."""
-        try:
-            path, _ = order_route_for(session, "live", "buy")
-        except KISBrokerError:
-            return
-        pytest.fail(f"{session} silently routed to {path}")
-
-    def test_only_the_two_specified_sessions_are_routed(self):
-        assert ROUTED_SESSIONS == {"REGULAR", "OVERNIGHT_DAYTIME"}
+            order_route_for("AFTERMARKET_EXTENSION", "live", "buy")
 
     def test_an_unknown_session_name_is_refused(self):
         for name in ("LUNCH", "", "regular_session", "S6-P"):

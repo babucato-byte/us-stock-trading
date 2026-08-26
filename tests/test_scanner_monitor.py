@@ -660,12 +660,24 @@ class TestOneSessionVocabulary:
         assert "DAYTIME" not in monitor.ALL_SESSIONS
         assert "OVERNIGHT_DAYTIME" in monitor.ALL_SESSIONS
 
-    def test_a_scan_only_session_says_so_in_the_message(self):
-        """§5: PREMARKET is scannable and must not read as live-capable."""
+    def test_a_routed_session_reports_live_capable(self):
+        """PREMARKET reads as live-capable now, and that is the point of
+        the correction: it shares the general order family with the
+        regular session, so reporting it as scan-only UNDERSTATED what
+        S6 can actually do. A report that understates capability is as
+        wrong as one that overstates it."""
         text = monitor.format_scan(
             scanner_name="accumulation", session="PREMARKET", trading_day="d",
             scanned=10, candidates=1, status="SUCCESS")
-        assert "세션 주문: 스캔 전용 (실거래 미검증)" in text
+        assert "세션 주문: 실거래 가능" in text
+
+    def test_a_session_with_no_route_claims_nothing(self):
+        """It omits the line rather than asserting either way -- which is
+        the right answer for a session nobody defined."""
+        text = monitor.format_scan(
+            scanner_name="accumulation", session="NOT_A_SESSION",
+            trading_day="d", scanned=10, candidates=1, status="SUCCESS")
+        assert "세션 주문:" not in text
 
     def test_a_verified_session_says_that_instead(self):
         text = monitor.format_scan(

@@ -53,40 +53,62 @@ class TestOrderingIsTheSpecifiedSessions:
     """Ordering is permitted in the sessions whose KIS route the official
     specification defines, and in no others.
 
-    This class used to read "REGULAR only". The invariant it protects was
-    never the number one -- it is that ORDERING IS A STRICT SUBSET OF
-    SCANNING, chosen by evidence rather than by convenience. Widening it
-    to two required re-stating every assertion for two, not deleting any
-    of them: PREMARKET and AFTER_HOURS must still be refused, a verified
-    route must still not imply permission, and scanning must still not
-    imply ordering.
+    This class read "REGULAR only", then "REGULAR and daytime". It now
+    reads "all four", because the overseas order API documents US orders
+    in the premarket and aftermarket too -- they share the general
+    endpoint and TR family with the regular session. The old reading
+    inferred from "no premarket-specific TR exists" that premarket could
+    not be ordered in at all, which inverted what the absence meant.
+
+    The invariant this protects was never a NUMBER. It is that ordering
+    is strictly narrower than scanning, chosen by evidence rather than
+    convenience. That is still true -- but the narrowing has moved from
+    the session set to the CLOCK. S6 scans in every session whatever the
+    hour; it may order only inside a window KIS actually runs, which
+    excludes the closed hour between the aftermarket extension and
+    daytime, and excludes the extension itself.
     """
 
-    ORDER_CAPABLE = {"REGULAR", "OVERNIGHT_DAYTIME"}
-    NEVER_ORDER_CAPABLE = ("PREMARKET", "AFTER_HOURS", "CLOSED", None)
+    ORDER_CAPABLE = {"PREMARKET", "REGULAR", "AFTER_HOURS", "OVERNIGHT_DAYTIME"}
+    #: Never orderable at any hour: not sessions at all, or a window
+    #: whose API support has not been established.
+    NEVER_ORDER_CAPABLE = ("CLOSED", "AFTERMARKET_EXTENSION", "", None)
 
     def test_exactly_the_specified_sessions_may_order(self):
         assert s6.LIVE_SESSIONS == self.ORDER_CAPABLE
-        assert s6.orders_allowed("REGULAR") is True
-        assert s6.orders_allowed("OVERNIGHT_DAYTIME") is True
+        for session in sorted(self.ORDER_CAPABLE):
+            assert s6.orders_allowed(session) is True
 
     @pytest.mark.parametrize("session", NEVER_ORDER_CAPABLE)
-    def test_an_unrouted_session_is_shadow(self, session):
-        """PREMARKET and AFTER_HOURS have no US extended-hours order
-        endpoint in the overseas API. They are not awaiting a decision;
-        there is nothing to enable."""
+    def test_a_non_session_is_shadow(self, session):
         assert s6.orders_allowed(session) is False
         assert s6.mode_for(session) == s6.MODE_REALTIME_SHADOW
 
-    @pytest.mark.parametrize("session", ["PREMARKET", "AFTER_HOURS"])
-    def test_an_unrouted_session_is_refused_by_the_broker_too(self, session):
+    @pytest.mark.parametrize("session", ["CLOSED", "AFTERMARKET_EXTENSION", ""])
+    def test_a_non_session_is_refused_by_the_broker_too(self, session):
         """Refused at the route resolver as well as by policy. Two
-        independent refusals, because a policy list can be edited and
-        the absence of an endpoint cannot."""
+        independent refusals, because a policy list can be edited and the
+        absence of an endpoint cannot."""
         from brokers.kis_broker import KISBrokerError, order_route_for
 
         with pytest.raises(KISBrokerError):
             order_route_for(session, "live", "buy")
+
+    def test_the_clock_still_narrows_what_the_session_set_permits(self):
+        """The separation that replaced the session-set one: being in
+        LIVE_SESSIONS is not being inside a KIS window."""
+        from datetime import datetime
+
+        from config import session_capability as sc
+        from market_hours import EASTERN
+
+        # 20:30 ET under DST is 09:30 KST -- after the aftermarket
+        # extension, before 주간거래 opens. A fixed-ET daytime boundary
+        # called this OVERNIGHT_DAYTIME and permitted an order.
+        closed = sc.capability_at(datetime(2026, 8, 26, 20, 30, tzinfo=EASTERN))
+        assert closed.entry_supported is False
+        assert closed.exit_supported is False
+        assert closed.session == ""
 
     def test_a_verified_route_is_still_not_permission_to_trade(self):
         """The property that mattered when this said REGULAR-only, and
@@ -142,11 +164,26 @@ class TestOrderingIsTheSpecifiedSessions:
         assert armed and daytime
         assert armed.isdisjoint(daytime)
 
-    def test_scanning_and_ordering_are_not_the_same_set(self):
-        """If these were ever equal, the separation would have collapsed
-        and every scannable session would be tradeable."""
-        assert s6.SCAN_SESSIONS != s6.LIVE_SESSIONS
-        assert s6.LIVE_SESSIONS < s6.SCAN_SESSIONS
+    def test_scanning_and_ordering_are_separated_by_the_clock(self):
+        """The session SETS are now equal -- every session S6 scans has a
+        route. The separation did not collapse; it moved to the clock,
+        and asserting the old set inequality here would have forced the
+        premarket correction to be reverted to keep a test green.
+
+        Scanning is calendar- and clock-independent by design; ordering
+        is confined to a window KIS actually runs.
+        """
+        from datetime import datetime
+
+        from config import session_capability as sc
+        from market_hours import EASTERN
+
+        assert s6.SCAN_SESSIONS == s6.LIVE_SESSIONS
+        # Hours inside a scanned session that are still not orderable.
+        for moment in (datetime(2026, 8, 26, 20, 30, tzinfo=EASTERN),   # closed
+                       datetime(2026, 8, 26, 18, 30, tzinfo=EASTERN),   # extension
+                       datetime(2026, 8, 29, 22, 0, tzinfo=EASTERN)):   # Saturday
+            assert sc.capability_at(moment).orders_allowed is False
 
     def test_the_routed_sessions_report_limited_live(self):
         assert s6.mode_for("REGULAR") == s6.MODE_LIMITED_LIVE

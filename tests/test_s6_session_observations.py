@@ -210,19 +210,32 @@ class TestNothingHerePromotes:
 
         assert slm.SCANNER_LIVE_MODE["orb"] == slm.MODE_LIMITED_LIVE
         assert slm.SCANNER_LIVE_MODE["hma_early_trend"] == slm.MODE_LIMITED_LIVE
-        # Two routed sessions may ATTEMPT an order. That is still a
-        # statement about the SESSION route, not about promotion --
-        # observing here changes neither.
+        # All four routed sessions may ATTEMPT an order -- premarket and
+        # aftermarket share the general family with the regular session.
+        # That is still a statement about the SESSION route, not about
+        # promotion; observing here changes neither.
         assert s6_sessions.LIVE_SESSIONS == frozenset(
-            {"REGULAR", "OVERNIGHT_DAYTIME"})
+            {"PREMARKET", "REGULAR", "AFTER_HOURS", "OVERNIGHT_DAYTIME"})
 
     def test_a_passing_observation_does_not_make_a_variant_orderable(self):
+        """The invariant is that an OBSERVATION changes nothing about
+        permission -- not that S6-O happens to be blocked.
+
+        It used to be shown by asserting BLOCKED_ORDER_ROUTE, which held
+        only while daytime had no usable route. Now that it does, that
+        assertion would have forced the route correction to be reverted
+        to keep a test green. So the invariant is asserted directly:
+        collect the observation and confirm the verdict is identical to
+        the one reached without it.
+        """
+        without = variant_state.evaluate()["S6-O"]
         observed = observations.collect(final_check=report("OVERNIGHT_DAYTIME"))
-        state = variant_state.evaluate(observations=observed)["S6-O"]
-        assert state.checks["overnight_market_tick_verified"] == \
+        with_obs = variant_state.evaluate(observations=observed)["S6-O"]
+
+        assert with_obs.checks["overnight_market_tick_verified"] == \
             variant_state.PASS
-        assert state.may_order is False
-        assert state.mode == variant_state.BLOCKED_ORDER_ROUTE
+        assert with_obs.may_order is without.may_order
+        assert with_obs.mode == without.mode
 
 
 class TestOrderabilityIsClassified:

@@ -296,18 +296,43 @@ class TestManagementContinuesWhereOrderingCannot:
 # §7 / §17: route capability, derived and fail-closed
 # ====================================================================
 class TestRouteCapabilityIsDerivedNotAssumed:
-    def test_extended_hours_sessions_are_blocked_by_the_rollout_control(self):
-        for session in ("PREMARKET", "AFTER_HOURS"):
-            cap = session_capability.capability(session)
-            assert cap.buy.status == session_capability.BLOCKED
-            assert cap.buy.reason == \
-                session_capability.REASON_EXTENDED_HOURS_FORBIDDEN
-            assert cap.order_capable is False
+    def test_every_routed_session_reports_capable(self):
+        """The report now agrees with the ORDER PATH, which is the point.
 
-    def test_overnight_is_blocked_while_the_rollout_is_regular_only(self):
-        cap = session_capability.capability("OVERNIGHT_DAYTIME")
+        It used to refuse every non-REGULAR session on
+        `rollout.regular_session_only` -- a flag S6's order path does not
+        consult, since `_session_permitted` routes S6 through the shared
+        resolver. So the report said BLOCKED for sessions S6 could
+        actually trade. That is the more dangerous direction of wrong: an
+        understated capability is invisible, and gets planned around
+        rather than investigated.
+        """
+        for session in ("PREMARKET", "REGULAR", "AFTER_HOURS",
+                        "OVERNIGHT_DAYTIME"):
+            cap = session_capability.capability(session)
+            assert cap.buy.status == session_capability.VERIFIED, session
+            assert cap.order_capable is True, session
+            assert cap.blocking_reasons() == []
+
+    def test_the_report_and_the_order_path_ask_one_resolver(self):
+        """Two answers to one question is how they drifted apart."""
+        import inspect
+
+        source = inspect.getsource(session_capability.capability)
+        assert "static_capability" in source
+        # The flag is named in the docstring to explain the fix; what
+        # matters is that it is no longer CONSULTED.
+        body = source.split('"""')[-1]
+        assert "_regular_only(" not in body
+        assert "regular_session_only" not in body
+
+    def test_a_window_with_no_established_support_is_still_blocked(self):
+        """Understating capability was the bug; overstating it would be
+        worse. The aftermarket extension is gated behind a per-customer
+        application and stays refused."""
+        cap = session_capability.capability("NOT_A_SESSION")
         assert cap.order_capable is False
-        assert cap.buy.reason == session_capability.REASON_REGULAR_ONLY
+        assert cap.buy.status == session_capability.BLOCKED
 
     def test_the_fill_query_verdict_is_session_independent(self):
         """An order id is an order id: the same inquiry answers for a
@@ -340,10 +365,13 @@ class TestRouteCapabilityIsDerivedNotAssumed:
 
 
 class TestVariantStates:
-    def test_blocked_route_is_its_own_state_not_discovery(self):
+    def test_a_routed_variant_is_not_reported_as_route_blocked(self):
+        """BLOCKED_ORDER_ROUTE means "there is no endpoint", and for
+        these there is one. Reporting them as route-blocked pointed an
+        operator at the wrong thing entirely."""
         states = variant_state.evaluate()
-        for variant in ("S6-P", "S6-A", "S6-O"):
-            assert states[variant].mode == variant_state.BLOCKED_ORDER_ROUTE
+        for variant in ("S6-P", "S6-A", "S6-O", "S6-R"):
+            assert states[variant].mode != variant_state.BLOCKED_ORDER_ROUTE
 
     def test_regular_reflects_the_promoted_strategy(self):
         """S6-R is the one variant whose order route is open AND whose
@@ -458,10 +486,16 @@ class TestS1IsUnaffected:
         # subject of this test is that S1 was not touched by it.
 
     def test_s6_live_sessions_holds_only_routed_sessions(self):
+        """All four are routed now -- premarket and aftermarket share the
+        general family with the regular session. The invariant is still
+        that LIVE_SESSIONS contains nothing WITHOUT a route, which is
+        what this asserts against the broker's own table rather than
+        against a hardcoded pair."""
+        from brokers.kis_broker import ROUTED_SESSIONS
+
         assert s6_sessions.LIVE_SESSIONS == frozenset(
-            {"REGULAR", "OVERNIGHT_DAYTIME"})
-        assert "PREMARKET" not in s6_sessions.LIVE_SESSIONS
-        assert "AFTER_HOURS" not in s6_sessions.LIVE_SESSIONS
+            {"PREMARKET", "REGULAR", "AFTER_HOURS", "OVERNIGHT_DAYTIME"})
+        assert s6_sessions.LIVE_SESSIONS <= ROUTED_SESSIONS
 
     def test_s1_keeps_its_own_session_policy(self):
         """The S6 session gate is per strategy. Widening S6's sessions

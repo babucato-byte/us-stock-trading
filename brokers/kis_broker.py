@@ -187,7 +187,85 @@ TR_ID_DAYTIME_CANCEL = {"live": "TTTS6038U"}
 #: values are at-the-open and at-the-close types WITHIN the regular
 #: session, not extended-hours trading. A session with no specified
 #: route stays refused rather than being served a guessed one.
-ROUTED_SESSIONS = frozenset({"REGULAR", "OVERNIGHT_DAYTIME"})
+#: Sessions the general order family serves. The overseas order API
+#: documents US orders in the premarket and aftermarket as well as the
+#: regular session -- they share one endpoint and one TR family, because
+#: there is nothing session-specific about them on the wire.
+#:
+#: Reading "there is no premarket-specific TR" as "the API cannot order
+#: in premarket" was wrong, and it cost S6 two of the four sessions it
+#: scans. The absence of a distinct TR is what SHARING a route looks
+#: like, not evidence that the route is unavailable.
+GENERAL_SESSIONS = frozenset({"PREMARKET", "REGULAR", "AFTER_HOURS"})
+DAYTIME_SESSIONS = frozenset({"OVERNIGHT_DAYTIME"})
+
+FAMILY_GENERAL = "GENERAL"
+FAMILY_DAYTIME = "DAYTIME"
+
+#: Session -> API family. The aftermarket EXTENSION is not a session
+#: here: it is gated behind a per-customer application, so it is refused
+#: by `config.kis_market_schedule` before a route is ever asked for.
+FAMILY_BY_SESSION = {s: FAMILY_GENERAL for s in GENERAL_SESSIONS}
+FAMILY_BY_SESSION.update({s: FAMILY_DAYTIME for s in DAYTIME_SESSIONS})
+
+ROUTED_SESSIONS = frozenset(FAMILY_BY_SESSION)
+
+
+def family_for_session(session):
+    """The API family a session addresses, or raise.
+
+    `None` means "not specified" and keeps the regular route, matching
+    `order_route_for`. A blank string does not: that means a caller
+    COMPUTED a session and got nothing, and on a live-order path a fault
+    must not resolve to a working route.
+    """
+    if session is None:
+        return FAMILY_GENERAL
+    name = str(session).strip().upper()
+    family = FAMILY_BY_SESSION.get(name)
+    if family is None:
+        raise KISBrokerError(
+            f"no KIS order route is specified for session {name!r}; the "
+            "overseas API serves the premarket, regular and aftermarket "
+            "sessions through the general order family and US daytime "
+            "trading through its own")
+    return family
+
+
+def order_route_for_family(family, env_key, side):
+    """`(path, tr_id)` for an API family, or raise.
+
+    Families are never assumed to share a route. Serving daytime with the
+    general TR would be a real order sent to an endpoint that does not
+    run at that hour, and the failure is a rejected or mis-booked live
+    order rather than an error anyone sees in testing.
+    """
+    name = str(family or "").strip().upper()
+    if name == FAMILY_GENERAL:
+        tr_id, path = TR_ID_ORDER_US.get((env_key, side)), ORDER_PATH
+    elif name == FAMILY_DAYTIME:
+        tr_id, path = TR_ID_DAYTIME_ORDER_US.get((env_key, side)), DAYTIME_ORDER_PATH
+    else:
+        raise KISBrokerError(f"no KIS order route for family {name!r}")
+    if tr_id is None:
+        raise KISBrokerError(
+            f"no order TR_ID for family={name!r} env={env_key!r} side={side!r}")
+    return path, tr_id
+
+
+def cancel_route_for_family(family, env_key):
+    """`(path, tr_id)` for cancelling an order in this API family."""
+    name = str(family or "").strip().upper()
+    if name == FAMILY_GENERAL:
+        tr_id, path = TR_ID_CANCEL.get(env_key), CANCEL_PATH
+    elif name == FAMILY_DAYTIME:
+        tr_id, path = TR_ID_DAYTIME_CANCEL.get(env_key), DAYTIME_CANCEL_PATH
+    else:
+        raise KISBrokerError(f"no KIS cancel route for family {name!r}")
+    if tr_id is None:
+        raise KISBrokerError(
+            f"no cancel TR_ID for family={name!r} env={env_key!r}")
+    return path, tr_id
 
 
 def order_route_for(session, env_key, side):
@@ -201,22 +279,7 @@ def order_route_for(session, env_key, side):
     # Only None means "not specified". An empty or blank string means a
     # caller COMPUTED a session and got nothing, which is a fault -- and
     # on a live-order path a fault must not resolve to a working route.
-    name = "REGULAR" if session is None else str(session).strip().upper()
-    if name == "REGULAR":
-        tr_id = TR_ID_ORDER_US.get((env_key, side))
-        path = ORDER_PATH
-    elif name == "OVERNIGHT_DAYTIME":
-        tr_id = TR_ID_DAYTIME_ORDER_US.get((env_key, side))
-        path = DAYTIME_ORDER_PATH
-    else:
-        raise KISBrokerError(
-            f"no KIS order route is specified for session {name!r}; "
-            "the overseas API defines US order endpoints for the regular "
-            "session and for daytime trading only")
-    if tr_id is None:
-        raise KISBrokerError(
-            f"no order TR_ID for session={name!r} env={env_key!r} side={side!r}")
-    return path, tr_id
+    return order_route_for_family(family_for_session(session), env_key, side)
 
 
 def cancel_route_for(session, env_key):
@@ -234,22 +297,7 @@ def cancel_route_for(session, env_key):
     ("not specified", so the regular route) versus a blank string (a
     caller COMPUTED a session and got nothing, which is a fault).
     """
-    name = "REGULAR" if session is None else str(session).strip().upper()
-    if name == "REGULAR":
-        tr_id = TR_ID_CANCEL.get(env_key)
-        path = CANCEL_PATH
-    elif name == "OVERNIGHT_DAYTIME":
-        tr_id = TR_ID_DAYTIME_CANCEL.get(env_key)
-        path = DAYTIME_CANCEL_PATH
-    else:
-        raise KISBrokerError(
-            f"no KIS cancel route is specified for session {name!r}; "
-            "the overseas API defines US cancel endpoints for the regular "
-            "session and for daytime trading only")
-    if tr_id is None:
-        raise KISBrokerError(
-            f"no cancel TR_ID for session={name!r} env={env_key!r}")
-    return path, tr_id
+    return cancel_route_for_family(family_for_session(session), env_key)
 
 # EXCD (3-letter) is the quotations-API exchange code (price/quote
 # endpoint); OVRS_EXCG_CD (4-letter, order/balance endpoints) is a

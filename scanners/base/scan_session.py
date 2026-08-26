@@ -37,12 +37,19 @@ does not make.
 
 Scanning is not permission to trade
 -----------------------------------
-`ORDER_VERIFIED_SESSIONS` records which sessions have had their live
-order route actually verified against the broker. PREMARKET and
-AFTER_HOURS are scannable and are NOT verified: a reserved order is an
-instruction to trade later, not an execution, and treating the two as the
-same is how a scan-only session quietly becomes a live one. Nothing in
-this module grants execution -- it only refuses to imply it.
+`ORDER_VERIFIED_SESSIONS` records which sessions the specification
+defines an order route for -- now all four, since premarket and
+aftermarket share the general endpoint with the regular session. Nothing
+in this module grants execution; it only records what a route exists for.
+
+The boundaries below are for SCANNING and are fixed in Eastern time on
+purpose: every scan must land in exactly one bucket, and buckets that
+moved would make per-session comparison a sample rather than a partition.
+They are NOT the hours orders may be placed in. KIS publishes its windows
+in KST and they shift against Eastern time with US daylight saving --
+`config.kis_market_schedule` derives those, and `session_capability`
+refuses whenever the two disagree, which under DST they do for the hour
+between the aftermarket extension and the daytime open.
 """
 
 from datetime import datetime, time
@@ -64,11 +71,23 @@ OVERNIGHT_DAYTIME = "OVERNIGHT_DAYTIME"
 #: Clock order, starting at the premarket boundary.
 SESSIONS = (PREMARKET, REGULAR, AFTER_HOURS, OVERNIGHT_DAYTIME)
 
-#: Sessions whose live order route has been verified against the broker.
-#: See the module docstring: this is a record of what was checked, not a
-#: policy that can be widened by editing a tuple. Widening it requires the
-#: verification, and the verification is not in this file.
-ORDER_VERIFIED_SESSIONS = frozenset({REGULAR, OVERNIGHT_DAYTIME})
+#: Sessions for which the official specification defines an order route.
+#:
+#: All four. Premarket, regular and aftermarket share the general family
+#: (/trading/order, TTTT1002U/TTTT1006U/TTTT1004U); daytime has its own
+#: (/trading/daytime-order, TTTS6036U/TTTS6037U/TTTS6038U). Premarket and
+#: aftermarket were previously excluded on the reasoning that no
+#: extended-hours TR exists, which read a SHARED route as a missing one.
+#:
+#: "Route specified" is not "wire values confirmed by a live response",
+#: and this set says only the first. The second lives in the broker's
+#: verification matrix, per ROUTE rather than per session -- the three
+#: general sessions confirm one set together because they address one
+#: endpoint. Nor is either of them permission: `s6_sessions.LIVE_SESSIONS`
+#: is the rollout, and `config.kis_market_schedule` still refuses any
+#: hour outside a window KIS actually runs.
+ORDER_VERIFIED_SESSIONS = frozenset(
+    {PREMARKET, REGULAR, AFTER_HOURS, OVERNIGHT_DAYTIME})
 
 #: What a session is allowed to imply, printed rather than inferred.
 STATUS_ORDER_VERIFIED = "REFERENCE_VERIFIED"

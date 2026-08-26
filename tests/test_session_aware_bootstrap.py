@@ -69,32 +69,45 @@ class TestTheOrderCarriesItsSession:
 
 
 class TestTheOrderableSessionIsMeasured:
-    def test_an_unrouted_session_yields_none(self, monkeypatch):
-        from scanners.base import scan_session
+    """The session is now resolved from the MOMENT, against KIS's own
+    windows, rather than from the scanner's fixed-Eastern buckets.
 
-        monkeypatch.setattr(scan_session, "session_at", lambda *a, **k: "PREMARKET")
-        assert bootstrap._order_session() is None
+    These tests used to patch `scan_session.session_at` and assert that
+    PREMARKET and AFTER_HOURS yielded None. Both premises are gone: the
+    resolver no longer reads that function, and those two sessions are
+    orderable through the general route family. So they pass a real
+    moment and assert the real answer.
+    """
 
-    def test_a_routed_live_session_is_returned(self, monkeypatch):
-        from scanners.base import scan_session
+    from datetime import datetime as _dt
 
-        for session in ("REGULAR", "OVERNIGHT_DAYTIME"):
-            monkeypatch.setattr(scan_session, "session_at", lambda *a, _s=session, **k: _s)
-            assert bootstrap._order_session() == session
+    from market_hours import EASTERN as _ET
 
-    def test_a_session_s6_may_not_order_in_yields_none(self, monkeypatch):
-        """Both conditions are required. AFTER_HOURS is a real session
-        with real scanning and no order permission."""
-        from scanners.base import scan_session
+    ORDERABLE = (
+        (_dt(2026, 8, 26, 5, 0, tzinfo=_ET), "PREMARKET"),
+        (_dt(2026, 8, 26, 12, 0, tzinfo=_ET), "REGULAR"),
+        (_dt(2026, 8, 26, 17, 0, tzinfo=_ET), "AFTER_HOURS"),
+        (_dt(2026, 8, 26, 22, 0, tzinfo=_ET), "OVERNIGHT_DAYTIME"),
+    )
+    NOT_ORDERABLE = (
+        (_dt(2026, 8, 26, 18, 30, tzinfo=_ET), "aftermarket extension"),
+        (_dt(2026, 8, 26, 20, 30, tzinfo=_ET), "the DST closed hour"),
+        (_dt(2026, 8, 29, 22, 0, tzinfo=_ET), "Saturday"),
+    )
 
-        monkeypatch.setattr(scan_session, "session_at", lambda *a, **k: "AFTER_HOURS")
-        assert bootstrap._order_session() is None
+    @pytest.mark.parametrize("moment,expected", ORDERABLE)
+    def test_every_routed_window_is_returned(self, moment, expected):
+        assert bootstrap._order_session(now=moment) == expected
 
-    def test_it_never_falls_back_to_regular(self, monkeypatch):
-        from scanners.base import scan_session
+    @pytest.mark.parametrize("moment,label", NOT_ORDERABLE)
+    def test_an_unroutable_moment_yields_none(self, moment, label):
+        assert bootstrap._order_session(now=moment) is None, label
 
-        monkeypatch.setattr(scan_session, "session_at", lambda *a, **k: None)
-        assert bootstrap._order_session() is None
+    def test_it_never_falls_back_to_regular(self):
+        """None is a refusal. Falling back is exactly how an order
+        reaches an endpoint that is not open at the hour it is sent."""
+        for moment, _label in self.NOT_ORDERABLE:
+            assert bootstrap._order_session(now=moment) != "REGULAR"
 
 
 class TestEvidenceIsPerRoute:

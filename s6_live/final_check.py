@@ -220,6 +220,19 @@ def _unmeasured(reason: str) -> Dict[str, Dict[str, str]]:
     return {gate: _result(NOT_MEASURED, reason) for gate in GATES}
 
 
+
+def _session_orders_allowed(moment) -> bool:
+    """Whether KIS is running an order-capable window at `moment`.
+
+    Asked of `config.session_capability`, which is what the order path
+    asks. A report that answered this itself would drift from what can
+    actually be sent -- and it did, understating capability for every
+    session but REGULAR.
+    """
+    from config import session_capability
+
+    return bool(session_capability.capability_at(moment).orders_allowed)
+
 def build(*, conn=None, broker=None, trading_day=None, session=None,
           modes=None, rollout=None, now=None) -> Dict[str, Any]:
     """The whole report. Never raises: a report that crashed reports nothing.
@@ -260,7 +273,14 @@ def build(*, conn=None, broker=None, trading_day=None, session=None,
         "session_mode": s6_sessions.mode_for(resolved_session),
         "strategy_live_mode": _strategy_live_mode(modes),
         "order_capable": s6_sessions.orders_allowed(resolved_session),
-        "orders_allowed": (market != "CLOSED"
+        # NOT `market != "CLOSED"`. `get_market_state()` reports the
+        # US venue's own state and is CLOSED for the whole daytime
+        # window by construction, so conjoining it here made the
+        # report say "no orders" for a session KIS was running --
+        # the same defect the runtime carried, in the place an
+        # operator reads. Capability comes from the one resolver the
+        # ORDER PATH uses, so a report cannot disagree with it.
+        "orders_allowed": (_session_orders_allowed(moment)
                            and s6_sessions.orders_allowed(resolved_session)
                            and _strategy_is_live(modes)),
         # The invariant, stated rather than computed: no path through

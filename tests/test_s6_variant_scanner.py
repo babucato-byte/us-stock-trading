@@ -127,14 +127,25 @@ class TestAnUnformedRangeIsNotARejection:
 
 class TestTheSessionMatrixIsHonoured:
     def test_only_the_routed_sessions_may_order(self):
-        """REGULAR and OVERNIGHT_DAYTIME have a specified KIS order
-        route; the other two have none, so they stay shadow no matter
-        what the scanner finds in them."""
-        for session in ("REGULAR", "OVERNIGHT_DAYTIME"):
+        """All four have a specified KIS order route: premarket and
+        aftermarket share the general endpoint and TR family with the
+        regular session, and daytime has its own. What still keeps a
+        scanner finding from becoming an order is the clock -- KIS runs
+        no window in the DST hour between the aftermarket extension and
+        the daytime open, nor on a weekend."""
+        for session in ("PREMARKET", "REGULAR", "AFTER_HOURS",
+                        "OVERNIGHT_DAYTIME"):
             assert s6.orders_allowed(session) is True
-        for session in ("PREMARKET", "AFTER_HOURS"):
-            assert s6.orders_allowed(session) is False
-            assert s6.mode_for(session) == s6.MODE_REALTIME_SHADOW
+            assert s6.mode_for(session) == s6.MODE_LIMITED_LIVE
+
+        from datetime import datetime
+
+        from config import session_capability as sc
+        from market_hours import EASTERN
+
+        for closed in (datetime(2026, 8, 26, 20, 30, tzinfo=EASTERN),
+                       datetime(2026, 8, 29, 22, 0, tzinfo=EASTERN)):
+            assert sc.capability_at(closed).orders_allowed is False
 
     def test_s6_is_live_only_now_that_its_lifecycle_exists(self):
         """§11: the mode goes up only once the whole lifecycle exists.

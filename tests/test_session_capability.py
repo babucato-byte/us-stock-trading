@@ -116,14 +116,43 @@ class TestEntryAndExitAreSeparateQuestions:
         assert sc.order_session(now=TUE_EVENING, strategy_id=S1) is None
         assert sc.order_session(now=TUE_EVENING, strategy_id=S6) == "OVERNIGHT_DAYTIME"
 
-    def test_a_session_with_no_route_refuses_both_sides(self):
-        """No asymmetry here: an exit cannot be sent to a nonexistent
-        endpoint either."""
-        for moment in (datetime(2026, 8, 26, 5, 0, tzinfo=EASTERN),
-                       datetime(2026, 8, 26, 17, 0, tzinfo=EASTERN)):
+    def test_premarket_and_aftermarket_now_support_both_sides(self):
+        """They address the GENERAL family, which the overseas order API
+        documents US orders in. Excluding them read a SHARED route as a
+        missing one and cost S6 half the sessions it scans."""
+        for moment, expected in (
+                (datetime(2026, 8, 26, 5, 0, tzinfo=EASTERN), "PREMARKET"),
+                (datetime(2026, 8, 26, 17, 0, tzinfo=EASTERN), "AFTER_HOURS")):
             cap = _cap(moment, S6)
-            assert cap.entry_supported is False
-            assert cap.exit_supported is False
+            assert cap.session == expected
+            assert cap.family == sc.FAMILY_GENERAL
+            assert cap.entry_supported is True
+            assert cap.exit_supported is True
+
+    def test_a_window_with_no_established_family_refuses_both_sides(self):
+        """No asymmetry: an exit cannot be sent to an endpoint whose
+        availability has not been established either. The aftermarket
+        EXTENSION is gated behind a per-customer application, so API
+        support does not follow from the published schedule."""
+        cap = sc.capability_at(datetime(2026, 8, 26, 18, 30, tzinfo=EASTERN),
+                               strategy_id=S6)
+        assert cap.window == "AFTERMARKET_EXTENSION"
+        assert cap.session == ""
+        assert cap.entry_supported is False
+        assert cap.exit_supported is False
+        assert cap.entry_reason == sc.ROUTE_FAMILY_UNVERIFIED
+
+    def test_the_closed_hour_refuses_both_sides(self):
+        """Under DST, 20:00-21:00 ET is 09:00-10:00 KST: the extension
+        has ended and 주간거래 has not opened. A fixed-ET daytime
+        boundary called this OVERNIGHT_DAYTIME and permitted an order."""
+        cap = sc.capability_at(datetime(2026, 8, 26, 20, 30, tzinfo=EASTERN),
+                               strategy_id=S6)
+        assert cap.window == "CLOSED"
+        assert cap.session == ""
+        assert cap.entry_supported is False
+        assert cap.exit_supported is False
+        assert cap.entry_reason == sc.MARKET_CLOSED
 
 
 class TestItFailsClosed:
@@ -140,14 +169,22 @@ class TestItFailsClosed:
                                  now=TUE_EVENING).entry_supported is True
 
     def test_an_unreadable_clock_is_a_refusal_not_a_pass(self, monkeypatch):
-        from scanners.base import scan_session
+        """Capability is time-driven now, so the clock IS the input.
+        An unreadable one must refuse rather than fall through."""
+        from config import kis_market_schedule
 
         def _boom(*_a, **_k):
             raise RuntimeError("clock unavailable")
 
-        monkeypatch.setattr(scan_session, "session_at", _boom)
+        monkeypatch.setattr(kis_market_schedule, "window_at", _boom)
+        with pytest.raises(RuntimeError):
+            kis_market_schedule.window_at(TUE_EVENING)
+
+        monkeypatch.setattr(kis_market_schedule, "window_at",
+                            lambda *_a, **_k: kis_market_schedule.WINDOW_CLOSED)
         assert sc.current_session() == ""
         assert sc.order_session(strategy_id=S6) is None
+        assert sc.exit_session() is None
 
 
 class TestTheRoutesComeFromTheBroker:
@@ -191,10 +228,16 @@ class TestTheCancelRouteFollowsTheOrder:
 
         assert kb.cancel_route_for(None, "live")[1] == "TTTT1004U"
 
-    def test_an_unrouted_session_raises_rather_than_guessing(self):
+    def test_the_general_sessions_share_one_cancel_route(self):
+        from brokers.kis_broker import cancel_route_for
+
+        for session in ("PREMARKET", "REGULAR", "AFTER_HOURS"):
+            assert cancel_route_for(session, "live")[1] == "TTTT1004U"
+
+    def test_a_non_session_raises_rather_than_guessing(self):
         from brokers.kis_broker import KISBrokerError, cancel_route_for
 
-        for session in ("PREMARKET", "AFTER_HOURS", "", "  "):
+        for session in ("AFTERMARKET_EXTENSION", "CLOSED", "", "  "):
             with pytest.raises(KISBrokerError):
                 cancel_route_for(session, "live")
 
@@ -279,8 +322,14 @@ class TestBothGatesAgreeAboutArmed:
         from config import session_capability
         from execution import bootstrap_capability as bc
 
-        monkeypatch.setattr(session_capability, "route_session",
-                            lambda **_k: "OVERNIGHT_DAYTIME")
+        monkeypatch.setattr(
+            session_capability, "capability_at",
+            lambda *_a, **_k: session_capability.SessionCapability(
+                session="OVERNIGHT_DAYTIME", window="DAYTIME",
+                family=session_capability.FAMILY_DAYTIME,
+                trading_day="2026-08-27", entry_supported=True,
+                exit_supported=True, entry_reason=session_capability.CAPABLE,
+                exit_reason=session_capability.CAPABLE))
         cap = bc.mint(symbol="IBN", allowed_symbols={"IBN"}, env=self.ARMED_ENV)
         assert cap.mode == bc.MODE_LIMITED_LIVE_BOOTSTRAP
         assert cap.symbol == "IBN" and cap.quantity == 1 and cap.side == "buy"
@@ -291,7 +340,13 @@ class TestBothGatesAgreeAboutArmed:
         from config import session_capability
         from execution import bootstrap_capability as bc
 
-        monkeypatch.setattr(session_capability, "route_session", lambda **_k: None)
+        monkeypatch.setattr(session_capability, "capability_at",
+                            lambda *_a, **_k: session_capability.SessionCapability(
+                                session="", window="CLOSED", family=None,
+                                trading_day=None, entry_supported=False,
+                                exit_supported=False,
+                                entry_reason=session_capability.MARKET_CLOSED,
+                                exit_reason=session_capability.MARKET_CLOSED))
         with pytest.raises(bc.BootstrapCapabilityError):
             bc.mint(symbol="IBN", allowed_symbols={"IBN"}, env=self.ARMED_ENV)
 
@@ -405,3 +460,145 @@ class TestStrategyEntryPolicy:
 
         assert slm.SCANNER_LIVE_MODE["hma_early_trend"] == slm.MODE_LIMITED_LIVE
         assert slm.SCANNER_LIVE_MODE["orb"] == slm.MODE_LIMITED_LIVE
+
+
+class TestTheKISScheduleIsTheSourceOfTruth:
+    """Windows are KIS's, published in KST, and derived -- not asserted
+    alongside them in Eastern time.
+
+    `scan_session` partitions the day by fixed Eastern hours, which is
+    right for SCANNING: every scan lands in exactly one bucket and the
+    buckets never move. It is wrong for ORDERING, because KIS's windows
+    are fixed in KST and the KST->ET offset moves an hour with US
+    daylight saving. KIS shortens the daytime window in summer (17:00
+    rather than 18:00 KST close) precisely so its ET *close* stays 04:00,
+    which means the ET *open* moves -- 20:00 in standard time, 21:00
+    under DST.
+    """
+
+    from datetime import datetime as _dt
+
+    from market_hours import EASTERN as _ET
+
+    def test_dst_daytime_is_refused_before_the_open(self):
+        """20:00-21:00 ET under DST is 09:00-10:00 KST: the aftermarket
+        extension has ended and 주간거래 has not begun. The fixed-ET
+        boundary called this OVERNIGHT_DAYTIME and permitted an order
+        every DST day."""
+        for minute in (0, 30, 59):
+            t = self._dt(2026, 8, 26, 20, minute, tzinfo=self._ET)
+            cap = sc.capability_at(t, strategy_id=S6)
+            assert cap.window == "CLOSED", t
+            assert cap.entry_supported is False
+            assert cap.exit_supported is False
+
+    def test_dst_daytime_is_accepted_at_the_exact_open(self):
+        t = self._dt(2026, 8, 26, 21, 0, tzinfo=self._ET)
+        cap = sc.capability_at(t, strategy_id=S6)
+        assert cap.window == "DAYTIME"
+        assert cap.family == sc.FAMILY_DAYTIME
+        assert cap.entry_supported is True and cap.exit_supported is True
+
+    def test_standard_time_daytime_opens_an_hour_earlier_in_eastern(self):
+        """The same KST instant, 10:00, in both halves of the year. The
+        boundary is only 'an hour early' relative to a fixed ET rule; in
+        KST it never moved."""
+        before = sc.capability_at(self._dt(2026, 12, 10, 19, 59, tzinfo=self._ET))
+        at_open = sc.capability_at(self._dt(2026, 12, 10, 20, 0, tzinfo=self._ET))
+        assert before.window == "CLOSED"
+        assert at_open.window == "DAYTIME"
+
+    def test_the_daytime_close_is_04_00_eastern_in_both_halves(self):
+        """What KIS holds fixed. Shortening the KST window in summer is
+        what keeps this true."""
+        for month, day in ((8, 27), (12, 11)):
+            last = sc.capability_at(self._dt(2026, month, day, 3, 59, tzinfo=self._ET))
+            after = sc.capability_at(self._dt(2026, month, day, 4, 0, tzinfo=self._ET))
+            assert last.window == "DAYTIME", (month, day)
+            assert after.window == "PREMARKET", (month, day)
+
+
+class TestEveryWindowRoutesToItsFamily:
+    from datetime import datetime as _dt
+
+    from market_hours import EASTERN as _ET
+
+    GENERAL = (
+        (_dt(2026, 8, 26, 5, 0, tzinfo=_ET), "PREMARKET"),
+        (_dt(2026, 8, 26, 12, 0, tzinfo=_ET), "REGULAR"),
+        (_dt(2026, 8, 26, 17, 0, tzinfo=_ET), "AFTER_HOURS"),
+    )
+
+    @pytest.mark.parametrize("moment,session", GENERAL)
+    def test_general_sessions_buy_sell_and_cancel_on_one_family(
+            self, moment, session):
+        cap = sc.capability_at(moment, strategy_id=S6)
+        assert cap.session == session
+        assert cap.family == sc.FAMILY_GENERAL
+        assert cap.order_route_buy == (
+            "/uapi/overseas-stock/v1/trading/order", "TTTT1002U")
+        assert cap.order_route_sell == (
+            "/uapi/overseas-stock/v1/trading/order", "TTTT1006U")
+        assert cap.cancel_route == (
+            "/uapi/overseas-stock/v1/trading/order-rvsecncl", "TTTT1004U")
+
+    def test_daytime_buy_sell_and_cancel_on_its_own_family(self):
+        cap = sc.capability_at(
+            self._dt(2026, 8, 26, 22, 0, tzinfo=self._ET), strategy_id=S6)
+        assert cap.family == sc.FAMILY_DAYTIME
+        assert cap.order_route_buy == (
+            "/uapi/overseas-stock/v1/trading/daytime-order", "TTTS6036U")
+        assert cap.order_route_sell == (
+            "/uapi/overseas-stock/v1/trading/daytime-order", "TTTS6037U")
+        assert cap.cancel_route == (
+            "/uapi/overseas-stock/v1/trading/daytime-order-rvsecncl", "TTTS6038U")
+
+    def test_the_two_families_share_no_endpoint_and_no_tr(self):
+        general = sc.capability_at(self._dt(2026, 8, 26, 12, 0, tzinfo=self._ET))
+        daytime = sc.capability_at(self._dt(2026, 8, 26, 22, 0, tzinfo=self._ET))
+        for a, b in ((general.order_route_buy, daytime.order_route_buy),
+                     (general.order_route_sell, daytime.order_route_sell),
+                     (general.cancel_route, daytime.cancel_route)):
+            assert a[0] != b[0] and a[1] != b[1]
+
+    def test_evidence_is_per_route_not_per_session(self):
+        """The three general sessions confirm ONE set together, because
+        they address one endpoint. 'The ARMED five' is a name from when
+        the regular session was the only one considered."""
+        from brokers import kis_broker as kb
+
+        assert sc.evidence_posture_for_family(sc.FAMILY_GENERAL) \
+            == kb.REQUIRED_FOR_ARMED
+        assert sc.evidence_posture_for_family(sc.FAMILY_DAYTIME) \
+            == kb.REQUIRED_FOR_DAYTIME
+        for session in ("PREMARKET", "REGULAR", "AFTER_HOURS"):
+            assert sc.route_awaiting_live_evidence(session) is \
+                sc.route_awaiting_live_evidence(sc.FAMILY_GENERAL)
+
+
+class TestOneNowThreadedThroughEverything:
+    """A boundary straddle is the failure this prevents: an order checked
+    against one session and addressed to another because two reads of the
+    clock fell either side of a window edge."""
+
+    from datetime import datetime as _dt, timedelta as _td
+
+    from market_hours import EASTERN as _ET
+
+    def test_the_same_moment_gives_the_same_answer_everywhere(self):
+        from live_pilot import bootstrap
+
+        for t in (self._dt(2026, 8, 26, 5, 0, tzinfo=self._ET),
+                  self._dt(2026, 8, 26, 12, 0, tzinfo=self._ET),
+                  self._dt(2026, 8, 26, 22, 0, tzinfo=self._ET)):
+            cap = sc.capability_at(t, strategy_id=S6)
+            assert bootstrap._order_session(now=t) == cap.session
+            assert sc.exit_session(now=t) == cap.session
+            assert sc.route_session(now=t) == cap.session
+
+    def test_either_side_of_a_boundary_answers_differently(self):
+        """Which is exactly why one snapshot must be threaded rather than
+        the clock read repeatedly."""
+        edge = self._dt(2026, 8, 26, 21, 0, tzinfo=self._ET)
+        assert sc.capability_at(edge - self._td(seconds=1)).window == "CLOSED"
+        assert sc.capability_at(edge).window == "DAYTIME"

@@ -162,7 +162,13 @@ class TestClassificationMatchesTheSource:
     #:
     #: The property that matters is unchanged and is asserted below:
     #: only the two order methods can TRANSMIT.
-    ROUTE_SELECTORS = {"order_route_for", "cancel_route_for"}
+    #: The family-level resolvers joined when premarket and
+    #: aftermarket were found to SHARE the general route with the
+    #: regular session. Route selection moved up a level -- from
+    #: "which session" to "which API family" -- and the session
+    #: functions became thin wrappers over them.
+    ROUTE_SELECTORS = {"order_route_for", "cancel_route_for",
+                       "order_route_for_family", "cancel_route_for_family"}
 
     @pytest.mark.parametrize("name", ["order_path", "order_tr_id_live_buy"])
     def test_order_values_are_referenced_only_by_submission(self, name):

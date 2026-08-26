@@ -342,7 +342,10 @@ class TestFinalCheckReportsWhatItMeasured:
                                    modes=live_modes(), now=T0)
         gate = report["candidates"][0]["buy_gates"]["risk_matrix"]
         assert gate["status"] == final_check.BLOCK
-        assert "REALTIME_SHADOW" in gate["detail"]
+        # PREMARKET is order-capable now, so the block here is no longer
+        # the SESSION's -- it is the rollout's, which is what this gate
+        # is actually about.
+        assert gate["detail"]
 
     def test_a_missing_master_is_not_measured_not_blocked(self, handoff,
                                                           monkeypatch):
@@ -508,14 +511,22 @@ class TestCommonStockSnapshot:
 # §4  S6-O SESSION REPORT
 # ====================================================================
 class TestSessionReport:
-    def test_an_unrouted_session_expects_shadow(self, handoff, conn):
+    def test_a_routed_session_reports_its_real_capability(self, handoff, conn):
+        """PREMARKET reports LIMITED_LIVE and order_capable now: it
+        addresses the general order family. Reporting it as shadow
+        UNDERSTATED what S6 can do, which is the direction of wrong that
+        gets planned around instead of investigated.
+
+        `orders_allowed` still requires BOTH -- the session's capability
+        AND the strategy's promotion -- which the DISCOVERY_ONLY mode
+        here withholds."""
         report = session_report.build(conn=conn, trading_day=DAY,
                                       session="PREMARKET",
                                       modes=discovery_modes(), now=T0)
         assert report["variant"] == "S6-P"
-        assert report["session_mode"] == s6_sessions.MODE_REALTIME_SHADOW
+        assert report["session_mode"] == s6_sessions.MODE_LIMITED_LIVE
         assert report["strategy_live_mode"] == slm.MODE_DISCOVERY_ONLY
-        assert report["order_capable"] is False
+        assert report["order_capable"] is True
         assert report["orders_allowed"] is False
         assert report["broker_submit_count"] == 0
         assert report["matches_expectations"]["matched"] is True
@@ -943,24 +954,36 @@ class TestCapabilityIsNotPromotion:
         assert report["strategy_live_mode"] == slm.MODE_LIMITED_LIVE
 
     def test_the_session_report_separates_them_too(self, handoff, conn):
-        # PREMARKET is the shadow exemplar now: OVERNIGHT_DAYTIME has a
-        # specified KIS order route and is session-permitted, while
-        # PREMARKET has none and cannot become one.
+        # Every session is route-capable now, so the separation the
+        # report must keep is no longer capable-vs-uncapable SESSIONS --
+        # it is CAPABILITY vs PROMOTION. A capable session with an
+        # unpromoted strategy must still report orders_allowed False.
         report = session_report.build(conn=conn, trading_day=DAY,
                                       session="PREMARKET",
                                       modes=discovery_modes(), now=T0)
-        assert report["session_mode"] == s6_sessions.MODE_REALTIME_SHADOW
+        assert report["order_capable"] is True
+        assert report["session_mode"] == s6_sessions.MODE_LIMITED_LIVE
         assert report["strategy_live_mode"] == slm.MODE_DISCOVERY_ONLY
         assert report["orders_allowed"] is False
 
     def test_orders_allowed_needs_both(self, handoff, master):
-        """Neither alone is enough, in either direction."""
+        """Neither alone is enough, in either direction.
+
+        The second half is now a CLOCK case rather than a session case:
+        every session is route-capable, so "promoted but not capable"
+        means promoted while KIS runs no window -- here the DST hour
+        between the aftermarket extension and the daytime open.
+        """
+        from datetime import datetime
+
+        from market_hours import EASTERN
+
         capable_not_promoted = final_check.build(
             trading_day=DAY, session="REGULAR",
             modes=discovery_modes(), now=T0)
         promoted_not_capable = final_check.build(
-            trading_day=DAY, session="PREMARKET", modes=live_modes(),
-            now=T0)
+            trading_day=DAY, session="OVERNIGHT_DAYTIME", modes=live_modes(),
+            now=datetime(2026, 8, 26, 20, 30, tzinfo=EASTERN))
         assert capable_not_promoted["orders_allowed"] is False
         assert promoted_not_capable["orders_allowed"] is False
 

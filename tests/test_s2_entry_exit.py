@@ -456,13 +456,24 @@ class TestEntryFailsClosed:
             features=Features(hma200=None, hma200_slope=0.4))
         assert verdict.reason == entry.REASON_HMA200_UNAVAILABLE
 
-    @pytest.mark.parametrize("session", ["PREMARKET", "AFTER_HOURS", None,
-                                         "DAILY", "OVERNIGHT"])
-    def test_an_unverified_session_blocks(self, session):
+    @pytest.mark.parametrize("session", [None, "DAILY", "OVERNIGHT"])
+    def test_a_session_that_is_not_a_session_blocks(self, session):
         verdict = entry.confirm(
             current_price=101.0, signal_price=100.0, session=session,
             features=Features(hma200=95.0, hma200_slope=0.4))
         assert verdict.reason == entry.REASON_STALE_SESSION
+
+    @pytest.mark.parametrize("session", ["PREMARKET", "AFTER_HOURS"])
+    def test_a_routed_session_s2_has_not_reached_blocks_as_not_enabled(
+            self, session):
+        """These have a specified route now -- they share the general
+        family with the regular session -- so refusing them as
+        "unverified route" would report the wrong cause. What holds S2
+        back is S2's OWN rollout, and the reason code now says so."""
+        verdict = entry.confirm(
+            current_price=101.0, signal_price=100.0, session=session,
+            features=Features(hma200=95.0, hma200_slope=0.4))
+        assert verdict.reason == entry.REASON_SESSION_NOT_ENABLED
 
     def test_only_regular_is_enabled_for_live_orders(self):
         """The rollout has reached REGULAR and nothing else."""
@@ -487,9 +498,12 @@ class TestEntryFailsClosed:
         assert verdict.allowed is False
         assert verdict.reason == entry.REASON_SESSION_NOT_ENABLED
 
-    def test_an_unverified_route_is_refused_for_a_different_reason(self):
+    def test_a_session_with_no_route_is_refused_for_a_different_reason(self):
+        """The two refusals stay distinct: "S2 has not been rolled out
+        here" and "this is not a session at all" need different operator
+        responses."""
         verdict = entry.confirm(
-            current_price=101.0, signal_price=100.0, session="PREMARKET",
+            current_price=101.0, signal_price=100.0, session="NOT_A_SESSION",
             features=Features(hma200=95.0, hma200_slope=0.4))
         assert verdict.reason == entry.REASON_STALE_SESSION
 

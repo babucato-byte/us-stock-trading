@@ -110,17 +110,24 @@ class TestNormalizeRefusesToGuess:
 
 
 class TestScanningIsNotPermissionToTrade:
-    def test_only_the_verified_sessions_are_verified(self):
-        assert ss.ORDER_VERIFIED_SESSIONS == {ss.REGULAR, ss.OVERNIGHT_DAYTIME}
+    """All four sessions now have a specified order route -- premarket
+    and aftermarket share the general endpoint and TR family with the
+    regular session, which the overseas order API documents.
 
-    @pytest.mark.parametrize("session", [ss.PREMARKET, ss.AFTER_HOURS])
-    def test_scannable_sessions_are_not_live_sessions(self, session):
-        assert ss.order_route_verified(session) is False
-        assert ss.execution_status(session) == ss.STATUS_SCAN_ONLY
-        assert "UNVERIFIED" in ss.execution_status(session)
+    Excluding them rested on "no premarket-specific TR exists", which
+    read a SHARED route as a missing one. So this class no longer
+    separates scanning from ordering by SESSION. The separation it
+    protects is real and still here; it moved to the clock and to the
+    layers above, which the last three tests pin.
+    """
 
-    @pytest.mark.parametrize("session", [ss.REGULAR, ss.OVERNIGHT_DAYTIME])
-    def test_verified_sessions_say_so(self, session):
+    def test_every_scanned_session_has_a_specified_route(self):
+        assert ss.ORDER_VERIFIED_SESSIONS == {
+            ss.PREMARKET, ss.REGULAR, ss.AFTER_HOURS, ss.OVERNIGHT_DAYTIME}
+
+    @pytest.mark.parametrize(
+        "session", [ss.PREMARKET, ss.REGULAR, ss.AFTER_HOURS, ss.OVERNIGHT_DAYTIME])
+    def test_routed_sessions_say_so(self, session):
         assert ss.order_route_verified(session) is True
         assert ss.execution_status(session) == ss.STATUS_ORDER_VERIFIED
 
@@ -130,14 +137,37 @@ class TestScanningIsNotPermissionToTrade:
         for bogus in ("REGULARR", "", None, "DAYTIME"):
             assert ss.order_route_verified(bogus) is False
 
-    def test_a_reserved_order_is_not_execution_support(self):
-        """The distinction the docstring exists to protect: KIS accepts a
-        reservation in premarket, and a reservation is an instruction to
-        trade later, not a fill."""
-        source = (REPO_ROOT / "scanners" / "base" / "scan_session.py").read_text()
-        flat = " ".join(source.split())
-        assert "reserved order is an instruction to trade later" in flat
-        assert ss.PREMARKET not in ss.ORDER_VERIFIED_SESSIONS
+    def test_a_specified_route_is_not_an_open_market(self):
+        """The separation that replaced the session-set one. Having a
+        route says nothing about the hour: under DST, 20:00-21:00 ET is
+        09:00-10:00 KST, after the aftermarket extension and before
+        주간거래 opens, and KIS runs no window there at all."""
+        from datetime import datetime
+
+        from config import session_capability as sc
+        from market_hours import EASTERN
+
+        assert ss.order_route_verified(ss.OVERNIGHT_DAYTIME) is True
+        closed = sc.capability_at(datetime(2026, 8, 26, 20, 30, tzinfo=EASTERN))
+        assert closed.orders_allowed is False
+
+    def test_a_specified_route_is_not_a_confirmed_one(self):
+        """Route SPECIFIED and wire values CONFIRMED BY A LIVE RESPONSE
+        are different facts. Conflating them would let an edit to a tuple
+        stand in for a KIS answer."""
+        from config import session_capability as sc
+
+        for family in (sc.FAMILY_GENERAL, sc.FAMILY_DAYTIME):
+            assert sc.route_awaiting_live_evidence(family) is True
+
+    def test_a_specified_route_is_not_permission(self):
+        """`s6_sessions.LIVE_SESSIONS` is the rollout, and
+        `strategy_entry_policy` can stand a strategy down on top of it.
+        Route, rollout and permission remain three gates."""
+        from config import strategy_entry_policy as sep
+
+        assert sep.entry_enabled("S1_HMA_EARLY_TREND_V1") is False
+        assert sep.exit_enabled("S1_HMA_EARLY_TREND_V1") is True
 
 
 class TestItChangesNoScannerCondition:

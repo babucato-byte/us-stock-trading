@@ -170,13 +170,24 @@ class TestScanningIsNotOrdering:
         window = scan_window.evaluate(at(MON, hour))
         assert window.scan_allowed is True
         # The order decision is asked elsewhere, and scanning never
-        # widens it. Ordering is a STRICT SUBSET of scanning: every
-        # session here is scannable, and the two without a specified KIS
-        # route are still refused.
-        assert s6_sessions.LIVE_SESSIONS < s6_sessions.SCAN_SESSIONS
+        # widens it. The session SETS are equal now -- premarket and
+        # aftermarket share the general route family with the regular
+        # session -- so what narrows ordering is no longer the set but
+        # the CLOCK: KIS runs no window in the DST hour between the
+        # aftermarket extension and the daytime open, and none on a
+        # weekend or holiday.
+        assert s6_sessions.LIVE_SESSIONS <= s6_sessions.SCAN_SESSIONS
         assert window.session in s6_sessions.SCAN_SESSIONS
-        if window.session in ("PREMARKET", "AFTER_HOURS"):
-            assert s6_sessions.orders_allowed(window.session) is False
+
+        from datetime import datetime
+
+        from config import session_capability as sc
+        from market_hours import EASTERN
+
+        for closed in (datetime(2026, 8, 26, 20, 30, tzinfo=EASTERN),
+                       datetime(2026, 8, 26, 18, 30, tzinfo=EASTERN),
+                       datetime(2026, 8, 29, 22, 0, tzinfo=EASTERN)):
+            assert sc.capability_at(closed).orders_allowed is False
 
     def test_the_module_consults_no_order_policy(self):
         import ast

@@ -206,51 +206,57 @@ def _fill_query_verdict(session: str) -> RouteVerdict:
 
 
 def capability(session, *, rollout=None) -> SessionCapability:
-    """What this session may actually do, with the reason for each answer."""
+    """What this session may actually do, with the reason for each answer.
+
+    Delegated to `config.session_capability`, which is the same resolver
+    the ORDER PATH uses. It used to decide here, and the two drifted:
+    this module refused every non-REGULAR session on
+    `rollout.regular_session_only`, a flag S6's order path does not
+    consult -- `kis_live_trading._session_permitted` routes S6 through
+    the shared resolver instead. So the report said BLOCKED for sessions
+    S6 could actually trade, which is the more dangerous direction of
+    wrong: an understated capability is invisible, and gets planned
+    around rather than investigated.
+
+    `static_capability` is asked rather than `capability_at` on purpose.
+    This answers "what can this session do", not "what can it do at this
+    instant" -- a report that used the clock would say no for the three
+    sessions that happen to be shut while it runs.
+    """
+    from config import session_capability as authoritative
     from scanners.base import scan_session
 
     normalised = scan_session.normalize(session) or str(session or "").upper()
     variant = s6_sessions.variant_for(normalised)
+    cap = authoritative.static_capability(normalised)
+    fill = _fill_query_verdict(normalised)
 
-    # 1. Has the route been verified against the broker at all?
-    if not scan_session.order_route_verified(normalised):
-        if normalised in EXTENDED_HOURS_SESSIONS and _extended_hours_forbidden(rollout):
-            verdict = RouteVerdict(
-                BLOCKED, REASON_EXTENDED_HOURS_FORBIDDEN,
-                "live_rollout_config.validate() raises on "
-                "allow_extended_hours=True; the buy cycle aborts on that "
-                "error, so no extended-hours order can be placed")
-        else:
-            verdict = RouteVerdict(
-                BLOCKED, REASON_ROUTE_UNVERIFIED,
-                f"{normalised} is not in "
-                f"scan_session.ORDER_VERIFIED_SESSIONS")
-        return SessionCapability(normalised, variant, verdict, verdict,
-                                 _fill_query_verdict(normalised))
+    if cap.orders_allowed:
+        ok = RouteVerdict(
+            VERIFIED, None,
+            f"{normalised} addresses the {cap.family} order family "
+            f"({cap.order_route_buy[1]} buy / {cap.order_route_sell[1]} sell "
+            f"/ {cap.cancel_route[1]} cancel) and is reached by the S6 rollout")
+        return SessionCapability(normalised, variant, ok, ok, fill)
 
-    # 2. The route is verified. Does the rollout permit this session?
-    if _regular_only(rollout) and normalised != "REGULAR":
-        verdict = RouteVerdict(
-            BLOCKED, REASON_REGULAR_ONLY,
-            "rollout.regular_session_only is True; order_gate blocks when "
-            "is_regular_session is False")
-        return SessionCapability(normalised, variant, verdict, verdict,
-                                 _fill_query_verdict(normalised))
+    # Refused. The reason is the resolver's, translated into this
+    # module's vocabulary so operators reading a report see one story.
+    reason, detail = {
+        authoritative.STRATEGY_NOT_LIVE_IN_SESSION: (
+            REASON_ROLLOUT_NOT_REACHED,
+            f"a route exists; {normalised} is not in "
+            f"s6_sessions.LIVE_SESSIONS {sorted(s6_sessions.LIVE_SESSIONS)}"),
+        authoritative.ROUTE_FAMILY_UNVERIFIED: (
+            REASON_ROUTE_UNVERIFIED,
+            f"{normalised} is a window KIS runs but whose API support is "
+            "not established -- the aftermarket extension is gated behind "
+            "a per-customer application"),
+    }.get(cap.entry_reason, (
+        REASON_ROUTE_UNVERIFIED,
+        f"{normalised} has no KIS order route ({cap.entry_reason})"))
 
-    # 3. The rollout allows the session type. Has S6's rollout reached it?
-    if not s6_sessions.orders_allowed(normalised):
-        verdict = RouteVerdict(
-            NOT_VERIFIED, REASON_ROLLOUT_NOT_REACHED,
-            f"route is verified; {normalised} is not in "
-            f"s6_sessions.LIVE_SESSIONS {sorted(s6_sessions.LIVE_SESSIONS)}")
-        return SessionCapability(normalised, variant, verdict, verdict,
-                                 _fill_query_verdict(normalised))
-
-    ok = RouteVerdict(VERIFIED, None,
-                      "route verified against the broker and reached by "
-                      "the S6 rollout")
-    return SessionCapability(normalised, variant, ok, ok,
-                             _fill_query_verdict(normalised))
+    verdict = RouteVerdict(BLOCKED, reason, detail)
+    return SessionCapability(normalised, variant, verdict, verdict, fill)
 
 
 def all_sessions(*, rollout=None) -> Dict[str, SessionCapability]:

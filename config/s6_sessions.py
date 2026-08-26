@@ -46,47 +46,49 @@ VARIANT_BY_SESSION: Dict[str, str] = {
 #: Scanned and measured everywhere.
 SCAN_SESSIONS: FrozenSet[str] = frozenset(VARIANT_BY_SESSION)
 
-#: Sessions in which a real order may be attempted.
+#: Sessions in which a real order may be ATTEMPTED -- all four.
 #:
-#: REGULAR and OVERNIGHT_DAYTIME, because those are the two whose KIS
-#: order route the official specification defines:
+#: The overseas order API documents US orders in the premarket, the
+#: regular session and the aftermarket, and they SHARE one endpoint and
+#: one TR family:
 #:
-#:   REGULAR            /trading/order          TTTT1002U / TTTT1006U
-#:   OVERNIGHT_DAYTIME  /trading/daytime-order  TTTS6036U / TTTS6037U
+#:   PREMARKET / REGULAR / AFTER_HOURS
+#:       /trading/order            TTTT1002U buy / TTTT1006U sell
+#:       /trading/order-rvsecncl   TTTT1004U cancel
+#:   OVERNIGHT_DAYTIME
+#:       /trading/daytime-order            TTTS6036U / TTTS6037U
+#:       /trading/daytime-order-rvsecncl   TTTS6038U
 #:
-#: PREMARKET and AFTER_HOURS are absent because no US extended-hours
-#: order endpoint exists in the overseas API -- the complete set of US
-#: order TRs is those four plus the two cancels. ORD_DVSN carries
-#: LOO/LOC/MOO/MOC, but those are at-the-open and at-the-close types
-#: WITHIN the regular session, not extended-hours trading. They are not
-#: waiting on a decision here; there is nothing to enable.
+#: Premarket and aftermarket were previously absent on the reasoning
+#: that "no extended-hours TR exists, so the API cannot order there".
+#: That inverted what the absence meant: having no session-specific TR
+#: is what SHARING a route looks like. The mistake cost S6 half the
+#: sessions it scans, in a family whose whole premise is that a breakout
+#: is worth measuring in every session.
 #:
-#: Membership is not permission on its own. Each session still needs its
-#: own wire values confirmed by a real response -- REGULAR's five are the
-#: ARMED set, OVERNIGHT_DAYTIME's five are REQUIRED_FOR_DAYTIME -- and
-#: they are deliberately disjoint so neither session's pending evidence
-#: can block the other. The S6 family limit of one position spans all
-#: four variants regardless.
-#: Sessions in which a real order may be ATTEMPTED -- REGULAR and
-#: OVERNIGHT_DAYTIME, the two whose KIS order route the official
-#: specification defines:
+#: The aftermarket EXTENSION is NOT included and is not a session here.
+#: It is gated behind a per-customer application through HTS or the app,
+#: so API support for it does not follow from the published schedule.
+#: `config.kis_market_schedule` refuses it as UNVERIFIED rather than
+#: assuming either way.
 #:
-#:   REGULAR            /trading/order          TTTT1002U / TTTT1006U
-#:   OVERNIGHT_DAYTIME  /trading/daytime-order  TTTS6036U / TTTS6037U
-#:
-#: PREMARKET and AFTER_HOURS are absent because the overseas API exposes
-#: no US extended-hours order endpoint at all. That is not a pending
-#: decision -- there is nothing to enable, and the REGULAR or daytime
-#: route must never be reused for them on the assumption that it will
-#: do.
-#:
-#: Membership is CAPABILITY, not permission. Three further gates stand
-#: between this set and an order, and each is separately tested:
-#:   * the session's own wire values, confirmed by a real KIS response
-#:     (ARMED five for REGULAR, REQUIRED_FOR_DAYTIME five for daytime)
-#:   * scanner_live_mode["orb"], which is DISCOVERY_ONLY
+#: Membership is CAPABILITY, not permission. Further gates stand between
+#: this set and an order, and each is separately tested:
+#:   * the ROUTE's wire values, confirmed by a real KIS response -- the
+#:     GENERAL five and the DAYTIME five, disjoint so neither route's
+#:     pending evidence blocks the other. They are per ROUTE, not per
+#:     session: premarket, regular and aftermarket confirm one set
+#:     together because they address one endpoint.
+#:   * `strategy_entry_policy`, which can stand a strategy down for new
+#:     entries without touching its exit
 #:   * the S6 family limit of one position across all four variants
-LIVE_SESSIONS: FrozenSet[str] = frozenset({"REGULAR", "OVERNIGHT_DAYTIME"})
+#:
+#: WHEN each session is actually open is not decided here. KIS publishes
+#: its windows in KST and they move against Eastern time with US DST;
+#: `config.kis_market_schedule` derives them, and a session listed here
+#: is still refused outside its window.
+LIVE_SESSIONS: FrozenSet[str] = frozenset(
+    {"PREMARKET", "REGULAR", "AFTER_HOURS", "OVERNIGHT_DAYTIME"})
 
 MODE_LIMITED_LIVE = "LIMITED_LIVE"
 MODE_REALTIME_SHADOW = "REALTIME_SHADOW"

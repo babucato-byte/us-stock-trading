@@ -58,15 +58,20 @@ class TestTheTwoConditionsAreIndependent:
         assert source.symbols() == []
         assert "not LIMITED_LIVE" in source.describe()["refusal"]
 
-    def test_promotion_alone_does_not_open_a_shadow_session(self):
-        """The mirror error: LIMITED_LIVE must not make PREMARKET
-        tradeable."""
+    def test_promotion_alone_does_not_open_a_session(self):
+        """The mirror error: LIMITED_LIVE must not be the only thing
+        standing between a session and an order.
+
+        PREMARKET is no longer a shadow session -- it addresses the
+        general route family -- so the refusal here is no longer about
+        the session at all. The candidate source still refuses, on the
+        scan cycle it cannot establish, which is the point: promotion
+        alone opens nothing."""
         source = cs.S6CandidateSource(trading_day="2026-08-21",
                                       session="PREMARKET",
                                       modes=live_modes())
         assert source.symbols() == []
-        refusal = source.describe()["refusal"]
-        assert "REALTIME_SHADOW" in refusal or "orders are enabled" in refusal
+        assert source.describe()["refusal"]
 
     @pytest.mark.parametrize("session", [
         "OVERNIGHT_DAYTIME", "PREMARKET", "AFTER_HOURS"])
@@ -95,16 +100,19 @@ class TestTheTwoConditionsAreIndependent:
 
 class TestCapabilityIsNotPromotion:
     def test_the_session_matrix_says_capable_for_the_routed_sessions(self):
-        """Capable, not promoted. Both sessions whose KIS order route the
-        specification defines report LIMITED_LIVE as a statement about
-        the SESSION; the two with no route report shadow and cannot be
-        widened, because there is no endpoint to widen to."""
-        assert s6.LIVE_SESSIONS == {"REGULAR", "OVERNIGHT_DAYTIME"}
-        assert s6.mode_for("REGULAR") == s6.MODE_LIMITED_LIVE
-        assert s6.mode_for("OVERNIGHT_DAYTIME") == s6.MODE_LIMITED_LIVE
-        for unrouted in ("PREMARKET", "AFTER_HOURS"):
-            assert s6.mode_for(unrouted) == s6.MODE_REALTIME_SHADOW
-            assert s6.orders_allowed(unrouted) is False
+        """Capable, not promoted. All four sessions have a specified KIS
+        route -- premarket and aftermarket share the general endpoint and
+        TR family with the regular session -- and each reports
+        LIMITED_LIVE as a statement about the SESSION, never about
+        whether S6 has been promoted."""
+        assert s6.LIVE_SESSIONS == {
+            "PREMARKET", "REGULAR", "AFTER_HOURS", "OVERNIGHT_DAYTIME"}
+        for session in sorted(s6.LIVE_SESSIONS):
+            assert s6.mode_for(session) == s6.MODE_LIMITED_LIVE
+        # A non-session still reports shadow and cannot be widened.
+        for absent in ("AFTERMARKET_EXTENSION", "CLOSED", ""):
+            assert s6.mode_for(absent) == s6.MODE_REALTIME_SHADOW
+            assert s6.orders_allowed(absent) is False
 
     def test_mode_for_describes_the_SESSION_not_the_strategy(self):
         """`mode_for("REGULAR")` returning LIMITED_LIVE is a statement
@@ -116,8 +124,10 @@ class TestCapabilityIsNotPromotion:
         assert slm.is_limited_live(s6.SCANNER_NAME, discovery_modes()) is False
         assert s6.mode_for("REGULAR") == "LIMITED_LIVE"
 
-    def test_the_scan_set_is_wider_than_the_order_set(self):
-        assert s6.LIVE_SESSIONS < s6.SCAN_SESSIONS
+    def test_the_order_set_never_exceeds_the_scan_set(self):
+        """Equal now: every session S6 scans has a route. The narrowing
+        that used to live in this inequality moved to the clock."""
+        assert s6.LIVE_SESSIONS <= s6.SCAN_SESSIONS
 
 
 class TestAStoodDownStrategyCannotSubmit:
