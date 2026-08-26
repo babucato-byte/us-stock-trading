@@ -609,3 +609,137 @@ class TestOneNowThreadedThroughEverything:
         edge = self._dt(2026, 8, 26, 21, 0, tzinfo=self._ET)
         assert sc.capability_at(edge - self._td(seconds=1)).window == "CLOSED"
         assert sc.capability_at(edge).window == "DAYTIME"
+
+
+class TestTheStandDownReachesTheGate:
+    """A policy visible everywhere except the place that can stop an
+    order is not a policy.
+
+    `entry_disabled` was hardcoded False in both gate-context builders
+    while `strategy_entry_policy` existed and was read only by the
+    readiness report and the capability resolver. So S1's stand-down
+    showed up in every report and stopped nothing. Route resolution
+    deliberately does NOT apply the policy -- addressing an envelope is
+    not permission -- which makes wiring it at the gate the other half of
+    that split rather than a duplicate of it.
+    """
+
+    def test_the_buy_cycle_asks_the_policy(self):
+        import inspect
+
+        import kis_live_trading
+
+        source = inspect.getsource(kis_live_trading.run_live_buy_entry_cycle)
+        assert "entry_disabled=not strategy_entry_policy.entry_enabled(" in source
+        assert "entry_disabled=False" not in source
+
+    def test_the_bootstrap_asks_the_policy_too(self):
+        """The bootstrap is a smaller first order, not an exemption from
+        the permission every other order answers to."""
+        import inspect
+
+        from live_pilot import bootstrap
+
+        source = inspect.getsource(bootstrap.run_bootstrap_buy)
+        assert "entry_disabled=not strategy_entry_policy.entry_enabled(" in source
+        assert "entry_disabled=False" not in source
+
+    def test_the_gate_refuses_a_stood_down_strategy(self):
+        """End to end at the gate itself, not just at its caller."""
+        from execution import order_gate
+
+        assert "entry_disabled" in inspect_source(order_gate.evaluate_buy_gate)
+
+    def test_a_stood_down_strategy_resolves_to_disabled(self):
+        from config import strategy_entry_policy as sep
+
+        assert sep.entry_enabled(S1) is False   # -> entry_disabled True
+        assert sep.entry_enabled(S6) is True    # -> entry_disabled False
+
+    def test_the_sell_gate_still_never_sees_it(self):
+        """The whole point of the split: standing a strategy down must
+        not touch its ability to leave a position it already holds."""
+        from execution import order_gate
+
+        source = inspect_source(order_gate.evaluate_sell_gate)
+        assert "entry_disabled" not in source
+        assert "strategy_entry_policy" not in source
+
+
+def inspect_source(fn):
+    import inspect
+
+    return inspect.getsource(fn)
+
+
+class TestTheLiveEntryRunnerCanReachS6:
+    """The normal live path defaults to S1's source, so S6 has to be
+    asked for -- and the asking has to actually construct something the
+    cycle can use.
+
+    This exists because the first version passed `valid_for_seconds` to
+    `s6_live.candidate_source.S6CandidateSource`, which does not take it:
+    that argument belongs to the SAME-NAMED class in
+    `live_pilot.candidate_sources`, the bootstrap's adapter. It would
+    have raised TypeError on the first real invocation, and no test
+    caught it because nothing constructed the factories.
+    """
+
+    def _runner(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "rlbe_under_test", "scripts/run_live_buy_entry.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _rollout(self):
+        from config.live_rollout_config import LiveRolloutConfig
+
+        return LiveRolloutConfig.from_env()
+
+    def test_both_strategies_are_offered(self):
+        assert sorted(self._runner().SOURCE_FACTORIES) == ["s1", "s6"]
+
+    def test_the_default_is_still_s1(self):
+        """Turning S6 on by default would change which strategy the live
+        cycle trades without anyone saying so."""
+        source = (pathlib_read("scripts/run_live_buy_entry.py"))
+        assert '"--strategy", default="s1"' in source
+
+    def test_the_s6_factory_builds_a_source_the_cycle_can_use(self):
+        from datetime import datetime, timezone
+
+        source = self._runner().SOURCE_FACTORIES["s6"](
+            self._rollout(), datetime.now(timezone.utc))
+        # The name is what `_session_permitted` matches on to route S6
+        # through the capability resolver rather than the global flag.
+        from s6_live import candidate_source as s6cs
+
+        assert source.name == s6cs.SOURCE_S6
+        for method in ("symbols", "allowed_symbols", "describe",
+                       "candidate_row", "qualify"):
+            assert hasattr(source, method), method
+
+    def test_it_is_not_the_bootstraps_adapter(self):
+        """Same class name, different interface, different caller."""
+        from datetime import datetime, timezone
+
+        from live_pilot import candidate_sources as lpcs
+
+        source = self._runner().SOURCE_FACTORIES["s6"](
+            self._rollout(), datetime.now(timezone.utc))
+        assert not isinstance(source, lpcs.S6CandidateSource)
+
+    def test_s1_keeps_the_cycles_own_default(self):
+        from datetime import datetime, timezone
+
+        assert self._runner().SOURCE_FACTORIES["s1"](
+            self._rollout(), datetime.now(timezone.utc)) is None
+
+
+def pathlib_read(rel):
+    import pathlib
+
+    return pathlib.Path(rel).read_text(encoding="utf-8")

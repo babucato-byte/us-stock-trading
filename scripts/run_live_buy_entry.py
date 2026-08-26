@@ -83,15 +83,74 @@ def refusal_reason():
     return None
 
 
-def run_once(broker=None):
+#: Which strategy's candidate source the cycle asks. Not which symbol --
+#: the symbols are the source's own, at its own production threshold.
+#:
+#: Omitting it keeps the shipped default exactly as it was: S1's source,
+#: resolved from the environment. S6 has to be asked for, because turning
+#: it on by default would change which strategy the live cycle trades
+#: without anyone saying so.
+SOURCE_FACTORIES = {
+    "s1": lambda rollout, now: None,  # None -> the cycle's own default
+    "s6": lambda rollout, now: _s6_source(rollout, now),
+}
+
+
+def _s6_source(rollout, now):
+    """S6's own published breakout rows for the session we are in.
+
+    `s6_live.candidate_source.S6CandidateSource`, not the same-named
+    class in `live_pilot.candidate_sources` -- they are different
+    interfaces for different callers. This one carries `.name` (which
+    `_session_permitted` matches on to route S6 through the capability
+    resolver) and the pipeline methods the cycle calls; the live_pilot
+    one is the bootstrap's adapter and takes `valid_for_seconds`, which
+    this one neither accepts nor needs.
+
+    No freshness argument is passed because this source does not take
+    one: its staleness policy is the trading-day, session, variant and
+    scan-cycle checks it already applies, and how old a PRICE may be at
+    the moment an order is placed is the shared gate's question. A second
+    age limit here would be a second staleness policy.
+    """
+    from market_hours import us_trading_day
+    from s6_live.candidate_source import S6CandidateSource
+    from scanners.base import scan_session
+
+    return S6CandidateSource(
+        trading_day=us_trading_day(now),
+        session=scan_session.session_at(),
+        rollout=rollout,
+    )
+
+
+def run_once(broker=None, *, strategy="s1"):
     """The work this entrypoint does, factored out so it can be driven
-    (and faulted) directly -- same shape as every other service script."""
-    return klt.run_live_buy_entry_cycle(broker=broker or KISBroker())
+    (and faulted) directly -- same shape as every other service script.
+
+    Only the SOURCE varies with `strategy`. Every gate below it --
+    allow-list, price re-validation, orderable cash, duplicate order,
+    entry limits, kill switch, reconciliation, the Execution Engine --
+    is shared and exists exactly once, which is what keeps a second
+    strategy from getting a second, less-exercised execution path.
+    """
+    from datetime import datetime, timezone
+
+    from config.live_rollout_config import LiveRolloutConfig
+
+    now = datetime.now(timezone.utc)
+    factory = SOURCE_FACTORIES[strategy]
+    source = factory(LiveRolloutConfig.from_env(), now)
+    return klt.run_live_buy_entry_cycle(
+        broker=broker or KISBroker(), candidate_source=source)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="KIS live buy-entry cycle")
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument("--strategy", default="s1",
+                        choices=sorted(SOURCE_FACTORIES),
+                        help="which strategy's candidate source to use")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -103,7 +162,7 @@ def main(argv=None):
         return EXIT_REFUSED
 
     try:
-        results = run_once()
+        results = run_once(strategy=args.strategy)
     except klt.KISLiveTradingError as exc:
         logger.error("live buy-entry cycle refused to run: %s", exc)
         return EXIT_REFUSED

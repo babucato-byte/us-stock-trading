@@ -27,6 +27,21 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.setenv("RECONCILIATION_STATE_FILE", str(tmp_path / "RECONCILIATION_STATE.json"))
     from execution import idempotency
     monkeypatch.setattr(idempotency, "_LOCK_FILE", tmp_path / "KIS_ORDER_IDEMPOTENCY.lock")
+    # These tests exercise the CYCLE's mechanics -- audit trail, shadow
+    # records, ranked fallback, sizing, the gate's own refusals -- using
+    # the legacy watchlist source, whose signals are signed
+    # PAPER_STRATEGY_ORDER_SCORE_V1 and therefore belong to slot S1.
+    #
+    # S1 is currently stood down for new entries, so without this every
+    # one of them would fail with ENTRY_DISABLED and stop testing what it
+    # is named for. Coupling the mechanics to whichever strategy happens
+    # to be stood down is the wrong dependency: the stand-down is a
+    # policy that changes, and these assertions are about plumbing that
+    # does not. `test_session_capability.py` is where the policy itself
+    # is pinned, including that the gate consults it.
+    from config import strategy_entry_policy
+    monkeypatch.setattr(strategy_entry_policy, "entry_enabled",
+                        lambda _strategy: True)
     monkeypatch.setenv("VALIDATED_COMMIT", "c1")
     monkeypatch.setenv("DEPLOYED_COMMIT", "c1")
     monkeypatch.setenv("KIS_ALLOWED_ACCOUNT_NO", "12345678")

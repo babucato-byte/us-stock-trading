@@ -78,7 +78,7 @@ import shadow_audit
 from brokers.kis_broker import (
     KISAmbiguousResponseError, KISBrokerError, KISOrderableCashUnavailableError,
 )
-from config import strategy_registry
+from config import strategy_entry_policy, strategy_registry
 from config.live_rollout_config import LiveRolloutConfig, LiveRolloutConfigError
 from domain.cash_sizing import (
     INSUFFICIENT_CASH, ORDERABLE_CASH_UNAVAILABLE, whole_shares_affordable,
@@ -815,7 +815,13 @@ def run_bootstrap_buy(*, broker, conn, rollout=None, now=None, env=None, source=
             exclude_internal_order_id=order_intent.internal_order_id,
         )
         return order_gate.BuyGateContext(
-            execution_broker="kis", live_order_enabled=True, entry_disabled=False,
+            execution_broker="kis", live_order_enabled=True,
+            # Same policy the readiness checker and the resolver read. A
+            # strategy stood down for new entries is refused here too --
+            # the bootstrap is a smaller first order, not an exemption
+            # from the permission every other order answers to.
+            entry_disabled=not strategy_entry_policy.entry_enabled(
+                order_intent.strategy_id),
             validated_commit=str(mapping.get("VALIDATED_COMMIT", "") or "").strip(),
             deployed_commit=deployed_commit,
             kis_account_no=account_id, allowed_account_no=account_id,

@@ -89,7 +89,7 @@ from s2_live import candidate_source as s2_candidate_source
 from s6_live import candidate_source as s6_candidate_source
 from s6_live import entry_lifecycle as s6_entry_lifecycle
 from scanners.base import scan_session
-from config import s6_sessions, session_capability
+from config import s6_sessions, session_capability, strategy_entry_policy
 from s1_live import execution_price as s1_execution_price
 from s1_live import security_type as s1_security_type
 from state_store import db as state_db
@@ -791,8 +791,22 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                         broker=broker, conn=conn, rollout=rollout, now=current,
                         exclude_internal_order_id=order_intent.internal_order_id,
                     )
+                    # A strategy stood down for new entries must be
+                    # refused HERE, at the gate, by the same policy the
+                    # readiness checker and the capability resolver read.
+                    #
+                    # This was hardcoded False while `strategy_entry_policy`
+                    # existed and was consulted only by the report and the
+                    # resolver -- so the stand-down was visible everywhere
+                    # except the one place that can stop an order. Route
+                    # resolution deliberately does NOT apply the policy
+                    # (addressing an envelope is not permission), which
+                    # makes wiring it here the other half of that split
+                    # rather than a duplicate of it.
                     return order_gate.BuyGateContext(
-                        execution_broker="kis", live_order_enabled=True, entry_disabled=False,
+                        execution_broker="kis", live_order_enabled=True,
+                        entry_disabled=not strategy_entry_policy.entry_enabled(
+                            order_intent.strategy_id),
                         validated_commit=validated_commit, deployed_commit=deployed_commit,
                         kis_account_no=account_snapshot.account_id, allowed_account_no=allowed_account_no,
                         order_intent=order_intent, instrument=instrument, signal=signal,

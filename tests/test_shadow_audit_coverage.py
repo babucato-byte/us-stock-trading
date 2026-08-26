@@ -29,6 +29,15 @@ ACCOUNT_ID = "12345678"
 
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
+    # The buy CYCLE's mechanics, driven through the legacy watchlist
+    # source whose signals belong to slot S1 -- which is stood down for
+    # new entries. Without this these assertions would all fail with
+    # ENTRY_DISABLED and stop testing what they are named for. The policy
+    # itself, and that the gate consults it, is pinned in
+    # tests/test_session_capability.py.
+    from config import strategy_entry_policy
+    monkeypatch.setattr(strategy_entry_policy, "entry_enabled",
+                        lambda _strategy: True)
     monkeypatch.setenv("STATE_STORE_DB_FILE", str(tmp_path / "TEST_STATE.db"))
     monkeypatch.setenv("POSITION_STORE_FILE", str(tmp_path / "POSITION_STORE.json"))
     monkeypatch.setenv("KILL_SWITCH_STATE_FILE", str(tmp_path / "KILL_SWITCH.json"))
