@@ -693,6 +693,33 @@ class TestReadyForLiveBootstrapIsActuallyReachable:
         assert "READY_FOR_LIVE_BOOTSTRAP" not in result.stdout
         assert "PRE_LIVE_BLOCKED" in result.stdout
 
+    def test_an_info_line_is_reported_without_blocking(self, tmp_path):
+        """Informational lines carry facts an operator's decision turns
+        on -- the other route's evidence, the occupancy of slots that are
+        not the one about to trade -- and are deliberately not verdicts.
+
+        Emitting them as bare text made the catch-all treat each one as
+        CHECK_OUTPUT_UNPARSEABLE, so three purely informational lines
+        became three blocking reason codes and the bootstrap verdict
+        became unreachable."""
+        lines = list(self.PY_LINES)
+        lines.insert(1, "INFO::OTHER_ROUTE_PENDING::ARMED: 5 pending")
+        lines.insert(2, "INFO::STRATEGY_SLOT_S1::S1=1/1 ['TX']")
+        result = self._fixture(tmp_path, py_lines=lines)
+        assert "CHECK_OUTPUT_UNPARSEABLE" not in result.stdout
+        assert "OTHER_ROUTE_PENDING" in result.stdout
+        assert "READY_FOR_LIVE_BOOTSTRAP" in result.stdout
+
+    def test_a_genuinely_unparseable_line_still_blocks(self, tmp_path):
+        """The catch-all must keep meaning "a check whose verdict is
+        unknown". Adding INFO:: as a known prefix must not have widened
+        it into "anything the parser does not recognise is fine"."""
+        lines = list(self.PY_LINES)
+        lines.insert(1, "this line has no recognised prefix")
+        result = self._fixture(tmp_path, py_lines=lines)
+        assert "CHECK_OUTPUT_UNPARSEABLE" in result.stdout
+        assert "PRE_LIVE_BLOCKED" in result.stdout
+
     def test_an_allowlist_that_is_not_exactly_one_blocks_it(self, tmp_path):
         for value in ("", "AAPL,MSFT"):
             result = self._fixture(tmp_path / f"al-{len(value)}",

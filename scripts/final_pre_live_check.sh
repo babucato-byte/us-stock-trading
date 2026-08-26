@@ -433,6 +433,16 @@ else
                 ;;
             BOOTSTRAPABLE::*)
                 ;;  # control line, consumed below
+            INFO::*)
+                # Reported, never judged. These carry facts an operator's
+                # decision turns on -- the other route's evidence, the
+                # occupancy of slots that are not the one about to trade
+                # -- which are deliberately NOT verdicts. They are listed
+                # explicitly rather than by falling through, so the
+                # catch-all below keeps meaning "a check whose verdict is
+                # unknown", which is still not ready.
+                printf '  [INFO] %s\n' "${line#INFO::}"
+                ;;
             *)
                 fail CHECK_OUTPUT_UNPARSEABLE "${line:0:80}"
                 ;;
