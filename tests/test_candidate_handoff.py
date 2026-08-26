@@ -533,5 +533,10 @@ class TestS2IsUnchanged:
 
         rollout = LiveRolloutConfig.from_env()
         assert rollout.max_quantity_per_order == 1
-        assert rollout.max_open_positions == 1
+        # The COUNT caps are unset by design since LIMITED_LIVE ended:
+        # capacity is bounded by cash, the per-symbol lock, same-day
+        # re-entry, ownership and reconciliation. The invariant this
+        # test guards -- that the work in this file widened nothing --
+        # is carried by the flags and the per-order quantity below.
+        assert rollout.max_open_positions is None
         assert rollout.allow_fractional is False

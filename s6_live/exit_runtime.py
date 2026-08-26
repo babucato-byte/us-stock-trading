@@ -122,6 +122,14 @@ def sync_buy_fills(conn, *, fills_for, now=None) -> List[Dict[str, Any]]:
     return applied
 
 
+def _session_name(session):
+    """A session object, a plain string, or None -- all acceptable."""
+    if session is None:
+        return None
+    return getattr(session, "name", None) or (
+        str(session) if isinstance(session, str) else None)
+
+
 def _settle_intent(conn, position_id, sold, *, done):
     """Close the exit intent out once the fill that answers it is in.
 
@@ -152,7 +160,7 @@ def _settle_intent(conn, position_id, sold, *, done):
                        exc_info=True)
 
 
-def sync_sell_fills(conn, *, fills_for, now=None) -> List[Dict[str, Any]]:
+def sync_sell_fills(conn, *, fills_for, session=None, now=None) -> List[Dict[str, Any]]:
     """EXIT_SUBMITTED -> CLOSED, or a reduced position on a partial.
 
     A partial SELL leaves the remainder OPEN and still managed. Closing
@@ -186,9 +194,14 @@ def sync_sell_fills(conn, *, fills_for, now=None) -> List[Dict[str, Any]]:
             # The broker's own average fill, carried through instead of
             # discarded: it is the only price at which the trade actually
             # ended, and nothing downstream can recover it later.
+            # The session is recorded by the tick that saw the fill --
+            # a REGULAR entry closed in AFTER_HOURS is a different trade
+            # from one closed in REGULAR, and deriving it later from
+            # `closed_at` guesses at what this moment already knows.
             position_store.close_position(
                 conn, pid, reason=row.get("exit_reason"),
-                exit_price=fill.get("average_fill_price"), now=now)
+                exit_price=fill.get("average_fill_price"),
+                exit_session=_session_name(session), now=now)
             _settle_intent(conn, pid, sold, done=True)
             results.append({"position_id": pid, "symbol": symbol,
                             "status": "CLOSED", "sold": sold,

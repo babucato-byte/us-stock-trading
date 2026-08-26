@@ -24,7 +24,7 @@ from domain.instrument import Instrument
 from domain.order_intent import OrderIntent
 from domain.signal import Signal
 from config import strategy_registry
-from execution import entry_limits
+from execution import entry_limits, reentry_policy
 from execution.entry_limits import EntryLimitState
 from execution.secret_redaction import mask_account_number
 from reconciliation.snapshot import (
@@ -219,45 +219,44 @@ def evaluate_buy_gate(ctx: BuyGateContext) -> bool:
 
 
 def _check_entry_limits(ctx):
-    """LIVE_ROLLOUT_MAX_POSITIONS and LIVE_ROLLOUT_MAX_DAILY_ENTRIES.
+    """Capacity, and the two locks that replaced it.
 
-    Last, deliberately. Both are ACCOUNT-scoped capacity limits rather
-    than facts about this candidate, so every candidate-specific reason
-    an order would be refused anyway -- wrong symbol, ineligible
-    instrument, stale reconciliation -- is reported first. An operator
-    reading "MAX_OPEN_POSITIONS" then knows the candidate was otherwise
-    fit and the account was simply full, which is a different action from
-    "that symbol is not allow-listed".
+    Last, deliberately. Every candidate-specific reason an order would
+    be refused anyway -- wrong symbol, ineligible instrument, stale
+    reconciliation -- is reported first, so a limit code here means the
+    candidate was otherwise fit.
 
-    They still run before any transport: this is the same gate the
-    execution engine must pass before it will call the broker at all.
+    Two kinds of check live here and they are not equivalent:
 
-    SELLS ARE NOT SUBJECT TO EITHER. An account at its position cap must
-    always be able to close what it holds -- see evaluate_sell_gate,
-    which does not call this.
+      ALWAYS ON   the per-symbol position lock and the same-day
+                  re-entry block. Facts about THIS candidate, enforced
+                  unconditionally, and the operating risk model now
+                  rests on them.
+
+      OPTIONAL    LIVE_ROLLOUT_MAX_POSITIONS,
+                  LIVE_ROLLOUT_MAX_POSITIONS_PER_STRATEGY and
+                  LIVE_ROLLOUT_MAX_DAILY_ENTRIES. Account-scoped counts
+                  that LIMITED_LIVE pinned to 1/1/2 so the first real
+                  orders could be counted by hand. Unset they do not
+                  run; set they are enforced exactly as before.
+
+    The always-on checks run FIRST so that when a cap is also set, the
+    specific reason -- "we already hold this" -- is the one reported
+    rather than "the account is full".
+
+    SELLS ARE SUBJECT TO NONE OF IT. An account at its cap must always
+    be able to close what it holds -- see evaluate_sell_gate, which does
+    not call this.
     """
     limits = ctx.entry_limits
     if limits is None:
         raise OrderGateBlockedError(
-            "entry-limit state was not supplied; the position and daily-entry caps "
-            "cannot be enforced", code=entry_limits.POSITION_LIMIT_STATE_UNKNOWN,
-        )
-    if limits.effective_position_count >= limits.max_open_positions:
-        raise OrderGateBlockedError(
-            f"open-position cap reached: {limits.effective_position_count} of "
-            f"{limits.max_open_positions} slot(s) in use "
-            f"({limits.open_position_count} held, {limits.pending_entry_count} in flight)",
-            code=entry_limits.MAX_OPEN_POSITIONS,
+            "entry-limit state was not supplied; the position locks and "
+            "capacity caps cannot be enforced",
+            code=entry_limits.POSITION_LIMIT_STATE_UNKNOWN,
         )
 
-    # -- the candidate's own strategy, inside the account's room.
-    #
-    # Inline rather than delegated: all three capacity caps are one
-    # decision -- "may this candidate take a slot?" -- and the drift
-    # detector in tests/test_observe_cash_path_probe.py reads THIS
-    # function's source to prove BUY_GATE_SEQUENCE still matches the
-    # order the gate actually runs. A cap raised from a helper is a cap
-    # that report cannot see.
+    # -- whose slot is this? Needed by every check below.
     #
     # The strategy comes from the ORDER INTENT, which is what gets
     # written to the idempotency ledger and therefore what every future
@@ -274,16 +273,54 @@ def _check_entry_limits(ctx):
             "slot cannot be attributed",
             code=entry_limits.STRATEGY_ATTRIBUTION_UNKNOWN,
         )
-    # No name, no slot, no cap. Blocking is the only honest answer:
+    # No name, no slot, no lock. Blocking is the only honest answer:
     # "unknown strategy" must not be the one input that skips a limit.
     if slot is None:
         raise OrderGateBlockedError(
             f"the candidate's strategy {intent_strategy!r} is not a known live "
-            "strategy, so its per-strategy position cap cannot be enforced",
+            "strategy, so its position locks cannot be enforced",
             code=entry_limits.STRATEGY_ATTRIBUTION_UNKNOWN,
         )
+
+    # -- ALWAYS ON: one position per symbol.
+    candidate_symbol = str(
+        getattr(ctx.order_intent, "symbol", None) or "").upper()
+    if not candidate_symbol:
+        raise OrderGateBlockedError(
+            "the order intent carries no symbol, so the per-symbol position "
+            "lock cannot be enforced",
+            code=entry_limits.STRATEGY_ATTRIBUTION_UNKNOWN,
+        )
+    if candidate_symbol in limits.strategy_symbols_for(slot):
+        raise OrderGateBlockedError(
+            f"{slot} already holds or has in flight {candidate_symbol}; "
+            "one position per symbol",
+            code=entry_limits.SYMBOL_ALREADY_HELD,
+        )
+
+    # -- ALWAYS ON: not something this strategy sold today.
+    previous_exit = limits.same_day_exit_for(slot, candidate_symbol)
+    if previous_exit:
+        raise OrderGateBlockedError(
+            f"{slot} already exited {candidate_symbol} today "
+            f"({previous_exit.get('exit_reason')} at "
+            f"{previous_exit.get('exit_price')}); it may be bought again on "
+            "the next trading day",
+            code=reentry_policy.SAME_DAY_REENTRY_BLOCK,
+        )
+
+    # -- OPTIONAL: account-scoped counts, only if an operator set them.
+    if (limits.max_open_positions is not None
+            and limits.effective_position_count >= limits.max_open_positions):
+        raise OrderGateBlockedError(
+            f"open-position cap reached: {limits.effective_position_count} of "
+            f"{limits.max_open_positions} slot(s) in use "
+            f"({limits.open_position_count} held, {limits.pending_entry_count} in flight)",
+            code=entry_limits.MAX_OPEN_POSITIONS,
+        )
     in_use = limits.strategy_effective_count(slot)
-    if in_use >= limits.max_positions_per_strategy:
+    if (limits.max_positions_per_strategy is not None
+            and in_use >= limits.max_positions_per_strategy):
         detail = f"{slot} holds/has in flight {sorted(limits.strategy_symbols_for(slot))}"
         if limits.unattributed_symbols:
             # Said explicitly: a block caused by a row nobody could
@@ -297,7 +334,8 @@ def _check_entry_limits(ctx):
             f"{limits.max_positions_per_strategy} slot(s) in use ({detail})",
             code=entry_limits.MAX_STRATEGY_POSITIONS,
         )
-    if limits.daily_entry_count >= limits.max_daily_entries:
+    if (limits.max_daily_entries is not None
+            and limits.daily_entry_count >= limits.max_daily_entries):
         raise OrderGateBlockedError(
             f"daily-entry cap reached for {limits.trading_day}: "
             f"{limits.daily_entry_count} of {limits.max_daily_entries} entr(y/ies) used",
@@ -318,6 +356,7 @@ BUY_GATE_SEQUENCE = (
     # this one. Both are listed so a report can name whichever refused.
     "EXECUTION_PRICE",
     "CASH", "OPEN_ORDER", "DUPLICATE_SIGNAL", "SYMBOL", "INSTRUMENT", "RECONCILIATION",
+    entry_limits.SYMBOL_ALREADY_HELD, reentry_policy.SAME_DAY_REENTRY_BLOCK,
     entry_limits.MAX_OPEN_POSITIONS, entry_limits.MAX_STRATEGY_POSITIONS,
     entry_limits.MAX_DAILY_ENTRIES,
 )

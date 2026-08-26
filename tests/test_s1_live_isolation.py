@@ -274,8 +274,13 @@ class TestOrdersRemainBlocked:
         config = LiveRolloutConfig.from_env({})
         assert config.enabled is False
         assert config.max_quantity_per_order == 1
-        assert config.max_open_positions == 1
-        assert config.max_daily_entries == 1
+        # The COUNT caps are unset by design since LIMITED_LIVE ended:
+        # capacity is bounded by cash, the per-symbol lock, same-day
+        # re-entry, ownership and reconciliation. The invariant this
+        # test guards -- that the work in this file widened nothing --
+        # is carried by the flags and the per-order quantity below.
+        assert config.max_open_positions is None
+        assert config.max_daily_entries is None
         assert config.allow_fractional is False
         assert config.allow_leverage is False
         assert config.allow_margin is False

@@ -25,6 +25,7 @@ import sys
 import pytest
 
 from execution import entry_limits as entry_limits_module
+from execution import reentry_policy as _reentry_policy_module
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 PROBE_PATH = REPO_ROOT / "scripts" / "verify_kis_observe_cash_path.py"
@@ -173,6 +174,14 @@ class TestItTouchesNoProductionArtifact:
             "live_entry_reservations", "exit_intents", "order_state_events"}
 
 
+#: Modules whose attributes may appear as an OrderGateBlockedError
+#: `code=`. Looked up by the name used in the gate's own source.
+_GATE_CODE_MODULES = {
+    "entry_limits": entry_limits_module,
+    "reentry_policy": _reentry_policy_module,
+}
+
+
 class TestGateSequenceMatchesTheGate:
     def _gate_codes_in_source_order(self):
         """The `code=` literals raised by evaluate_buy_gate, in order."""
@@ -197,8 +206,14 @@ class TestGateSequenceMatchesTheGate:
         return [code for _lineno, code in sorted(codes)]
 
     def _helper_codes_in_source_order(self, function_name):
-        """The codes raised by a helper the gate calls. These are
-        `entry_limits.X` attribute references, not string literals."""
+        """The codes raised by a helper the gate calls.
+
+        These are module-attribute references rather than string
+        literals -- `entry_limits.X`, and since the same-day re-entry
+        block was added, `reentry_policy.X` too. The module is resolved
+        from the reference itself, so a code introduced from a THIRD
+        module is picked up here instead of silently going unreported.
+        """
         source = (REPO_ROOT / "execution" / "order_gate.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
         function = next(
@@ -211,9 +226,15 @@ class TestGateSequenceMatchesTheGate:
             if getattr(node.func, "id", None) != "OrderGateBlockedError":
                 continue
             for keyword in node.keywords:
-                if keyword.arg == "code" and isinstance(keyword.value, ast.Attribute):
-                    codes.append((keyword.value.lineno,
-                                  getattr(entry_limits_module, keyword.value.attr)))
+                if keyword.arg != "code" or not isinstance(keyword.value, ast.Attribute):
+                    continue
+                module_name = getattr(keyword.value.value, "id", None)
+                module = _GATE_CODE_MODULES.get(module_name)
+                assert module is not None, (
+                    f"{module_name!r} is not a known source of gate codes; "
+                    "add it to _GATE_CODE_MODULES so its codes stay covered")
+                codes.append((keyword.value.lineno,
+                              getattr(module, keyword.value.attr)))
         return [code for _lineno, code in sorted(codes)]
 
     def test_the_probe_sequence_matches_the_gate_source(self):

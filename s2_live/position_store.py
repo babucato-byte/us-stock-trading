@@ -213,15 +213,27 @@ def mark_exit_submitted(conn, position_id, reason, *, now=None) -> bool:
     return bool(changed)
 
 
-def close_position(conn, position_id, *, reason=None, now=None) -> bool:
+def close_position(conn, position_id, *, reason=None, exit_price=None,
+                   exit_session=None, now=None) -> bool:
+    """Close a position, recording the SELL's actual fill and session.
+
+    `exit_price` and `exit_session` are COALESCEd rather than
+    overwritten, so a second close cannot replace a real fill with a
+    None -- the same discipline `entry_price` has always had.
+    """
     stamp = _now(now)
     changed = conn.execute(
         f"""UPDATE {TABLE}
             SET status = ?, exit_reason = COALESCE(?, exit_reason),
+                exit_price = COALESCE(?, exit_price),
+                exit_session = COALESCE(?, exit_session),
                 closed_at = ?, updated_at = ?
             WHERE position_id = ? AND status != ?""",
-        (CLOSED, reason, stamp, stamp, position_id, CLOSED)).rowcount
+        (CLOSED, reason, exit_price, exit_session, stamp, stamp,
+         position_id, CLOSED)).rowcount
     conn.commit()
+    if changed:
+        _after_close(conn, position_id, strategy_id=STRATEGY_ID, now=now)
     return bool(changed)
 
 
@@ -258,3 +270,17 @@ def holdings(conn) -> List[Tuple[str, str, int]]:
         f"""SELECT symbol, venue, quantity FROM {TABLE} WHERE status != ?""",
         (CLOSED,)).fetchall()
     return [(r["symbol"], r["venue"], int(r["quantity"])) for r in rows]
+
+
+def _after_close(conn, position_id, *, strategy_id, now=None):
+    """Open post-exit tracking for a position that just closed.
+
+    Research only, and deliberately unable to affect the close: see
+    post_exit/tracker.py. Called from close_position so every closer
+    goes through it, rather than from each runtime that happens to
+    remember.
+    """
+    from post_exit import tracker
+
+    tracker.on_position_closed(conn, table=TABLE, position_id=position_id,
+                               strategy_id=strategy_id, now=now)

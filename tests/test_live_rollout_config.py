@@ -8,8 +8,15 @@ class TestFromEnv:
         cfg = LiveRolloutConfig.from_env(env={})
         assert cfg.enabled is False
         assert cfg.max_quantity_per_order == 1
-        assert cfg.max_open_positions == 1
-        assert cfg.max_daily_entries == 1
+        # The COUNT caps default to absent now that LIMITED_LIVE is
+        # over. That is not a relaxation of safety: every flag below is
+        # still off by default, quantity is still 1, and capacity is
+        # bounded by orderable cash, the per-symbol position lock, the
+        # same-day re-entry block, ownership and reconciliation -- none
+        # of which are configurable off.
+        assert cfg.max_open_positions is None
+        assert cfg.max_daily_entries is None
+        assert cfg.max_positions_per_strategy is None
         assert cfg.regular_session_only is True
         assert cfg.allow_fractional is False
         assert cfg.allow_market_order is False

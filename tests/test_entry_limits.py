@@ -387,12 +387,24 @@ class TestConfigValidation:
             _rollout(**{field: value}).validate()
 
     @pytest.mark.parametrize("field", ["max_open_positions", "max_daily_entries"])
-    @pytest.mark.parametrize("value", [True, False, 1.0, "1", None, [1]])
+    @pytest.mark.parametrize("value", [True, False, 1.0, "1", [1]])
     def test_polluted_types_are_rejected_by_the_config(self, field, value):
         with pytest.raises(LiveRolloutConfigError):
             _rollout(**{field: value}).validate()
 
-    @pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, "1", None])
+    @pytest.mark.parametrize("field", ["max_open_positions", "max_daily_entries"])
+    def test_None_is_a_legitimate_absence_not_pollution(self, field):
+        """LIMITED_LIVE is over: an unset count cap means the cap is not
+        enforced, and capacity is bounded by cash, the per-symbol lock,
+        same-day re-entry, ownership and reconciliation instead.
+
+        This is the one value that changed meaning. Everything else in
+        the case above is still refused, so "unset" cannot be reached by
+        accident from a malformed setting.
+        """
+        _rollout(**{field: None}).validate()
+
+    @pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, "1"])
     def test_the_collector_refuses_a_bad_limit_even_if_config_is_bypassed(self, value):
         """bool is an int subclass; True must never read as a cap of 1."""
         class _Rollout:
@@ -402,6 +414,17 @@ class TestConfigValidation:
         with pytest.raises(EntryLimitStateUnavailable) as excinfo:
             _collect(rollout=_Rollout())
         assert excinfo.value.reason_code == POSITION_LIMIT_STATE_UNKNOWN
+
+    def test_the_collector_passes_an_absent_cap_through(self):
+        class _Rollout:
+            max_open_positions = None
+            max_daily_entries = None
+            max_positions_per_strategy = None
+
+        state = _collect(rollout=_Rollout())
+        assert state.max_open_positions is None
+        assert state.max_daily_entries is None
+        assert state.max_positions_per_strategy is None
 
 
 # ---------------------------------------------------------------------
@@ -418,7 +441,11 @@ class TestAuditPayload:
             # Added with the per-strategy cap. An operator reading this
             # payload to decide whether an entry is possible needs to
             # know WHOSE slots are in use, not only how many.
-            "max_positions_per_strategy", "strategy_positions", "unattributed"}
+            "max_positions_per_strategy", "strategy_positions", "unattributed",
+            # Added with the same-day re-entry block. A refused BUY that
+            # names SAME_DAY_REENTRY_BLOCK is only diagnosable if the
+            # payload says which symbols were already sold today.
+            "same_day_exits"}
         assert payload["trading_day"] == TODAY
 
     def test_the_payload_carries_no_identifiers(self):

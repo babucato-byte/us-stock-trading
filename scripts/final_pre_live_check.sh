@@ -79,21 +79,33 @@ check_limit() {
         fail "${name}_NOT_${expected}" "got '${actual:-<unset>}'"
     fi
 }
-# The GLOBAL cap is no longer pinned to 1: with S1 and S6 both live at
-# one position each, the account cap is their sum. What must stay at 1
-# is the PER-STRATEGY cap and the per-order quantity -- those are the
-# numbers that decide how much a single mistake can cost.
-check_limit LIVE_ROLLOUT_MAX_POSITIONS_PER_STRATEGY 1
-check_limit LIVE_ROLLOUT_MAX_DAILY_ENTRIES 1
+# Per-ORDER quantity stays pinned at 1. It is not a LIMITED_LIVE count:
+# whole-share, one share per order is the operating rule, and it is the
+# number that bounds what a single mistake can cost.
 check_limit LIVE_ROLLOUT_MAX_QUANTITY 1
+
+# The three COUNT caps were LIMITED_LIVE scaffolding -- 1 position per
+# strategy, 1 entry per day, 1 or 2 overall -- so the first real orders
+# could be counted by hand. That test is over, and requiring those
+# numbers here would make its shape permanent.
+#
+# Unset is now the expected posture and is reported, not failed. A cap
+# an operator DOES set is still checked for sanity, because a malformed
+# one must never read as "no cap".
+for _cap in LIVE_ROLLOUT_MAX_POSITIONS LIVE_ROLLOUT_MAX_POSITIONS_PER_STRATEGY \
+            LIVE_ROLLOUT_MAX_DAILY_ENTRIES; do
+    _value="$(eval "printf '%s' \"\${${_cap}:-}\"")"
+    if [ -z "${_value}" ]; then
+        info "${_cap}=<unset> (capacity bounded by cash, the per-symbol lock, same-day re-entry, ownership and reconciliation)"
+    elif printf '%s' "${_value}" | grep -Eq '^[1-9][0-9]*$'; then
+        pass "${_cap}=${_value}"
+    else
+        fail "${_cap}_INVALID" "got '${_value}'"
+    fi
+done
 
 GLOBAL_MAX="${LIVE_ROLLOUT_MAX_POSITIONS:-}"
 PER_STRATEGY_MAX="${LIVE_ROLLOUT_MAX_POSITIONS_PER_STRATEGY:-}"
-if [ "${GLOBAL_MAX}" = "1" ] || [ "${GLOBAL_MAX}" = "2" ]; then
-    pass "LIVE_ROLLOUT_MAX_POSITIONS=${GLOBAL_MAX}"
-else
-    fail LIVE_ROLLOUT_MAX_POSITIONS_NOT_1_OR_2 "got '${GLOBAL_MAX:-<unset>}'"
-fi
 # Enforced here as well as in config.validate(), because this checker is
 # read by an operator deciding whether to place a real order and must
 # not require them to trust that a second file agrees.

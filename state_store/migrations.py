@@ -17,6 +17,7 @@ from state_store.schema import (
     MIGRATION_13_STATEMENTS, MIGRATION_14_STATEMENTS,
     MIGRATION_15_STATEMENTS, MIGRATION_16_STATEMENTS,
     MIGRATION_17_STATEMENTS, MIGRATION_18_STATEMENTS,
+    MIGRATION_19_STATEMENTS,
 )
 
 MIGRATIONS = [
@@ -57,6 +58,10 @@ MIGRATIONS = [
     (18, "PER-STRATEGY CAPS: kis_order_idempotency.strategy_id -- a global "
          "count cannot answer whose slot is in use",
      MIGRATION_18_STATEMENTS),
+    (19, "NORMAL LIVE: exit_session/exit_price as recorded execution "
+         "metadata, plus the post-exit research tables and the "
+         "same-day re-entry block record",
+     MIGRATION_19_STATEMENTS),
 ]
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1][0]

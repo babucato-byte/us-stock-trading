@@ -56,7 +56,7 @@ can give, because it reads exactly like "nothing is open yet".
 """
 
 from dataclasses import dataclass, field
-from typing import FrozenSet, Mapping
+from typing import FrozenSet, Mapping, Optional
 
 from config import strategy_registry
 from execution.order_repository import FatalRepositoryConnectionError
@@ -67,6 +67,11 @@ from market_hours import us_trading_day
 # working, an unavailable state is the system unable to tell.
 POSITION_LIMIT_STATE_UNKNOWN = "POSITION_LIMIT_STATE_UNKNOWN"
 DAILY_ENTRY_STATE_UNKNOWN = "DAILY_ENTRY_STATE_UNKNOWN"
+
+#: The candidate's own symbol is already held or in flight for this
+#: strategy. This is the lock that replaced the LIMITED_LIVE count caps:
+#: capacity is no longer "one position", it is "one position per symbol".
+SYMBOL_ALREADY_HELD = "SYMBOL_ALREADY_HELD"
 
 MAX_OPEN_POSITIONS = "MAX_OPEN_POSITIONS"
 MAX_DAILY_ENTRIES = "MAX_DAILY_ENTRIES"
@@ -102,8 +107,12 @@ class EntryLimitState:
     the reconciliation snapshot it is handed.
     """
 
-    max_open_positions: int
-    max_daily_entries: int
+    #: None means the count cap is not enforced -- see
+    #: config/live_rollout_config._env_optional_int. Capacity is then
+    #: bounded by cash, the per-symbol lock, same-day re-entry,
+    #: ownership and reconciliation, all of which are always on.
+    max_open_positions: Optional[int]
+    max_daily_entries: Optional[int]
     open_position_symbols: FrozenSet[str]
     pending_entry_symbols: FrozenSet[str]
     daily_entry_count: int
@@ -112,12 +121,23 @@ class EntryLimitState:
     #: Defaulted so every existing constructor call keeps working; a
     #: context built without them enforces the global cap exactly as
     #: before and reports the per-strategy one as unenforceable.
-    max_positions_per_strategy: int = 1
+    max_positions_per_strategy: Optional[int] = None
     strategy_symbols: Mapping[str, FrozenSet[str]] = field(
         default_factory=dict)
     #: Symbols held or in flight that no strategy could be named for.
     #: Never empty-by-assumption: see `strategy_effective_count`.
     unattributed_symbols: FrozenSet[str] = frozenset()
+    #: Per slot, the symbols that strategy has already sold today, with
+    #: the exit that did it. Collected here rather than looked up in the
+    #: gate because the gate performs no I/O -- the same reason the
+    #: reconciliation snapshot is handed to it rather than built there.
+    same_day_exits: Mapping[str, Mapping[str, Mapping]] = field(
+        default_factory=dict)
+
+    def same_day_exit_for(self, slot, symbol):
+        """The exit that bars `symbol` for `slot` today, or None."""
+        return (self.same_day_exits.get(slot) or {}).get(
+            str(symbol or "").upper())
 
     @property
     def open_position_count(self):
@@ -165,6 +185,11 @@ class EntryLimitState:
                 for slot in strategy_registry.LIVE_SLOTS
             },
             "unattributed": sorted(self.unattributed_symbols),
+            "same_day_exits": {
+                slot: sorted(symbols or {})
+                for slot, symbols in (self.same_day_exits or {}).items()
+                if symbols
+            },
         }
 
 
@@ -342,6 +367,49 @@ def _daily_entry_count(conn, *, trading_day, exclude_internal_order_id):
     return count
 
 
+def _optional_cap(rollout, name, reason_code):
+    """A count cap that may be None, validated when it is not.
+
+    bool is an int subclass, so True must never read as a cap of 1.
+    """
+    value = getattr(rollout, name, None)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise EntryLimitStateUnavailable(
+            f"rollout {name} is set but is not a positive int: {value!r}",
+            reason_code=reason_code,
+        )
+    return value
+
+
+def _same_day_exits_by_slot(conn, *, trading_day, now=None):
+    """Per slot, what that strategy already sold today.
+
+    An unreadable book raises rather than reporting "nothing sold": the
+    whole point of the block is to refuse, and a read failure that
+    reads as "no exits" would permit exactly the re-entry it exists to
+    prevent.
+    """
+    from execution import reentry_policy
+
+    by_slot = {}
+    for slot in strategy_registry.LIVE_SLOTS:
+        try:
+            # The slot name is itself a registry alias, so it resolves
+            # back to this same slot -- no second spelling to keep in
+            # step with `_ALIASES`.
+            by_slot[slot] = reentry_policy.exits_today(
+                conn, strategy_id=slot, trading_day=trading_day, now=now)
+        except reentry_policy.ReentryStateUnavailable as exc:
+            raise EntryLimitStateUnavailable(
+                f"same-day exit history for {slot} is unreadable, so the "
+                f"re-entry block cannot be enforced: {exc}",
+                reason_code=POSITION_LIMIT_STATE_UNKNOWN,
+            ) from exc
+    return by_slot
+
+
 def collect(*, broker, conn, rollout, now=None, exclude_internal_order_id=None):
     """Gather the authoritative limit state, or raise.
 
@@ -358,26 +426,17 @@ def collect(*, broker, conn, rollout, now=None, exclude_internal_order_id=None):
             reason_code=DAILY_ENTRY_STATE_UNKNOWN,
         ) from exc
 
-    max_positions = getattr(rollout, "max_open_positions", None)
-    max_entries = getattr(rollout, "max_daily_entries", None)
-    for name, value in (("max_open_positions", max_positions),
-                        ("max_daily_entries", max_entries)):
-        # bool is an int subclass; True must not read as a limit of 1.
-        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-            raise EntryLimitStateUnavailable(
-                f"rollout {name} is not a positive int: {value!r}",
-                reason_code=(POSITION_LIMIT_STATE_UNKNOWN if "position" in name
-                             else DAILY_ENTRY_STATE_UNKNOWN),
-            )
-
-    max_per_strategy = getattr(rollout, "max_positions_per_strategy", 1)
-    if isinstance(max_per_strategy, bool) or not isinstance(max_per_strategy, int) \
-            or max_per_strategy < 1:
-        raise EntryLimitStateUnavailable(
-            f"rollout max_positions_per_strategy is not a positive int: "
-            f"{max_per_strategy!r}",
-            reason_code=POSITION_LIMIT_STATE_UNKNOWN,
-        )
+    # A cap may legitimately be absent now that LIMITED_LIVE is over.
+    # None means "not enforced" and is passed straight through; anything
+    # PRESENT is still validated exactly as strictly as before, because
+    # a malformed cap reading as "no cap" is the one failure mode that
+    # would silently widen risk.
+    max_positions = _optional_cap(rollout, "max_open_positions",
+                                  POSITION_LIMIT_STATE_UNKNOWN)
+    max_entries = _optional_cap(rollout, "max_daily_entries",
+                                DAILY_ENTRY_STATE_UNKNOWN)
+    max_per_strategy = _optional_cap(rollout, "max_positions_per_strategy",
+                                     POSITION_LIMIT_STATE_UNKNOWN)
 
     open_symbols = _open_position_symbols(broker)
     pending_symbols = _pending_entry_symbols(
@@ -412,4 +471,6 @@ def collect(*, broker, conn, rollout, now=None, exclude_internal_order_id=None):
         max_positions_per_strategy=max_per_strategy,
         strategy_symbols=strategy_symbols,
         unattributed_symbols=frozenset(unattributed),
+        same_day_exits=_same_day_exits_by_slot(
+            conn, trading_day=trading_day, now=now),
     )

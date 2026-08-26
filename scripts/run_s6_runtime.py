@@ -113,7 +113,7 @@ def run_once(*, now=None) -> dict:
             ("sell_fills", lambda: exit_runtime.sync_sell_fills(
                 conn, fills_for=_sell_fill_lookup(
                     conn, broker, now=moment, open_orders=open_orders),
-                now=moment)),
+                session=session, now=moment)),
         ):
             try:
                 report[stage] = call()

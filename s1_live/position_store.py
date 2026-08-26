@@ -255,13 +255,26 @@ def mark_exit_submitted(conn, position_id, reason, now=None):
     }, now=now)
 
 
-def close_position(conn, position_id, exit_reason=None, now=None):
+def close_position(conn, position_id, exit_reason=None, now=None,
+                   exit_price=None, exit_session=None):
+    """Close a position, recording the SELL's actual fill and session.
+
+    `exit_price`/`exit_session` are written only when supplied, so a
+    caller that does not know them cannot erase values a caller that did
+    already recorded.
+    """
     stamp = _now_iso(now)
-    _update(conn, position_id, {
+    fields = {
         "status": STATUS_CLOSED, "exit_submitted": 1,
         "exit_reason": exit_reason, "closed_at": stamp,
-    }, now=now)
+    }
+    if exit_price is not None:
+        fields["exit_price"] = exit_price
+    if exit_session is not None:
+        fields["exit_session"] = exit_session
+    _update(conn, position_id, fields, now=now)
     logger.info("S1 position closed: %s (%s)", position_id, exit_reason)
+    _after_close(conn, position_id, strategy_id=STRATEGY_ID, now=now)
 
 
 def holdings(conn):
@@ -282,3 +295,24 @@ def holdings(conn):
         "SELECT symbol, quantity FROM s1_positions WHERE status != 'CLOSED'"
     ).fetchall()
     return [(row["symbol"], None, int(row["quantity"])) for row in rows]
+
+
+#: Named here for the post-exit hook. The rest of this module spells the
+#: table inline; introducing one constant for the hook is smaller than
+#: rewriting every query to use it.
+TABLE = "s1_positions"
+STRATEGY_ID = "S1_HMA_EARLY_TREND_V1"
+
+
+def _after_close(conn, position_id, *, strategy_id, now=None):
+    """Open post-exit tracking for a position that just closed.
+
+    Research only, and deliberately unable to affect the close: see
+    post_exit/tracker.py. Called from close_position so every closer
+    goes through it, rather than from each runtime that happens to
+    remember.
+    """
+    from post_exit import tracker
+
+    tracker.on_position_closed(conn, table=TABLE, position_id=position_id,
+                               strategy_id=strategy_id, now=now)

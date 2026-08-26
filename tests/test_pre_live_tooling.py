@@ -132,19 +132,43 @@ class TestTheCheckerBlocksInTheCurrentPosture:
         result = _run(CHECK, env={"KIS_ENV": "paper"})
         assert "KIS_ENV_NOT_LIVE" in result.stdout
 
-    @pytest.mark.parametrize("var", [
-        "LIVE_ROLLOUT_MAX_POSITIONS_PER_STRATEGY",
-        "LIVE_ROLLOUT_MAX_DAILY_ENTRIES", "LIVE_ROLLOUT_MAX_QUANTITY"])
-    def test_a_widened_limit_is_a_block(self, var):
-        result = _run(CHECK, env={var: "5"})
-        assert f"{var}_NOT_1" in result.stdout
+    def test_a_widened_per_order_quantity_is_a_block(self):
+        """Quantity is NOT one of the retired count caps. Whole-share,
+        one share per order is the operating rule and stays pinned."""
+        result = _run(CHECK, env={"LIVE_ROLLOUT_MAX_QUANTITY": "5"})
+        assert "LIVE_ROLLOUT_MAX_QUANTITY_NOT_1" in result.stdout
 
-    def test_a_global_cap_beyond_two_is_a_block(self):
-        """One position each for S1 and S6 is the authorised ceiling.
-        Two is therefore allowed and three is not -- the global cap is
-        no longer pinned to 1, but it is not unbounded either."""
-        result = _run(CHECK, env={"LIVE_ROLLOUT_MAX_POSITIONS": "3"})
-        assert "LIVE_ROLLOUT_MAX_POSITIONS_NOT_1_OR_2" in result.stdout
+    @pytest.mark.parametrize("var", [
+        "LIVE_ROLLOUT_MAX_POSITIONS",
+        "LIVE_ROLLOUT_MAX_POSITIONS_PER_STRATEGY",
+        "LIVE_ROLLOUT_MAX_DAILY_ENTRIES"])
+    def test_an_unset_count_cap_is_reported_not_blocked(self, var):
+        """LIMITED_LIVE pinned these to 1/1/2 so the first real orders
+        could be counted by hand. That test is over; requiring those
+        numbers here would make its shape the permanent risk model.
+
+        Unset is the expected posture now -- capacity is bounded by
+        cash, the per-symbol lock, same-day re-entry, ownership and
+        reconciliation, none of which can be configured off.
+        """
+        result = _run(CHECK, env={var: ""})
+        assert f"{var}_NOT_1" not in result.stdout
+        assert f"{var}_INVALID" not in result.stdout
+
+    @pytest.mark.parametrize("var", [
+        "LIVE_ROLLOUT_MAX_POSITIONS",
+        "LIVE_ROLLOUT_MAX_POSITIONS_PER_STRATEGY",
+        "LIVE_ROLLOUT_MAX_DAILY_ENTRIES"])
+    def test_a_cap_an_operator_sets_is_still_sanity_checked(self, var):
+        """Retired as a requirement, not as a mechanism. A malformed cap
+        must never read as 'no cap'."""
+        result = _run(CHECK, env={var: "banana"})
+        assert f"{var}_INVALID" in result.stdout
+
+    def test_a_widened_count_cap_is_accepted(self, ):
+        """Several positions at once is the point of the change."""
+        result = _run(CHECK, env={"LIVE_ROLLOUT_MAX_POSITIONS": "8"})
+        assert "LIVE_ROLLOUT_MAX_POSITIONS_INVALID" not in result.stdout
 
     def test_a_per_strategy_cap_above_the_global_one_is_a_block(self):
         """Two numbers that are both meant to be enforced must not

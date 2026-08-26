@@ -887,6 +887,163 @@ MIGRATION_18_STATEMENTS = [
     KIS_ORDER_IDEMPOTENCY_STRATEGY_ID,
 ]
 
+# Migration 19: NORMAL LIVE -- the session a position was left in, and
+# the research path that studies exits after they happen.
+#
+# exit_session
+# ------------
+# `entry_session` has always been recorded; `exit_session` was derived
+# after the fact from `closed_at`. Derivation is not the same fact: a
+# REGULAR entry closed in AFTER_HOURS and an AFTER_HOURS entry closed in
+# REGULAR are different trades, and the session a fill actually happened
+# in is execution metadata that only the closing tick knows. Recorded
+# once, immutable thereafter, on every strategy's book rather than S6's
+# alone.
+#
+# exit_price on S1 and S2
+# -----------------------
+# S6 gained this in migration 17 for the same reason it is needed here:
+# realised P&L measured against an intended price is not realised P&L.
+# Without it neither strategy can be studied at all.
+S1_POSITIONS_EXIT_SESSION = (
+    "ALTER TABLE s1_positions ADD COLUMN exit_session TEXT")
+S1_POSITIONS_EXIT_PRICE = (
+    "ALTER TABLE s1_positions ADD COLUMN exit_price REAL")
+S2_POSITIONS_EXIT_SESSION = (
+    "ALTER TABLE s2_positions ADD COLUMN exit_session TEXT")
+S2_POSITIONS_EXIT_PRICE = (
+    "ALTER TABLE s2_positions ADD COLUMN exit_price REAL")
+S6_POSITIONS_EXIT_SESSION = (
+    "ALTER TABLE s6_positions ADD COLUMN exit_session TEXT")
+
+#: One row per completed exit, for every strategy.
+#:
+#: Deliberately a copy rather than a join. The position row it descends
+#: from stays mutable and strategy-shaped; this is the flat, immutable
+#: description of one finished trade that analytics reads, and it must
+#: keep meaning the same thing after the strategy's book changes shape.
+#:
+#: `status` is TRACKING until `tracking_end_at` passes, then COMPLETED.
+#: Nothing observes a completed row again -- see config/post_exit_policy.
+POST_EXIT_TRACKING_TABLE = """
+CREATE TABLE IF NOT EXISTS post_exit_tracking (
+    tracking_id TEXT PRIMARY KEY,
+    strategy_id TEXT NOT NULL,
+    strategy_version TEXT,
+    scanner_id TEXT,
+    position_id TEXT NOT NULL UNIQUE,
+    symbol TEXT NOT NULL,
+    venue TEXT,
+    quantity REAL,
+    entry_time TEXT,
+    entry_session TEXT,
+    entry_price REAL,
+    exit_time TEXT,
+    exit_session TEXT,
+    exit_price REAL,
+    exit_reason TEXT,
+    realized_pnl REAL,
+    realized_pnl_pct REAL,
+    trading_day TEXT NOT NULL,
+    tracking_started_at TEXT NOT NULL,
+    tracking_end_at TEXT NOT NULL,
+    status TEXT NOT NULL,
+    max_price_after_exit REAL,
+    min_price_after_exit REAL,
+    max_return_after_exit_pct REAL,
+    min_return_after_exit_pct REAL,
+    exit_mfe_pct REAL,
+    avoided_loss_pct REAL,
+    note TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+"""
+
+POST_EXIT_TRACKING_STRATEGY_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_post_exit_tracking_strategy_reason
+ON post_exit_tracking (strategy_id, exit_reason)
+"""
+
+POST_EXIT_TRACKING_STATUS_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_post_exit_tracking_status
+ON post_exit_tracking (status, tracking_end_at)
+"""
+
+#: One row per (tracking_id, horizon). UNIQUE so a re-run records the
+#: same horizon once: these are observations of a moment that has passed,
+#: and a second read of it is the same fact, not a new one.
+#:
+#: A horizon whose price could not be read is stored with status
+#: UNAVAILABLE rather than omitted. "Not yet observed" and "observed and
+#: unavailable" are different, and only the second should stop retrying.
+POST_EXIT_OBSERVATIONS_TABLE = """
+CREATE TABLE IF NOT EXISTS post_exit_observations (
+    observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tracking_id TEXT NOT NULL,
+    horizon TEXT NOT NULL,
+    observed_at TEXT,
+    price REAL,
+    return_pct REAL,
+    source TEXT,
+    status TEXT NOT NULL,
+    detail TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE (tracking_id, horizon)
+)
+"""
+
+POST_EXIT_OBSERVATIONS_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_post_exit_observations_tracking
+ON post_exit_observations (tracking_id)
+"""
+
+#: Every BUY refused because the strategy already sold that symbol today.
+#:
+#: Recorded so the policy can be judged rather than assumed: the block
+#: prevents a trade, and whether preventing it was right is only knowable
+#: from what the price did afterwards, which post_exit_tracking is
+#: separately collecting for the exit that caused the block.
+REENTRY_BLOCKS_TABLE = """
+CREATE TABLE IF NOT EXISTS reentry_blocks (
+    block_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    strategy_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    trading_day TEXT NOT NULL,
+    blocked_at TEXT NOT NULL,
+    reason_code TEXT NOT NULL,
+    candidate_rank INTEGER,
+    candidate_score REAL,
+    candidate_price REAL,
+    previous_exit_price REAL,
+    previous_exit_reason TEXT,
+    previous_position_id TEXT,
+    tracking_id TEXT,
+    created_at TEXT NOT NULL
+)
+"""
+
+REENTRY_BLOCKS_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_reentry_blocks_day
+ON reentry_blocks (trading_day, strategy_id, symbol)
+"""
+
+MIGRATION_19_STATEMENTS = [
+    S1_POSITIONS_EXIT_SESSION,
+    S1_POSITIONS_EXIT_PRICE,
+    S2_POSITIONS_EXIT_SESSION,
+    S2_POSITIONS_EXIT_PRICE,
+    S6_POSITIONS_EXIT_SESSION,
+    POST_EXIT_TRACKING_TABLE,
+    POST_EXIT_TRACKING_STRATEGY_INDEX,
+    POST_EXIT_TRACKING_STATUS_INDEX,
+    POST_EXIT_OBSERVATIONS_TABLE,
+    POST_EXIT_OBSERVATIONS_INDEX,
+    REENTRY_BLOCKS_TABLE,
+    REENTRY_BLOCKS_INDEX,
+]
+
+
 # Every table this schema version creates -- used by export.py's
 # export_all() and by tests asserting the full table set exists.
 ALL_TABLES = [
@@ -896,4 +1053,5 @@ ALL_TABLES = [
     "order_state_events", "shadow_audit_events", "s1_live_trades",
     "s1_risk_state", "s1_risk_peak", "s1_verification_state",
     "s1_positions", "s2_positions", "s6_positions",
+    "post_exit_tracking", "post_exit_observations", "reentry_blocks",
 ]

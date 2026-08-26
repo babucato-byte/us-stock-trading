@@ -203,8 +203,13 @@ class TestRolloutLimitsAreUnmoved:
         config = LiveRolloutConfig.from_env({})
         assert config.enabled is False
         assert config.max_quantity_per_order == 1
-        assert config.max_open_positions == 1
-        assert config.max_daily_entries == 1
+        # The COUNT caps are unset by design since LIMITED_LIVE ended:
+        # capacity is bounded by cash, the per-symbol lock, same-day
+        # re-entry, ownership and reconciliation. The invariant this
+        # test guards -- that the work in this file widened nothing --
+        # is carried by the flags and the per-order quantity below.
+        assert config.max_open_positions is None
+        assert config.max_daily_entries is None
 
     def test_the_trusted_operator_ceilings_are_unmoved(self):
         from live_readiness import trusted_operator_config as toc
@@ -216,9 +221,17 @@ class TestRolloutLimitsAreUnmoved:
         assert s1_allocation.PLANNED_MAX_POSITION_COUNT == 4
         assert s1_allocation.TARGET_POSITION_COUNT == 3
         rollout = (REPO_ROOT / "config" / "live_rollout_config.py").read_text(encoding="utf-8")
+        # Per-ORDER quantity still defaults to 1 -- whole-share, one
+        # share per order is the operating rule, not a retired cap.
         assert 'LIVE_ROLLOUT_MAX_QUANTITY", 1' in rollout
-        assert 'LIVE_ROLLOUT_MAX_POSITIONS", 1' in rollout
-        assert 'LIVE_ROLLOUT_MAX_DAILY_ENTRIES", 1' in rollout
+        # The COUNT caps read through _env_optional_int now, so an unset
+        # value means "not enforced" rather than 1. Asserted on the
+        # reader rather than on a default, because the point of this
+        # test is that the PLANNED four-position shape has not leaked
+        # into the live config -- and it has not: there is no 4 here.
+        assert '_env_optional_int(\n                mapping, "LIVE_ROLLOUT_MAX_POSITIONS")' in rollout
+        assert '_env_optional_int(\n                mapping, "LIVE_ROLLOUT_MAX_DAILY_ENTRIES")' in rollout
+        assert "PLANNED_MAX_POSITION_COUNT" not in rollout
 
     def test_risk_config_is_untouched(self):
         import risk_config

@@ -178,6 +178,33 @@ def _finalize(run_id, outcome, *, symbol, now):
         )
 
 
+def _record_reentry_block(conn, exc, *, signal, symbol, order_intent, now):
+    """Note a BUY refused as a same-day re-entry, and why it was ranked.
+
+    Never fatal, and deliberately narrow: only this one reason code is
+    recorded, because only this one is a policy choice worth auditing
+    against what the price did next.
+    """
+    from execution import reentry_policy
+
+    if getattr(exc, "reason_code", None) != reentry_policy.SAME_DAY_REENTRY_BLOCK:
+        return
+    try:
+        strategy_id = getattr(order_intent, "strategy_id", None) or getattr(
+            signal, "strategy_id", None)
+        previous = reentry_policy.exits_today(
+            conn, strategy_id=strategy_id, now=now).get(str(symbol).upper(), {})
+        reentry_policy.record_block(
+            conn, strategy_id=strategy_id, symbol=symbol,
+            previous_exit=previous, now=now,
+            candidate_rank=getattr(signal, "rank", None),
+            candidate_score=getattr(signal, "score", None),
+            candidate_price=getattr(order_intent, "limit_price", None))
+    except Exception:  # noqa: BLE001 - the block already happened
+        logger.warning("could not record the re-entry block for %s", symbol,
+                       exc_info=True)
+
+
 def _audit_cycle_block(run_id, event_type, reason_code, detail, *, now):
     """A cycle-level structural block. Emits the specific block event AND
     exactly one terminal SHADOW_BLOCKED, so no run is ever left without a
@@ -902,6 +929,14 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                            shadow_audit.RESULT_BLOCKED, symbol=symbol, signal_id=signal.signal_id,
                            internal_order_id=order_intent.internal_order_id,
                            reason_code=exc.reason_code, detail=str(exc), now=current)
+                    # A same-day re-entry block is the one refusal whose
+                    # correctness is not knowable at the time: it stops a
+                    # trade, and only the price afterwards says whether
+                    # stopping it was right. Recorded with the candidate
+                    # that was refused so §N can answer that later.
+                    _record_reentry_block(
+                        conn, exc, signal=signal, symbol=symbol,
+                        order_intent=order_intent, now=current)
                 except KISAmbiguousResponseError as exc:
                     results["blocked"].append((symbol, f"ambiguous KIS response, order status UNKNOWN: {exc}"))
                     shadow_mode.persist(_shadow_record("AMBIGUOUS", str(exc)))

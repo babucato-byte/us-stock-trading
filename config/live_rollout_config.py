@@ -18,7 +18,7 @@ environment, not a silent default drift.
 import math
 import os
 from dataclasses import dataclass, field
-from typing import FrozenSet
+from typing import FrozenSet, Optional
 
 from dotenv import load_dotenv
 
@@ -47,6 +47,34 @@ def _env_int(env, name, default):
         raise LiveRolloutConfigError(f"{name} must be an integer, got {value!r}")
 
 
+def _env_optional_int(env, name):
+    """A count cap that may legitimately be absent.
+
+    LIMITED_LIVE pinned these to 1 and 2 so the first real orders could
+    be counted on one hand. That was scaffolding for a test, not a risk
+    model, and leaving it in place would make the test's shape permanent.
+    Unset -- or set to an empty value -- now means the cap is not
+    enforced, and capacity is decided by the things that actually bound
+    it: orderable cash, one position per symbol, same-day re-entry,
+    ownership and reconciliation.
+
+    A VALUE is still honoured. An operator who wants a hard ceiling sets
+    one and gets it; what is gone is a ceiling nobody chose.
+    """
+    value = env.get(name)
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise LiveRolloutConfigError(f"{name} must be an integer, got {value!r}")
+    if parsed < 1:
+        raise LiveRolloutConfigError(
+            f"{name} must be a positive int when set, got {parsed!r}; "
+            "leave it empty to run without a count cap")
+    return parsed
+
+
 def _env_float(env, name, default):
     value = env.get(name)
     if value is None:
@@ -69,7 +97,7 @@ class LiveRolloutConfig:
     enabled: bool
     allowed_symbols: FrozenSet[str]
     max_quantity_per_order: int
-    max_open_positions: int
+    max_open_positions: Optional[int]
     #: The cap EACH live strategy gets inside `max_open_positions`.
     #:
     #: The global cap alone cannot express the posture that is actually
@@ -78,8 +106,8 @@ class LiveRolloutConfig:
     #: different and larger risk than one name each. Both caps are
     #: enforced and neither substitutes for the other: a strategy is
     #: blocked at its own cap even when the account has a free slot.
-    max_positions_per_strategy: int
-    max_daily_entries: int
+    max_positions_per_strategy: Optional[int]
+    max_daily_entries: Optional[int]
     regular_session_only: bool
     allow_fractional: bool
     allow_market_order: bool
@@ -97,10 +125,12 @@ class LiveRolloutConfig:
             enabled=_env_bool(mapping, "LIVE_ROLLOUT_ENABLED", False),
             allowed_symbols=_env_symbol_set(mapping, "LIVE_ROLLOUT_ALLOWED_SYMBOLS", frozenset()),
             max_quantity_per_order=_env_int(mapping, "LIVE_ROLLOUT_MAX_QUANTITY", 1),
-            max_open_positions=_env_int(mapping, "LIVE_ROLLOUT_MAX_POSITIONS", 1),
-            max_positions_per_strategy=_env_int(
-                mapping, "LIVE_ROLLOUT_MAX_POSITIONS_PER_STRATEGY", 1),
-            max_daily_entries=_env_int(mapping, "LIVE_ROLLOUT_MAX_DAILY_ENTRIES", 1),
+            max_open_positions=_env_optional_int(
+                mapping, "LIVE_ROLLOUT_MAX_POSITIONS"),
+            max_positions_per_strategy=_env_optional_int(
+                mapping, "LIVE_ROLLOUT_MAX_POSITIONS_PER_STRATEGY"),
+            max_daily_entries=_env_optional_int(
+                mapping, "LIVE_ROLLOUT_MAX_DAILY_ENTRIES"),
             regular_session_only=_env_bool(mapping, "REGULAR_SESSION_ONLY", True),
             allow_fractional=_env_bool(mapping, "ALLOW_FRACTIONAL", False),
             allow_market_order=_env_bool(mapping, "MARKET_ORDER_ENABLED", False),
@@ -119,28 +149,29 @@ class LiveRolloutConfig:
         if isinstance(self.max_quantity_per_order, bool) or not isinstance(self.max_quantity_per_order, int) \
                 or self.max_quantity_per_order < 1:
             raise LiveRolloutConfigError(f"max_quantity_per_order must be a positive int, got {self.max_quantity_per_order!r}")
-        if isinstance(self.max_open_positions, bool) or not isinstance(self.max_open_positions, int) \
-                or self.max_open_positions < 1:
-            raise LiveRolloutConfigError(f"max_open_positions must be a positive int, got {self.max_open_positions!r}")
-        if isinstance(self.max_positions_per_strategy, bool) \
-                or not isinstance(self.max_positions_per_strategy, int) \
-                or self.max_positions_per_strategy < 1:
-            raise LiveRolloutConfigError(
-                f"max_positions_per_strategy must be a positive int, got "
-                f"{self.max_positions_per_strategy!r}")
+        # None means "not enforced". A SET value is still validated
+        # exactly as before: an operator who chose a cap must get the
+        # cap they chose, and a malformed one must never read as absent.
+        for name in ("max_open_positions", "max_positions_per_strategy",
+                     "max_daily_entries"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise LiveRolloutConfigError(
+                    f"{name} must be a positive int when set, got {value!r}")
         # A per-strategy cap above the global one is not a stricter
         # setting that happens to be unreachable -- it is a contradiction
         # between two numbers that are both meant to be enforced, and
         # the operator cannot be assumed to have meant either. Refusing
         # is the only reading that does not silently pick one.
-        if self.max_positions_per_strategy > self.max_open_positions:
+        if (self.max_positions_per_strategy is not None
+                and self.max_open_positions is not None
+                and self.max_positions_per_strategy > self.max_open_positions):
             raise LiveRolloutConfigError(
                 f"max_positions_per_strategy ({self.max_positions_per_strategy}) exceeds "
                 f"max_open_positions ({self.max_open_positions}) -- a single strategy may "
                 "never be allowed more slots than the whole account has")
-        if isinstance(self.max_daily_entries, bool) or not isinstance(self.max_daily_entries, int) \
-                or self.max_daily_entries < 1:
-            raise LiveRolloutConfigError(f"max_daily_entries must be a positive int, got {self.max_daily_entries!r}")
         if not isinstance(self.max_price_deviation_percent, (int, float)) \
                 or isinstance(self.max_price_deviation_percent, bool) \
                 or not math.isfinite(self.max_price_deviation_percent) or self.max_price_deviation_percent <= 0:

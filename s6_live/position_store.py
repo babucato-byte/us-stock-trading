@@ -306,7 +306,7 @@ def mark_exit_submitted(conn, position_id, reason, *, now=None) -> bool:
 
 
 def close_position(conn, position_id, *, reason=None, exit_price=None,
-                   now=None) -> bool:
+                   exit_session=None, now=None) -> bool:
     """Close a position, recording the SELL's actual average fill.
 
     `exit_price` is COALESCEd rather than overwritten so a second close
@@ -315,15 +315,21 @@ def close_position(conn, position_id, *, reason=None, exit_price=None,
     intended price is not realised P&L.
     """
     stamp = _now(now)
+    # COALESCE for the same reason exit_price gets it: the session a
+    # fill happened in is recorded once, by the tick that saw it, and a
+    # later close must not overwrite a real session with a derived one.
     changed = conn.execute(
         f"""UPDATE {TABLE}
             SET status = ?, exit_reason = COALESCE(?, exit_reason),
                 exit_price = COALESCE(?, exit_price),
+                exit_session = COALESCE(?, exit_session),
                 closed_at = ?, updated_at = ?
             WHERE position_id = ? AND status != ?""",
-        (CLOSED, reason, _finite(exit_price), stamp, stamp, position_id,
-         CLOSED)).rowcount
+        (CLOSED, reason, _finite(exit_price), exit_session, stamp, stamp,
+         position_id, CLOSED)).rowcount
     conn.commit()
+    if changed:
+        _after_close(conn, position_id, strategy_id=STRATEGY_ID, now=now)
     return bool(changed)
 
 
@@ -373,3 +379,17 @@ def holdings(conn) -> List[Tuple[str, Optional[str], int]]:
             WHERE status IN ({','.join('?' * len(HELD_STATUSES))})""",
         HELD_STATUSES).fetchall()
     return [(r["symbol"], r["venue"], int(r["quantity"] or 0)) for r in rows]
+
+
+def _after_close(conn, position_id, *, strategy_id, now=None):
+    """Open post-exit tracking for a position that just closed.
+
+    Research only, and deliberately unable to affect the close: see
+    post_exit/tracker.py. Called from close_position so every closer
+    goes through it, rather than from each runtime that happens to
+    remember.
+    """
+    from post_exit import tracker
+
+    tracker.on_position_closed(conn, table=TABLE, position_id=position_id,
+                               strategy_id=strategy_id, now=now)

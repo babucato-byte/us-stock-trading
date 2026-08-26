@@ -352,4 +352,4 @@ class TestScannerConfigUntouched:
         config = LiveRolloutConfig.from_env({})
         assert config.enabled is False
         assert (config.max_quantity_per_order, config.max_open_positions,
-                config.max_daily_entries) == (1, 1, 1)
+                config.max_daily_entries) == (1, None, None)

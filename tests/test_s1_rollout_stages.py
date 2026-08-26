@@ -455,7 +455,7 @@ class TestActualRolloutUnmoved:
         config = LiveRolloutConfig.from_env({})
         assert config.enabled is False
         assert (config.max_quantity_per_order, config.max_open_positions,
-                config.max_daily_entries) == (1, 1, 1)
+                config.max_daily_entries) == (1, None, None)
 
     def test_the_s1_source_is_still_off_by_default(self):
         from s1_live import candidate_source
@@ -474,7 +474,8 @@ class TestActualRolloutUnmoved:
         planned = stages.profile_for(stages.STAGE_AGGRESSIVE)
         actual = LiveRolloutConfig.from_env({})
         assert planned["hard_max_positions"] == 4
-        assert actual.max_open_positions == 1, "planned must not have leaked into actual"
+        assert actual.max_open_positions is None, (
+            "planned must not have leaked into actual")
 
 
 class TestOrderStateDatabaseIsolation:
