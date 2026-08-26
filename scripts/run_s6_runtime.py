@@ -51,6 +51,7 @@ def run_once(*, now=None) -> dict:
     exits_allowed = capability.exit_supported
 
     report = {"started_at": moment.isoformat(), "session": session,
+              "entry_timeouts": [],
               "variant": s6_sessions.variant_for(session),
               "market_state": market,
               "trading_day": capability.trading_day,
@@ -96,6 +97,12 @@ def run_once(*, now=None) -> dict:
                 conn, fills_for=_buy_fill_lookup(
                     conn, broker, now=moment, open_orders=open_orders),
                 now=moment)),
+            # AFTER the fill sync: anything that filled is already
+            # applied, so what this sees is genuinely unfilled and the
+            # only questions left are the clock and the candidate.
+            ("entry_timeouts", lambda: _entry_timeouts(
+                conn, broker=broker, session=session, moment=moment,
+                capability=capability)),
             ("exits", lambda: exit_runtime.run_exits(
                 conn, broker_adapter=adapter, features_fn=features_fn,
                 price_fn=price_fn, session=session, now=moment,
@@ -119,6 +126,39 @@ def run_once(*, now=None) -> dict:
         _attach_session_report(report, conn=conn, session=session, now=moment)
     return report
 
+
+
+def _entry_timeouts(conn, *, broker, session, moment, capability):
+    """Cancel resting S6 BUYs that have run out of time or reason.
+
+    The candidate source is passed so an order whose candidate has
+    positively dropped out can be cancelled before its TTL -- but a
+    source that refuses (mid-scan, unresolved store) yields None inside
+    `candidate_still_valid`, and None never cancels.
+    """
+    from config.live_rollout_config import LiveRolloutConfig
+    from market_hours import us_trading_day
+    from s6_live import entry_timeout
+    from s6_live.candidate_source import S6CandidateSource
+
+    account_id = None
+    try:
+        account_id = broker.config.account_no
+    except Exception:  # noqa: BLE001
+        pass
+
+    source = None
+    try:
+        source = S6CandidateSource(
+            trading_day=us_trading_day(moment), session=session,
+            rollout=LiveRolloutConfig.from_env())
+    except Exception:  # noqa: BLE001 - no source is "cannot tell", which
+        # `candidate_still_valid` already treats as never-cancel.
+        source = None
+
+    return entry_timeout.evaluate(
+        conn, broker=broker, account_id=account_id, source=source,
+        now=moment, session_orderable=capability.entry_supported)
 
 def _attach_session_report(report, *, conn, session, now) -> None:
     """Generate the shadow-session report automatically, on the tick.
