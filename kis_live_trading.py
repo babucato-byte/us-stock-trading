@@ -88,7 +88,7 @@ from s1_live import candidate_source as s1_candidate_source
 from s2_live import candidate_source as s2_candidate_source
 from s6_live import candidate_source as s6_candidate_source
 from scanners.base import scan_session
-from config import s6_sessions
+from config import s6_sessions, session_capability
 from s1_live import execution_price as s1_execution_price
 from s1_live import security_type as s1_security_type
 from state_store import db as state_db
@@ -286,9 +286,17 @@ def _session_permitted(source, rollout) -> bool:
     place to import anything.
     """
     if getattr(source, "name", None) == s6_candidate_source.SOURCE_S6:
-        current = scan_session.session_at(
-            datetime.now(timezone.utc).astimezone(EASTERN))
-        return bool(s6_sessions.orders_allowed(current))
+        # Asked of the shared resolver rather than of the session policy
+        # alone. `s6_sessions.orders_allowed` answers "has the rollout
+        # reached this session", which is necessary but not sufficient:
+        # it knows nothing about whether KIS defines a route, and nothing
+        # about the calendar. `scan_session.session_at` is deliberately
+        # calendar-independent (a holiday still has a premarket window on
+        # the clock), so on its own it would have called a Saturday
+        # evening OVERNIGHT_DAYTIME and permitted an order into a day the
+        # market never opened.
+        return session_capability.order_session(
+            strategy_id=s6_sessions.STRATEGY_ID) is not None
 
     return pso.get_us_market_session() == "regular" \
         if rollout.regular_session_only else True
@@ -624,12 +632,46 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                            detail=reason, now=current)
                     continue
 
+                # The general live BUY path carries its session for the
+                # same reason the bootstrap and the exit path do: without
+                # it the broker falls back to `_session_hint` ("REGULAR")
+                # and a daytime entry is addressed to an endpoint that is
+                # not open at that hour. None is a refusal here, not a
+                # fallback -- the entry is skipped rather than guessed.
+                # Bound at module import, never here: importing mid-cycle
+                # re-initialises module state a caller may have patched,
+                # which this file has been bitten by before.
+                # ROUTING only -- deliberately without a strategy.
+                #
+                # "Which endpoint does this session use" and "is this
+                # strategy allowed to open a position" are different
+                # questions, and folding the second into the first here
+                # blocked every strategy that is stood down or simply not
+                # in the registry, at the point where the code was only
+                # trying to address an envelope. Entry permission is the
+                # gate's job (`entry_disabled`), applied once, where the
+                # decision is already made and audited.
+                entry_route_session = session_capability.route_session(now=current)
+                if entry_route_session is None:
+                    cap = session_capability.current_capability(now=current)
+                    reason = ("no KIS order route is available for the current "
+                              f"session: {cap.entry_reason}")
+                    results["blocked"].append((symbol, reason))
+                    outcome["reason_code"] = "NO_ENTRY_ROUTE_FOR_SESSION"
+                    _audit(run_id, shadow_audit.INSTRUMENT_BLOCKED,
+                           shadow_audit.RESULT_BLOCKED, symbol=symbol,
+                           signal_id=signal.signal_id,
+                           reason_code="NO_ENTRY_ROUTE_FOR_SESSION",
+                           detail=reason, now=current)
+                    continue
+
                 try:
                     order_intent = OrderIntent(
                         internal_order_id=f"kislive-{symbol}-{uuid.uuid4().hex[:12]}",
                         signal_id=signal.signal_id, strategy_id=signal.strategy_id, symbol=symbol,
                         exchange=instrument.exchange, side="buy", quantity=quantity, order_type="limit",
                         limit_price=buffered_price, stop_price=None, target_price=None, created_at=current,
+                        session=entry_route_session,
                     )
                 except OrderIntentError as exc:
                     reason = f"order intent construction failed: {exc}"

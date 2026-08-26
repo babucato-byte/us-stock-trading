@@ -26,7 +26,7 @@ logger = logging.getLogger("s6_runtime")
 
 
 def run_once(*, now=None) -> dict:
-    from config import s6_sessions
+    from config import s6_sessions, session_capability
     from market_hours import EASTERN, get_market_state
     from scanners.base import scan_session
     from state_store.db import open_db
@@ -34,12 +34,33 @@ def run_once(*, now=None) -> dict:
     moment = now or datetime.now(timezone.utc)
     market = get_market_state()
     session = scan_session.session_at(moment.astimezone(EASTERN))
-    orders_allowed = (market != "CLOSED"
-                      and s6_sessions.orders_allowed(session))
+
+    # Capability comes from the shared resolver, NOT from `market`.
+    #
+    # `get_market_state()` models the US venue's own sessions and returns
+    # CLOSED for exactly 20:00->04:00 ET -- which is precisely the
+    # OVERNIGHT_DAYTIME window. Conjoining it here made daytime orders
+    # structurally impossible: not "closed right now" but closed for the
+    # whole session, every day, by construction. KIS's 미국주간거래 runs
+    # while the US market is closed; that is what it is for.
+    #
+    # `market` is still reported, because an operator reading the tick
+    # wants to know which venue state it ran in. It just no longer
+    # decides anything.
+    capability = session_capability.capability_for(session, now=moment)
+    exits_allowed = capability.exit_supported
 
     report = {"started_at": moment.isoformat(), "session": session,
               "variant": s6_sessions.variant_for(session),
-              "market_state": market, "orders_allowed": orders_allowed,
+              "market_state": market,
+              "trading_day": capability.trading_day,
+              "entry_supported": capability.entry_supported,
+              "exit_supported": capability.exit_supported,
+              "exit_reason": capability.exit_reason,
+              # Retained under its original name so existing log readers
+              # and dashboards keep working; it now means "may any order
+              # be sent", with the per-side answers alongside it.
+              "orders_allowed": capability.orders_allowed,
               "mode": s6_sessions.mode_for(session),
               "buy_fills": [], "exits": [], "retried": [], "sell_fills": [],
               "errors": []}
@@ -78,10 +99,10 @@ def run_once(*, now=None) -> dict:
             ("exits", lambda: exit_runtime.run_exits(
                 conn, broker_adapter=adapter, features_fn=features_fn,
                 price_fn=price_fn, session=session, now=moment,
-                orders_allowed=orders_allowed)),
+                orders_allowed=exits_allowed)),
             ("retried", lambda: exit_runtime.retry_latched_exits(
                 conn, broker_adapter=adapter, session=session, now=moment,
-                orders_allowed=orders_allowed)),
+                orders_allowed=exits_allowed)),
             ("sell_fills", lambda: exit_runtime.sync_sell_fills(
                 conn, fills_for=_sell_fill_lookup(
                     conn, broker, now=moment, open_orders=open_orders),
@@ -114,7 +135,10 @@ def _attach_session_report(report, *, conn, session, now) -> None:
     """
     from config import s6_sessions
 
-    if not s6_sessions.scans(session) or s6_sessions.orders_allowed(session):
+    from config import session_capability
+
+    if not s6_sessions.scans(session) or \
+            session_capability.capability_for(session, now=now).orders_allowed:
         return
     try:
         from s6_live import session_report

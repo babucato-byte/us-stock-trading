@@ -187,12 +187,37 @@ class KISBrokerAdapter:
                 text=f"KIS price re-check failed: {exc}", now=current,
             )
 
+        # The EXIT route follows the session too. Without this the intent
+        # had no `session`, so `KISBroker.submit_order` fell back to its
+        # `_session_hint` class default of "REGULAR" and a daytime SELL
+        # was addressed to /trading/order + TTTT1006U instead of
+        # /trading/daytime-order + TTTS6037U -- the same mis-routing the
+        # buy side was fixed for, on the side that closes a position.
+        #
+        # Resolved from the shared capability rather than from the
+        # process: `exit_session()` returns None when no route exists,
+        # and that is a refusal, never a fallback to the regular route.
+        from config import session_capability
+
+        exit_route_session = session_capability.exit_session(now=current)
+        if exit_route_session is None:
+            return self._blocked(
+                run_id, shadow_audit.INSTRUMENT_BLOCKED, symbol=symbol,
+                internal_order_id=internal_order_id,
+                reason_code="NO_EXIT_ROUTE_FOR_SESSION",
+                detail=session_capability.current_capability(now=current).exit_reason,
+                status_code=422,
+                text="no KIS order route is available for the current session",
+                now=current,
+            )
+
         try:
             order_intent = OrderIntent(
                 internal_order_id=internal_order_id, signal_id=internal_order_id,
                 strategy_id="POSITIONS_LIFECYCLE_EXIT", symbol=symbol, exchange=instrument.exchange,
                 side="sell", quantity=int(qty), order_type="limit", limit_price=kis_price,
                 stop_price=None, target_price=None, created_at=current,
+                session=exit_route_session,
             )
         except OrderIntentError as exc:
             return self._blocked(

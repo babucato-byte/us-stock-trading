@@ -115,7 +115,6 @@ FLAG_BOOTSTRAP_ACK = "LIVE_BOOTSTRAP_ACK"
 POSTURE_NOT_BOOTSTRAP = "POSTURE_NOT_LIMITED_LIVE_BOOTSTRAP"
 BOOTSTRAP_ACK_MISSING = "BOOTSTRAP_ACK_MISSING"
 KIS_ENV_NOT_LIVE = "KIS_ENV_NOT_LIVE"
-NOT_REGULAR_SESSION = "NOT_REGULAR_SESSION"
 #: No KIS order route is available for the session we are actually in --
 #: either S6 may not order in it, or KIS defines no endpoint for it.
 NOT_ORDERABLE_SESSION = "NOT_ORDERABLE_SESSION"
@@ -302,20 +301,20 @@ def _order_session():
     caller treats as a refusal. It never falls back to REGULAR: that
     fallback is exactly how an order reaches an endpoint that is not
     open at the hour it is sent.
-    """
-    from brokers.kis_broker import ROUTED_SESSIONS
-    from config import s6_sessions
-    from scanners.base import scan_session
 
-    session = scan_session.session_at()
-    if session is None:
-        return None
-    name = str(session).strip().upper()
-    if not s6_sessions.orders_allowed(name):
-        return None
-    if name not in ROUTED_SESSIONS:
-        return None
-    return name
+    Delegated to `config.session_capability`, which is the one place that
+    decides this now. It used to be decided here, and separately in
+    `run_s6_runtime`, in `exit_runtime`'s caller and in
+    `final_pre_live_check.sh` -- four answers to one question, and they
+    disagreed. This one asked whether the session was routable, while the
+    runtime asked `get_market_state() != "CLOSED"`, which is False for
+    the whole of OVERNIGHT_DAYTIME by construction. The result was a
+    session a BUY could be placed into but a SELL could not leave.
+    """
+    from config import s6_sessions, session_capability
+
+    return session_capability.order_session(
+        strategy_id=s6_sessions.STRATEGY_ID)
 
 
 def _route_awaiting_live_evidence(session):

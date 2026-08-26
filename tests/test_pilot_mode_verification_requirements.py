@@ -145,16 +145,24 @@ class TestClassificationMatchesTheSource:
                     found.add(node.name)
         return found
 
-    #: `order_route_for` may name the order constants because it only
-    #: SELECTS a route -- it is a module-level pure function with no
-    #: session, no client and no request. Keeping route selection in one
-    #: testable place is what makes "PREMARKET has no route" assertable
-    #: at all; inlining it back into submit_order would hide that branch
-    #: behind a live-order method nothing can call in a test.
+    #: `order_route_for` and `cancel_route_for` may name their side's
+    #: constants because they only SELECT a route -- module-level pure
+    #: functions with no session, no client and no request. Keeping route
+    #: selection in one testable place is what makes "PREMARKET has no
+    #: route" assertable at all; inlining either back into its live-order
+    #: method would hide that branch behind something nothing can call in
+    #: a test.
+    #:
+    #: `cancel_route_for` joined the set when the cancel side was given
+    #: the same treatment the order side already had. Until then
+    #: `cancel_order` read TR_ID_CANCEL and CANCEL_PATH unconditionally,
+    #: so a daytime order was cancelled through the REGULAR endpoint --
+    #: and a cancel addressed to the wrong family leaves the resting
+    #: order live.
     #:
     #: The property that matters is unchanged and is asserted below:
-    #: exactly one method can TRANSMIT.
-    ROUTE_SELECTORS = {"order_route_for"}
+    #: only the two order methods can TRANSMIT.
+    ROUTE_SELECTORS = {"order_route_for", "cancel_route_for"}
 
     @pytest.mark.parametrize("name", ["order_path", "order_tr_id_live_buy"])
     def test_order_values_are_referenced_only_by_submission(self, name):
@@ -169,21 +177,22 @@ class TestClassificationMatchesTheSource:
         import ast
 
         tree = ast.parse(BROKER_SOURCE)
-        selector = next(
-            (n for n in ast.walk(tree)
-             if isinstance(n, ast.FunctionDef) and n.name == "order_route_for"),
-            None)
-        assert selector is not None, "order_route_for is gone; revisit this guard"
-
-        # Attribute access and calls only. A bare-name check trips on
-        # the function's own `session` PARAMETER, which is the thing it
-        # is supposed to take.
         reached = set()
-        for child in ast.walk(selector):
-            if isinstance(child, ast.Attribute):
-                reached.add(child.attr)
-            elif isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
-                reached.add(child.func.id)
+        for name in sorted(self.ROUTE_SELECTORS):
+            selector = next(
+                (n for n in ast.walk(tree)
+                 if isinstance(n, ast.FunctionDef) and n.name == name),
+                None)
+            assert selector is not None, f"{name} is gone; revisit this guard"
+
+            # Attribute access and calls only. A bare-name check trips on
+            # the function's own `session` PARAMETER, which is the thing
+            # it is supposed to take.
+            for child in ast.walk(selector):
+                if isinstance(child, ast.Attribute):
+                    reached.add(child.attr)
+                elif isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
+                    reached.add(child.func.id)
         # Not "get": `TR_ID_ORDER_US.get(...)` is a dict lookup, and
         # forbidding it would fail on the selector doing exactly its job.
         for forbidden in ("request", "post", "urlopen", "_auth_headers",
@@ -219,7 +228,8 @@ class TestClassificationMatchesTheSource:
     def test_cancel_values_are_referenced_only_by_cancellation(self, name):
         methods = self._methods_referencing(self._assigned_constant(name))
         assert methods, name
-        assert methods <= {"cancel_order"}, f"{name} referenced by {methods}"
+        assert methods <= {"cancel_order"} | self.ROUTE_SELECTORS, \
+            f"{name} referenced by {methods}"
 
     def test_price_path_is_referenced_by_the_read_path(self):
         methods = self._methods_referencing("PRICE_PATH")

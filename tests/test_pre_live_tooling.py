@@ -117,7 +117,7 @@ class TestTheCheckerBlocksInTheCurrentPosture:
         assert "BLOCKING REASON CODES" in stdout
         # The two that must be present in this posture, whatever else is.
         assert "LIVE_ALLOWLIST_NOT_EXACTLY_ONE" in stdout
-        assert "ARMED_MATRIX_PENDING" in stdout
+        assert "SESSION_MATRIX_PENDING" in stdout
 
     def test_an_empty_allowlist_is_a_block(self):
         result = _run(CHECK, env={"LIVE_ROLLOUT_ALLOWED_SYMBOLS": ""})
@@ -490,7 +490,7 @@ class TestTheThreeStateVerdict:
         confirm, and "not ARMED", which is the state it runs in. Every
         other reason still blocks, which the count comparison enforces:
         the tolerated ones must account for the WHOLE list."""
-        assert "ARMED_MATRIX_PENDING|POSTURE_NOT_ARMED" in CHECK_SOURCE
+        assert "SESSION_MATRIX_PENDING|POSTURE_NOT_ARMED" in CHECK_SOURCE
         assert '"${BOOTSTRAP_TOLERATED}" -eq "${#REASONS[@]}"' in CHECK_SOURCE
         # INVALID_BOOTSTRAP_POSTURE is not tolerated, so a posture that is
         # neither ARMED nor LIMITED_LIVE_BOOTSTRAP still blocks.
@@ -501,7 +501,7 @@ class TestTheThreeStateVerdict:
         assert "NOT approval for ARMED or AUTO LIVE" in CHECK_SOURCE
 
     def test_a_pending_item_beyond_the_five_blocks_outright(self):
-        assert "ARMED_PENDING_BEYOND_BOOTSTRAP" in CHECK_SOURCE
+        assert "SESSION_PENDING_BEYOND_BOOTSTRAP" in CHECK_SOURCE
 
 
 class TestTheBootstrapPostureIsASeparateCapability:
@@ -573,7 +573,7 @@ class TestTheBootstrapPostureIsASeparateCapability:
         """The contradiction this fixes: requiring ARMED made
         READY_FOR_LIVE_BOOTSTRAP unreachable, since reaching ARMED is
         what the bootstrap exists to make possible."""
-        assert "ARMED_MATRIX_PENDING|POSTURE_NOT_ARMED" in CHECK_SOURCE
+        assert "SESSION_MATRIX_PENDING|POSTURE_NOT_ARMED" in CHECK_SOURCE
 
     def test_pre_live_ready_still_requires_armed(self):
         assert 'check("POSTURE_NOT_ARMED", decision.posture == "ARMED"' in CHECK_SOURCE
@@ -589,7 +589,7 @@ class TestReadyForLiveBootstrapIsActuallyReachable:
     arithmetic -- from a live KIS account and from whatever state this
     working tree happens to be in.
 
-    The tolerated-reason list is deliberately tiny: ARMED_MATRIX_PENDING
+    The tolerated-reason list is deliberately tiny: SESSION_MATRIX_PENDING
     and POSTURE_NOT_ARMED, the two things a bootstrap exists to resolve.
     Anything else outstanding must still produce PRE_LIVE_BLOCKED, which
     is what test_any_other_reason_blocks_it pins.
@@ -597,8 +597,8 @@ class TestReadyForLiveBootstrapIsActuallyReachable:
 
     PY_LINES = [
         "OK::OBSERVE_MATRIX_PENDING::7/7 confirmed",
-        "BAD::ARMED_MATRIX_PENDING::pending: order_path, order_tr_id_live_buy",
-        "OK::ARMED_PENDING_BEYOND_BOOTSTRAP::none",
+        "BAD::SESSION_MATRIX_PENDING::[REGULAR] pending: order_path, order_tr_id_live_buy",
+        "OK::SESSION_PENDING_BEYOND_BOOTSTRAP::none",
         "BOOTSTRAPABLE::yes",
         "OK::RECONCILIATION_NOT_USABLE::fresh and clean (age 1.0s)",
         "OK::HALT_ACTIVE::halted=False",

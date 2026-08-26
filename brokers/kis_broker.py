@@ -218,6 +218,39 @@ def order_route_for(session, env_key, side):
             f"no order TR_ID for session={name!r} env={env_key!r} side={side!r}")
     return path, tr_id
 
+
+def cancel_route_for(session, env_key):
+    """`(path, tr_id)` for cancelling an order placed INTO this session.
+
+    The cancel side had the defect the order side was fixed for: it read
+    `TR_ID_CANCEL[env]` and `CANCEL_PATH` unconditionally, so a daytime
+    order -- placed through /trading/daytime-order with TTTS6036U -- was
+    cancelled through /trading/order-rvsecncl with TTTT1004U. A cancel
+    addressed to the wrong family is not a cancel: the resting order it
+    was meant to pull stays live, which is the failure that matters when
+    the reason for cancelling is that something has gone wrong.
+
+    Mirrors `order_route_for` exactly, including its treatment of None
+    ("not specified", so the regular route) versus a blank string (a
+    caller COMPUTED a session and got nothing, which is a fault).
+    """
+    name = "REGULAR" if session is None else str(session).strip().upper()
+    if name == "REGULAR":
+        tr_id = TR_ID_CANCEL.get(env_key)
+        path = CANCEL_PATH
+    elif name == "OVERNIGHT_DAYTIME":
+        tr_id = TR_ID_DAYTIME_CANCEL.get(env_key)
+        path = DAYTIME_CANCEL_PATH
+    else:
+        raise KISBrokerError(
+            f"no KIS cancel route is specified for session {name!r}; "
+            "the overseas API defines US cancel endpoints for the regular "
+            "session and for daytime trading only")
+    if tr_id is None:
+        raise KISBrokerError(
+            f"no cancel TR_ID for session={name!r} env={env_key!r}")
+    return path, tr_id
+
 # EXCD (3-letter) is the quotations-API exchange code (price/quote
 # endpoint); OVRS_EXCG_CD (4-letter, order/balance endpoints) is a
 # DIFFERENT code space -- verified against the reference repo's order.py
@@ -1436,7 +1469,13 @@ class KISBroker:
         _authz.consume(authorization, order_intent, expected_action="cancel")
         self.config.validate_live_order_allowed(
             bootstrap_capability=bootstrap_capability, order_intent=order_intent)
-        tr_id = TR_ID_CANCEL[self._env_key()]
+        # The cancel follows the ORDER's session, exactly as the submit
+        # follows it -- see `cancel_route_for`. Falling back to the
+        # broker's hint here would send a daytime cancel to the regular
+        # endpoint and leave the resting order live.
+        cancel_path, tr_id = cancel_route_for(
+            getattr(order_intent, "session", None) or self._session_hint,
+            self._env_key())
         excg = _order_excg_for(order_intent.exchange)
         payload = {
             "CANO": self.config.account_no, "ACNT_PRDT_CD": self.config.account_product_cd,
@@ -1453,7 +1492,7 @@ class KISBroker:
             category=kis_rate_limiter.CATEGORY_CANCEL)
         try:
             response = self.session.request(
-                "POST", f"{self.config.base_url}{CANCEL_PATH}", headers=self._auth_headers(tr_id),
+                "POST", f"{self.config.base_url}{cancel_path}", headers=self._auth_headers(tr_id),
                 json=payload, timeout=10,
             )
         except requests.exceptions.RequestException as exc:

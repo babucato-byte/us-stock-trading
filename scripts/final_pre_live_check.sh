@@ -150,9 +150,10 @@ def check(name, ok, detail=""):
 
 try:
     from brokers.kis_broker import (
-        REQUIRED_FOR_ARMED, REQUIRED_FOR_OBSERVE, KISBroker,
+        REQUIRED_FOR_ARMED, REQUIRED_FOR_DAYTIME, REQUIRED_FOR_OBSERVE, KISBroker,
         matrix_entries_for, pending_items_for,
     )
+    from config import s6_sessions, session_capability, strategy_entry_policy
     from config import strategy_registry
     from config.live_rollout_config import LiveRolloutConfig
     from execution import entry_limits, idempotency
@@ -169,24 +170,49 @@ except Exception as exc:  # noqa: BLE001
 
 # -- wire verification matrix
 observe_pending = list(pending_items_for(REQUIRED_FOR_OBSERVE))
-armed_pending = list(pending_items_for(REQUIRED_FOR_ARMED))
 check("OBSERVE_MATRIX_PENDING", not observe_pending,
       f"{len(matrix_entries_for(REQUIRED_FOR_OBSERVE)) - len(observe_pending)}"
       f"/{len(matrix_entries_for(REQUIRED_FOR_OBSERVE))} confirmed")
+
+# The evidence set is the one belonging to the session about to be
+# traded, not the regular set in every session.
+#
+# REGULAR and OVERNIGHT_DAYTIME are separate endpoints with separate TR
+# families, so their five live-only values are separate sets and
+# confirming one says nothing about the other. Judging a daytime order
+# against the REGULAR set blocked daytime on evidence daytime can never
+# produce: the regular five are observable only by placing a REGULAR
+# order, which is not the order being placed. The strategy is one S6
+# either way; the ROUTE is what has or has not been confirmed.
+CAPABILITY = session_capability.current_capability(
+    strategy_id=s6_sessions.STRATEGY_ID)
+IS_DAYTIME = CAPABILITY.session == "OVERNIGHT_DAYTIME"
+SESSION_POSTURE = REQUIRED_FOR_DAYTIME if IS_DAYTIME else REQUIRED_FOR_ARMED
 LIVE_BOOTSTRAP_REQUIRED = {
+    "daytime_order_path", "daytime_order_tr_id_live_buy",
+    "daytime_order_tr_id_live_sell", "daytime_cancel_path",
+    "daytime_cancel_tr_id_live",
+} if IS_DAYTIME else {
     "order_path", "order_tr_id_live_buy", "cancel_path",
     "cancel_tr_id_live", "cancel_price_field_rule",
 }
-# The five that ONLY a real live response can establish. While exactly
-# those are outstanding the deployment is bootstrap-eligible but not
-# generally live-ready; anything else outstanding is a plain block.
-beyond_bootstrap = [n for n in armed_pending if n not in LIVE_BOOTSTRAP_REQUIRED]
-check("ARMED_MATRIX_PENDING", not armed_pending,
-      f"pending: {', '.join(armed_pending) if armed_pending else 'none'}")
-check("ARMED_PENDING_BEYOND_BOOTSTRAP", not beyond_bootstrap,
+session_pending = list(pending_items_for(SESSION_POSTURE))
+# While exactly those are outstanding the deployment is bootstrap-
+# eligible but not generally live-ready; anything else is a plain block.
+beyond_bootstrap = [n for n in session_pending if n not in LIVE_BOOTSTRAP_REQUIRED]
+check("SESSION_MATRIX_PENDING", not session_pending,
+      f"[{CAPABILITY.session or 'UNKNOWN'}] pending: "
+      f"{', '.join(session_pending) if session_pending else 'none'}")
+check("SESSION_PENDING_BEYOND_BOOTSTRAP", not beyond_bootstrap,
       f"beyond the live-bootstrap five: "
       f"{', '.join(beyond_bootstrap) if beyond_bootstrap else 'none'}")
-print(f"BOOTSTRAPABLE::{'yes' if armed_pending and not beyond_bootstrap else 'no'}")
+# The OTHER route's evidence: reported, never blocking. An operator
+# placing a daytime order still wants to see that regular is unconfirmed;
+# it is just not a reason to refuse THIS order.
+other_posture = REQUIRED_FOR_ARMED if IS_DAYTIME else REQUIRED_FOR_DAYTIME
+other_pending = list(pending_items_for(other_posture))
+print(f"INFO::OTHER_ROUTE_PENDING::{other_posture}: {len(other_pending)} pending")
+print(f"BOOTSTRAPABLE::{'yes' if session_pending and not beyond_bootstrap else 'no'}")
 
 # -- reconciliation
 # A snapshot made minutes ago by an earlier step can age past its TTL
@@ -256,10 +282,23 @@ except Exception as exc:  # noqa: BLE001
 
 # -- session
 try:
-    session = get_us_market_session()
-    check("NOT_REGULAR_SESSION", str(session).lower() == "regular", f"session={session}")
+    # Not "is it REGULAR" -- "can THIS order be routed right now".
+    #
+    # The old question was a stand-in that stopped agreeing with the real
+    # one once S6 went live in OVERNIGHT_DAYTIME. Worse, it consulted
+    # `get_us_market_session()`, which reports the US venue's own state
+    # and is "closed" for the whole daytime window by construction -- so
+    # the readiness checker refused the daytime route in every session
+    # that could reach it. Both entry AND exit capability are required: a
+    # session an order can be placed into but not left is not one to
+    # trade in.
+    session = CAPABILITY.session or get_us_market_session()
+    check("NO_ENTRY_ROUTE_FOR_SESSION", CAPABILITY.entry_supported,
+          f"session={session} reason={CAPABILITY.entry_reason}")
+    check("NO_EXIT_ROUTE_FOR_SESSION", CAPABILITY.exit_supported,
+          f"session={session} reason={CAPABILITY.exit_reason}")
 except Exception as exc:  # noqa: BLE001
-    check("NOT_REGULAR_SESSION", False, type(exc).__name__)
+    check("NO_ENTRY_ROUTE_FOR_SESSION", False, type(exc).__name__)
 
 # -- posture
 # Two different questions. PRE_LIVE_READY means the general live path may
@@ -337,12 +376,30 @@ try:
     # than only the one about to trade. An operator reading this is
     # deciding whether to place a real order, and "S1 1/1, S6 0/1" is
     # the fact that decision turns on.
+    # Only the slot of the strategy ABOUT TO TRADE can block. The others
+    # are still reported, because "S1 1/1, S6 0/1" is the fact an
+    # operator's decision turns on -- but a full S1 is not a reason to
+    # refuse an S6 entry. Per-strategy caps exist precisely so one
+    # strategy holding a position does not consume another's capacity;
+    # blocking on every slot re-created the single global cap that the
+    # per-strategy table was introduced to replace.
+    trading_slot = strategy_registry.slot_for(s6_sessions.STRATEGY_ID)
     for slot in strategy_registry.LIVE_SLOTS:
         used = limits.strategy_effective_count(slot)
-        check(f"STRATEGY_SLOT_FULL_{slot}",
-              used < limits.max_positions_per_strategy,
-              f"{slot}={used}/{limits.max_positions_per_strategy} "
-              f"{sorted(limits.strategy_symbols_for(slot))}")
+        detail = (f"{slot}={used}/{limits.max_positions_per_strategy} "
+                  f"{sorted(limits.strategy_symbols_for(slot))}")
+        if slot == trading_slot:
+            check(f"STRATEGY_SLOT_FULL_{slot}",
+                  used < limits.max_positions_per_strategy, detail)
+        else:
+            print(f"INFO::STRATEGY_SLOT_{slot}::{detail}")
+    # Capacity and permission are different questions: a strategy can
+    # have a free slot and still be stood down for new entries.
+    _entry_ok = strategy_entry_policy.entry_enabled(s6_sessions.STRATEGY_ID)
+    check("STRATEGY_ENTRY_DISABLED", _entry_ok,
+          f"{s6_sessions.STRATEGY_ID} entry="
+          f"{'ENABLED' if _entry_ok else 'DISABLED'} "
+          f"disabled_slots={list(strategy_entry_policy.entry_disabled_slots())}")
     # A held or in-flight symbol nobody can attribute counts against
     # EVERY strategy (execution/entry_limits.py), so it silently makes
     # all of the above look full. Naming it separately is the difference
@@ -393,21 +450,20 @@ fi
 # exactly one symbol, one share, one BUY attempt and at most one CANCEL
 # attempt -- the only way the five live-only wire values can be observed
 # at all. Every OTHER safety check must still have passed, which is why
-# it requires the reason list to contain nothing but ARMED_MATRIX_PENDING.
+# it requires the reason list to contain nothing but SESSION_MATRIX_PENDING.
 BOOTSTRAPABLE="$(printf '%s\n' "${PY_OUTPUT}" | sed -n 's/^BOOTSTRAPABLE:://p' | tail -1)"
 BOOTSTRAP_TOLERATED=0
 for reason in "${REASONS[@]-}"; do
     case "${reason}" in
-        ARMED_MATRIX_PENDING|POSTURE_NOT_ARMED) BOOTSTRAP_TOLERATED=$((BOOTSTRAP_TOLERATED+1)) ;;
+        SESSION_MATRIX_PENDING|POSTURE_NOT_ARMED) BOOTSTRAP_TOLERATED=$((BOOTSTRAP_TOLERATED+1)) ;;
     esac
 done
 if [ "${BOOTSTRAPABLE}" = "yes" ] \
    && [ "${BOOTSTRAP_TOLERATED}" -eq "${#REASONS[@]}" ]; then
     printf 'RESULT: READY_FOR_LIVE_BOOTSTRAP\n'
     printf 'Every safety check passed. The only outstanding items are the five\n'
-    printf 'wire values that a real live response is the only way to confirm:\n'
-    printf '  order_path, order_tr_id_live_buy, cancel_path,\n'
-    printf '  cancel_tr_id_live, cancel_price_field_rule\n'
+    printf 'wire values that a real live response is the only way to confirm\n'
+    printf 'for the session being traded -- see SESSION_MATRIX_PENDING above.\n'
     printf 'Authorised scope: 1 symbol, 1 share, 1 BUY, at most 1 CANCEL.\n'
     printf 'This is NOT approval for ARMED or AUTO LIVE.\n'
     exit 0
