@@ -165,6 +165,34 @@ class TestTheCheckerBlocksInTheCurrentPosture:
         result = _run(CHECK, env={var: "banana"})
         assert f"{var}_INVALID" in result.stdout
 
+    def test_an_uncapped_posture_does_not_crash_the_checker(self):
+        """The caps became optional and three comparisons still read
+        them as ints, so the whole account block died with a bare
+        `TypeError` -- which the checker reported as
+        KIS_ACCOUNT_READ_FAILED, naming the wrong thing entirely.
+
+        Every count is reported rather than compared when its cap is
+        absent, so the operator sees the occupancy without a refusal.
+        """
+        result = _run(CHECK, env={
+            "LIVE_ROLLOUT_MAX_POSITIONS": "",
+            "LIVE_ROLLOUT_MAX_POSITIONS_PER_STRATEGY": "",
+            "LIVE_ROLLOUT_MAX_DAILY_ENTRIES": ""})
+        # Without credentials the account read fails for its own honest
+        # reason (KISConfigError), which is not what this guards. What
+        # must never come back is the TypeError from comparing a count
+        # with an absent cap.
+        assert "TypeError" not in result.stdout
+        assert "PER_STRATEGY_CAP_EXCEEDS_GLOBAL" not in result.stdout
+        assert "POSITION_SLOTS_ALREADY_USED" not in result.stdout
+        assert "DAILY_ENTRIES_ALREADY_USED" not in result.stdout
+
+    def test_the_account_read_failure_names_what_actually_failed(self):
+        """A bare class name sent the reader looking at KIS."""
+        source = (REPO_ROOT / "scripts" / "final_pre_live_check.sh").read_text(
+            encoding="utf-8")
+        assert 'f"{type(exc).__name__}: {exc}' in source
+
     def test_a_widened_count_cap_is_accepted(self, ):
         """Several positions at once is the point of the change."""
         result = _run(CHECK, env={"LIVE_ROLLOUT_MAX_POSITIONS": "8"})

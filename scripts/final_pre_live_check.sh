@@ -109,12 +109,16 @@ PER_STRATEGY_MAX="${LIVE_ROLLOUT_MAX_POSITIONS_PER_STRATEGY:-}"
 # Enforced here as well as in config.validate(), because this checker is
 # read by an operator deciding whether to place a real order and must
 # not require them to trust that a second file agrees.
-if [ -n "${GLOBAL_MAX}" ] && [ -n "${PER_STRATEGY_MAX}" ] \
-   && [ "${PER_STRATEGY_MAX}" -le "${GLOBAL_MAX}" ] 2>/dev/null; then
+# Two caps that are both absent cannot contradict each other -- the
+# contradiction is only meaningful when an operator has set BOTH, which
+# is exactly when config.validate() refuses it too.
+if [ -z "${GLOBAL_MAX}" ] || [ -z "${PER_STRATEGY_MAX}" ]; then
+    info "per-strategy/global cap comparison skipped (at least one is unset)"
+elif [ "${PER_STRATEGY_MAX}" -le "${GLOBAL_MAX}" ] 2>/dev/null; then
     pass "per-strategy cap (${PER_STRATEGY_MAX}) <= global cap (${GLOBAL_MAX})"
 else
     fail PER_STRATEGY_CAP_EXCEEDS_GLOBAL \
-        "per_strategy=${PER_STRATEGY_MAX:-<unset>} global=${GLOBAL_MAX:-<unset>}"
+        "per_strategy=${PER_STRATEGY_MAX} global=${GLOBAL_MAX}"
 fi
 
 # The one symbol a first limited-live order may touch. Empty is the
@@ -348,8 +352,14 @@ try:
     # held anything, which is a scheduling accident rather than a safety
     # property. What matters is that the account has ROOM -- the
     # per-strategy check below is what stops a strategy doubling up.
-    check("ACCOUNT_AT_POSITION_CAP", len(positions) < rollout.max_open_positions,
-          f"open positions={len(positions)}/{rollout.max_open_positions}")
+    if rollout.max_open_positions is None:
+        # No count cap: how many names the account holds is a fact, not
+        # a refusal. Cash and the per-symbol lock decide capacity now.
+        print(f"INFO::ACCOUNT_POSITIONS::{len(positions)} held (uncapped)")
+    else:
+        check("ACCOUNT_AT_POSITION_CAP",
+              len(positions) < rollout.max_open_positions,
+              f"open positions={len(positions)}/{rollout.max_open_positions}")
 
     open_orders = broker.get_open_orders()
     check("OPEN_ORDERS_NOT_ZERO", len(open_orders) == 0, f"open orders={len(open_orders)}")
@@ -376,13 +386,28 @@ try:
         limits = entry_limits.collect(broker=broker, conn=conn, rollout=rollout)
     finally:
         conn.close()
-    check("DAILY_ENTRIES_ALREADY_USED",
-          limits.daily_entry_count < limits.max_daily_entries,
-          f"daily entries={limits.daily_entry_count}/{limits.max_daily_entries}")
-    check("POSITION_SLOTS_ALREADY_USED",
-          limits.effective_position_count < limits.max_open_positions,
-          f"effective positions={limits.effective_position_count}/"
-          f"{limits.max_open_positions}")
+    # Both of these were LIMITED_LIVE counters. With the caps unset they
+    # are reported and never block: an entry is refused now because the
+    # strategy already holds THAT symbol or sold it today, not because
+    # some number of unrelated positions is open.
+    if limits.max_daily_entries is None:
+        print(f"INFO::DAILY_ENTRIES::{limits.daily_entry_count} today (uncapped)")
+    else:
+        check("DAILY_ENTRIES_ALREADY_USED",
+              limits.daily_entry_count < limits.max_daily_entries,
+              f"daily entries={limits.daily_entry_count}/{limits.max_daily_entries}")
+    if limits.max_open_positions is None:
+        print(f"INFO::POSITION_SLOTS::{limits.effective_position_count} "
+              f"effective (uncapped)")
+    else:
+        check("POSITION_SLOTS_ALREADY_USED",
+              limits.effective_position_count < limits.max_open_positions,
+              f"effective positions={limits.effective_position_count}/"
+              f"{limits.max_open_positions}")
+    # What DOES bar a candidate now, named so an operator can see it.
+    _blocked_today = sorted(limits.same_day_exits.get(
+        strategy_registry.slot_for(s6_sessions.STRATEGY_ID)) or {})
+    print(f"INFO::SAME_DAY_REENTRY_BLOCKED::{_blocked_today or 'none'}")
 
     # Per-strategy occupancy, reported for EVERY live strategy rather
     # than only the one about to trade. An operator reading this is
@@ -396,14 +421,19 @@ try:
     # blocking on every slot re-created the single global cap that the
     # per-strategy table was introduced to replace.
     trading_slot = strategy_registry.slot_for(s6_sessions.STRATEGY_ID)
+    _cap = limits.max_positions_per_strategy
     for slot in strategy_registry.LIVE_SLOTS:
         used = limits.strategy_effective_count(slot)
-        detail = (f"{slot}={used}/{limits.max_positions_per_strategy} "
+        detail = (f"{slot}={used}/{_cap if _cap is not None else 'uncapped'} "
                   f"{sorted(limits.strategy_symbols_for(slot))}")
-        if slot == trading_slot:
-            check(f"STRATEGY_SLOT_FULL_{slot}",
-                  used < limits.max_positions_per_strategy, detail)
+        if slot == trading_slot and _cap is not None:
+            check(f"STRATEGY_SLOT_FULL_{slot}", used < _cap, detail)
         else:
+            # With no count cap, "how many does this slot hold" is a
+            # fact worth printing and not a reason to refuse: what bars
+            # a candidate now is holding THAT symbol, or having sold it
+            # today -- both of which the gate checks per candidate and
+            # neither of which this slot count can express.
             print(f"INFO::STRATEGY_SLOT_{slot}::{detail}")
     # Capacity and permission are different questions: a strategy can
     # have a free slot and still be stood down for new entries.
@@ -419,7 +449,12 @@ try:
     check("UNATTRIBUTED_POSITIONS", not limits.unattributed_symbols,
           f"unattributed={sorted(limits.unattributed_symbols)}")
 except Exception as exc:  # noqa: BLE001
-    check("KIS_ACCOUNT_READ_FAILED", False, type(exc).__name__)
+    # The message, not just the class. An operator reading "TypeError"
+    # learns nothing about which read failed or why.
+    import traceback
+    _where = traceback.extract_tb(exc.__traceback__)[-1]
+    check("KIS_ACCOUNT_READ_FAILED", False,
+          f"{type(exc).__name__}: {exc} (at line {_where.lineno}: {_where.line})")
 
 for name, ok, detail in results:
     print(f"{'OK' if ok else 'BAD'}::{name}::{detail}")
