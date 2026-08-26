@@ -189,7 +189,7 @@ def all_clear(monkeypatch):
     # Pinned here so the whole class stays deterministic: left to the
     # real clock, every test below would depend on the session the
     # suite happens to run in.
-    monkeypatch.setattr(bootstrap, "_order_session", lambda: "REGULAR")
+    monkeypatch.setattr(bootstrap, "_order_session", lambda *a, **k: "REGULAR")
     monkeypatch.setattr(bootstrap.freshness, "evaluate", lambda: types.SimpleNamespace(age_seconds=1.0))
     monkeypatch.setattr(bootstrap.ops_kill_switch, "is_halted", lambda: False)
     monkeypatch.setattr(bootstrap.ops_kill_switch, "is_entry_allowed", lambda: True)
@@ -515,7 +515,7 @@ class TestEachPreconditionBlocksOnItsOwn:
         right now". A session S6 may not order in, or one KIS defines
         no endpoint for, blocks -- rather than being served a guessed
         route to an endpoint that is not open at that hour."""
-        all_clear.setattr(bootstrap, "_order_session", lambda: None)
+        all_clear.setattr(bootstrap, "_order_session", lambda *a, **k: None)
         assert bootstrap.NOT_ORDERABLE_SESSION in _recheck()
 
     def test_a_paper_environment_blocks(self, all_clear):

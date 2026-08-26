@@ -272,12 +272,28 @@ class TestBothGatesAgreeAboutArmed:
         "LIVE_BOOTSTRAP_ACK": "true",
     }
 
-    def test_the_mint_succeeds_on_an_armed_deployment(self):
+    def test_the_mint_succeeds_on_an_armed_deployment(self, monkeypatch):
+        """The session is pinned rather than read from the clock: minting
+        is a question about posture and evidence, and this test must not
+        pass or fail depending on which session the suite runs in."""
+        from config import session_capability
         from execution import bootstrap_capability as bc
 
+        monkeypatch.setattr(session_capability, "route_session",
+                            lambda **_k: "OVERNIGHT_DAYTIME")
         cap = bc.mint(symbol="IBN", allowed_symbols={"IBN"}, env=self.ARMED_ENV)
         assert cap.mode == bc.MODE_LIMITED_LIVE_BOOTSTRAP
         assert cap.symbol == "IBN" and cap.quantity == 1 and cap.side == "buy"
+
+    def test_a_session_with_no_route_gets_no_armed_exemption(self, monkeypatch):
+        """PREMARKET and AFTER_HOURS have no KIS order route at all, so
+        there is nothing a bootstrap could confirm in them."""
+        from config import session_capability
+        from execution import bootstrap_capability as bc
+
+        monkeypatch.setattr(session_capability, "route_session", lambda **_k: None)
+        with pytest.raises(bc.BootstrapCapabilityError):
+            bc.mint(symbol="IBN", allowed_symbols={"IBN"}, env=self.ARMED_ENV)
 
     def test_the_two_gates_share_one_predicate(self):
         """Two copies of a rule are two chances to fix only one."""

@@ -294,8 +294,16 @@ def working_tree_dirty():
 # The safety re-check
 # ---------------------------------------------------------------------
 
-def _order_session():
-    """The session a real order may be routed into right now, or None.
+def _order_session(now=None):
+    """The session a real order may be routed into at `now`, or None.
+
+    `now` is threaded rather than read from the wall clock because every
+    other time-dependent decision on this path is. A caller that passes
+    an explicit moment -- the re-check, the order builder, every test --
+    must have the session resolved against THAT moment, or the order is
+    checked against one session and addressed to another. Reading the
+    clock here also made the test suite pass or fail depending on which
+    session it happened to run in.
 
     None means "no order may be placed in this session", which every
     caller treats as a refusal. It never falls back to REGULAR: that
@@ -314,7 +322,7 @@ def _order_session():
     from config import s6_sessions, session_capability
 
     return session_capability.order_session(
-        strategy_id=s6_sessions.STRATEGY_ID)
+        now=now, strategy_id=s6_sessions.STRATEGY_ID)
 
 
 def _route_awaiting_live_evidence(session):
@@ -377,7 +385,7 @@ def final_safety_recheck(*, broker, conn, rollout, order_intent, now, env=None):
     # posture (as before) OR when it is ARMED and THIS session's route is
     # still awaiting live evidence. Anything weaker than ARMED without
     # the bootstrap flag is still refused.
-    session_for_posture = _order_session()
+    session_for_posture = _order_session(now=now)
     armed_with_unconfirmed_route = (
         decision.posture == posture_mod.POSTURE_ARMED
         and session_for_posture is not None
@@ -405,7 +413,7 @@ def final_safety_recheck(*, broker, conn, rollout, order_intent, now, env=None):
     # order route for it (`ROUTED_SESSIONS`). A session missing either is
     # refused here rather than served a guessed endpoint.
     try:
-        if _order_session() is None:
+        if _order_session(now=now) is None:
             reasons.append(NOT_ORDERABLE_SESSION)
     except Exception:  # noqa: BLE001
         logger.exception("bootstrap: market session unreadable")
@@ -725,7 +733,7 @@ def run_bootstrap_buy(*, broker, conn, rollout=None, now=None, env=None, source=
     # gate's session verdict -- so the session an order is checked
     # against is the same one it is addressed to. Two independent reads
     # could straddle a session boundary and disagree.
-    order_session = _order_session()
+    order_session = _order_session(now=current)
     if order_session is None:
         raise BootstrapBlocked(
             "no KIS order route is available for the current session",
