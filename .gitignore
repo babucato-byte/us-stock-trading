@@ -33,3 +33,4 @@ state/
 TRADING_STATE.db
 TRADING_STATE.db-wal
 TRADING_STATE.db-shm
+.claude/settings.local.json

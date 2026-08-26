@@ -116,6 +116,9 @@ POSTURE_NOT_BOOTSTRAP = "POSTURE_NOT_LIMITED_LIVE_BOOTSTRAP"
 BOOTSTRAP_ACK_MISSING = "BOOTSTRAP_ACK_MISSING"
 KIS_ENV_NOT_LIVE = "KIS_ENV_NOT_LIVE"
 NOT_REGULAR_SESSION = "NOT_REGULAR_SESSION"
+#: No KIS order route is available for the session we are actually in --
+#: either S6 may not order in it, or KIS defines no endpoint for it.
+NOT_ORDERABLE_SESSION = "NOT_ORDERABLE_SESSION"
 COMMIT_MISMATCH = "COMMIT_MISMATCH"
 WORKING_TREE_DIRTY = "WORKING_TREE_DIRTY"
 RECONCILIATION_NOT_USABLE = "RECONCILIATION_NOT_USABLE"
@@ -292,6 +295,46 @@ def working_tree_dirty():
 # The safety re-check
 # ---------------------------------------------------------------------
 
+def _order_session():
+    """The session a real order may be routed into right now, or None.
+
+    None means "no order may be placed in this session", which every
+    caller treats as a refusal. It never falls back to REGULAR: that
+    fallback is exactly how an order reaches an endpoint that is not
+    open at the hour it is sent.
+    """
+    from brokers.kis_broker import ROUTED_SESSIONS
+    from config import s6_sessions
+    from scanners.base import scan_session
+
+    session = scan_session.session_at()
+    if session is None:
+        return None
+    name = str(session).strip().upper()
+    if not s6_sessions.orders_allowed(name):
+        return None
+    if name not in ROUTED_SESSIONS:
+        return None
+    return name
+
+
+def _route_awaiting_live_evidence(session):
+    """Does THIS session's KIS route still lack a live response?
+
+    What decides whether a bootstrap is still meaningful is the route's
+    evidence, not the deployment's posture. The regular five and the
+    daytime five are separate sets against separate endpoints, so
+    confirming one says nothing about the other -- which is why the
+    posture is asked about a SESSION rather than in general.
+    """
+    from brokers import kis_broker as kb
+
+    posture = (kb.REQUIRED_FOR_DAYTIME
+               if str(session).strip().upper() == "OVERNIGHT_DAYTIME"
+               else kb.REQUIRED_FOR_ARMED)
+    return bool(list(kb.pending_items_for(posture)))
+
+
 def final_safety_recheck(*, broker, conn, rollout, order_intent, now, env=None):
     """Every precondition, re-read from live sources, returned as reason
     codes. An empty list means "safe to send this exact order right now".
@@ -319,7 +362,25 @@ def final_safety_recheck(*, broker, conn, rollout, order_intent, now, env=None):
 
     # -- posture and the explicit human acknowledgement
     decision = posture_mod.resolve_posture(mapping)
-    if not decision.bootstrap:
+    # ARMED is not a reason to refuse a bootstrap. `resolve_posture`
+    # returns ARMED whenever the three live flags are set, and returns
+    # LIMITED_LIVE_BOOTSTRAP only while they are not -- so on an armed
+    # deployment `decision.bootstrap` is False and this one-shot became
+    # unreachable. That is backwards for the case that matters: a route
+    # whose wire values have never been confirmed by a live response
+    # needs the bootstrap MORE, not less, and the general path must not
+    # be the thing that first touches it.
+    #
+    # So a bootstrap is permitted when the deployment is in bootstrap
+    # posture (as before) OR when it is ARMED and THIS session's route is
+    # still awaiting live evidence. Anything weaker than ARMED without
+    # the bootstrap flag is still refused.
+    session_for_posture = _order_session()
+    armed_with_unconfirmed_route = (
+        decision.posture == posture_mod.POSTURE_ARMED
+        and session_for_posture is not None
+        and _route_awaiting_live_evidence(session_for_posture))
+    if not decision.bootstrap and not armed_with_unconfirmed_route:
         reasons.append(POSTURE_NOT_BOOTSTRAP)
     if flag(FLAG_BOOTSTRAP_ACK).lower() != "true":
         reasons.append(BOOTSTRAP_ACK_MISSING)
@@ -327,12 +388,26 @@ def final_safety_recheck(*, broker, conn, rollout, order_intent, now, env=None):
         reasons.append(KIS_ENV_NOT_LIVE)
 
     # -- market session
+    #
+    # Not "is it REGULAR" any more. That question was a stand-in for the
+    # one that matters -- "can a real S6 order be routed right now?" --
+    # and the two stopped agreeing once S6 became live in
+    # OVERNIGHT_DAYTIME as well. Pinning the bootstrap to REGULAR meant
+    # the daytime route could never be exercised at all, because the one
+    # mechanism built to capture a live response refused to run in the
+    # only session that reaches that endpoint.
+    #
+    # Both conditions are required and neither implies the other: the
+    # strategy must be permitted to order in this session
+    # (`s6_sessions.orders_allowed`), and KIS must actually define an
+    # order route for it (`ROUTED_SESSIONS`). A session missing either is
+    # refused here rather than served a guessed endpoint.
     try:
-        if pso.get_us_market_session() != "regular":
-            reasons.append(NOT_REGULAR_SESSION)
+        if _order_session() is None:
+            reasons.append(NOT_ORDERABLE_SESSION)
     except Exception:  # noqa: BLE001
         logger.exception("bootstrap: market session unreadable")
-        reasons.append(NOT_REGULAR_SESSION)
+        reasons.append(NOT_ORDERABLE_SESSION)
 
     # -- release identity
     head = head_commit()
@@ -644,6 +719,17 @@ def run_bootstrap_buy(*, broker, conn, rollout=None, now=None, env=None, source=
             reason_codes=("ACCOUNT_UNCONFIGURED",),
         )
 
+    # Resolved ONCE, here, and used for both the order's route and the
+    # gate's session verdict -- so the session an order is checked
+    # against is the same one it is addressed to. Two independent reads
+    # could straddle a session boundary and disagree.
+    order_session = _order_session()
+    if order_session is None:
+        raise BootstrapBlocked(
+            "no KIS order route is available for the current session",
+            reason_codes=(NOT_ORDERABLE_SESSION,),
+        )
+
     candidate = select_candidate(
         broker=broker, rollout=rollout, deployed_commit=deployed_commit, now=current,
         source=source,
@@ -663,6 +749,12 @@ def run_bootstrap_buy(*, broker, conn, rollout=None, now=None, env=None, source=
             order_type=BOOTSTRAP_ORDER_TYPE,
             limit_price=candidate.limit_price,
             stop_price=None, target_price=None, created_at=current,
+            # The route follows the ORDER, not the process. Without this
+            # the broker fell back to its `_session_hint` class default
+            # of "REGULAR" and a daytime order was addressed to the
+            # regular endpoint -- open at neither the right hour nor the
+            # right TR family.
+            session=order_session,
         )
     except OrderIntentError as exc:
         raise BootstrapBlocked(
@@ -718,7 +810,12 @@ def run_bootstrap_buy(*, broker, conn, rollout=None, now=None, env=None, source=
             deployed_commit=deployed_commit,
             kis_account_no=account_id, allowed_account_no=account_id,
             order_intent=order_intent, instrument=candidate.instrument,
-            signal=candidate.signal, is_regular_session=True,
+            # Was hardcoded True, which made the shared gate's session
+            # check unfalsifiable for this path -- the one caller that
+            # most needed it. It now states what was actually measured:
+            # a session S6 may order in AND that KIS routes.
+            signal=candidate.signal,
+            is_regular_session=order_session is not None,
             kis_price_usd=candidate.kis_price_usd,
             max_price_deviation_percent=rollout.max_price_deviation_percent,
             usd_orderable_cash=candidate.orderable_usd,

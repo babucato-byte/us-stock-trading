@@ -40,6 +40,21 @@ class OrderIntent:
     stop_price: Optional[float]
     target_price: Optional[float]
     created_at: datetime
+    #: The US market session this order is being placed INTO.
+    #:
+    #: KIS routes the regular session and daytime trading to different
+    #: endpoints with different TR families, and `brokers/kis_broker.py`
+    #: already reads this field first when resolving the route -- it
+    #: simply never had it, so every order fell back to the broker's
+    #: `_session_hint` class default of "REGULAR". An S6 order placed in
+    #: OVERNIGHT_DAYTIME was therefore addressed to the regular endpoint,
+    #: which does not run at that hour.
+    #:
+    #: Optional, and None keeps the previous behaviour exactly (the
+    #: broker falls back to its hint), so no existing caller changes
+    #: meaning by gaining the field. A caller that knows its session says
+    #: so, and the route follows the order rather than the process.
+    session: Optional[str] = None
 
     def __post_init__(self):
         for field_name in ("internal_order_id", "signal_id", "strategy_id", "symbol", "exchange"):
@@ -70,3 +85,11 @@ class OrderIntent:
                 raise OrderIntentError(f"{name} must be a positive finite number or None, got {value!r}")
         if not isinstance(self.created_at, datetime) or self.created_at.tzinfo is None:
             raise OrderIntentError("created_at must be a timezone-aware datetime")
+        # Blank is not None. None means "this caller does not know the
+        # session, use the broker default"; an empty string means a
+        # caller COMPUTED one and got nothing, which on an order path is
+        # a fault that must not quietly resolve to the regular route.
+        if self.session is not None and (
+                not isinstance(self.session, str) or not self.session.strip()):
+            raise OrderIntentError(
+                f"session must be a non-empty string or None, got {self.session!r}")

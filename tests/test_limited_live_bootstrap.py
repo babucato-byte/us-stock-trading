@@ -184,7 +184,12 @@ def all_clear(monkeypatch):
     order. Individual tests break exactly one of them."""
     monkeypatch.setattr(bootstrap, "head_commit", lambda: "abc123")
     monkeypatch.setattr(bootstrap, "working_tree_dirty", lambda: False)
-    monkeypatch.setattr(bootstrap.pso, "get_us_market_session", lambda: "regular")
+    # The re-check no longer asks `pso.get_us_market_session`; it asks
+    # `_order_session()` -- "can a real order be routed right now".
+    # Pinned here so the whole class stays deterministic: left to the
+    # real clock, every test below would depend on the session the
+    # suite happens to run in.
+    monkeypatch.setattr(bootstrap, "_order_session", lambda: "REGULAR")
     monkeypatch.setattr(bootstrap.freshness, "evaluate", lambda: types.SimpleNamespace(age_seconds=1.0))
     monkeypatch.setattr(bootstrap.ops_kill_switch, "is_halted", lambda: False)
     monkeypatch.setattr(bootstrap.ops_kill_switch, "is_entry_allowed", lambda: True)
@@ -505,9 +510,13 @@ class TestEachPreconditionBlocksOnItsOwn:
     def test_a_commit_mismatch_blocks(self, all_clear):
         assert bootstrap.COMMIT_MISMATCH in _recheck({"VALIDATED_COMMIT": "deadbeef"})
 
-    def test_outside_the_regular_session_it_blocks(self, all_clear):
-        all_clear.setattr(bootstrap.pso, "get_us_market_session", lambda: "closed")
-        assert bootstrap.NOT_REGULAR_SESSION in _recheck()
+    def test_a_session_with_no_order_route_blocks(self, all_clear):
+        """Not "is it REGULAR" any more, but "can an order be routed
+        right now". A session S6 may not order in, or one KIS defines
+        no endpoint for, blocks -- rather than being served a guessed
+        route to an endpoint that is not open at that hour."""
+        all_clear.setattr(bootstrap, "_order_session", lambda: None)
+        assert bootstrap.NOT_ORDERABLE_SESSION in _recheck()
 
     def test_a_paper_environment_blocks(self, all_clear):
         assert bootstrap.KIS_ENV_NOT_LIVE in _recheck({"KIS_ENV": "paper"})
