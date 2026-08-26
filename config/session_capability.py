@@ -243,6 +243,49 @@ def order_session(*, now=None, strategy_id=None) -> Optional[str]:
     return cap.session if cap.entry_supported else None
 
 
+def route_awaiting_live_evidence(session) -> bool:
+    """Does THIS session's KIS route still lack a live response?
+
+    The regular five and the daytime five are separate sets against
+    separate endpoints, so confirming one says nothing about the other --
+    which is why the question is asked about a SESSION rather than in
+    general.
+
+    It lives here because two independent gates ask it: the safety
+    re-check inside the order path, and the capability mint one step
+    before the wire. They were written apart and only one of them was
+    taught that ARMED is not a reason to refuse a bootstrap, which left
+    the one-shot reachable through the first gate and refused by the
+    second. Two copies of a rule are two chances to fix only one.
+    """
+    from brokers import kis_broker as kb
+
+    posture = (kb.REQUIRED_FOR_DAYTIME
+               if str(session or "").strip().upper() == "OVERNIGHT_DAYTIME"
+               else kb.REQUIRED_FOR_ARMED)
+    return bool(list(kb.pending_items_for(posture)))
+
+
+def bootstrap_permitted_on_armed(*, now=None) -> bool:
+    """May a one-shot bootstrap run on an ARMED deployment right now?
+
+    `resolve_posture` returns ARMED whenever the three live flags are
+    set, and LIMITED_LIVE_BOOTSTRAP only while they are not -- so on an
+    armed deployment a posture-equality check makes the bootstrap
+    unreachable. That is backwards for the case that matters: a route
+    whose wire values have never been confirmed by a live response needs
+    the bootstrap MORE, not less, and the general path must not be the
+    thing that first touches it.
+
+    Reaching LIMITED_LIVE_BOOTSTRAP instead by clearing the live flags is
+    not an alternative: those flags are what `evaluate_sell_gate` reads,
+    so turning them off to permit an entry would disable the EXIT of
+    every position already held.
+    """
+    session = route_session(now=now)
+    return session is not None and route_awaiting_live_evidence(session)
+
+
 def route_session(*, now=None) -> Optional[str]:
     """The session an order should be ADDRESSED to right now, or None.
 

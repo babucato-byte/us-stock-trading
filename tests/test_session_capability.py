@@ -255,6 +255,89 @@ class TestTheFourCallersAgree:
         assert "NO_EXIT_ROUTE_FOR_SESSION" in source
 
 
+class TestBothGatesAgreeAboutArmed:
+    """Two gates ask "may a bootstrap run", and only one had been taught
+    that ARMED is not a reason to refuse.
+
+    `final_safety_recheck` inside the order path was fixed; the
+    capability mint one step before the wire was not. So the one-shot
+    passed the first gate and was refused by the second with
+    BOOTSTRAP_CAPABILITY_UNAVAILABLE -- on a live deployment, after every
+    other precondition had passed. The predicate now lives in one place.
+    """
+
+    ARMED_ENV = {
+        "KIS_LIVE_ORDER_ENABLED": "true", "LIVE_ROLLOUT_ENABLED": "true",
+        "ENTRY_DISABLED": "false", "LIVE_BOOTSTRAP_ENABLED": "true",
+        "LIVE_BOOTSTRAP_ACK": "true",
+    }
+
+    def test_the_mint_succeeds_on_an_armed_deployment(self):
+        from execution import bootstrap_capability as bc
+
+        cap = bc.mint(symbol="IBN", allowed_symbols={"IBN"}, env=self.ARMED_ENV)
+        assert cap.mode == bc.MODE_LIMITED_LIVE_BOOTSTRAP
+        assert cap.symbol == "IBN" and cap.quantity == 1 and cap.side == "buy"
+
+    def test_the_two_gates_share_one_predicate(self):
+        """Two copies of a rule are two chances to fix only one."""
+        import inspect
+
+        from execution import bootstrap_capability as bc
+        from live_pilot import bootstrap
+
+        assert "session_capability" in inspect.getsource(bc._check_environment)
+        assert "session_capability" in inspect.getsource(
+            bootstrap._route_awaiting_live_evidence)
+
+    def test_widening_the_posture_did_not_widen_the_acknowledgement(self):
+        """It widens WHICH posture may attempt, never what may be
+        attempted without a deliberate operator action."""
+        from execution import bootstrap_capability as bc
+
+        for flag in ("LIVE_BOOTSTRAP_ACK", "LIVE_BOOTSTRAP_ENABLED"):
+            env = dict(self.ARMED_ENV, **{flag: "false"})
+            with pytest.raises(bc.BootstrapCapabilityError):
+                bc.mint(symbol="IBN", allowed_symbols={"IBN"}, env=env)
+
+    def test_an_allow_list_of_other_than_one_is_still_refused(self):
+        from execution import bootstrap_capability as bc
+
+        for allowed in (frozenset(), frozenset({"IBN", "SLF"})):
+            with pytest.raises(bc.BootstrapCapabilityError):
+                bc.mint(symbol="IBN", allowed_symbols=allowed, env=self.ARMED_ENV)
+
+    def test_a_confirmed_route_gets_no_armed_exemption(self, monkeypatch):
+        """The exemption is for a route with unconfirmed wire values. A
+        route that has them all is not a bootstrap's business, and on an
+        armed deployment it must fall back to being refused."""
+        from config import session_capability
+        from execution import bootstrap_capability as bc
+
+        monkeypatch.setattr(session_capability,
+                            "route_awaiting_live_evidence", lambda _s: False)
+        with pytest.raises(bc.BootstrapCapabilityError) as excinfo:
+            bc.mint(symbol="IBN", allowed_symbols={"IBN"}, env=self.ARMED_ENV)
+        assert "unconfirmed wire values" in str(excinfo.value)
+
+    def test_the_evidence_sets_are_asked_per_session(self):
+        from config import session_capability as scap
+
+        assert scap.route_awaiting_live_evidence("OVERNIGHT_DAYTIME") is True
+        assert scap.route_awaiting_live_evidence("REGULAR") is True
+
+    def test_clearing_the_live_flags_is_not_the_alternative(self):
+        """Reaching LIMITED_LIVE_BOOTSTRAP by turning the live flags off
+        would disable the EXIT of every position already held --
+        `evaluate_sell_gate` reads `live_order_enabled`."""
+        import inspect
+
+        from execution import order_gate
+
+        assert "live_order_enabled" in inspect.getsource(
+            order_gate.evaluate_sell_gate)
+
+
 class TestStrategyEntryPolicy:
     def test_s1_entry_is_disabled_and_s6_is_enabled(self):
         from config import strategy_entry_policy as sep

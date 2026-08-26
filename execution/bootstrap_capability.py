@@ -99,9 +99,37 @@ def _check_environment(mapping):
     from live_pilot import posture as posture_mod
 
     decision = posture_mod.resolve_posture(mapping)
+    # ARMED is not a reason to refuse a bootstrap.
+    #
+    # This check and the one in `live_pilot.bootstrap.
+    # final_safety_recheck` are two gates asking the same question, and
+    # only the other one had been taught that -- so the one-shot passed
+    # the safety re-check and was then refused here, one step before the
+    # wire, on an armed deployment. `resolve_posture` returns ARMED
+    # whenever the three live flags are set and LIMITED_LIVE_BOOTSTRAP
+    # only while they are not, so a posture-equality test makes the
+    # bootstrap unreachable exactly where it is most needed: a route
+    # whose wire values have never been confirmed by a live response.
+    #
+    # Reaching LIMITED_LIVE_BOOTSTRAP by clearing the live flags is not
+    # an alternative. Those flags are what `evaluate_sell_gate` reads, so
+    # turning them off to permit one entry would disable the EXIT of
+    # every position already held.
+    #
+    # The shared predicate is in `config.session_capability` so the two
+    # gates cannot drift apart again. LIVE_BOOTSTRAP_ENABLED and the
+    # acknowledgement below are still required either way -- this widens
+    # WHICH posture may attempt, never what may be attempted without a
+    # deliberate operator action.
     if decision.posture != MODE_LIMITED_LIVE_BOOTSTRAP:
-        raise BootstrapCapabilityError(
-            f"posture is {decision.posture!r}, not {MODE_LIMITED_LIVE_BOOTSTRAP}")
+        from config import session_capability
+
+        if not (decision.posture == posture_mod.POSTURE_ARMED
+                and session_capability.bootstrap_permitted_on_armed()):
+            raise BootstrapCapabilityError(
+                f"posture is {decision.posture!r}, not {MODE_LIMITED_LIVE_BOOTSTRAP}, "
+                "and this session's route has no unconfirmed wire values that a "
+                "bootstrap could resolve")
     if not _env_true(mapping, FLAG_BOOTSTRAP_ENABLED):
         raise BootstrapCapabilityError(f"{FLAG_BOOTSTRAP_ENABLED} is not true")
     if not _env_true(mapping, FLAG_BOOTSTRAP_ACK):

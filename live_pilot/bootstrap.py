@@ -325,13 +325,16 @@ def _route_awaiting_live_evidence(session):
     daytime five are separate sets against separate endpoints, so
     confirming one says nothing about the other -- which is why the
     posture is asked about a SESSION rather than in general.
-    """
-    from brokers import kis_broker as kb
 
-    posture = (kb.REQUIRED_FOR_DAYTIME
-               if str(session).strip().upper() == "OVERNIGHT_DAYTIME"
-               else kb.REQUIRED_FOR_ARMED)
-    return bool(list(kb.pending_items_for(posture)))
+    Delegated to `config.session_capability` because the capability mint
+    one step before the wire asks the same question, and when the two
+    were written apart only this one was taught that ARMED is not a
+    reason to refuse. Two copies of a rule are two chances to fix only
+    one of them.
+    """
+    from config import session_capability
+
+    return session_capability.route_awaiting_live_evidence(session)
 
 
 def final_safety_recheck(*, broker, conn, rollout, order_intent, now, env=None):
