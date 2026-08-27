@@ -130,6 +130,13 @@ UNKNOWN_RECONCILIATION_LINE = "RECONCILIATION_REQUIRED=true"
 
 _TEST_PREFIX = "[TEST]"
 
+# A validation order is REAL money placed to prove a route works, not a
+# simulation. It must not be filed under [TEST] -- an operator who reads
+# "TEST" and looks away has been told the wrong thing about an order that
+# can lose money -- and it must not read as ordinary strategy traffic
+# either, because nobody's strategy chose it.
+_VALIDATION_PREFIX = "[VALIDATION]"
+
 # Every message this module produces is real money on a real account, and
 # it shares an operator's screen with Alpaca paper traffic. The prefix is
 # how that distinction survives a glance at a phone notification.
@@ -213,13 +220,18 @@ def _mirror_to_monitor(event, fields):
                        exc_info=True)
 
 
-def _format(event, fields, *, test=False):
+def _format(event, fields, *, test=False, validation=False):
     """`[KIS LIVE] [EVENT]` headline plus one `- key: value` line per field.
 
     Field ORDER is the caller's; dicts preserve insertion order, and the
     payload contracts put the operationally important values first.
     """
-    prefix = f"{_TEST_PREFIX}" if test else ""
+    if validation:
+        prefix = _VALIDATION_PREFIX
+    elif test:
+        prefix = _TEST_PREFIX
+    else:
+        prefix = ""
     is_urgent = event in URGENT_EVENTS
     tag = KIS_LIVE_CRITICAL_PREFIX if is_urgent else KIS_LIVE_PREFIX
     urgent = ":rotating_light: " if is_urgent else ""
@@ -264,7 +276,8 @@ def _sender_for(event):
     return slack_utils.send_kis_live_message
 
 
-def notify(event, fields=None, *, test=False, send_fn=None, track_health=True):
+def notify(event, fields=None, *, test=False, validation=False,
+           send_fn=None, track_health=True):
     """Send one lifecycle event. Never raises. Return value is delivery
     status only and must not influence trading.
 
@@ -276,7 +289,7 @@ def notify(event, fields=None, *, test=False, send_fn=None, track_health=True):
             logger.error("unknown live notification event %r; not sent", event)
             return False
         safe = redact_value(dict(fields or {}))
-        message = _format(event, safe, test=test)
+        message = _format(event, safe, test=test, validation=validation)
     except Exception:  # noqa: BLE001 -- a formatting bug must not reach trading
         logger.exception("could not format live notification %s", event)
         return False
