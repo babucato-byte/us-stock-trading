@@ -174,9 +174,34 @@ class TestTheWireValuesAreNotSelfCertified:
                 "daytime_order_tr_id_live_sell", "daytime_cancel_path",
                 "daytime_cancel_tr_id_live"} <= names
 
-    def test_none_of_them_claims_a_live_response(self):
-        from brokers.kis_broker import LIVE_RESPONSE_PENDING, VERIFICATION_MATRIX
+    def test_a_daytime_claim_must_cite_a_daytime_order(self):
+        """Self-certification is the failure this guards.
+
+        The daytime values were all PENDING until S6 exited DT through
+        /trading/daytime-order with TTTS6037U on 2026-08-27. A value may
+        now be CONFIRMED, but only by naming the order that confirmed it
+        -- never from documentation, and never from another route's
+        response.
+        """
+        from brokers.kis_broker import (
+            LIVE_RESPONSE_CONFIRMED, LIVE_RESPONSE_PENDING, VERIFICATION_MATRIX,
+        )
 
         for wire in VERIFICATION_MATRIX:
-            if wire.name.startswith("daytime_"):
-                assert wire.live_status == LIVE_RESPONSE_PENDING, wire.name
+            if not wire.name.startswith("daytime_"):
+                continue
+            assert wire.live_status in (LIVE_RESPONSE_PENDING,
+                                        LIVE_RESPONSE_CONFIRMED), wire.name
+            if wire.live_status == LIVE_RESPONSE_CONFIRMED:
+                assert "odno=" in wire.source, wire.name
+                assert "examples_" not in wire.source, wire.name
+
+    def test_the_unexercised_daytime_legs_stay_pending(self):
+        """TTTS6036U has never carried a buy; TTTS6038U has never carried
+        a cancel. Neither is implied by the sell."""
+        from brokers.kis_broker import LIVE_RESPONSE_PENDING, VERIFICATION_MATRIX
+
+        by_name = {w.name: w for w in VERIFICATION_MATRIX}
+        for name in ("daytime_order_tr_id_live_buy", "daytime_cancel_path",
+                     "daytime_cancel_tr_id_live"):
+            assert by_name[name].live_status == LIVE_RESPONSE_PENDING, name

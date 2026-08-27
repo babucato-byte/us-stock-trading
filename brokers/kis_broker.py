@@ -410,6 +410,21 @@ class WireValueVerification(NamedTuple):
 #: nothing about the DAYTIME family: different endpoint, different TR
 #: family, and its five stay LIVE_RESPONSE_PENDING until a real daytime
 #: response of its own.
+#: The one live response the DAYTIME family has produced.
+#:
+#: S6 exited DT in OVERNIGHT_DAYTIME on 2026-08-27: the order was built
+#: for the DAYTIME family, addressed to /trading/daytime-order with
+#: TTTS6037U, accepted as 0000001014 and filled 1 @ 51.61.
+#:
+#: It confirms the PATH and the SELL TR, and those only. TTTS6036U has
+#: never carried a buy and TTTS6038U has never carried a cancel; marking
+#: either from this would be asserting a wire value that nothing has
+#: exercised, which is precisely what this matrix exists to prevent.
+DAYTIME_SELL_EVIDENCE = (
+    "LIVE 2026-08-27 OVERNIGHT_DAYTIME: S6 exit of DT -> daytime-order "
+    "TTTS6037U accepted odno=0000001014, filled 1 @ 51.61"
+)
+
 BOOTSTRAP_GENERAL_EVIDENCE = (
     "LIMITED LIVE bootstrap 2026-08-26 PREMARKET: BUY TPG qty=1 @52.88 "
     "-> ACCEPTED odno=0030661086 (NASD, 매수, ft_ord_qty=1, "
@@ -470,8 +485,8 @@ VERIFICATION_MATRIX = (
     # mistaken for "the wire has been exercised".
     WireValueVerification(
         "daytime_order_path", DAYTIME_ORDER_PATH, REFERENCE_VERIFIED,
-        LIVE_RESPONSE_PENDING,
-        "examples_llm/overseas_stock/daytime_order/daytime_order.py",
+        LIVE_RESPONSE_CONFIRMED,
+        DAYTIME_SELL_EVIDENCE,
         required_for=_DAYTIME_ONLY,
     ),
     WireValueVerification(
@@ -482,8 +497,8 @@ VERIFICATION_MATRIX = (
     ),
     WireValueVerification(
         "daytime_order_tr_id_live_sell", TR_ID_DAYTIME_ORDER_US[("live", "sell")],
-        REFERENCE_VERIFIED, LIVE_RESPONSE_PENDING,
-        "examples_llm/overseas_stock/daytime_order/daytime_order.py",
+        REFERENCE_VERIFIED, LIVE_RESPONSE_CONFIRMED,
+        DAYTIME_SELL_EVIDENCE,
         required_for=_DAYTIME_ONLY,
     ),
     WireValueVerification(

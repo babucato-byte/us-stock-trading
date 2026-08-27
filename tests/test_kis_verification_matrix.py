@@ -223,10 +223,12 @@ class TestRunbookMatchesTheMatrix:
         still pending -- see the paper-scope test below."""
         assert set(kis_broker.pending_items_for(kis_broker.REQUIRED_FOR_ARMED)) == set()
         assert kis_broker.pending_items_for(kis_broker.REQUIRED_FOR_OBSERVE) == ()
-        # The daytime family is a separate gate and is still closed.
+        # The daytime family is a separate gate and is still closed:
+        # S6's DT exit confirmed the daytime PATH and SELL TR on
+        # 2026-08-27, but the buy TR and the cancel pair remain
+        # unexercised, so the family as a whole still gates.
         assert set(kis_broker.pending_items_for(kis_broker.REQUIRED_FOR_DAYTIME)) == {
-            "daytime_order_path", "daytime_order_tr_id_live_buy",
-            "daytime_order_tr_id_live_sell", "daytime_cancel_path",
+            "daytime_order_tr_id_live_buy", "daytime_cancel_path",
             "daytime_cancel_tr_id_live",
         }
 

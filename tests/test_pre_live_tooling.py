@@ -462,13 +462,15 @@ class TestLiveAndPaperRequirementsAreSeparate:
 
     def test_armed_waits_on_nothing_now_that_a_response_confirmed_it(self):
         """Those five were the whole outstanding set, and a real BUY and
-        CANCEL confirmed them. DAYTIME keeps its own five."""
+        CANCEL confirmed them. DAYTIME keeps its own, and confirming one
+        family never confirms the other -- S6's DT exit closed the
+        daytime PATH and SELL TR by using them, and left the buy TR and
+        the cancel pair open because nothing has used those."""
         from brokers import kis_broker
 
         assert set(kis_broker.pending_items_for(kis_broker.REQUIRED_FOR_ARMED)) == set()
         assert set(kis_broker.pending_items_for(kis_broker.REQUIRED_FOR_DAYTIME)) == {
-            "daytime_order_path", "daytime_order_tr_id_live_buy",
-            "daytime_order_tr_id_live_sell", "daytime_cancel_path",
+            "daytime_order_tr_id_live_buy", "daytime_cancel_path",
             "daytime_cancel_tr_id_live"}
 
     def test_observe_is_unaffected(self):

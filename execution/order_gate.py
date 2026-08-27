@@ -214,8 +214,75 @@ def evaluate_buy_gate(ctx: BuyGateContext) -> bool:
         ctx.reconciliation, account_id=ctx.kis_account_no,
         symbol=ctx.order_intent.symbol, now=ctx.now,
     )
+    _check_route_evidence(ctx)
     _check_entry_limits(ctx)
     return True
+
+
+#: What KISBroker.submit_order uses when an intent names no session.
+#: Kept in step with `KISBroker._session_hint` -- if that changes, the
+#: gate would otherwise judge a route the order does not take.
+_BROKER_SESSION_FALLBACK = "REGULAR"
+
+#: The candidate's session addresses a KIS route family that has never
+#: produced a live response.
+ROUTE_UNVERIFIED = "ROUTE_UNVERIFIED"
+
+
+def _check_route_evidence(ctx):
+    """Refuse a BUY on a route family no live order has ever exercised.
+
+    The gap this closes
+    -------------------
+    `route_awaiting_live_evidence` existed and was consulted by preflight
+    and by the one-shot bootstrap -- but not by the ordinary live order
+    path. So the DAYTIME family, whose wire values were all
+    LIVE_RESPONSE_PENDING, would have accepted a real BUY on TTTS6036U:
+    a first order sent to prove a route works, placed by a strategy that
+    did not know it was proving anything.
+
+    BUYS ONLY. A sell is deliberately not gated here. Refusing to exit on
+    an unproven route traps a position that the account is already
+    holding, which is a larger risk than the route being unproven -- and
+    §J's rule is that an exit which cannot be routed LATCHES and retries,
+    never that it is abandoned. Reducing exposure on an imperfectly
+    evidenced route beats being unable to reduce it at all.
+
+    Unknown fails closed: a family that cannot be resolved is refused
+    rather than assumed verified.
+    """
+    intent = getattr(ctx, "order_intent", None)
+    if getattr(intent, "side", None) != "buy":
+        return
+    # The route this order will ACTUALLY take. KISBroker.submit_order
+    # falls back to its `_session_hint` (REGULAR) when the intent names
+    # no session, so checking a different session than the one the wire
+    # will use would be checking nothing. Mirrored rather than
+    # re-decided: the gate and the transport must agree about which
+    # route is being judged.
+    session = getattr(intent, "session", None) or _BROKER_SESSION_FALLBACK
+    try:
+        from config import session_capability
+
+        awaiting = session_capability.route_awaiting_live_evidence(session)
+    except Exception as exc:  # noqa: BLE001 - unresolvable is unverified
+        raise OrderGateBlockedError(
+            f"the route family for {session} could not be resolved: {exc}",
+            code=ROUTE_UNVERIFIED) from exc
+    if awaiting:
+        from brokers import kis_broker as kb
+
+        # Named individually so the refusal says WHICH wire value is
+        # unproven -- "the route is unverified" is not actionable, and
+        # the answer differs per leg: on 2026-08-27 the daytime SELL had
+        # live evidence while the BUY TR had none.
+        family = kb.family_for_session(session)
+        pending = sorted(kb.pending_items_for(
+            session_capability.evidence_posture_for_family(family)) or ())
+        raise OrderGateBlockedError(
+            f"the KIS {family} route for {session} has not produced a live "
+            f"response for: {', '.join(pending) or 'one or more wire values'}",
+            code=ROUTE_UNVERIFIED)
 
 
 def _check_entry_limits(ctx):
@@ -356,6 +423,10 @@ BUY_GATE_SEQUENCE = (
     # this one. Both are listed so a report can name whichever refused.
     "EXECUTION_PRICE",
     "CASH", "OPEN_ORDER", "DUPLICATE_SIGNAL", "SYMBOL", "INSTRUMENT", "RECONCILIATION",
+    # Route evidence runs before the position locks and the capacity
+    # caps: a buy addressed to a route no live order has exercised is
+    # refused before anything counts slots for it.
+    ROUTE_UNVERIFIED,
     entry_limits.SYMBOL_ALREADY_HELD, reentry_policy.SAME_DAY_REENTRY_BLOCK,
     entry_limits.MAX_OPEN_POSITIONS, entry_limits.MAX_STRATEGY_POSITIONS,
     entry_limits.MAX_DAILY_ENTRIES,

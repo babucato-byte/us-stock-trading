@@ -1131,12 +1131,33 @@ class TestWireEvidenceIsNeverManufactured:
         different endpoint and a different TR family, and confirming it
         from a general-route response is the same error as confirming
         from documentation -- evidence that does not exist."""
-        from brokers.kis_broker import REQUIRED_FOR_DAYTIME, pending_items_for
+        from brokers import kis_broker as kb
+        from brokers.kis_broker import (
+            BOOTSTRAP_GENERAL_EVIDENCE, LIVE_RESPONSE_CONFIRMED,
+            REQUIRED_FOR_DAYTIME, pending_items_for,
+        )
 
+        # A daytime value may only be confirmed by a DAYTIME response.
+        # S6's exit of DT on 2026-08-27 went through
+        # /trading/daytime-order with TTTS6037U, so the path and the SELL
+        # TR are legitimately confirmed -- by their own route, which is
+        # what this test protects. What must never happen is the general
+        # bootstrap's response being cited for any of them.
+        for entry in kb.VERIFICATION_MATRIX:
+            if not str(entry.name).startswith("daytime_"):
+                continue
+            if entry.live_status != LIVE_RESPONSE_CONFIRMED:
+                continue
+            assert entry.source != BOOTSTRAP_GENERAL_EVIDENCE, entry.name
+            assert "daytime" in entry.source.lower(), entry.name
+            assert "odno=" in entry.source, f"{entry.name} cites no observed order"
+
+        # The legs nothing has exercised stay pending. TTTS6036U has
+        # never carried a buy and TTTS6038U has never carried a cancel,
+        # and neither may be inferred from the sell.
         pending = set(pending_items_for(REQUIRED_FOR_DAYTIME))
         assert pending == {
-            "daytime_order_path", "daytime_order_tr_id_live_buy",
-            "daytime_order_tr_id_live_sell", "daytime_cancel_path",
+            "daytime_order_tr_id_live_buy", "daytime_cancel_path",
             "daytime_cancel_tr_id_live"}
 
     def test_the_bootstrap_does_not_write_to_the_verification_matrix(self):

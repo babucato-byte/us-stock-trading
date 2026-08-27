@@ -55,6 +55,12 @@ def _order_intent(**overrides):
         internal_order_id="ord-1", signal_id="sig-1", strategy_id="S1_HMA_EARLY_TREND_V1",
         symbol="AAPL", exchange="NASDAQ", side="buy", quantity=1, order_type="limit",
         limit_price=100.0, stop_price=95.0, target_price=110.0, created_at=NOW,
+        # Production always stamps the route session on a buy intent
+        # (kis_live_trading passes entry_route_session), and the gate now
+        # refuses a buy whose route family cannot be established. A
+        # fixture without one would be testing a shape that never
+        # reaches the wire.
+        session="REGULAR",
     )
     kwargs.update(overrides)
     return OrderIntent(**kwargs)

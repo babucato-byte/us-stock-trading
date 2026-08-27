@@ -25,6 +25,7 @@ import sys
 import pytest
 
 from execution import entry_limits as entry_limits_module
+from execution import order_gate as _order_gate_module
 from execution import reentry_policy as _reentry_policy_module
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -226,7 +227,17 @@ class TestGateSequenceMatchesTheGate:
             if getattr(node.func, "id", None) != "OrderGateBlockedError":
                 continue
             for keyword in node.keywords:
-                if keyword.arg != "code" or not isinstance(keyword.value, ast.Attribute):
+                if keyword.arg != "code":
+                    continue
+                # A code defined in order_gate itself is a bare Name, not
+                # a module attribute. Resolving only Attributes silently
+                # dropped ROUTE_UNVERIFIED, which is exactly the drift
+                # this test exists to catch.
+                if isinstance(keyword.value, ast.Name):
+                    codes.append((keyword.value.lineno,
+                                  getattr(_order_gate_module, keyword.value.id)))
+                    continue
+                if not isinstance(keyword.value, ast.Attribute):
                     continue
                 module_name = getattr(keyword.value.value, "id", None)
                 module = _GATE_CODE_MODULES.get(module_name)
@@ -261,7 +272,13 @@ class TestGateSequenceMatchesTheGate:
         # further stage of getting there.
         state_faults = {entry_limits_module.POSITION_LIMIT_STATE_UNKNOWN,
                         entry_limits_module.STRATEGY_ATTRIBUTION_UNKNOWN}
-        caps = self._helper_codes_in_source_order("_check_entry_limits")
+        # Route evidence runs before the capacity checks and raises from
+        # its own helper, so its code is collected the same way rather
+        # than being hand-added here -- a second helper that the gate
+        # calls must show up in this sequence or the probe would report
+        # "how far did this get" against a stage it cannot see.
+        route = self._helper_codes_in_source_order("_check_route_evidence")
+        caps = route + self._helper_codes_in_source_order("_check_entry_limits")
         deduped_caps = []
         for code in caps:
             if code in state_faults:
