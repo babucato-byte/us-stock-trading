@@ -86,6 +86,23 @@ def _env_float(env, name, default):
 
 
 def _env_symbol_set(env, name, default):
+    """Parse a symbol allow-list, keeping UNSET and EMPTY distinct.
+
+    The distinction is the whole safety property, so it is preserved
+    rather than collapsed:
+
+    * variable ABSENT -> `default` (None) -- no operator symbol
+      restriction. This is the NORMAL LIVE posture: what a strategy may
+      buy is decided by the scanner and the execution gates, not by a
+      hand-maintained list.
+    * variable SET BUT EMPTY -> `frozenset()` -- deny everything. An
+      operator who blanks the value is asking for a hard stop, and a
+      truncated or half-written env file reads this way too.
+
+    Collapsing the two would make a failed env load mean "every symbol
+    is permitted", which is the one reading a missing file must never
+    have.
+    """
     value = env.get(name)
     if value is None:
         return default
@@ -95,8 +112,10 @@ def _env_symbol_set(env, name, default):
 @dataclass(frozen=True)
 class LiveRolloutConfig:
     enabled: bool
-    allowed_symbols: FrozenSet[str]
-    max_quantity_per_order: int
+    #: None = no operator symbol restriction (NORMAL LIVE default).
+    #: An empty frozenset is NOT the same thing -- it denies everything.
+    allowed_symbols: Optional[FrozenSet[str]]
+    max_quantity_per_order: Optional[int]
     max_open_positions: Optional[int]
     #: The cap EACH live strategy gets inside `max_open_positions`.
     #:
@@ -123,8 +142,10 @@ class LiveRolloutConfig:
         mapping = env if env is not None else os.environ
         return cls(
             enabled=_env_bool(mapping, "LIVE_ROLLOUT_ENABLED", False),
-            allowed_symbols=_env_symbol_set(mapping, "LIVE_ROLLOUT_ALLOWED_SYMBOLS", frozenset()),
-            max_quantity_per_order=_env_int(mapping, "LIVE_ROLLOUT_MAX_QUANTITY", 1),
+            allowed_symbols=_env_symbol_set(
+                mapping, "LIVE_ROLLOUT_ALLOWED_SYMBOLS", None),
+            max_quantity_per_order=_env_optional_int(
+                mapping, "LIVE_ROLLOUT_MAX_QUANTITY"),
             max_open_positions=_env_optional_int(
                 mapping, "LIVE_ROLLOUT_MAX_POSITIONS"),
             max_positions_per_strategy=_env_optional_int(
@@ -146,14 +167,11 @@ class LiveRolloutConfig:
         """Raises LiveRolloutConfigError on any structurally-unsafe
         combination. Called by the pipeline before every entry attempt
         (fail-closed re-validation, not just at process startup)."""
-        if isinstance(self.max_quantity_per_order, bool) or not isinstance(self.max_quantity_per_order, int) \
-                or self.max_quantity_per_order < 1:
-            raise LiveRolloutConfigError(f"max_quantity_per_order must be a positive int, got {self.max_quantity_per_order!r}")
         # None means "not enforced". A SET value is still validated
         # exactly as before: an operator who chose a cap must get the
         # cap they chose, and a malformed one must never read as absent.
         for name in ("max_open_positions", "max_positions_per_strategy",
-                     "max_daily_entries"):
+                     "max_daily_entries", "max_quantity_per_order"):
             value = getattr(self, name)
             if value is None:
                 continue

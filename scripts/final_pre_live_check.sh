@@ -79,10 +79,14 @@ check_limit() {
         fail "${name}_NOT_${expected}" "got '${actual:-<unset>}'"
     fi
 }
-# Per-ORDER quantity stays pinned at 1. It is not a LIMITED_LIVE count:
-# whole-share, one share per order is the operating rule, and it is the
-# number that bounds what a single mistake can cost.
-check_limit LIVE_ROLLOUT_MAX_QUANTITY 1
+# Per-ORDER quantity is no longer pinned at 1.
+#
+# It was the last LIMITED_LIVE count. With it set, `min(affordable, cap)`
+# made every order one share regardless of cash, so variable sizing could
+# never take effect. What bounds a single mistake is unchanged and is not
+# this number: whole-share-only (fractional off), no margin, no leverage,
+# and orderable cash. A ceiling an operator DOES set is still honoured
+# and sanity-checked below; requiring the value 1 is a test posture.
 
 # The three COUNT caps were LIMITED_LIVE scaffolding -- 1 position per
 # strategy, 1 entry per day, 1 or 2 overall -- so the first real orders
@@ -93,7 +97,7 @@ check_limit LIVE_ROLLOUT_MAX_QUANTITY 1
 # an operator DOES set is still checked for sanity, because a malformed
 # one must never read as "no cap".
 for _cap in LIVE_ROLLOUT_MAX_POSITIONS LIVE_ROLLOUT_MAX_POSITIONS_PER_STRATEGY \
-            LIVE_ROLLOUT_MAX_DAILY_ENTRIES; do
+            LIVE_ROLLOUT_MAX_DAILY_ENTRIES LIVE_ROLLOUT_MAX_QUANTITY; do
     _value="$(eval "printf '%s' \"\${${_cap}:-}\"")"
     if [ -z "${_value}" ]; then
         info "${_cap}=<unset> (capacity bounded by cash, the per-symbol lock, same-day re-entry, ownership and reconciliation)"
@@ -121,17 +125,31 @@ else
         "per_strategy=${PER_STRATEGY_MAX} global=${GLOBAL_MAX}"
 fi
 
-# The one symbol a first limited-live order may touch. Empty is the
-# correct read-only posture AND a hard block on going live.
+# ABSENT, SET-BUT-EMPTY and SET are three different instructions, read
+# here exactly as config/live_rollout_config.py reads them.
+#
+# "Exactly one symbol" was how LIMITED_LIVE pinned trading to a
+# hand-picked ticker -- and it stayed pinned to DT long after that test
+# ended, filtering out every READY candidate before any gate ran. In
+# NORMAL LIVE the BUY target is decided by which candidates reach
+# READY_TO_BUY and clear the execution gate, so an ABSENT list is the
+# expected posture: reported, not failed.
+#
+# SET BUT EMPTY is a block. It denies every symbol, so live trading
+# would be enabled and simultaneously unable to trade -- and that is
+# also what a truncated or half-written env file looks like.
 ALLOWLIST="${LIVE_ROLLOUT_ALLOWED_SYMBOLS:-}"
 ALLOW_COUNT=0
 if [ -n "${ALLOWLIST}" ]; then
     ALLOW_COUNT="$(printf '%s' "${ALLOWLIST}" | tr ',' '\n' | grep -c '[^[:space:]]')"
 fi
-if [ "${ALLOW_COUNT}" -eq 1 ]; then
-    pass "live allow-list holds exactly 1 symbol"
+if [ -z "${LIVE_ROLLOUT_ALLOWED_SYMBOLS+set}" ]; then
+    info "LIVE_ROLLOUT_ALLOWED_SYMBOLS=<unset> (no operator symbol restriction; candidates decide)"
+elif [ "${ALLOW_COUNT}" -eq 0 ]; then
+    fail LIVE_ALLOWLIST_EMPTY \
+        "LIVE_ROLLOUT_ALLOWED_SYMBOLS is set but empty, which denies every symbol"
 else
-    fail LIVE_ALLOWLIST_NOT_EXACTLY_ONE "count=${ALLOW_COUNT}"
+    pass "live allow-list restricts to ${ALLOW_COUNT} symbol(s)"
 fi
 
 if [ -n "${SLACK_WEBHOOK_URL:-}" ] && [ -n "${SLACK_ALERT_WEBHOOK_URL:-}" ]; then

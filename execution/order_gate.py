@@ -67,7 +67,10 @@ class BuyGateContext:
     usd_orderable_cash: float
     has_open_order_for_symbol: bool
     has_order_for_signal_id: bool
-    allowed_symbols: FrozenSet[str]
+    #: None = no operator symbol restriction. An EMPTY frozenset is a
+    #: different instruction and denies every symbol -- see
+    #: config.live_rollout_config._env_symbol_set.
+    allowed_symbols: Optional[FrozenSet[str]]
     # CODEX-044: the gate takes a VERIFIED SNAPSHOT, never a raw
     # `reconciliation_ok=True`/`has_unknown_order=False` boolean a caller
     # could simply assert. See reconciliation/snapshot.py.
@@ -202,7 +205,27 @@ def evaluate_buy_gate(ctx: BuyGateContext) -> bool:
     if ctx.has_order_for_signal_id:
         raise OrderGateBlockedError(
             f"an order already exists for signal_id {ctx.signal.signal_id!r}", code="DUPLICATE_SIGNAL")
-    if ctx.order_intent.symbol not in ctx.allowed_symbols:
+    # An allow-list that is PRESENT still restricts; an ABSENT one does
+    # not. Absent and empty are different instructions.
+    #
+    # The list was how LIMITED_LIVE pinned trading to a single
+    # hand-picked symbol, and it stayed pinned to "DT" long after that
+    # test ended -- so every READY candidate in a normal session was
+    # filtered out before any gate ran, and the system looked like it had
+    # nothing to trade when it had twelve.
+    #
+    # `None` -- the variable is not set -- now means "no operator
+    # restriction". What a candidate must still pass is unchanged and
+    # considerable: strategy conditions, freshness, cash, ownership,
+    # reconciliation, duplicate protection, same-day re-entry, instrument
+    # eligibility and a verified route. Requiring a human to pre-approve
+    # each ticker on top of those is a test posture, not a safety one.
+    #
+    # An EMPTY list still denies everything, and deliberately so: that is
+    # what a blanked value, a truncated env file or a failed load looks
+    # like, and none of those may read as "all symbols permitted".
+    if ctx.allowed_symbols is not None \
+            and ctx.order_intent.symbol not in ctx.allowed_symbols:
         raise OrderGateBlockedError(
             f"{ctx.order_intent.symbol!r} is not in the allowed-symbols list", code="SYMBOL")
     if not ctx.instrument.is_order_eligible:
@@ -529,7 +552,8 @@ def evaluate_buy_gate_diagnostic(ctx: BuyGateContext) -> DiagnosticGateResult:
     a report about a hypothetical, not a relaxation of the real check.
     """
     live = _blocked(ctx)
-    allowed = ctx.order_intent.symbol in ctx.allowed_symbols
+    allowed = (ctx.allowed_symbols is None
+               or ctx.order_intent.symbol in ctx.allowed_symbols)
 
     if live is not None and live.code == LIVE_ALLOWLIST_GATE:
         # Look past the allow-list, and only the allow-list.

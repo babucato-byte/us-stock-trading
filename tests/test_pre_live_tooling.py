@@ -47,7 +47,14 @@ def _run(script, env=None, timeout=180):
 
     merged = {**os.environ, "TRADING_PROJECT_ROOT": str(REPO_ROOT),
               "PYTHON_BIN": sys.executable}
-    merged.update(env or {})
+    # A None VALUE removes the variable, so a test can distinguish
+    # "absent" from "set but empty" -- a distinction the checker now
+    # reports differently and the whole allow-list posture rests on.
+    for key, value in (env or {}).items():
+        if value is None:
+            merged.pop(key, None)
+        else:
+            merged[key] = value
     return subprocess.run(
         ["bash", str(script)], capture_output=True, text=True,
         timeout=timeout, env=merged, cwd=str(REPO_ROOT))
@@ -115,28 +122,52 @@ class TestTheCheckerBlocksInTheCurrentPosture:
     def test_it_lists_every_blocking_reason_code(self):
         stdout = _run(CHECK).stdout
         assert "BLOCKING REASON CODES" in stdout
-        # The two that must be present in this posture, whatever else is.
-        assert "LIVE_ALLOWLIST_NOT_EXACTLY_ONE" in stdout
         assert "SESSION_MATRIX_PENDING" in stdout
 
-    def test_an_empty_allowlist_is_a_block(self):
-        result = _run(CHECK, env={"LIVE_ROLLOUT_ALLOWED_SYMBOLS": ""})
-        assert "LIVE_ALLOWLIST_NOT_EXACTLY_ONE" in result.stdout
+    def test_an_absent_allowlist_is_the_expected_posture(self):
+        """NORMAL LIVE: which symbol gets bought is decided by which
+        candidates reach READY_TO_BUY and clear the execution gate, not
+        by a human pre-approving a ticker. Absent is reported, not
+        failed -- and must not be reported as an approval either."""
+        stdout = _run(CHECK, env={"LIVE_ROLLOUT_ALLOWED_SYMBOLS": None}).stdout
+        assert "LIVE_ALLOWLIST_EMPTY" not in stdout
+        assert "no operator symbol restriction" in stdout
 
-    def test_two_allowlisted_symbols_are_also_a_block(self):
-        """Limited live means ONE symbol. Two is not 'more ready'."""
+    def test_an_allowlist_that_is_set_but_empty_is_a_block(self):
+        """Set-but-empty denies every symbol, so live trading would be
+        enabled and simultaneously unable to trade. It is also what a
+        truncated env file looks like, which is the more important
+        reason it may never read the same as absent."""
+        result = _run(CHECK, env={"LIVE_ROLLOUT_ALLOWED_SYMBOLS": ""})
+        assert "LIVE_ALLOWLIST_EMPTY" in result.stdout
+        assert result.returncode == 1
+
+    def test_two_allowlisted_symbols_are_an_operator_restriction(self):
+        """A list an operator DOES set still restricts, and is reported
+        so the restriction is visible rather than silently narrowing the
+        candidate set the way "DT" did for weeks."""
         result = _run(CHECK, env={"LIVE_ROLLOUT_ALLOWED_SYMBOLS": "AAPL,MSFT"})
-        assert "LIVE_ALLOWLIST_NOT_EXACTLY_ONE" in result.stdout
+        assert "LIVE_ALLOWLIST_EMPTY" not in result.stdout
+        assert "restricts to 2 symbol(s)" in result.stdout
 
     def test_a_non_live_kis_env_is_a_block(self):
         result = _run(CHECK, env={"KIS_ENV": "paper"})
         assert "KIS_ENV_NOT_LIVE" in result.stdout
 
-    def test_a_widened_per_order_quantity_is_a_block(self):
-        """Quantity is NOT one of the retired count caps. Whole-share,
-        one share per order is the operating rule and stays pinned."""
+    def test_an_operator_chosen_per_order_quantity_is_honoured(self):
+        """The fixed 1 was the last LIMITED_LIVE count: `min(affordable,
+        cap)` made every order one share regardless of cash, so variable
+        sizing could never take effect. A ceiling an operator DOES set is
+        still honoured and reported."""
         result = _run(CHECK, env={"LIVE_ROLLOUT_MAX_QUANTITY": "5"})
-        assert "LIVE_ROLLOUT_MAX_QUANTITY_NOT_1" in result.stdout
+        assert "LIVE_ROLLOUT_MAX_QUANTITY_NOT_1" not in result.stdout
+        assert "LIVE_ROLLOUT_MAX_QUANTITY=5" in result.stdout
+
+    def test_a_malformed_per_order_quantity_is_still_a_block(self):
+        """A cap that cannot be parsed must never read as "no cap"."""
+        for bad in ("0", "-1", "two", "1.5"):
+            result = _run(CHECK, env={"LIVE_ROLLOUT_MAX_QUANTITY": bad})
+            assert "LIVE_ROLLOUT_MAX_QUANTITY_INVALID" in result.stdout, bad
 
     @pytest.mark.parametrize("var", [
         "LIVE_ROLLOUT_MAX_POSITIONS",
@@ -804,12 +835,18 @@ class TestReadyForLiveBootstrapIsActuallyReachable:
         assert "CHECK_OUTPUT_UNPARSEABLE" in result.stdout
         assert "PRE_LIVE_BLOCKED" in result.stdout
 
-    def test_an_allowlist_that_is_not_exactly_one_blocks_it(self, tmp_path):
-        for value in ("", "AAPL,MSFT"):
-            result = self._fixture(tmp_path / f"al-{len(value)}",
-                                   env={"LIVE_ROLLOUT_ALLOWED_SYMBOLS": value})
-            assert "LIVE_ALLOWLIST_NOT_EXACTLY_ONE" in result.stdout
-            assert "READY_FOR_LIVE_BOOTSTRAP" not in result.stdout
+    def test_an_allowlist_that_is_set_but_empty_blocks_it(self, tmp_path):
+        """Two symbols no longer block -- that was the LIMITED_LIVE
+        "exactly one" rule. Set-but-empty still does, because it denies
+        everything."""
+        blocked = self._fixture(tmp_path / "al-empty",
+                                env={"LIVE_ROLLOUT_ALLOWED_SYMBOLS": ""})
+        assert "LIVE_ALLOWLIST_EMPTY" in blocked.stdout
+        assert "READY_FOR_LIVE_BOOTSTRAP" not in blocked.stdout
+
+        two = self._fixture(tmp_path / "al-two",
+                            env={"LIVE_ROLLOUT_ALLOWED_SYMBOLS": "AAPL,MSFT"})
+        assert "LIVE_ALLOWLIST_EMPTY" not in two.stdout
 
     def test_a_non_bootstrapable_matrix_blocks_it(self, tmp_path):
         """BOOTSTRAPABLE::no means something beyond the five live-only

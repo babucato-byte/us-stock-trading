@@ -99,7 +99,11 @@ class KISBrokerAdapter:
                  max_price_deviation_percent=0.30, is_regular_session_fn=None, now_fn=None):
         self.kis_broker = kis_broker or KISBroker()
         self.config = _FakeConfig()
-        self.allowed_symbols = allowed_symbols or frozenset()
+        # Carried through as given: `None` (no operator restriction) and
+        # `frozenset()` (deny everything) are different instructions, and
+        # collapsing them here would make the adapter disagree with the
+        # rollout it was built from.
+        self.allowed_symbols = allowed_symbols
         self.max_price_deviation_percent = max_price_deviation_percent
         self._is_regular_session_fn = is_regular_session_fn or (lambda: True)
         self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))

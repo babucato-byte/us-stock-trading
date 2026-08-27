@@ -202,7 +202,12 @@ class TestRolloutLimitsAreUnmoved:
 
         config = LiveRolloutConfig.from_env({})
         assert config.enabled is False
-        assert config.max_quantity_per_order == 1
+        # Per-ORDER quantity is unset by design since LIMITED_LIVE
+        # ended: order size comes from orderable cash and whole-share
+        # arithmetic, bounded by the flags below. An operator ceiling is
+        # still honoured when one is set; what is gone is the fixed
+        # one-share test cap nobody chose.
+        assert config.max_quantity_per_order is None
         # The COUNT caps are unset by design since LIMITED_LIVE ended:
         # capacity is bounded by cash, the per-symbol lock, same-day
         # re-entry, ownership and reconciliation. The invariant this
@@ -221,9 +226,11 @@ class TestRolloutLimitsAreUnmoved:
         assert s1_allocation.PLANNED_MAX_POSITION_COUNT == 4
         assert s1_allocation.TARGET_POSITION_COUNT == 3
         rollout = (REPO_ROOT / "config" / "live_rollout_config.py").read_text(encoding="utf-8")
-        # Per-ORDER quantity still defaults to 1 -- whole-share, one
-        # share per order is the operating rule, not a retired cap.
-        assert 'LIVE_ROLLOUT_MAX_QUANTITY", 1' in rollout
+        # Per-ORDER quantity reads through _env_optional_int too, so an
+        # unset value means "no operator ceiling" and order size comes
+        # from orderable cash. Asserted on the reader for the same
+        # reason as the count caps below.
+        assert '_env_optional_int(\n                mapping, "LIVE_ROLLOUT_MAX_QUANTITY")' in rollout
         # The COUNT caps read through _env_optional_int now, so an unset
         # value means "not enforced" rather than 1. Asserted on the
         # reader rather than on a default, because the point of this

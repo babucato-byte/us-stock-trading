@@ -665,8 +665,21 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                            detail=reason, now=current)
                     continue
 
+                # Variable sizing. `whole_shares_affordable` divides the
+                # broker's own orderable amount by the price we would
+                # actually pay, so the answer is per candidate rather
+                # than a single account-level verdict: $20.96 buys one
+                # share of a $10.91 name and none of a $40.19 one, and
+                # only the second is a reason to skip.
+                #
+                # The per-order cap is applied only when an operator set
+                # one. It defaulted to 1 for LIMITED_LIVE and stayed
+                # there, which silently made every order a single share
+                # however much cash was available.
                 balance_qty = whole_shares_affordable(available_usd, buffered_price)
-                quantity = min(balance_qty, rollout.max_quantity_per_order)
+                quantity = (min(balance_qty, rollout.max_quantity_per_order)
+                            if rollout.max_quantity_per_order is not None
+                            else balance_qty)
                 if quantity < 1:
                     reason = "insufficient KIS orderable cash for even 1 share"
                     results["blocked"].append((symbol, reason))

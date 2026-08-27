@@ -7,7 +7,12 @@ class TestFromEnv:
     def test_defaults_are_safe(self):
         cfg = LiveRolloutConfig.from_env(env={})
         assert cfg.enabled is False
-        assert cfg.max_quantity_per_order == 1
+        # Per-order quantity is no longer pinned either: with a cap of
+        # 1, min(affordable, cap) made every order one share regardless
+        # of cash, so variable sizing could not take effect. Whole-share
+        # only still holds -- allow_fractional below is the rule that
+        # matters, and it is still False.
+        assert cfg.max_quantity_per_order is None
         # The COUNT caps default to absent now that LIMITED_LIVE is
         # over. That is not a relaxation of safety: every flag below is
         # still off by default, quantity is still 1, and capacity is

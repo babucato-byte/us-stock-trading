@@ -455,7 +455,7 @@ class TestActualRolloutUnmoved:
         config = LiveRolloutConfig.from_env({})
         assert config.enabled is False
         assert (config.max_quantity_per_order, config.max_open_positions,
-                config.max_daily_entries) == (1, None, None)
+                config.max_daily_entries) == (None, None, None)
 
     def test_the_s1_source_is_still_off_by_default(self):
         from s1_live import candidate_source

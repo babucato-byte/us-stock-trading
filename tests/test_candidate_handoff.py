@@ -532,7 +532,12 @@ class TestS2IsUnchanged:
         from config.live_rollout_config import LiveRolloutConfig
 
         rollout = LiveRolloutConfig.from_env()
-        assert rollout.max_quantity_per_order == 1
+        # Per-ORDER quantity is unset by design since LIMITED_LIVE
+        # ended: order size comes from orderable cash and whole-share
+        # arithmetic, bounded by the flags below. An operator ceiling is
+        # still honoured when one is set; what is gone is the fixed
+        # one-share test cap nobody chose.
+        assert rollout.max_quantity_per_order is None
         # The COUNT caps are unset by design since LIMITED_LIVE ended:
         # capacity is bounded by cash, the per-symbol lock, same-day
         # re-entry, ownership and reconciliation. The invariant this

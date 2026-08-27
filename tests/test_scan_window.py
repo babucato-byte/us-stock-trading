@@ -225,7 +225,12 @@ class TestScanningIsNotOrdering:
         # test guards -- that the work in this file widened nothing --
         # is carried by the flags and the per-order quantity below.
         assert rollout.max_open_positions is None
-        assert rollout.max_quantity_per_order == 1
+        # Per-ORDER quantity is unset by design since LIMITED_LIVE
+        # ended: order size comes from orderable cash and whole-share
+        # arithmetic, bounded by the flags below. An operator ceiling is
+        # still honoured when one is set; what is gone is the fixed
+        # one-share test cap nobody chose.
+        assert rollout.max_quantity_per_order is None
 
 
 class TestTheShellProbe:

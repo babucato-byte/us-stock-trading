@@ -140,7 +140,14 @@ class LegacyWatchlistSource(CandidateSource):
         return list(pso.load_watchlist())
 
     def allowed_symbols(self) -> FrozenSet[str]:
-        return self._rollout.allowed_symbols
+        # `None` on the rollout means "no operator restriction"; this
+        # interface answers with a SET, so the unrestricted case becomes
+        # the legacy watchlist itself rather than an empty set that
+        # would read as "nothing may be traded".
+        operator = self._rollout.allowed_symbols
+        if operator is None:
+            return frozenset(self.symbols())
+        return operator
 
     def qualify(self, symbol, *, analyze, score_threshold):
         """Unchanged legacy qualification: analyze_stock + SCORE_THRESHOLD."""
@@ -151,7 +158,7 @@ class LegacyWatchlistSource(CandidateSource):
 
     def describe(self) -> dict:
         return {"candidate_source": self.name,
-                "allowed_symbol_count": len(self._rollout.allowed_symbols)}
+                "allowed_symbol_count": len(self.allowed_symbols())}
 
 
 class S1CandidateSource(CandidateSource):
