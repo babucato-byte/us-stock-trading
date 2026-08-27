@@ -19,7 +19,7 @@ from state_store.schema import (
     MIGRATION_17_STATEMENTS, MIGRATION_18_STATEMENTS,
     MIGRATION_19_STATEMENTS, MIGRATION_20_STATEMENTS,
     MIGRATION_21_STATEMENTS, MIGRATION_22_STATEMENTS,
-    MIGRATION_23_STATEMENTS,
+    MIGRATION_23_STATEMENTS, MIGRATION_24_STATEMENTS,
 )
 
 MIGRATIONS = [
@@ -77,6 +77,9 @@ MIGRATIONS = [
     (23, "LINEAGE: the sequence a post-mortem walks -- scanner_id, "
          "watch_started_at, ready_at, execution_gate_at, broker_fill_time",
      MIGRATION_23_STATEMENTS),
+    (24, "NOTIFICATIONS: a durable ledger so a per-minute engine does not "
+         "send the same true statement sixty times an hour",
+     MIGRATION_24_STATEMENTS),
 ]
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1][0]

@@ -1197,6 +1197,49 @@ MIGRATION_23_STATEMENTS = [
 ]
 
 
+#: One row per notification actually sent, keyed so a repeat cannot be.
+#:
+#: The engine ticks every minute. Without this, "the position is still
+#: EXIT_PENDING" is a true statement the system would make sixty times an
+#: hour, and a channel that says the same thing sixty times is a channel
+#: nobody reads -- which is how a genuinely new message gets missed.
+#:
+#: The PRIMARY KEY is the dedupe. `INSERT OR IGNORE` either writes the
+#: row or does not, atomically, so two processes racing on the same
+#: event resolve without a lock and a cron restart cannot re-send what
+#: the previous run already sent.
+#:
+#: `delay_seconds` is sent_at minus the event's OWN time, not minus the
+#: tick's. A notification is late because the event happened earlier,
+#: and measuring against when we noticed would report zero for a message
+#: that arrived an hour after the fill.
+NOTIFICATION_LEDGER_TABLE = """
+CREATE TABLE IF NOT EXISTS notification_ledger (
+    notification_key TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    strategy_id TEXT,
+    symbol TEXT,
+    subject_id TEXT,
+    state_version TEXT,
+    channel TEXT,
+    event_time TEXT,
+    sent_at TEXT NOT NULL,
+    delay_seconds REAL,
+    created_at TEXT NOT NULL
+)
+"""
+
+NOTIFICATION_LEDGER_EVENT_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_notification_ledger_event
+ON notification_ledger (event_type, symbol, sent_at)
+"""
+
+MIGRATION_24_STATEMENTS = [
+    NOTIFICATION_LEDGER_TABLE,
+    NOTIFICATION_LEDGER_EVENT_INDEX,
+]
+
+
 # Every table this schema version creates -- used by export.py's
 # export_all() and by tests asserting the full table set exists.
 ALL_TABLES = [
@@ -1207,5 +1250,5 @@ ALL_TABLES = [
     "s1_risk_state", "s1_risk_peak", "s1_verification_state",
     "s1_positions", "s2_positions", "s6_positions",
     "post_exit_tracking", "post_exit_observations", "reentry_blocks",
-    "order_lineage",
+    "order_lineage", "notification_ledger",
 ]
