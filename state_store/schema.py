@@ -1085,6 +1085,82 @@ MIGRATION_20_STATEMENTS = [
 ]
 
 
+# Migration 21: the broker's own execution time, verbatim.
+#
+# `actual_sell_time` is derived from the position row's `closed_at`,
+# which is stamped with the TICK's clock rather than the fill's. DT
+# closed at 01:00:10 on a tick whose SELL was submitted at 01:00:29 --
+# so the recorded sell time preceded the order. Bounded by the tick
+# length and therefore small, but it is the number the exit-timing
+# analytics divides by.
+#
+# Stored unparsed: KIS returns HHMMSS with no date, and reconstructing a
+# datetime from it across a session boundary is exactly the kind of
+# guess that produces a confidently wrong figure.
+POST_EXIT_BROKER_FILL_TIMESTAMP = (
+    "ALTER TABLE post_exit_tracking ADD COLUMN broker_fill_timestamp TEXT")
+
+MIGRATION_21_STATEMENTS = [
+    POST_EXIT_BROKER_FILL_TIMESTAMP,
+]
+
+
+#: One row per BUY, answering "why was this bought?" in one query.
+#:
+#: The DT post-mortem had to reconstruct that answer from four places --
+#: a candidate JSONL, the shadow audit, the order ledger and the position
+#: row -- and the single most important fact, that the candidate's market
+#: data was hours older than its `generated_at`, existed in none of them.
+#: Both timestamps are columns here precisely because conflating them is
+#: what allowed the trade.
+#:
+#: Written on the entry path but never READ by it: this is a record, not
+#: an input, and nothing about an order depends on it existing.
+ORDER_LINEAGE_TABLE = """
+CREATE TABLE IF NOT EXISTS order_lineage (
+    lineage_id TEXT PRIMARY KEY,
+    internal_order_id TEXT,
+    broker_order_id TEXT,
+    position_id TEXT,
+    strategy_id TEXT NOT NULL,
+    strategy_version TEXT,
+    scan_id TEXT,
+    generation_id TEXT,
+    candidate_id TEXT,
+    symbol TEXT NOT NULL,
+    session TEXT,
+    trading_day TEXT,
+    rank INTEGER,
+    score REAL,
+    candidate_generated_at TEXT,
+    market_data_asof TEXT,
+    ready_evaluated_at TEXT,
+    watch_state TEXT,
+    watch_conditions TEXT,
+    gate_results TEXT,
+    order_price REAL,
+    quantity REAL,
+    created_at TEXT NOT NULL
+)
+"""
+
+ORDER_LINEAGE_SYMBOL_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_order_lineage_symbol_day
+ON order_lineage (trading_day, symbol)
+"""
+
+ORDER_LINEAGE_ORDER_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_order_lineage_order
+ON order_lineage (internal_order_id)
+"""
+
+MIGRATION_22_STATEMENTS = [
+    ORDER_LINEAGE_TABLE,
+    ORDER_LINEAGE_SYMBOL_INDEX,
+    ORDER_LINEAGE_ORDER_INDEX,
+]
+
+
 # Every table this schema version creates -- used by export.py's
 # export_all() and by tests asserting the full table set exists.
 ALL_TABLES = [
@@ -1095,4 +1171,5 @@ ALL_TABLES = [
     "s1_risk_state", "s1_risk_peak", "s1_verification_state",
     "s1_positions", "s2_positions", "s6_positions",
     "post_exit_tracking", "post_exit_observations", "reentry_blocks",
+    "order_lineage",
 ]

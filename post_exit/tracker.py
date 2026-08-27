@@ -234,6 +234,30 @@ def annotate(conn, *, position_id, note) -> bool:
         return False
 
 
+def record_broker_fill_time(conn, *, position_id, broker_timestamp) -> bool:
+    """Store KIS's own execution time next to the derived one.
+
+    `actual_sell_time` comes from the position row's `closed_at`, which
+    is stamped with the tick's clock. This is the broker's fact, kept
+    verbatim so a later analysis can prefer it without this code having
+    guessed at a date for it. Never fatal.
+    """
+    if not broker_timestamp:
+        return False
+    try:
+        changed = conn.execute(
+            "UPDATE post_exit_tracking SET broker_fill_timestamp = ?, "
+            "updated_at = ? WHERE position_id = ?",
+            (str(broker_timestamp), datetime.now(timezone.utc).isoformat(),
+             position_id)).rowcount
+        conn.commit()
+        return bool(changed)
+    except Exception:  # noqa: BLE001
+        logger.warning("could not record the broker fill time for %s",
+                       position_id, exc_info=True)
+        return False
+
+
 def due_for_observation(conn, *, now=None):
     """Tracking rows still inside their window."""
     current = _now(now)

@@ -421,3 +421,52 @@ class TestALateRouteIsNotALateRule:
         row = _tracking(conn)[0]
         assert row["actual_sell_time"] is not None
         assert row["route_wait_duration_seconds"] in (None, 0) or True
+
+
+class TestTheBrokersOwnFillTime:
+    """`closed_at` carries the TICK's clock, not the fill's.
+
+    DT closed at 01:00:10 on a tick whose SELL was submitted at
+    01:00:29 -- the recorded sell time preceded the order that caused
+    it. Bounded by the tick length and so small, but it is the number
+    the exit-timing analytics divides by.
+    """
+
+    def test_the_fill_report_exposes_the_brokers_timestamp(self):
+        from brokers.kis_fill_inquiry import FillReport
+
+        report = FillReport(order_id="0000001014", status="FILLED",
+                            filled_quantity=1, average_fill_price=51.61,
+                            broker_timestamp="210059", terminal=True)
+        assert report.as_store_fill()["broker_timestamp"] == "210059"
+
+    def test_it_is_stored_verbatim_next_to_the_derived_time(self, conn):
+        pid = _s6_trade(conn)
+        assert tracker.record_broker_fill_time(
+            conn, position_id=pid, broker_timestamp="210059") is True
+        row = _tracking(conn)[0]
+        assert row["broker_fill_timestamp"] == "210059"
+        # The derived value is untouched: both facts are kept.
+        assert row["actual_sell_time"] is not None
+
+    def test_it_is_not_parsed_into_a_datetime(self, conn):
+        """KIS returns HHMMSS with no date. Reconstructing one across a
+        session boundary is how a confidently wrong figure is made."""
+        pid = _s6_trade(conn)
+        tracker.record_broker_fill_time(conn, position_id=pid,
+                                        broker_timestamp="210059")
+        assert _tracking(conn)[0]["broker_fill_timestamp"] == "210059"
+
+    def test_a_missing_broker_timestamp_is_not_an_error(self, conn):
+        pid = _s6_trade(conn)
+        assert tracker.record_broker_fill_time(
+            conn, position_id=pid, broker_timestamp=None) is False
+
+    def test_the_sell_sync_passes_it_through(self):
+        import inspect
+
+        from s6_live import exit_runtime
+
+        source = inspect.getsource(exit_runtime.sync_sell_fills)
+        assert '_record_broker_fill_time(conn, pid, fill.get("broker_timestamp"))' \
+            in source

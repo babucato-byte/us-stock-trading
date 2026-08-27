@@ -130,6 +130,22 @@ def _session_name(session):
         str(session) if isinstance(session, str) else None)
 
 
+def _record_broker_fill_time(conn, position_id, broker_timestamp):
+    """KIS's own execution time, alongside the tick-stamped close.
+
+    Research bookkeeping only, and never fatal: the position is already
+    closed by the time this runs.
+    """
+    try:
+        from post_exit import tracker
+
+        tracker.record_broker_fill_time(
+            conn, position_id=position_id, broker_timestamp=broker_timestamp)
+    except Exception:  # noqa: BLE001
+        logger.debug("broker fill time not recorded for %s", position_id,
+                     exc_info=True)
+
+
 def _settle_intent(conn, position_id, sold, *, done):
     """Close the exit intent out once the fill that answers it is in.
 
@@ -203,6 +219,7 @@ def sync_sell_fills(conn, *, fills_for, session=None, now=None) -> List[Dict[str
                 exit_price=fill.get("average_fill_price"),
                 exit_session=_session_name(session), now=now)
             _settle_intent(conn, pid, sold, done=True)
+            _record_broker_fill_time(conn, pid, fill.get("broker_timestamp"))
             results.append({"position_id": pid, "symbol": symbol,
                             "status": "CLOSED", "sold": sold,
                             "exit_price": fill.get("average_fill_price")})

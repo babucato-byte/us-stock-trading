@@ -111,6 +111,14 @@ class FillReport:
             "order_id": self.order_id,
             "terminal": self.terminal,
             "status": self.status,
+            # KIS's own execution time, verbatim. The position row
+            # stamps `closed_at` with the TICK's clock, so a fill
+            # collected late in a slow tick is recorded up to a tick
+            # early -- DT closed at 01:00:10 on a tick whose SELL was
+            # submitted at 01:00:29. This is the broker's fact and is
+            # passed through unparsed: it is HHMMSS with no date, and a
+            # wrong reconstruction would be worse than a coarse one.
+            "broker_timestamp": self.broker_timestamp,
         }
 
     def as_dict(self) -> Dict[str, Any]:

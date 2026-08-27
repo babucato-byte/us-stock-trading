@@ -18,6 +18,7 @@ from state_store.schema import (
     MIGRATION_15_STATEMENTS, MIGRATION_16_STATEMENTS,
     MIGRATION_17_STATEMENTS, MIGRATION_18_STATEMENTS,
     MIGRATION_19_STATEMENTS, MIGRATION_20_STATEMENTS,
+    MIGRATION_21_STATEMENTS, MIGRATION_22_STATEMENTS,
 )
 
 MIGRATIONS = [
@@ -65,6 +66,13 @@ MIGRATIONS = [
     (20, "EXIT TIMING: when the rule decided vs when the broker would "
          "accept -- a late route must not read as a late rule",
      MIGRATION_20_STATEMENTS),
+    (21, "EXIT TIMING: the broker's own execution time, verbatim -- "
+         "closed_at carries the tick's clock, not the fill's",
+     MIGRATION_21_STATEMENTS),
+    (22, "LINEAGE: one row per BUY carrying candidate_generated_at AND "
+         "market_data_asof -- the pair whose conflation allowed the DT "
+         "entry",
+     MIGRATION_22_STATEMENTS),
 ]
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1][0]

@@ -75,7 +75,7 @@ def is_s6(strategy_id) -> bool:
 
 def record_entry_submission(conn, *, symbol, session, client_order_id,
                             candidate_row: Optional[Dict[str, Any]] = None,
-                            now=None) -> str:
+                            watch=None, now=None) -> str:
     """Record a SENT S6 BUY and return its position id.
 
     The ORB measurements come from the candidate the order was built
@@ -98,4 +98,35 @@ def record_entry_submission(conn, *, symbol, session, client_order_id,
         "S6 entry recorded in the canonical store: position=%s symbol=%s "
         "session=%s variant=%s client_order_id=%s",
         position_id, symbol, session, variant, client_order_id)
+    _record_lineage(conn, symbol=symbol, session=session,
+                    client_order_id=client_order_id, position_id=position_id,
+                    candidate_row=candidate_row, watch=watch, now=now)
     return position_id
+
+
+def _record_lineage(conn, *, symbol, session, client_order_id, position_id,
+                    candidate_row, watch, now):
+    """Why this symbol was bought, in one row.
+
+    Reconstructing the DT entry took four sources and the fact that
+    mattered -- market data hours older than the candidate's
+    `generated_at` -- was in none of them. Never fatal: the order has
+    already been sent by the time this runs, and a trade must not depend
+    on its own paperwork.
+    """
+    try:
+        from s6_live import lineage
+
+        fields = lineage.from_watch(watch, candidate=candidate_row) if watch \
+            else {"session": session,
+                  "rank": (candidate_row or {}).get("rank"),
+                  "score": (candidate_row or {}).get("score"),
+                  "candidate_generated_at": (candidate_row or {}).get(
+                      "generated_at")}
+        lineage.record(conn, symbol=symbol,
+                       strategy_id=position_store.STRATEGY_ID,
+                       internal_order_id=client_order_id,
+                       position_id=position_id, now=now, **fields)
+    except Exception:  # noqa: BLE001
+        logger.warning("S6 order lineage not recorded for %s", symbol,
+                       exc_info=True)
