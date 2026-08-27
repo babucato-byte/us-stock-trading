@@ -65,9 +65,18 @@ echo "$(date -u +%FT%TZ) tick sha=$SCANNER_SHA root=$SCANNER_RUNTIME_ROOT" >> "$
 # distinguishable in the log from a runner that failed. Without it both
 # arrive as exit 1 and a minute where the entry never ran reads the same
 # as a minute where it ran and crashed.
+# A new BUY is the LOWEST-priority use of the KIS budget -- below
+# exits, below position management, below reconciliation. One second,
+# not the ten-second default: if another owner holds the rate-limit
+# state lock, this tick gives up and the next minute re-asks. Missing an
+# entry costs an opportunity; making S1's executor wait costs the
+# management of a real open position, and on 2026-08-27 that ended with
+# its watchdog disabling entries for every strategy.
 flock -n -E 99 /home/ubuntu/logs/cron/s6_exec.lock \
   env TRADING_PROJECT_ROOT="$SCANNER_RUNTIME_ROOT" \
       SCANNER_CANDIDATE_DIR="${SCANNER_CANDIDATE_DIR:-}" \
+      KIS_LOCK_OWNER=S6_ENTRY \
+      KIS_LOCK_ACQUIRE_TIMEOUT_SECONDS=1 \
   "$SCANNER_RUNTIME_ROOT/venv/bin/python" \
     "$SCANNER_RUNTIME_ROOT/scripts/run_live_buy_entry.py" --strategy s6 \
     >> "$LOG" 2>&1

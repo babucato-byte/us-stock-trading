@@ -29,6 +29,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import kis_live_trading as klt  # noqa: E402
+from brokers import kis_rate_limiter  # noqa: E402
 from brokers.kis_broker import KISBroker  # noqa: E402
 from execution.order_repository import (  # noqa: E402
     FatalRepositoryConnectionError,
@@ -42,6 +43,111 @@ EXIT_ERROR = 1
 EXIT_REFUSED = 3
 
 EXIT_FATAL_DB = 4
+
+#: The broker was busy, so this tick did nothing and that is correct.
+#:
+#: A new BUY is the lowest-priority use of the KIS budget: below exits,
+#: below position management, below reconciliation. Missing an entry
+#: costs an opportunity; making a position-managing tick wait costs the
+#: management of a real holding, which on 2026-08-27 ended with S1's
+#: watchdog disabling entries account-wide.
+#:
+#: Deferring is not queueing. The tick ends, and the next one re-asks --
+#: by then the candidate is either still READY, in which case nothing was
+#: lost, or it is not, in which case the order should not have been sent.
+ENTRY_DEFERRED_KIS_BUSY = "ENTRY_DEFERRED_KIS_BUSY"
+
+#: An exit is in flight, so this tick does not start.
+#:
+#: The entry and the exit runtime share `s6_exec.lock`, so whichever
+#: arrives first holds it -- and an entry cycle that has taken it delays
+#: the exit behind it for as long as the cycle runs. An entry is an
+#: opportunity; an exit is a position already at risk, and a strategy
+#: whose exit condition has fired is not one that should be opening
+#: anything else first.
+#:
+#: Checked from the local position store: a SQLite read, no broker call,
+#: so asking costs nothing from the budget it is protecting.
+ENTRY_DEFERRED_EXIT_PENDING = "ENTRY_DEFERRED_EXIT_PENDING"
+
+#: S1's executor has gone quiet, so this tick stands down.
+#:
+#: On 2026-08-27 the entry consumed enough of the shared KIS budget that
+#: S1's executor missed two of its fifteen-minute ticks while holding a
+#: real position, and its watchdog then disabled entries for every
+#: strategy. The lock is fair now and the entry yields on contention, so
+#: that should not recur -- but "should not" is an argument, and this is
+#: a measurement.
+#:
+#: The threshold is deliberately well under the watchdog's own limit:
+#: the entry gets out of the way while S1 still has room to recover, so
+#: the account-wide stop is never reached in the first place. Reads the
+#: same cycle log the watchdog reads, so the two cannot disagree about
+#: what "quiet" means.
+ENTRY_DEFERRED_S1_STALE = "ENTRY_DEFERRED_S1_STALE"
+
+#: Minutes of S1 silence after which a new entry stands down. Half the
+#: watchdog's 40, so there is a full recovery window between the entry
+#: getting out of the way and the account-wide stop.
+S1_SILENCE_STAND_DOWN_MINUTES = 20.0
+
+
+def _s1_is_falling_behind(now=None):
+    """True when S1's executor has been quiet too long to crowd."""
+    try:
+        from datetime import datetime, timezone
+
+        from market_hours import us_trading_day
+
+        # `scripts/` is not a package, so the watchdog is imported by
+        # sitting next to it on the path rather than through a dotted
+        # name that does not exist.
+        script_dir = str(Path(__file__).resolve().parent)
+        if script_dir not in sys.path:
+            sys.path.insert(0, script_dir)
+        import run_s1_position_watchdog as watchdog
+
+        current = now or datetime.now(timezone.utc)
+        if not watchdog.ticks_expected_now():
+            # Outside the executor's own session rule it is not due to
+            # tick at all, so silence says nothing.
+            return False
+        newest = watchdog.newest_tick_at(us_trading_day(current))
+        if newest is None:
+            # No tick recorded yet today. Early in the session that is
+            # ordinary; it is not evidence of falling behind.
+            return False
+        silence = (current - newest).total_seconds() / 60.0
+        if silence >= S1_SILENCE_STAND_DOWN_MINUTES:
+            logger.warning(
+                "S1 executor last ticked %.1f min ago (stand-down at %.0f, "
+                "watchdog stops entries at 40)", silence,
+                S1_SILENCE_STAND_DOWN_MINUTES)
+            return True
+        return False
+    except Exception:  # noqa: BLE001 -- a missing diagnostic must not
+        # decide trading either way; the watchdog remains the backstop.
+        logger.warning("could not measure S1 tick age", exc_info=True)
+        return False
+
+
+def _exit_in_flight():
+    """True when any S6 position has an exit submitted or pending."""
+    try:
+        from s6_live import position_store
+        from state_store import db as state_db
+
+        with state_db.open_db() as conn:
+            for _pid, row in position_store.load_live(conn):
+                if row.get("exit_submitted") or row.get("pending_exit_reason"):
+                    return True
+        return False
+    except Exception:  # noqa: BLE001 -- an unreadable store is not a
+        # reason to refuse the entry; the gate and the runtime have their
+        # own, stronger refusals, and failing the tick over a diagnostic
+        # would stop trading for the wrong reason.
+        logger.warning("could not check for exits in flight", exc_info=True)
+        return False
 
 
 def _fail_stop(stage, exc):
@@ -261,8 +367,34 @@ def main(argv=None):
         logger.error("refusing to run the live buy-entry cycle: %s", reason)
         return EXIT_REFUSED
 
+    if _s1_is_falling_behind():
+        logger.info(
+            "%s: S1's executor is behind and holds the account's open "
+            "position; a new entry stands down rather than compete with it",
+            ENTRY_DEFERRED_S1_STALE)
+        return EXIT_OK
+
+    if _exit_in_flight():
+        logger.info(
+            "%s: an S6 exit is in flight; a position already at risk outranks "
+            "a new one, and this tick is dropped rather than queued",
+            ENTRY_DEFERRED_EXIT_PENDING)
+        return EXIT_OK
+
     try:
         results = run_once(strategy=args.strategy)
+    except kis_rate_limiter.KISRateLimitStateUnavailable as exc:
+        # Only the contention case yields here. A genuinely broken or
+        # missing state file is a different fault and must still surface
+        # as an error rather than be filed as "the broker was busy".
+        if getattr(exc, "reason_code", None) != kis_rate_limiter.REASON_LOCK_FAILED:
+            logger.exception("KIS rate-limit state unavailable: %s", exc)
+            return EXIT_ERROR
+        logger.info(
+            "%s: another owner holds the KIS rate-limit lock; this tick is "
+            "dropped, not queued, and the next one re-evaluates",
+            ENTRY_DEFERRED_KIS_BUSY)
+        return EXIT_OK
     except klt.KISLiveTradingError as exc:
         logger.error("live buy-entry cycle refused to run: %s", exc)
         return EXIT_REFUSED

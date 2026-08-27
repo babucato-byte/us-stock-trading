@@ -388,6 +388,21 @@ def _check_entry_limits(ctx):
             code=entry_limits.SYMBOL_ALREADY_HELD,
         )
 
+    # -- ALWAYS ON: not an order the broker already refused today.
+    #
+    # Until the rejection defect was fixed, a refused buy left an orphan
+    # SUBMITTED row and THAT is what stopped the entry re-sending the
+    # same order every tick. Removing the orphan removes the accidental
+    # brake, so this one is deliberate: one refusal is enough, the reason
+    # is now recorded, and retrying spends a real order on an answer the
+    # broker has already given.
+    if limits.broker_refused_today(candidate_symbol):
+        raise OrderGateBlockedError(
+            f"KIS already refused a buy for {candidate_symbol} today; "
+            "not re-sending it",
+            code=entry_limits.SYMBOL_REJECTED_TODAY,
+        )
+
     # -- ALWAYS ON: not something this strategy sold today.
     previous_exit = limits.same_day_exit_for(slot, candidate_symbol)
     if previous_exit:
@@ -450,7 +465,8 @@ BUY_GATE_SEQUENCE = (
     # caps: a buy addressed to a route no live order has exercised is
     # refused before anything counts slots for it.
     ROUTE_UNVERIFIED,
-    entry_limits.SYMBOL_ALREADY_HELD, reentry_policy.SAME_DAY_REENTRY_BLOCK,
+    entry_limits.SYMBOL_ALREADY_HELD, entry_limits.SYMBOL_REJECTED_TODAY,
+    reentry_policy.SAME_DAY_REENTRY_BLOCK,
     entry_limits.MAX_OPEN_POSITIONS, entry_limits.MAX_STRATEGY_POSITIONS,
     entry_limits.MAX_DAILY_ENTRIES,
 )

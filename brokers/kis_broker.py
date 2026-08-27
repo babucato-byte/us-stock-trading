@@ -60,6 +60,7 @@ config.validate_read_allowed() gate, so Shadow Mode (spec §26) can read
 KIS state without also being able to submit an order.
 """
 
+import logging
 import math
 import uuid
 from datetime import datetime, timezone
@@ -86,6 +87,18 @@ from domain.exchange import (
     to_kis_order_exchange_code,
 )
 from execution.secret_redaction import redact_text, safe_repr
+
+# This module had no logger. Nothing about a KIS rejection was recorded
+# anywhere, so when three buys were refused on 2026-08-27 the reason
+# could not be recovered afterwards -- msg_cd and msg1 came back on the
+# response and were dropped.
+#
+# Safe to log from here because every operational entrypoint installs
+# `execution.secret_redaction.install_logging_redaction()` on the root
+# logger and its handlers before any of this runs, and msg1 additionally
+# goes through `redact_text` at the call site. No header, token or
+# credential is ever passed to it.
+logger = logging.getLogger(__name__)
 
 TOKEN_PATH = "/oauth2/tokenP"
 PRICE_PATH = "/uapi/overseas-price/v1/quotations/price"
@@ -1529,6 +1542,27 @@ class KISBroker:
                 "been accepted -- manual reconciliation required"
             )
         if rt_cd != "0" or not broker_order_id:
+            # Everything an operator needs to classify the refusal, at
+            # the only place that still has it: the TR and the exchange
+            # never reach the ExecutionRecord, and msg_cd/msg1 reached it
+            # and were then dropped. On 2026-08-27 three buys were
+            # refused and the reason could not be recovered from any log
+            # or table afterwards.
+            #
+            # msg1 goes through redact_text like everywhere else, and no
+            # credential or header is included.
+            logger.warning(
+                "KIS_ORDER_REJECTED symbol=%s side=buy qty=%s limit=%s "
+                "tr_id=%s exchange=%s session=%s rt_cd=%s msg_cd=%s msg1=%s "
+                "requested_at=%s",
+                order_intent.symbol, order_intent.quantity,
+                order_intent.limit_price, tr_id,
+                getattr(instrument, "kis_exchange_code", None)
+                or getattr(instrument, "exchange", None),
+                getattr(order_intent, "session", None), rt_cd,
+                body.get("msg_cd"), redact_text(body.get("msg1")),
+                current.isoformat() if hasattr(current, "isoformat") else current,
+            )
             return ExecutionRecord(
                 internal_order_id=order_intent.internal_order_id, broker="kis",
                 broker_order_id=broker_order_id, requested_quantity=order_intent.quantity,

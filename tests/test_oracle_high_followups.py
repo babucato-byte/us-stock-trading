@@ -273,13 +273,26 @@ class TestLimiterInvalidStateFailsClosed:
         assert excinfo.value.detail == "future_timestamp"
         assert clock.slept == []
 
-    def test_skew_within_tolerance_waits_the_full_interval(self, tmp_path, clock, paced):
-        """Slightly ahead is tolerated as clock noise -- but it buys no
-        head start: the caller still waits the whole interval."""
+    def test_a_timestamp_slightly_ahead_buys_no_head_start(self, tmp_path, clock, paced):
+        """The invariant: being ahead of the recorded time must never let
+        a caller go SOONER than a full interval.
+
+        The stored value used to mean "when the last request went out",
+        so a stamp 2s ahead was read as clock noise and the wait was the
+        plain 3s interval. It now means "the slot the previous caller
+        claimed" -- the pacing wait moved outside the state lock, and
+        callers reserve successive slots so a busy one cannot starve an
+        occasional one. Under that reading the next free slot is a full
+        interval after the claimed one, so the wait is 5s.
+
+        Either way the guarantee this test exists for holds, and holds
+        more strongly: never less than the interval.
+        """
         path = tmp_path / "rate.json"
         path.write_text(json.dumps({CATEGORY_READ: clock.now + 2}), encoding="utf-8")
         waited = _limiter(path, clock).wait(category=CATEGORY_READ)
-        assert waited == 3.0
+        assert waited >= 3.0
+        assert waited == 5.0, "the slot after the one already claimed"
 
     def test_a_valid_state_still_paces_normally(self, tmp_path, clock, paced):
         path = tmp_path / "rate.json"

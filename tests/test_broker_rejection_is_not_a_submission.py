@@ -163,3 +163,139 @@ class TestARefusedOrderCanReachATerminalState:
         from execution import reentry_policy
 
         assert "BUY_NEVER_FILLED" in reentry_policy.NON_TRADE_EXIT_REASONS
+
+
+class TestTheBTGFixture:
+    """§15. The production event, fixed as a regression.
+
+    2026-08-27 18:42 UTC. BTG, READY, sized to 3 shares at $5.805 from
+    $20.96 of orderable cash, gate-approved, sent to KIS, refused. KIS's
+    own order book for the day held one row -- the DT sell -- so nothing
+    reached the account. The internal record disagreed: a position at
+    SUBMITTED and a `submitted` count of one.
+    """
+
+    SYMBOL = "BTG"
+    QTY = 3
+    PRICE = 5.805
+
+    def test_a_rejection_creates_no_position_row(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TRADING_STATE_DB", str(tmp_path / "state.db"))
+        from state_store.db import open_db
+        from s6_live import position_store
+
+        with open_db() as conn:
+            assert list(position_store.load_live(conn)) == []
+            assert list(position_store.load_unconfirmed(conn)) == []
+
+    def test_a_refused_order_is_abandoned_not_left_pending(self, tmp_path, monkeypatch):
+        """The exact state the three orphans were in: SUBMITTED, quantity
+        NULL, an order id that does not exist."""
+        from datetime import datetime, timezone
+
+        monkeypatch.setenv("TRADING_STATE_DB", str(tmp_path / "state.db"))
+        from state_store.db import open_db
+        from s6_live import exit_runtime, position_store
+
+        now = datetime(2026, 8, 27, 18, 43, tzinfo=timezone.utc)
+        with open_db() as conn:
+            client_order_id = "kislive-BTG-d04420a1209a"
+            pid = position_store.record_submission(
+                conn, symbol=self.SYMBOL, variant="S6-R",
+                entry_session="REGULAR", client_order_id=client_order_id,
+                now=now)
+            conn.execute(
+                "INSERT INTO kis_order_idempotency (internal_order_id, "
+                "signal_id, symbol, side, trading_date, broker_order_id, "
+                "status, created_at, updated_at, requested_quantity, version, "
+                "strategy_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (client_order_id, "sig", self.SYMBOL, "buy", "2026-08-27",
+                 None, "REJECTED", now.isoformat(), now.isoformat(),
+                 float(self.QTY), 1, "S6_ORB_BREAKOUT_V1"))
+            conn.commit()
+
+            applied = exit_runtime.sync_buy_fills(
+                conn, fills_for=lambda row: None, now=now)
+
+            assert [a["status"] for a in applied] == ["ABANDONED"]
+            assert list(position_store.load_live(conn)) == []
+            row = conn.execute(
+                "SELECT status, exit_reason FROM s6_positions "
+                "WHERE position_id = ?", (pid,)).fetchone()
+            assert row["status"] == "CLOSED"
+            assert row["exit_reason"] == "BUY_NEVER_FILLED"
+
+    def test_a_refused_symbol_is_not_re_sent_the_same_day(self, tmp_path, monkeypatch):
+        """§16. The orphan row was what stopped the retry loop, and it
+        was a bug. Without a deliberate brake, the fix would have the
+        entry re-sending a refused order every minute."""
+        from datetime import datetime, timezone
+
+        monkeypatch.setenv("TRADING_STATE_DB", str(tmp_path / "state.db"))
+        from state_store.db import open_db
+        from execution import entry_limits
+
+        now = datetime(2026, 8, 27, 18, 43, tzinfo=timezone.utc)
+        with open_db() as conn:
+            conn.execute(
+                "INSERT INTO kis_order_idempotency (internal_order_id, "
+                "signal_id, symbol, side, trading_date, broker_order_id, "
+                "status, created_at, updated_at, requested_quantity, version, "
+                "strategy_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("kislive-BTG-d04420a1209a", "sig", self.SYMBOL, "buy",
+                 "2026-08-27", None, "REJECTED", now.isoformat(),
+                 now.isoformat(), float(self.QTY), 1, "S6_ORB_BREAKOUT_V1"))
+            conn.commit()
+            refused = entry_limits._broker_rejected_today(
+                conn, trading_day="2026-08-27")
+            assert refused == frozenset({"BTG"})
+
+    def test_yesterdays_rejection_does_not_bar_today(self, tmp_path, monkeypatch):
+        """The brake is for the day, not forever."""
+        from datetime import datetime, timezone
+
+        monkeypatch.setenv("TRADING_STATE_DB", str(tmp_path / "state.db"))
+        from state_store.db import open_db
+        from execution import entry_limits
+
+        now = datetime(2026, 8, 27, 18, 43, tzinfo=timezone.utc)
+        with open_db() as conn:
+            conn.execute(
+                "INSERT INTO kis_order_idempotency (internal_order_id, "
+                "signal_id, symbol, side, trading_date, broker_order_id, "
+                "status, created_at, updated_at, requested_quantity, version, "
+                "strategy_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("kislive-BTG-old", "sig", self.SYMBOL, "buy", "2026-08-26",
+                 None, "REJECTED", now.isoformat(), now.isoformat(),
+                 float(self.QTY), 1, "S6_ORB_BREAKOUT_V1"))
+            conn.commit()
+            assert entry_limits._broker_rejected_today(
+                conn, trading_day="2026-08-27") == frozenset()
+
+    def test_the_brake_is_candidate_specific_not_account_wide(self):
+        """§9 and §26: a refused symbol is skipped and the next ranked
+        candidate is evaluated. It is not a reason to stop trading."""
+        from execution import entry_limits, order_gate
+
+        # In the gate's own sequence, so a report names it -- and BEFORE
+        # the capacity caps, so a refused symbol is skipped rather than
+        # counted against a slot.
+        seq = order_gate.BUY_GATE_SEQUENCE
+        assert entry_limits.SYMBOL_REJECTED_TODAY in seq
+        assert seq.index(entry_limits.SYMBOL_REJECTED_TODAY) < seq.index(
+            entry_limits.MAX_OPEN_POSITIONS)
+        # And it is not the account-wide kill switch: that is ENTRY_DISABLED.
+        assert seq.index(entry_limits.SYMBOL_REJECTED_TODAY) > seq.index(
+            "ENTRY_DISABLED")
+
+    def test_an_unreadable_ledger_does_not_bar_everything(self):
+        """Refusing every symbol because a diagnostic query broke would
+        be a worse failure than the one it guards against."""
+        from execution import entry_limits
+
+        class Boom:
+            def execute(self, *a, **k):
+                raise RuntimeError("db gone")
+
+        assert entry_limits._broker_rejected_today(
+            Boom(), trading_day="2026-08-27") == frozenset()

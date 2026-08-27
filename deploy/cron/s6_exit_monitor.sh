@@ -63,6 +63,9 @@ LOG=/home/ubuntu/releases/us-stock-trading/shared/state/s6_exit_monitor_$(date -
 # Shares the runtime lock: the monitor and the 15-minute tick run the
 # same evaluation, and two of them at once could both act on one
 # position.
+# No acquire-timeout override: an exit outranks a new entry and takes
+# the default patience. It is the entry that yields, not this.
 flock -n /home/ubuntu/logs/cron/s6_exec.lock \
   env PYTHONPATH="$ROOT" TRADING_PROJECT_ROOT="$ROOT" \
+      KIS_LOCK_OWNER=S6_EXIT \
   "$ROOT/venv/bin/python" "$ROOT/scripts/run_s6_runtime.py" >> "$LOG" 2>&1

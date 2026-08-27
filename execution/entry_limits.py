@@ -55,12 +55,15 @@ count of zero is the single most dangerous wrong answer a limit checker
 can give, because it reads exactly like "nothing is open yet".
 """
 
+import logging
 from dataclasses import dataclass, field
 from typing import FrozenSet, Mapping, Optional
 
 from config import strategy_registry
 from execution.order_repository import FatalRepositoryConnectionError
 from market_hours import us_trading_day
+
+logger = logging.getLogger(__name__)
 
 # Reason codes. Distinct from the ordinary "the limit says no" codes,
 # because the operator response differs: a limit block is the system
@@ -72,6 +75,21 @@ DAILY_ENTRY_STATE_UNKNOWN = "DAILY_ENTRY_STATE_UNKNOWN"
 #: strategy. This is the lock that replaced the LIMITED_LIVE count caps:
 #: capacity is no longer "one position", it is "one position per symbol".
 SYMBOL_ALREADY_HELD = "SYMBOL_ALREADY_HELD"
+
+#: The broker already refused an order for this symbol today.
+#:
+#: Until 2026-08-27 a rejected buy left an orphan SUBMITTED position row,
+#: and that row -- a bug -- was what stopped the entry re-sending the
+#: same refused order every tick. Removing the orphan removes the
+#: accidental brake with it, so the brake has to be deliberate: a symbol
+#: KIS has refused today is not offered again today.
+#:
+#: One rejection is enough. Retrying costs a real order the broker has
+#: already said no to, and the reason is now recorded, so an operator can
+#: see what it was rather than watching the same order bounce.
+#: Candidate-specific, never account-wide: the next ranked candidate is
+#: evaluated normally.
+SYMBOL_REJECTED_TODAY = "SYMBOL_REJECTED_TODAY"
 
 MAX_OPEN_POSITIONS = "MAX_OPEN_POSITIONS"
 MAX_DAILY_ENTRIES = "MAX_DAILY_ENTRIES"
@@ -133,6 +151,13 @@ class EntryLimitState:
     #: reconciliation snapshot is handed to it rather than built there.
     same_day_exits: Mapping[str, Mapping[str, Mapping]] = field(
         default_factory=dict)
+    #: Symbols whose BUY the broker refused today. Collected here for the
+    #: same reason as everything else on this object: the gate does no
+    #: I/O.
+    broker_rejected_symbols: FrozenSet[str] = frozenset()
+
+    def broker_refused_today(self, symbol):
+        return str(symbol or "").upper() in self.broker_rejected_symbols
 
     def same_day_exit_for(self, slot, symbol):
         """The exit that bars `symbol` for `slot` today, or None."""
@@ -473,4 +498,33 @@ def collect(*, broker, conn, rollout, now=None, exclude_internal_order_id=None):
         unattributed_symbols=frozenset(unattributed),
         same_day_exits=_same_day_exits_by_slot(
             conn, trading_day=trading_day, now=now),
+        broker_rejected_symbols=_broker_rejected_today(
+            conn, trading_day=trading_day),
     )
+
+
+def _broker_rejected_today(conn, *, trading_day):
+    """Symbols whose BUY the broker refused today.
+
+    Read from the order ledger rather than tracked separately: the
+    ledger is where a rejection is already durable, and a second record
+    of the same fact could disagree with it.
+
+    Unreadable fails CLOSED for this check by returning nothing, because
+    the alternative -- refusing every symbol when the query breaks --
+    would stop all trading over a diagnostic. The order gate has its own
+    reasons to refuse, and this one is a courtesy brake on re-sending an
+    order the broker already declined.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT symbol FROM kis_order_idempotency "
+            "WHERE side = 'buy' AND status = 'REJECTED' AND trading_date = ?",
+            (trading_day,)).fetchall()
+    except Exception:  # noqa: BLE001
+        logger.warning("could not read today's broker rejections",
+                       exc_info=True)
+        return frozenset()
+    return frozenset(
+        str((r["symbol"] if hasattr(r, "keys") else r[0]) or "").upper()
+        for r in rows) - {""}

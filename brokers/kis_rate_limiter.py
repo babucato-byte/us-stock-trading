@@ -108,6 +108,55 @@ RETRYABLE_CATEGORIES = frozenset({CATEGORY_READ})
 
 _STATE_LOCK_TIMEOUT = 10.0
 
+#: Who is asking, for the contention telemetry. Set by each cron wrapper.
+#: Not authorisation -- it changes nothing about what a caller may do,
+#: and a wrong or missing value costs only a less useful log line.
+OWNER_ENV = "KIS_LOCK_OWNER"
+
+#: How long THIS process may wait for the state lock, overriding the
+#: default. The entry path sets it low: a new BUY is the lowest-priority
+#: use of the broker, and it must never be the reason a position-managing
+#: tick waits.
+ACQUIRE_TIMEOUT_ENV = "KIS_LOCK_ACQUIRE_TIMEOUT_SECONDS"
+
+#: A wait or hold above this is worth an operator's attention; below it
+#: the line is debug-level so normal operation does not flood the log.
+_TELEMETRY_NOTABLE_MS = 500.0
+
+
+#: Entrypoint script -> owner, so a caller is labelled without every
+#: wrapper having to remember to export one. Several of those wrappers
+#: live outside the repository on the host, and a label that depends on
+#: editing them would be missing from exactly the processes whose
+#: contention most needs naming.
+_OWNER_BY_ENTRYPOINT = {
+    "run_s1_live_cycle.py": "S1_EXECUTOR",
+    "run_s1_position_watchdog.py": "S1_WATCHDOG",
+    "run_live_buy_entry.py": "S6_ENTRY",
+    "run_s6_runtime.py": "S6_EXIT",
+    "run_reconciliation.py": "RECONCILIATION",
+}
+
+
+def lock_owner():
+    """Who is asking. The environment wins; the entrypoint is the
+    fallback; UNKNOWN is honest rather than a guess."""
+    declared = str(os.environ.get(OWNER_ENV, "") or "").strip()
+    if declared:
+        return declared
+    try:
+        import sys
+
+        return _OWNER_BY_ENTRYPOINT.get(os.path.basename(sys.argv[0] or ""),
+                                        "UNKNOWN")
+    except Exception:  # noqa: BLE001 - a label is never worth an exception
+        return "UNKNOWN"
+
+
+def acquire_timeout():
+    """Seconds to wait for the state lock before giving up."""
+    return _float_env(ACQUIRE_TIMEOUT_ENV, _STATE_LOCK_TIMEOUT)
+
 
 
 
@@ -428,6 +477,12 @@ class KisRateLimiter:
         acquired = False
         primary = None
         slept = 0.0
+        # Contention telemetry. The 2026-08-27 starvation was diagnosed
+        # from a missing tick and one error line, which said that a lock
+        # could not be acquired but not who was holding it or for how
+        # long. These three stamps make the next one arithmetic.
+        request_at = self._clock()
+        acquired_at = None
         try:
             if not self._acquire(lock_handle):
                 self._alert(category, "lock could not be acquired")
@@ -436,6 +491,7 @@ class KisRateLimiter:
                     reason_code=REASON_LOCK_FAILED, detail="lock_timeout",
                 )
             acquired = True
+            acquired_at = self._clock()
             try:
                 slept = self._wait_locked(path, category, interval)
             except BaseException as exc:
@@ -446,6 +502,7 @@ class KisRateLimiter:
             # failure is reported, and it must not silently mask the
             # error that got us here.
             release_error = self._release(lock_handle, acquired, category)
+            self._report_contention(category, request_at, acquired_at)
             if release_error is not None and primary is None:
                 raise release_error
             if release_error is not None:
@@ -456,7 +513,41 @@ class KisRateLimiter:
                     "the shared KIS rate-limit lock also failed to release (%s)",
                     release_error.reason_code,
                 )
+        # OUTSIDE the lock. The reservation is already durable, so every
+        # other caller can take its own slot while this one waits for the
+        # slot it holds.
+        if slept > 0:
+            self._sleeper(slept)
         return slept
+
+    def _report_contention(self, category, request_at, acquired_at):
+        """One line per acquisition: who waited, how long, how long held.
+
+        Deliberately a log line and not a database write. This runs on
+        the path whose contention it measures, and a shared table would
+        add exactly the kind of cross-process serialisation the numbers
+        exist to find.
+        """
+        try:
+            released_at = self._clock()
+            if acquired_at is None:
+                wait_ms = (released_at - request_at) * 1000.0
+                logger.warning(
+                    "KIS_LOCK owner=%s category=%s outcome=NOT_ACQUIRED "
+                    "lock_wait_ms=%.1f", lock_owner(), category, wait_ms)
+                return
+            wait_ms = (acquired_at - request_at) * 1000.0
+            hold_ms = (released_at - acquired_at) * 1000.0
+            line = ("KIS_LOCK owner=%s category=%s outcome=ACQUIRED "
+                    "lock_wait_ms=%.1f lock_hold_ms=%.1f")
+            args = (lock_owner(), category, wait_ms, hold_ms)
+            if max(wait_ms, hold_ms) >= _TELEMETRY_NOTABLE_MS:
+                logger.info(line, *args)
+            else:
+                logger.debug(line, *args)
+        except Exception:  # noqa: BLE001 -- telemetry must never be able
+            # to fail a request that has already been paced and reserved.
+            logger.debug("KIS lock telemetry failed", exc_info=True)
 
     def _release(self, lock_handle, acquired, category):
         """Unlocks and closes. Returns the error to raise, or None.
@@ -506,7 +597,7 @@ class KisRateLimiter:
             logger.debug("could not alert on limiter unavailability: %s", exc)
 
     def _acquire(self, handle):
-        deadline = self._clock() + _STATE_LOCK_TIMEOUT
+        deadline = self._clock() + acquire_timeout()
         while True:
             try:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -543,23 +634,47 @@ class KisRateLimiter:
                         f"KIS rate-limit timestamp for {category} is not a usable time",
                         detail=repr(last))
                 elapsed = now - last
-                if elapsed < -max_clock_skew():
-                    # The recorded time is in the FUTURE. Waiting it out
-                    # could block for hours and proceeding would bypass
-                    # pacing entirely, so stop and let an operator fix the
-                    # clock or the file.
+                # A recorded time may legitimately be up to one interval
+                # in the FUTURE: that is a slot another caller reserved
+                # and has not reached yet. Anything beyond that is a
+                # clock or a file an operator has to fix -- waiting it
+                # out could block for hours, and ignoring it would
+                # bypass pacing entirely.
+                if elapsed < -(max_clock_skew() + interval):
                     raise KISRateLimitStateInvalid(
                         f"KIS rate-limit timestamp for {category} is "
                         f"{abs(elapsed):.1f}s in the future",
                         detail="future_timestamp")
                 if elapsed < interval:
-                    # Covers small negative skew too: within tolerance we
-                    # wait the FULL interval rather than assume freshness.
-                    slept = interval - max(elapsed, 0.0)
-                    self._sleeper(slept)
-                    now = self._wall()
+                    # RESERVE the slot; do not occupy it here.
+                    #
+                    # This used to sleep out the whole interval while
+                    # holding the exclusive lock, which made the lock a
+                    # proxy for the pacing budget rather than a guard on
+                    # the state file. With a 3s READ interval, any process
+                    # issuing back-to-back reads held it ~3s at a time and
+                    # re-took it immediately, so a process asking
+                    # occasionally could lose the race for the full 10s
+                    # acquisition timeout and give up. That is what
+                    # happened on 2026-08-27: S6's entry cycle polled
+                    # continuously, S1's executor could not get in, missed
+                    # two 15-minute ticks while holding a real position,
+                    # and its watchdog disabled entries account-wide.
+                    #
+                    # Reserving instead makes the queue fair and the lock
+                    # short. `last` is now the slot the PREVIOUS caller
+                    # claimed, so `last + interval` is the next free one;
+                    # concurrent callers take successive slots in the
+                    # order they get the lock, and each then waits for its
+                    # own slot outside it. Pacing is unchanged -- the
+                    # spacing between reservations is still `interval`.
+                    reserved = last + interval
+                    slept = reserved - now
+                    now = reserved
             state[category] = now
-            # The reservation must be DURABLE before the request goes out.
+            # The reservation must be DURABLE before the request goes out,
+            # and before the lock is released -- a slot handed out twice
+            # would let two callers issue at the same instant.
             self._store_state(path, state, category)
             return slept
 
