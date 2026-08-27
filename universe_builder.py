@@ -38,7 +38,30 @@ from universe_filter import (
 UNIVERSE_OUTPUT_PATH = "universe.csv"
 # Absolute path for READERS -- systemd/cron invoke the runner from an
 # arbitrary cwd, where a relative "universe.csv" would silently miss.
-UNIVERSE_LISTING_PATH = get_project_root() / "universe.csv"
+def universe_listing_path():
+    """Where the full tradable listing lives, read and written.
+
+    Deferred to `scanners.universe.universe_path()` so ONE variable --
+    SCANNER_UNIVERSE_FILE -- governs both the producer here and the
+    scanners that consume it. They used to resolve it independently:
+    this module wrote to the project root while the scanner read
+    whatever its own resolution produced, which is the same
+    producer/consumer split that once had scanners publishing candidates
+    into a directory no consumer read.
+
+    It also matters that this is a FUNCTION. Evaluated at import, an
+    env-dependent path freezes to whatever the variable was when the
+    module first loaded, which is exactly the kind of staleness this
+    file is being changed to avoid.
+    """
+    from scanners.universe import universe_path
+
+    return universe_path()
+
+
+#: Kept as a module attribute for callers that read it directly. Its
+#: value is resolved at import; prefer `universe_listing_path()`.
+UNIVERSE_LISTING_PATH = universe_listing_path()
 TRADABLE_UNIVERSE_OUTPUT_PATH = get_project_root() / "universe_tradable.csv"
 FILTER_REPORT_PATH = get_project_root() / "logs" / "universe_filter_report.json"
 DECISIONS_LOG_PATH = get_project_root() / "logs" / "universe_decisions.csv"
@@ -114,7 +137,7 @@ def build_universe(broker=None, output_path=UNIVERSE_OUTPUT_PATH):
     return df
 
 
-def load_universe_rows(path=UNIVERSE_LISTING_PATH):
+def load_universe_rows(path=None):
     """Reads the full listing back as plain dicts.
 
     Uses csv.DictReader rather than pandas so that every value stays the
@@ -122,6 +145,7 @@ def load_universe_rows(path=UNIVERSE_LISTING_PATH):
     "NA" or "INF" into a float, which is exactly the class of bug the
     exchange registry avoids by reading this file the same way.
     """
+    path = path if path is not None else universe_listing_path()
     file_path = Path(path)
     rows = []
     try:
