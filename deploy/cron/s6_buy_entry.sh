@@ -31,6 +31,20 @@
 # is flat" while that is landing is the race the shared lock removes.
 set -u
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+# The credentials, the account number and the rollout flags. Without
+# this the runner has no KIS_LIVE_ORDER_ENABLED and no token, so every
+# tick refuses -- which looks exactly like "no candidate today" in the
+# log and would have made the whole schedule a silent no-op.
+#
+# Loaded BEFORE the release check, never instead of it:
+# `resolve_release_root` reads the deployed and validated SHAs from the
+# file itself rather than from the environment, so an env file that
+# names a root cannot talk the verification out of comparing it.
+ENV_FILE=/home/ubuntu/releases/us-stock-trading/shared/env/kis-readonly.env
+[ -r "$ENV_FILE" ] || exit 1
+set -a; . "$ENV_FILE"; set +a
+
 . "$SCRIPT_DIR/shared_env.sh"
 
 # Code from the release, verified against the deployed and validated

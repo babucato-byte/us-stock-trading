@@ -225,6 +225,26 @@ class TestTheEntryTickIsScheduledAndSafe:
         text = self.WRAPPER.read_text(encoding="utf-8")
         assert "s6_exec.lock" in text
 
+    def test_it_loads_the_credentials_before_running(self):
+        """Without the env file the runner has no KIS_LIVE_ORDER_ENABLED
+        and no token, so every tick refuses -- and a refusal reads
+        exactly like "no candidate today" in the log. The whole schedule
+        would be a silent no-op."""
+        text = self.WRAPPER.read_text(encoding="utf-8")
+        assert "kis-readonly.env" in text
+        assert "set -a; . \"$ENV_FILE\"; set +a" in text
+
+    def test_the_env_load_does_not_replace_the_release_check(self):
+        """Order matters: the env file names a TRADING_PROJECT_ROOT, and
+        that value must not become the one the tick runs from. The SHA
+        verification reads the file itself, so it still compares -- but
+        only if it runs after, and runs at all."""
+        text = self.WRAPPER.read_text(encoding="utf-8")
+        code = "\n".join(l for l in text.splitlines()
+                          if not l.strip().startswith("#"))
+        assert code.index("ENV_FILE=") < code.index("resolve_release_root")
+        assert "resolve_release_root || exit 1" in code
+
     def test_it_reads_the_shared_candidate_store(self):
         text = self.WRAPPER.read_text(encoding="utf-8")
         assert "resolve_shared_candidate_dir" in text
