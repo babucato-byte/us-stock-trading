@@ -62,6 +62,14 @@ _SCHEMA_MAPPED = {
 
 
 class PremarketMomentumScanner(BaseScanner):
+
+    @property
+    def market_data_basis(self):
+        """Minute bars, not daily: this scanner's gates are computed from
+        the intraday session."""
+        from scanners.base.scanner_base import MARKET_DATA_BASIS_INTRADAY
+
+        return MARKET_DATA_BASIS_INTRADAY
     scanner_dir = "premarket_momentum"
     scanner_name = "premarket_momentum"
     #: The wrapped scanner reads intraday bars for VWAP/EMA/volume and

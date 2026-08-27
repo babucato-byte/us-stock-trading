@@ -23,7 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scanners.orb.scanner import _bar_timestamp  # noqa: E402
+from scanners.base.scanner_base import bar_timestamp as _bar_timestamp  # noqa: E402
 from scanners.publish import candidates  # noqa: E402
 
 ET = "America/New_York"
@@ -116,4 +116,4 @@ class TestTheBarTimestamp:
         from scanners.orb import scanner
 
         source = inspect.getsource(scanner)
-        assert '"market_data_asof": _bar_timestamp(session)' in source
+        assert '"market_data_asof": bar_timestamp(session)' in source

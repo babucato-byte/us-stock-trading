@@ -53,6 +53,14 @@ from scanners.base.scanner_base import BaseScanner, fmt, require
 
 
 class GapPullbackScanner(BaseScanner):
+
+    @property
+    def market_data_basis(self):
+        """Minute bars, not daily: this scanner's gates are computed from
+        the intraday session."""
+        from scanners.base.scanner_base import MARKET_DATA_BASIS_INTRADAY
+
+        return MARKET_DATA_BASIS_INTRADAY
     scanner_dir = "gap_pullback"
     scanner_name = "gap_pullback"
     requires_intraday = True

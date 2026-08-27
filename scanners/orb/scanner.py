@@ -50,10 +50,18 @@ from scanners.base.config import ScannerConfigError
 from scanners.base.features import SymbolFeatures
 from scanners.base.market_data_provider import SymbolData
 from scanners.base.models import ScannerDataError
-from scanners.base.scanner_base import BaseScanner, fmt, require
+from scanners.base.scanner_base import bar_timestamp, BaseScanner, fmt, require
 
 
 class OpeningRangeBreakoutScanner(BaseScanner):
+
+    @property
+    def market_data_basis(self):
+        """Minute bars, not daily: this scanner's gates are computed from
+        the intraday session."""
+        from scanners.base.scanner_base import MARKET_DATA_BASIS_INTRADAY
+
+        return MARKET_DATA_BASIS_INTRADAY
     scanner_dir = "orb"
     scanner_name = "orb"
     requires_intraday = True
@@ -249,7 +257,7 @@ class OpeningRangeBreakoutScanner(BaseScanner):
             # the row carrying them is written. Everything above is
             # computed from `session`, so its final bar IS the moment
             # this judgement describes.
-            "market_data_asof": _bar_timestamp(session),
+            "market_data_asof": bar_timestamp(session),
         })
         return reasons
 
@@ -329,26 +337,6 @@ class OpeningRangeBreakoutScanner(BaseScanner):
             "extension_hma200_pct": ind.extension_pct(price, features.hma200),
             "extension_vwap_pct": ind.extension_pct(price, vwap),
         }
-
-
-def _bar_timestamp(frame):
-    """The newest bar's timestamp, ISO-8601 UTC, or None.
-
-    None rather than a guess: a caller that cannot learn when the data
-    was observed must see that, not a plausible substitute.
-    """
-    try:
-        if frame is None or len(frame) == 0:
-            return None
-        stamp = frame.index[-1]
-        moment = stamp.to_pydatetime() if hasattr(stamp, "to_pydatetime") else stamp
-        if getattr(moment, "tzinfo", None) is None:
-            from datetime import timezone
-
-            moment = moment.replace(tzinfo=timezone.utc)
-        return moment.astimezone(__import__("datetime").timezone.utc).isoformat()
-    except Exception:  # noqa: BLE001
-        return None
 
 
 def _mean_volume(frame) -> Optional[float]:

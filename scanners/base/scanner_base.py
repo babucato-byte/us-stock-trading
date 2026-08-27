@@ -49,6 +49,47 @@ from scanners.base.models import ScannerDataError, ScannerSignal
 from scanners.base.scanner_logging import get_scanner_logger, log_decision
 
 
+#: Which frame a scanner's decision actually rests on.
+#:
+#: `market_data_asof` must be the timestamp of the data the judgement was
+#: made from, and a daily scanner and an intraday one are looking at
+#: different things. Declared per scanner rather than guessed, because
+#: guessing here produces a number that looks authoritative and is wrong.
+MARKET_DATA_BASIS_DAILY = "daily"
+MARKET_DATA_BASIS_INTRADAY = "intraday"
+
+
+def bar_timestamp(frame):
+    """The newest bar's timestamp in a frame, ISO-8601 UTC, or None.
+
+    None rather than a substitute. A caller that cannot learn when the
+    data was observed must see that, not a plausible stand-in: the whole
+    reason this exists is that a candidate carrying a fresh publication
+    time over hours-old bars was indistinguishable from a fresh one.
+
+    A date-only index (daily bars) is returned as midnight UTC of that
+    date, which is honest about the resolution available -- a daily bar
+    does not know what time of day it closed.
+    """
+    try:
+        if frame is None or len(frame) == 0:
+            return None
+        stamp = frame.index[-1]
+        moment = stamp.to_pydatetime() if hasattr(stamp, "to_pydatetime") else stamp
+        if not isinstance(moment, datetime):
+            # A plain date, which has no time and must not be given one
+            # that implies precision it does not have.
+            try:
+                return moment.isoformat()
+            except AttributeError:
+                return None
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return moment.astimezone(timezone.utc).isoformat()
+    except Exception:  # noqa: BLE001 - unknown stays unknown
+        return None
+
+
 class Rejected(Exception):
     """This symbol does not qualify, and here is the condition that
     failed. Control flow, not an error."""
@@ -196,6 +237,17 @@ class BaseScanner(ABC):
         return self.config.fingerprint
 
     # ---- subclass hooks -------------------------------------------------
+
+    @property
+    def market_data_basis(self) -> str:
+        """Which frame this scanner's decision rests on.
+
+        Daily by default because most scanners here are daily; the three
+        that read minute bars override it. Declared rather than inferred:
+        a base class guessing which frame a subclass consulted would
+        produce a confident timestamp for data the scanner never read.
+        """
+        return MARKET_DATA_BASIS_DAILY
 
     @abstractmethod
     def check(self, features: SymbolFeatures, data: SymbolData,
@@ -350,6 +402,18 @@ class BaseScanner(ABC):
         metrics = dict(features.shared_metrics())
         metrics.update(self.extra_metrics(features, data, context) or {})
         metrics["config_fingerprint"] = self.config_fingerprint
+        # When the data behind this judgement was last observed, as
+        # distinct from when the row carrying it is written.
+        #
+        # Only filled if the scanner did not supply its own: ORB computes
+        # it from the SESSION slice it actually evaluated, which is more
+        # precise than the whole frame, and a blanket assignment here
+        # would overwrite the better answer with a worse one.
+        if metrics.get("market_data_asof") is None:
+            frame = (data.intraday
+                     if self.market_data_basis == MARKET_DATA_BASIS_INTRADAY
+                     else data.daily)
+            metrics["market_data_asof"] = bar_timestamp(frame)
 
         schema = features.schema_fields()
         signal_price = features.price

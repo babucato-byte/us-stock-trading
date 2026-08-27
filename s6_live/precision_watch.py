@@ -62,6 +62,13 @@ FAIL = "FAIL"
 UNAVAILABLE = "UNAVAILABLE"
 
 # --- the conditions, in the order they are reported ------------------------
+#: The candidate never said when its data was observed. Distinct from
+#: "the data is old": one is a stale row, the other is a row that cannot
+#: be judged at all, and only the second means the producer is not
+#: supplying the contract.
+MARKET_DATA_ASOF_UNKNOWN = "MARKET_DATA_ASOF_UNKNOWN"
+
+C_MARKET_DATA_ASOF = "MARKET_DATA_ASOF_KNOWN"
 C_MARKET_DATA_FRESH = "MARKET_DATA_FRESH"
 C_PRICE = "EXECUTABLE_PRICE"
 C_VWAP_AVAILABLE = "VWAP_AVAILABLE"
@@ -75,7 +82,7 @@ C_EXTENSION = "EXTENSION_WITHIN_LIMIT"
 C_REENTRY = "SAME_DAY_REENTRY"
 
 CONDITION_ORDER = (
-    C_MARKET_DATA_FRESH, C_PRICE, C_VWAP_AVAILABLE, C_EMA_AVAILABLE,
+    C_MARKET_DATA_ASOF, C_MARKET_DATA_FRESH, C_PRICE, C_VWAP_AVAILABLE, C_EMA_AVAILABLE,
     C_PRICE_ABOVE_VWAP, C_EMA_STRUCTURE, C_BREAKOUT, C_VOLUME_VALID,
     C_VOLUME_EXPANSION, C_EXTENSION, C_REENTRY,
 )
@@ -171,6 +178,14 @@ def _evaluate(symbol, *, session, now, features, conn, config,
     #
     # The DT candidate's `generated_at` was minutes old while its market
     # data was hours old. This asks the second question.
+    # Research may record a candidate whose data age is unknown. A LIVE
+    # BUY may not: "we do not know how old this is" is not a weaker form
+    # of "it is recent", and the only safe reading of it is refusal.
+    if feats.market_data_asof is None:
+        conditions[C_MARKET_DATA_ASOF] = UNAVAILABLE
+        detail["market_data_asof_unknown"] = MARKET_DATA_ASOF_UNKNOWN
+    else:
+        conditions[C_MARKET_DATA_ASOF] = PASS
     stale = feats.is_stale(now, max_age=max_age)
     conditions[C_MARKET_DATA_FRESH] = FAIL if stale else PASS
     detail["market_data_asof"] = (feats.market_data_asof.isoformat()
