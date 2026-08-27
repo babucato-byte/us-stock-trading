@@ -247,3 +247,61 @@ class TestTheEntryTickIsScheduledAndSafe:
         text = self.WRAPPER.read_text(encoding="utf-8")
         assert 'if [ "$STATUS" -eq 99 ]' in text
         assert 'exit "$STATUS"' in text
+
+
+class TestTheTickIsLegibleAfterwards:
+    """§8, §13, §16 -- "no BUY today" has several explanations and the
+    log could not tell them apart."""
+
+    RUNNER = REPO_ROOT / "scripts" / "run_live_buy_entry.py"
+
+    def test_the_funnel_reports_every_stage(self):
+        text = self.RUNNER.read_text(encoding="utf-8")
+        for stage in ("scanned=", "watching=", "ready=", "executable=",
+                      "submitted="):
+            assert stage in text, stage
+
+    def test_ready_and_approved_but_unsubmitted_is_called_a_defect(self):
+        """The one combination that is not a market condition."""
+        text = self.RUNNER.read_text(encoding="utf-8")
+        assert "EXECUTION_DEFECT_SUSPECTED" in text
+        assert "ready > 0 and executable > 0 and submitted == 0" in text
+
+    def test_executable_comes_from_the_audit_trail(self):
+        """Not from a counter kept beside the submission loop: the number
+        meant to expose a gate/submit disagreement must not be derived
+        from the code suspected of having it."""
+        text = self.RUNNER.read_text(encoding="utf-8")
+        assert "GATE_APPROVED" in text
+        assert "created_at >= ?" in text
+
+    def test_a_reporting_failure_cannot_affect_the_cycle(self):
+        """The report runs after the orders are already placed. It must
+        not be able to turn a completed cycle into a failed one."""
+        text = self.RUNNER.read_text(encoding="utf-8")
+        block = text[text.index("_funnel(source, results, since=now)"):]
+        assert "except Exception" in block[:400]
+        assert "return results" in block[:800]
+
+    def test_sizing_is_logged_for_every_candidate(self):
+        """§13. Including the ones sized to zero -- a skipped candidate
+        and an unaffordable one are indistinguishable downstream, and the
+        account-level cash figure cannot separate them."""
+        text = (REPO_ROOT / "kis_live_trading.py").read_text(encoding="utf-8")
+        sizing = text[text.index('"SIZING %s'):]
+        for field in ("live_price=", "buffered_price=", "orderable_usd=",
+                      "max_orderable_qty=", "target_qty="):
+            assert field in sizing[:400], field
+
+    def test_the_sizing_line_precedes_the_zero_quantity_skip(self):
+        """Logged BEFORE the `quantity < 1` continue, or the candidates
+        whose sizing most needs explaining are the ones that never get a
+        line."""
+        text = (REPO_ROOT / "kis_live_trading.py").read_text(encoding="utf-8")
+        assert text.index('"SIZING %s') < text.index("if quantity < 1:")
+
+    def test_the_tick_records_which_release_ran_it(self):
+        text = self.RUNNER.read_text(encoding="utf-8")
+        assert "TICK started_at=" in text
+        assert "DEPLOYED_COMMIT" in text
+        assert "TRADING_PROJECT_ROOT" in text

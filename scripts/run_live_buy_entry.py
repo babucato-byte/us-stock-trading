@@ -141,6 +141,70 @@ def _s6_source(rollout, now):
         session=scan_session.session_at(), now=now)
 
 
+def _funnel(source, results, *, since):
+    """One line describing what happened to every candidate this tick.
+
+    The counts exist because "no BUY today" has several very different
+    explanations and the log could not tell them apart: nothing
+    published, everything still WATCHING, everything READY but
+    unaffordable, or -- the one that matters -- candidates that reached
+    READY and were never acted on. That last case is an execution defect
+    and it is invisible without the numbers either side of it.
+
+    EXECUTABLE is read from the audit trail rather than recounted here.
+    The Execution Engine records GATE_APPROVED before it calls the
+    broker, so an approval that never became an order is already durably
+    recorded; a second count kept alongside the submission loop could
+    disagree with the gate, and then the number meant to expose the
+    defect would be derived from the code suspected of having it.
+    """
+    scanned = watching = ready = executable = 0
+    evaluations = getattr(source, "evaluations", None) or {}
+    if evaluations:
+        scanned = len(evaluations)
+        ready = sum(1 for e in evaluations.values() if getattr(e, "ready", False))
+        watching = scanned - ready
+    submitted = len(results.get("submitted") or ())
+    try:
+        import shadow_audit
+
+        conn = shadow_audit._open_conn()
+        try:
+            executable = conn.execute(
+                "SELECT COUNT(*) FROM shadow_audit_events "
+                "WHERE event_type = ? AND created_at >= ?",
+                (shadow_audit.GATE_APPROVED, since.isoformat()),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 -- reporting must never affect trading
+        executable = -1
+
+    logger.info(
+        "FUNNEL scanned=%d watching=%d ready=%d executable=%s submitted=%d",
+        scanned, watching, ready,
+        "unavailable" if executable < 0 else executable, submitted)
+    for symbol, evaluation in sorted(evaluations.items()):
+        if not getattr(evaluation, "ready", False):
+            logger.info("FUNNEL_WATCHING %s state=%s blocking=%s", symbol,
+                        getattr(evaluation, "state", "?"),
+                        ",".join(getattr(evaluation, "blocking", ()) or ()) or "-")
+    for symbol, reason in (results.get("skipped") or ()):
+        logger.info("FUNNEL_SKIPPED %s reason=%s", symbol, reason)
+    for symbol, reason in (results.get("blocked") or ()):
+        logger.info("FUNNEL_BLOCKED %s reason=%s", symbol, reason)
+    for symbol in (results.get("submitted") or ()):
+        logger.info("FUNNEL_SUBMITTED %s", symbol)
+
+    # §16: READY candidates that reached the gate and were approved, and
+    # then produced no order, is the one combination that is a defect
+    # rather than a market condition.
+    if ready > 0 and executable > 0 and submitted == 0:
+        logger.error(
+            "EXECUTION_DEFECT_SUSPECTED ready=%d executable=%d submitted=0 -- "
+            "the gate approved an order that was never submitted", ready, executable)
+
+
 def run_once(broker=None, *, strategy="s1"):
     """The work this entrypoint does, factored out so it can be driven
     (and faulted) directly -- same shape as every other service script.
@@ -158,8 +222,27 @@ def run_once(broker=None, *, strategy="s1"):
     now = datetime.now(timezone.utc)
     factory = SOURCE_FACTORIES[strategy]
     source = factory(LiveRolloutConfig.from_env(), now)
-    return klt.run_live_buy_entry_cycle(
+
+    try:
+        from scanners.base import scan_session
+
+        session = scan_session.session_at()
+    except Exception:  # noqa: BLE001 -- context, not a precondition
+        session = "unavailable"
+    logger.info(
+        "TICK started_at=%s strategy=%s session=%s deployed=%s runtime_root=%s",
+        now.isoformat(), strategy, session,
+        os.environ.get("DEPLOYED_COMMIT", "<unset>"),
+        os.environ.get("TRADING_PROJECT_ROOT", "<unset>"))
+
+    results = klt.run_live_buy_entry_cycle(
         broker=broker or KISBroker(), candidate_source=source)
+    try:
+        _funnel(source, results, since=now)
+    except Exception:  # noqa: BLE001 -- a reporting fault must not
+        # change what the cycle already did, nor mask its result.
+        logger.warning("funnel report failed", exc_info=True)
+    return results
 
 
 def main(argv=None):

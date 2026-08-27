@@ -680,6 +680,18 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                 quantity = (min(balance_qty, rollout.max_quantity_per_order)
                             if rollout.max_quantity_per_order is not None
                             else balance_qty)
+                # Logged for every candidate, including the ones sized to
+                # zero. A skipped candidate and an unaffordable one look
+                # identical downstream, and the account-level cash figure
+                # cannot tell them apart -- the same $20.96 is a BUY for
+                # one name and a skip for the next.
+                logger.info(
+                    "SIZING %s live_price=%.4f buffered_price=%.4f "
+                    "orderable_usd=%.2f max_orderable_qty=%d cap=%s target_qty=%d",
+                    symbol, kis_quote.price_usd, buffered_price, available_usd, balance_qty,
+                    rollout.max_quantity_per_order
+                    if rollout.max_quantity_per_order is not None else "none",
+                    quantity)
                 if quantity < 1:
                     reason = "insufficient KIS orderable cash for even 1 share"
                     results["blocked"].append((symbol, reason))
