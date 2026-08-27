@@ -1161,6 +1161,42 @@ MIGRATION_22_STATEMENTS = [
 ]
 
 
+# Migration 23: the lineage timestamps a post-mortem actually walks.
+#
+# Migration 22 recorded WHAT was bought and the two candidate timestamps.
+# What it could not answer is the sequence: when the watch picked the
+# symbol up, when it first said READY, when the execution gate ran, and
+# when the broker filled. Without those, "READY at 10:03, bought at
+# 10:41" is unreconstructable, and §27 asks precisely that question --
+# whether a READY candidate waited on a scheduler it should not have.
+#
+# `scanner_id` is separate from `strategy_id` on purpose: one strategy
+# may be fed by more than one scanner, and attributing a fill to the
+# wrong producer is how a scanner's calibration gets judged on trades it
+# never proposed.
+ORDER_LINEAGE_SCANNER_ID = (
+    "ALTER TABLE order_lineage ADD COLUMN scanner_id TEXT")
+ORDER_LINEAGE_WATCH_STARTED_AT = (
+    "ALTER TABLE order_lineage ADD COLUMN watch_started_at TEXT")
+ORDER_LINEAGE_READY_AT = (
+    "ALTER TABLE order_lineage ADD COLUMN ready_at TEXT")
+ORDER_LINEAGE_EXECUTION_GATE_AT = (
+    "ALTER TABLE order_lineage ADD COLUMN execution_gate_at TEXT")
+ORDER_LINEAGE_BROKER_FILL_TIME = (
+    "ALTER TABLE order_lineage ADD COLUMN broker_fill_time TEXT")
+ORDER_LINEAGE_CANDIDATE_STATE = (
+    "ALTER TABLE order_lineage ADD COLUMN candidate_state TEXT")
+
+MIGRATION_23_STATEMENTS = [
+    ORDER_LINEAGE_SCANNER_ID,
+    ORDER_LINEAGE_WATCH_STARTED_AT,
+    ORDER_LINEAGE_READY_AT,
+    ORDER_LINEAGE_EXECUTION_GATE_AT,
+    ORDER_LINEAGE_BROKER_FILL_TIME,
+    ORDER_LINEAGE_CANDIDATE_STATE,
+]
+
+
 # Every table this schema version creates -- used by export.py's
 # export_all() and by tests asserting the full table set exists.
 ALL_TABLES = [

@@ -50,11 +50,24 @@ logger = logging.getLogger(__name__)
 STRATEGY_ID = "S6_ORB_BREAKOUT_V1"
 
 # --- candidate states -----------------------------------------------------
-DISCOVERED = "DISCOVERED"
-WATCHING = "WATCHING"
-READY_TO_BUY = "READY_TO_BUY"
-INVALIDATED = "INVALIDATED"
-DROPPED = "DROPPED"
+#
+# Re-exported from `domain.candidate_state` rather than restated, so the
+# scanner, this watch, the runtime and Slack cannot each drift into their
+# own spelling of the same idea -- which is exactly how "실거래 가능 0"
+# came to be printed on a day a real BUY filled.
+#
+# This module only ever produces the states it can decide: it evaluates
+# the STRATEGY's conditions, so it can say READY_TO_BUY but never
+# EXECUTABLE. That answer belongs to the execution gate, which knows
+# about cash, ownership and the broker route.
+from domain.candidate_state import (  # noqa: F401
+    BLOCKED, BUY_SUBMITTED, EXECUTABLE, INVALIDATED, OPEN, READY_TO_BUY,
+    SCANNED, WATCHING,
+)
+
+#: This module's own vocabulary, kept for callers that had it.
+DISCOVERED = SCANNED
+DROPPED = INVALIDATED
 
 #: A condition's answer. UNAVAILABLE blocks READY exactly as FAIL does.
 PASS = "PASS"

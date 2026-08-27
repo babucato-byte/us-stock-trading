@@ -20,6 +20,8 @@ paperwork.
 import json
 import logging
 import uuid
+
+from domain.candidate_state import READY_TO_BUY
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -42,7 +44,9 @@ def record(conn, *, symbol, strategy_id, internal_order_id=None,
            candidate_generated_at=None, market_data_asof=None,
            ready_evaluated_at=None, watch_state=None, watch_conditions=None,
            gate_results=None, order_price=None, quantity=None,
-           now=None) -> Optional[str]:
+           scanner_id=None, watch_started_at=None, ready_at=None,
+           execution_gate_at=None, broker_fill_time=None,
+           candidate_state=None, now=None) -> Optional[str]:
     """Record one order's provenance. Never raises."""
     current = now or datetime.now(timezone.utc)
     try:
@@ -56,15 +60,19 @@ def record(conn, *, symbol, strategy_id, internal_order_id=None,
             "candidate_id, symbol, session, trading_day, rank, score, "
             "candidate_generated_at, market_data_asof, ready_evaluated_at, "
             "watch_state, watch_conditions, gate_results, order_price, "
-            "quantity, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "quantity, created_at, scanner_id, watch_started_at, ready_at, "
+            "execution_gate_at, broker_fill_time, candidate_state) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+            "        ?,?,?,?,?,?)",
             (lineage_id, internal_order_id, broker_order_id, position_id,
              strategy_id, strategy_version, scan_id, generation_id,
              candidate_id, str(symbol or "").upper(), session,
              trading_day or us_trading_day(current), rank, score,
              candidate_generated_at, market_data_asof, ready_evaluated_at,
              watch_state, _json(watch_conditions), _json(gate_results),
-             order_price, quantity, current.isoformat()))
+             order_price, quantity, current.isoformat(),
+             scanner_id, watch_started_at, ready_at, execution_gate_at,
+             broker_fill_time, candidate_state))
         conn.commit()
         return lineage_id
     except Exception:  # noqa: BLE001 - a trade must not depend on its
@@ -97,6 +105,14 @@ def from_watch(evaluation, *, candidate=None) -> Dict[str, Any]:
                                else None),
         "watch_state": getattr(evaluation, "state", None),
         "watch_conditions": dict(getattr(evaluation, "conditions", {}) or {}),
+        # The moment the STRATEGY said yes. Distinct from when the
+        # execution gate ran and from when the broker filled -- §27 asks
+        # whether a READY candidate then waited on something it should
+        # not have, and that question needs all three.
+        "ready_at": (evaluation.evaluated_at.isoformat()
+                     if getattr(evaluation, "state", None) == READY_TO_BUY
+                     and getattr(evaluation, "evaluated_at", None) else None),
+        "candidate_state": getattr(evaluation, "state", None),
     }
 
 

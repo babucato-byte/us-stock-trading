@@ -19,6 +19,7 @@ from state_store.schema import (
     MIGRATION_17_STATEMENTS, MIGRATION_18_STATEMENTS,
     MIGRATION_19_STATEMENTS, MIGRATION_20_STATEMENTS,
     MIGRATION_21_STATEMENTS, MIGRATION_22_STATEMENTS,
+    MIGRATION_23_STATEMENTS,
 )
 
 MIGRATIONS = [
@@ -73,6 +74,9 @@ MIGRATIONS = [
          "market_data_asof -- the pair whose conflation allowed the DT "
          "entry",
      MIGRATION_22_STATEMENTS),
+    (23, "LINEAGE: the sequence a post-mortem walks -- scanner_id, "
+         "watch_started_at, ready_at, execution_gate_at, broker_fill_time",
+     MIGRATION_23_STATEMENTS),
 ]
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1][0]
