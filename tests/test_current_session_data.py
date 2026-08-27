@@ -151,3 +151,75 @@ class TestTheScannerRefusesToo:
         source = inspect.getsource(scanner)
         assert "current_session_date(requested)" in source
         assert "NO_CURRENT_SESSION_DATA" in source
+
+
+class TestTheSessionReachesTheScanner:
+    """The defect beneath the stale candidates.
+
+    `BaseScanner.evaluate` built `context = {}` and nothing ever put a
+    session in it, so ORB's `context.get("session") or "REGULAR"`
+    resolved to REGULAR on every run. Its entire session-aware branch was
+    unreachable in production: every PREMARKET, AFTER_HOURS and
+    OVERNIGHT_DAYTIME scan judged the REGULAR session and published the
+    result under the requested session's name.
+
+    That is why DT's AFTER_HOURS candidate carried price 51.640 -- the
+    15:55 ET regular close -- and volume 7,932,617, the whole regular
+    day, unchanged for hours after the close.
+    """
+
+    def _spy_scanner(self):
+        from scanners.registry import build_scanners
+
+        orb = [s for s in build_scanners() if s.scanner_name == "orb"][0]
+        seen = {}
+
+        def _check(features, data, context):
+            seen["session"] = context.get("session", "<absent>")
+            raise RuntimeError("stop after capture")
+
+        orb.check = _check
+        orb.build_features = lambda data, shared=None: object()
+        return orb, seen
+
+    class _Data:
+        symbol = "PTC"
+        intraday = None
+        daily = None
+
+    @pytest.mark.parametrize("session", ["PREMARKET", "AFTER_HOURS",
+                                         "OVERNIGHT_DAYTIME"])
+    def test_the_requested_session_reaches_the_context(self, session):
+        orb, seen = self._spy_scanner()
+        try:
+            orb.evaluate(self._Data(), trading_day="2026-08-27",
+                         session=session)
+        except RuntimeError:
+            pass
+        assert seen["session"] == session
+
+    def test_without_a_session_the_context_stays_empty(self):
+        """Unchanged default, so REGULAR scans behave exactly as before."""
+        orb, seen = self._spy_scanner()
+        try:
+            orb.evaluate(self._Data(), trading_day="2026-08-27")
+        except RuntimeError:
+            pass
+        assert seen["session"] == "<absent>"
+
+    def test_the_runner_passes_the_normalised_session(self):
+        import inspect
+
+        from scanners import runner
+
+        source = inspect.getsource(runner.run_scanners)
+        assert "scanned_session = scan_session.normalize(session)" in source
+        assert "session=scanned_session" in source
+
+    def test_evaluate_into_forwards_it(self):
+        import inspect
+
+        from scanners.base.scanner_base import BaseScanner
+
+        source = inspect.getsource(BaseScanner.evaluate_into)
+        assert "session=session" in source

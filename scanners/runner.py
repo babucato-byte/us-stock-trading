@@ -372,6 +372,24 @@ def run_scanners(
     the caller (a cron job) needs to store that and then report the
     failure -- not lose the day.
     """
+    # Two different questions, deliberately answered differently.
+    #
+    # `scanned_session` is what the REPORT says the run covered, and
+    # falls back to the current session so a report is never sessionless.
+    #
+    # `requested_session` is what the SCANNERS are told, and falls back
+    # to nothing. A caller that named a session gets that session; a
+    # caller that named none keeps the previous behaviour exactly --
+    # ORB's REGULAR branch. Defaulting this one to the wall clock would
+    # make the same call judge OVERNIGHT_DAYTIME at 3am and REGULAR at
+    # 10am, which is a verdict decided by when a cron happened to fire
+    # rather than by what was asked for.
+    #
+    # Production always passes --session explicitly, so the session-aware
+    # branch -- unreachable until now, because nothing ever put a session
+    # in the scanner's context -- becomes live where it matters.
+    scanned_session = scan_session.normalize(session) or scan_session.session_at()
+    requested_session = scan_session.normalize(session)
     day = trading_day or us_trading_day()
     # UNCACHED, deliberately.
     #
@@ -414,7 +432,7 @@ def run_scanners(
         # silently corrected -- `normalize` returns None and the clock
         # answers instead, because a typo quietly becoming REGULAR would
         # file an off-hours scan under the one session allowed to trade.
-        session=scan_session.normalize(session) or scan_session.session_at(),
+        session=scanned_session,
     )
 
     requested = list(scanners or ALL_SCANNERS)
@@ -625,9 +643,15 @@ def run_scanners(
             try:
                 if feature_error is not None:
                     raise feature_error
+                # The session being scanned, passed rather than left for
+                # the scanner to default. Without it ORB resolved
+                # `context.get("session") or "REGULAR"` to REGULAR on
+                # every run and judged the regular session no matter
+                # which one was requested.
                 scanner.evaluate_into(outcome, bundle, trading_day=day, timestamp=stamp,
                                       run_id=identifier,
-                                      shared_features=shared_features)
+                                      shared_features=shared_features,
+                                      session=requested_session)
             except ScannerDataError as exc:
                 # The shared pass could not build features for this
                 # symbol. Counted and logged exactly as the per-scanner

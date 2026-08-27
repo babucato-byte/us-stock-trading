@@ -364,6 +364,7 @@ class BaseScanner(ABC):
         run_id: Optional[str] = None,
         shared_features: Optional[SymbolFeatures] = None,
         reject_sink=None,
+        session: Optional[str] = None,
     ) -> Optional[ScannerSignal]:
         """One symbol. A signal, or None if it did not qualify.
 
@@ -379,7 +380,21 @@ class BaseScanner(ABC):
         """
         stamp = timestamp or datetime.now(timezone.utc).isoformat()
         features = self.build_features(data, shared_features)
+        # The session being judged, seeded so a session-aware scanner can
+        # read it.
+        #
+        # This dict used to be created empty and nothing ever put a
+        # session in it, so ORB's `context.get("session") or "REGULAR"`
+        # resolved to REGULAR on every run -- and its entire
+        # session-aware branch was unreachable in production. Every
+        # PREMARKET, AFTER_HOURS and OVERNIGHT_DAYTIME scan was actually
+        # judging the REGULAR session and publishing the result under the
+        # requested session's name. That is why an AFTER_HOURS candidate
+        # for DT carried price 51.640 -- the 15:55 ET regular close --
+        # and volume 7,932,617, the whole regular day.
         context: Dict[str, Any] = {}
+        if session:
+            context["session"] = session
         try:
             reasons = self.check(features, data, context)
         except Rejected as rejection:
@@ -498,6 +513,7 @@ class BaseScanner(ABC):
         timestamp: Optional[str] = None,
         run_id: Optional[str] = None,
         shared_features: Optional[SymbolFeatures] = None,
+        session: Optional[str] = None,
     ) -> Optional[ScannerSignal]:
         """One isolated evaluation, accumulated into `outcome`.
 
@@ -521,7 +537,7 @@ class BaseScanner(ABC):
         try:
             signal = self.evaluate(data, trading_day=trading_day, timestamp=timestamp,
                                    run_id=run_id, shared_features=shared_features,
-                                   reject_sink=_rejected)
+                                   reject_sink=_rejected, session=session)
         except ScannerDataError as exc:
             outcome.data_errors += 1
             count_reject_reason(outcome.reject_reasons, reject_reasons.DATA_ERROR)
