@@ -17,7 +17,7 @@ from state_store.schema import (
     MIGRATION_13_STATEMENTS, MIGRATION_14_STATEMENTS,
     MIGRATION_15_STATEMENTS, MIGRATION_16_STATEMENTS,
     MIGRATION_17_STATEMENTS, MIGRATION_18_STATEMENTS,
-    MIGRATION_19_STATEMENTS,
+    MIGRATION_19_STATEMENTS, MIGRATION_20_STATEMENTS,
 )
 
 MIGRATIONS = [
@@ -62,6 +62,9 @@ MIGRATIONS = [
          "metadata, plus the post-exit research tables and the "
          "same-day re-entry block record",
      MIGRATION_19_STATEMENTS),
+    (20, "EXIT TIMING: when the rule decided vs when the broker would "
+         "accept -- a late route must not read as a late rule",
+     MIGRATION_20_STATEMENTS),
 ]
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1][0]

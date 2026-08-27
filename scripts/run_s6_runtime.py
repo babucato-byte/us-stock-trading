@@ -201,7 +201,20 @@ def _dependencies():
     from s1_live import executor as s1_executor
 
     broker = KISBroker()
-    return (armed.build_adapter(broker), s1_executor.make_features_fn(),
+    # S6 reads its OWN intraday view, not S1's daily trend axis.
+    #
+    # `s1_executor.make_features_fn()` fetches with
+    # intraday_lookback_days=0 because S1's exit needs a daily HMA that
+    # must not flicker intraday. Handed to S6 it produced vwap=None,
+    # ema9=None, ema21=None and no volume_expansion field at all, so
+    # VWAP_FAILURE, EMA_STRUCTURE_FAILURE and VOLUME_DECAY_PRICE_WEAKNESS
+    # could never fire -- three of S6's seven rules, silently disabled by
+    # a data source that was correct for a different strategy.
+    from s6_live import realtime_features
+    from scanners.base import scan_session
+
+    return (armed.build_adapter(broker),
+            realtime_features.make_features_fn(session=scan_session.session_at()),
             s1_executor.make_price_fn(broker), broker)
 
 

@@ -70,6 +70,51 @@ def _tracking_end(exit_at: datetime, strategy_id) -> datetime:
     return cursor.replace(hour=21, minute=0, second=0, microsecond=0)
 
 
+def _exit_timing(conn, data, position_id):
+    """When the strategy decided, and when the broker would take it.
+
+    DT made the distinction unavoidable: SESSION_EXIT fired at 23:45:10Z
+    after the sell route had been unavailable for 1h45m. Recorded as one
+    "exit time" that trade reads as a late RULE, which is the opposite of
+    what happened. `route_wait_duration_seconds` isolates the part that
+    belongs to the venue rather than to the strategy.
+
+    Every field is best-effort: a trade that closed before these were
+    recorded still gets its row, with Nones where the fact is unknown.
+    """
+    signal_at = data.get("pending_exit_since")
+    signal_reason = data.get("pending_exit_reason") or data.get("exit_reason")
+    submit_at = None
+    try:
+        row = conn.execute(
+            "SELECT created_at FROM exit_intents WHERE position_id = ? "
+            "AND state NOT IN ('ABORTED') ORDER BY created_at DESC LIMIT 1",
+            (position_id,)).fetchone()
+        if row:
+            submit_at = row[0] if not hasattr(row, "keys") else row["created_at"]
+    except Exception:  # noqa: BLE001
+        logger.debug("exit intent timing unreadable for %s", position_id,
+                     exc_info=True)
+    filled_at = data.get("closed_at")
+
+    def _gap(start, end):
+        a, b = _as_dt(start), _as_dt(end)
+        return (b - a).total_seconds() if a and b else None
+
+    return {
+        "exit_signal_time": signal_at,
+        "exit_signal_reason": signal_reason,
+        "exit_pending_since": signal_at,
+        "sell_submit_time": submit_at,
+        "actual_sell_time": filled_at,
+        "signal_to_submit_seconds": _gap(signal_at, submit_at),
+        "submit_to_fill_seconds": _gap(submit_at, filled_at),
+        # The whole wait from decision to fill. When the signal fired
+        # while no route existed, this is dominated by the venue.
+        "route_wait_duration_seconds": _gap(signal_at, filled_at),
+    }
+
+
 def on_position_closed(conn, *, table, position_id, strategy_id,
                        now=None, note=None, scanner_id=None,
                        strategy_version=None):
@@ -135,14 +180,19 @@ def _record(conn, *, table, position_id, strategy_id, now, note,
 
     from market_hours import us_trading_day
 
+    timing = _exit_timing(conn, data, position_id)
     conn.execute(
         "INSERT OR IGNORE INTO post_exit_tracking ("
         "tracking_id, strategy_id, strategy_version, scanner_id, position_id, "
         "symbol, venue, quantity, entry_time, entry_session, entry_price, "
         "exit_time, exit_session, exit_price, exit_reason, realized_pnl, "
         "realized_pnl_pct, trading_day, tracking_started_at, tracking_end_at, "
-        "status, note, created_at, updated_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "status, note, created_at, updated_at, "
+        "exit_signal_time, exit_signal_reason, exit_pending_since, "
+        "sell_submit_time, actual_sell_time, signal_to_submit_seconds, "
+        "submit_to_fill_seconds, route_wait_duration_seconds) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+        "        ?,?,?,?,?,?,?,?)",
         (tracking_id, strategy_id, strategy_version, scanner_id, position_id,
          str(data.get("symbol") or "").upper(), data.get("venue"), quantity,
          data.get("entry_time") or data.get("opened_at"),
@@ -150,7 +200,12 @@ def _record(conn, *, table, position_id, strategy_id, now, note,
          closed_at, data.get("exit_session"), exit_price, exit_reason,
          realized, realized_pct, us_trading_day(exit_at), stamp,
          end_at.isoformat(), post_exit_policy.STATUS_TRACKING, note,
-         stamp, stamp))
+         stamp, stamp,
+         timing["exit_signal_time"], timing["exit_signal_reason"],
+         timing["exit_pending_since"], timing["sell_submit_time"],
+         timing["actual_sell_time"], timing["signal_to_submit_seconds"],
+         timing["submit_to_fill_seconds"],
+         timing["route_wait_duration_seconds"]))
     conn.commit()
     logger.info("post-exit tracking opened: %s %s %s (%s) until %s",
                 tracking_id, strategy_id, data.get("symbol"), exit_reason,

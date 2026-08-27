@@ -33,7 +33,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from s1_live.exit_runtime import ExitOutcome, _submit_sell
-from s6_live import exit_policy, position_store
+from s6_live import exit_diagnostics, exit_policy, position_store
 
 logger = logging.getLogger(__name__)
 
@@ -237,13 +237,30 @@ def evaluate_position(conn, *, broker_adapter, position_id, row,
         now=now)
     refreshed = position_store.load(conn, position_id) or row
 
+    state = position_store.to_state(refreshed)
     decision = exit_policy.decide(
-        position_store.to_state(refreshed), current_price=current_price,
+        state, current_price=current_price,
         features=features, session=session, now=now, emergency=emergency)
 
+    # Every tick records what each rule answered, including the ones that
+    # could not answer at all. A HOLD that was really "three rules had no
+    # VWAP to read" must not look like a calm market -- see
+    # s6_live/exit_diagnostics.py.
+    diagnostics = exit_diagnostics.evaluate(
+        state, features=features, price=exit_policy._price_of(
+            features, current_price),
+        session=session, now=now, decision=decision)
+    if diagnostics.get("unavailable_rules"):
+        logger.warning(
+            "S6 %s: %d exit rule(s) could not be evaluated this tick: %s",
+            symbol, len(diagnostics["unavailable_rules"]),
+            ", ".join(diagnostics["unavailable_rules"]))
+
     if not decision.sells:
+        # The diagnostics ARE the detail. An empty string here is what
+        # made the DT hold unexplainable after the fact.
         return ExitOutcome(position_id, symbol, ACTION_HELD,
-                           decision.reason, "")
+                           decision.reason, diagnostics)
 
     if not orders_allowed:
         # Latched, never dropped. A session that cannot place orders is a

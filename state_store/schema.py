@@ -1044,6 +1044,47 @@ MIGRATION_19_STATEMENTS = [
 ]
 
 
+# Migration 20: telling a late exit RULE from a late exit ORDER.
+#
+# DT, 2026-08-26: the exit signal (SESSION_EXIT) fired at 23:45:10Z, by
+# which time the sell route had been unavailable for 1h45m. Stored as a
+# single "exit time", that trade reads as an exit rule that fired late.
+# It is two facts -- when the strategy decided, and when the broker
+# would accept the order -- and pooling them would teach the wrong
+# lesson to every analysis built on top.
+#
+# `route_wait_duration_seconds` is the part that belongs to the broker
+# and not to the strategy. An exit-quality statistic that includes it is
+# measuring the venue.
+POST_EXIT_EXIT_SIGNAL_TIME = (
+    "ALTER TABLE post_exit_tracking ADD COLUMN exit_signal_time TEXT")
+POST_EXIT_EXIT_SIGNAL_REASON = (
+    "ALTER TABLE post_exit_tracking ADD COLUMN exit_signal_reason TEXT")
+POST_EXIT_EXIT_PENDING_SINCE = (
+    "ALTER TABLE post_exit_tracking ADD COLUMN exit_pending_since TEXT")
+POST_EXIT_SELL_SUBMIT_TIME = (
+    "ALTER TABLE post_exit_tracking ADD COLUMN sell_submit_time TEXT")
+POST_EXIT_ACTUAL_SELL_TIME = (
+    "ALTER TABLE post_exit_tracking ADD COLUMN actual_sell_time TEXT")
+POST_EXIT_SIGNAL_TO_SUBMIT = (
+    "ALTER TABLE post_exit_tracking ADD COLUMN signal_to_submit_seconds REAL")
+POST_EXIT_SUBMIT_TO_FILL = (
+    "ALTER TABLE post_exit_tracking ADD COLUMN submit_to_fill_seconds REAL")
+POST_EXIT_ROUTE_WAIT = (
+    "ALTER TABLE post_exit_tracking ADD COLUMN route_wait_duration_seconds REAL")
+
+MIGRATION_20_STATEMENTS = [
+    POST_EXIT_EXIT_SIGNAL_TIME,
+    POST_EXIT_EXIT_SIGNAL_REASON,
+    POST_EXIT_EXIT_PENDING_SINCE,
+    POST_EXIT_SELL_SUBMIT_TIME,
+    POST_EXIT_ACTUAL_SELL_TIME,
+    POST_EXIT_SIGNAL_TO_SUBMIT,
+    POST_EXIT_SUBMIT_TO_FILL,
+    POST_EXIT_ROUTE_WAIT,
+]
+
+
 # Every table this schema version creates -- used by export.py's
 # export_all() and by tests asserting the full table set exists.
 ALL_TABLES = [

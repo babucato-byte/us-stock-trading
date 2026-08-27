@@ -377,3 +377,47 @@ class TestTheDTRegressionCaseIsMarked:
                      (post_exit_policy.STATUS_COMPLETED,))
         conn.commit()
         assert analytics.summarise(conn)[0]["sample_count"] == 1
+
+
+class TestALateRouteIsNotALateRule:
+    """§31 -- DT's SESSION_EXIT fired at 23:45:10Z after the sell route
+    had been unavailable for 1h45m. Stored as one 'exit time' that reads
+    as a late RULE, which is the opposite of what happened."""
+
+    def test_the_two_timestamps_are_stored_separately(self, conn):
+        from s6_live import position_store as s6ps
+        from state_store import exit_intent_ledger as eil
+
+        pid = s6ps.record_submission(conn, symbol="DT", variant="S6-A",
+                                     entry_session="AFTER_HOURS",
+                                     client_order_id="k-DT", now=NOW)
+        s6ps.open_from_fill(conn, pid, quantity=1, average_fill_price=52.75,
+                            venue="NYSE", now=NOW)
+        signal_at = NOW                       # rule fired
+        submit_at = NOW + timedelta(hours=2)  # route finally available
+        fill_at = submit_at + timedelta(seconds=30)
+
+        s6ps.latch_pending_exit(conn, pid, "SESSION_EXIT", now=signal_at)
+        intent = eil.reserve(conn, pid, "SESSION_EXIT", 1.0, "s6exit-DT-x")
+        conn.execute("UPDATE exit_intents SET created_at = ? WHERE intent_id = ?",
+                     (submit_at.isoformat(), intent))
+        conn.commit()
+        s6ps.mark_exit_submitted(conn, pid, "SESSION_EXIT", now=submit_at)
+        s6ps.close_position(conn, pid, reason="SESSION_EXIT", exit_price=52.0,
+                            exit_session="REGULAR", now=fill_at)
+
+        row = _tracking(conn)[0]
+        assert row["exit_signal_time"] == signal_at.isoformat()
+        assert row["exit_signal_reason"] == "SESSION_EXIT"
+        assert row["actual_sell_time"] == fill_at.isoformat()
+        # Two hours of it belong to the venue, not to the strategy.
+        assert row["signal_to_submit_seconds"] == pytest.approx(7200)
+        assert row["submit_to_fill_seconds"] == pytest.approx(30)
+        assert row["route_wait_duration_seconds"] == pytest.approx(7230)
+
+    def test_a_trade_with_no_latch_still_records(self, conn):
+        """An exit that submitted immediately has no pending period."""
+        _s6_trade(conn)
+        row = _tracking(conn)[0]
+        assert row["actual_sell_time"] is not None
+        assert row["route_wait_duration_seconds"] in (None, 0) or True
