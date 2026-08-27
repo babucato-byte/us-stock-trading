@@ -34,6 +34,57 @@ NO_PRODUCER_RUN = ("no S6 scan ran for this session -- the candidate "
                    "producer is missing, not the candidates")
 
 
+
+def _latest_generation(rows):
+    """Only the newest scan's rows. Older generations are superseded.
+
+    The published file is append-only for the whole session: a scan
+    every fifteen minutes writes its complete candidate set, so by
+    mid-afternoon one REGULAR session holds seventeen generations and
+    229 rows. Filtering on trading day and variant alone keeps all of
+    them, and the entry cycle then sees the same symbol several times --
+    STE three times, ROP three times, SM ten -- once per generation it
+    ever appeared in.
+
+    Two things go wrong with that, and the cheap one is the cost: each
+    repeat spends a full KIS round trip, and a cycle that should take
+    two minutes takes seven, in a window the scanner is already
+    occupying most of.
+
+    The expensive one is that the older copies are WRONG. A candidate
+    row carries the ORB range, breakout price, rank and score the scan
+    computed at the time. Evaluating a symbol against a two-hour-old row
+    judges it against a range the market has since left -- which is the
+    exact failure that let DT be re-offered every fifteen minutes on
+    market data that had not changed since morning.
+
+    A scan publishes a COMPLETE set, so "newest generation" is the right
+    unit rather than "newest row per symbol": a symbol the latest scan
+    did not publish is not a candidate any more, and keeping its last
+    appearance would quietly resurrect it.
+
+    Rows with no `generated_at` cannot be ordered, so they are treated
+    as one generation of their own and kept only if nothing else
+    qualifies -- an unstamped file still trades rather than silently
+    becoming empty.
+    """
+    stamped = [r for r in rows if str(r.get("generated_at") or "")]
+    if not stamped:
+        # Nothing to order by. Deduplicate on symbol keeping the LAST
+        # occurrence, which is newest in an append-only file.
+        seen = {}
+        for row in rows:
+            seen[str(row.get("symbol") or "").upper()] = row
+        return list(seen.values())
+
+    newest = max(str(r.get("generated_at")) for r in stamped)
+    latest = [r for r in stamped if str(r.get("generated_at")) == newest]
+    if len(latest) < len(rows):
+        logger.info("S6 candidate set: %s of %s published rows are the "
+                    "newest generation (%s); the rest are superseded",
+                    len(latest), len(rows), newest)
+    return latest
+
 class S6CandidateSource:
     """This session's published S6 rows, or nothing at all."""
 
@@ -166,6 +217,8 @@ class S6CandidateSource:
                 f"{self._trading_day}")
             logger.warning("S6 candidate source refused: %s", self._refusal)
             return None
+
+        fresh = _latest_generation(fresh)
 
         self._consumed_at = datetime.now(timezone.utc)
         self._rows = sorted(fresh, key=lambda r: (int(r.get("rank") or 10**6),
