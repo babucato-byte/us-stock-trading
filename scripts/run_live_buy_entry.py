@@ -117,11 +117,28 @@ def _s6_source(rollout, now):
     from s6_live.candidate_source import S6CandidateSource
     from scanners.base import scan_session
 
-    return S6CandidateSource(
+    source = S6CandidateSource(
         trading_day=us_trading_day(now),
         session=scan_session.session_at(),
         rollout=rollout,
     )
+    # An hourly candidate is a reason to WATCH, not a reason to buy.
+    #
+    # DT was published every fifteen minutes with a fresh generated_at
+    # and bit-identical market data underneath -- price, volume, VWAP and
+    # EMAs unchanged for three hours -- and the entry path had no step
+    # that asked what the market was doing at the moment of the order.
+    # The watch re-asks S6's own entry conditions against the current
+    # intraday view and offers only the candidates that still hold.
+    #
+    # A pure restriction on `symbols()`: it can offer fewer names than
+    # the source it wraps, never more and never different ones.
+    from s6_live.precision_watch import WatchedCandidateSource
+    from state_store import db as state_db
+
+    return WatchedCandidateSource(
+        source, conn=state_db.open_db(),
+        session=scan_session.session_at(), now=now)
 
 
 def run_once(broker=None, *, strategy="s1"):
