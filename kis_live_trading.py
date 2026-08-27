@@ -910,6 +910,76 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                         account_id=account_snapshot.account_id, now=current,
                         audit_run_id=run_id,
                     )
+                    # A REJECTED transport result is not a submission.
+                    #
+                    # `submit_buy_order` PERSISTS the broker's answer and
+                    # RETURNS it -- ACCEPTED, REJECTED or UNKNOWN -- and
+                    # raises only when something went wrong on the way.
+                    # This branch read "no exception" as "the order is
+                    # live", so a rejection by KIS was recorded as an
+                    # approved buy: counted in `submitted`, audited as
+                    # APPROVED, and given an S6 position row at SUBMITTED
+                    # for an order that does not exist anywhere.
+                    #
+                    # That row then blocked every later entry for the
+                    # symbol through SYMBOL_ALREADY_HELD -- which is why
+                    # the damage stopped at one order per symbol, and why
+                    # it looked like duplicate protection working rather
+                    # than a defect being contained by it. On 2026-08-27
+                    # BTG, PBR and PTEN each ended the session holding a
+                    # position the account never had.
+                    if str(result.status).upper() == "REJECTED":
+                        broker_record = result.execution_record
+                        reason = (f"KIS rejected the order "
+                                  f"(code={getattr(broker_record, 'error_code', None)!r}: "
+                                  f"{getattr(broker_record, 'error_message', None)})")
+                        logger.warning("BROKER_REJECTED %s qty=%s limit=%s %s",
+                                       symbol, order_intent.quantity,
+                                       order_intent.limit_price, reason)
+                        results["blocked"].append((symbol, reason))
+                        shadow_mode.persist(_shadow_record("REJECTED", reason))
+                        outcome["result"] = shadow_audit.RESULT_BLOCKED
+                        outcome["reason_code"] = "BROKER_REJECTED"
+                        outcome["detail"] = reason
+                        _audit(run_id, shadow_audit.GATE_REJECTED,
+                               shadow_audit.RESULT_BLOCKED, symbol=symbol,
+                               signal_id=signal.signal_id,
+                               internal_order_id=order_intent.internal_order_id,
+                               reason_code="BROKER_REJECTED", detail=reason,
+                               now=current)
+                        continue
+                    # UNKNOWN is the other answer that is not a
+                    # submission, and it is the dangerous one: the order
+                    # may be live at KIS. It keeps the S6 row -- without
+                    # it a held share would be invisible to the exit
+                    # runtime -- but it is not counted or audited as an
+                    # approved buy, and nothing here re-sends it.
+                    if str(result.status).upper() == "UNKNOWN":
+                        reason = ("KIS did not confirm the order; left UNKNOWN "
+                                  "for reconciliation against KIS order history")
+                        logger.warning("BROKER_UNKNOWN %s qty=%s limit=%s",
+                                       symbol, order_intent.quantity,
+                                       order_intent.limit_price)
+                        results["blocked"].append((symbol, reason))
+                        shadow_mode.persist(_shadow_record("AMBIGUOUS", reason))
+                        outcome["result"] = shadow_audit.RESULT_ERROR
+                        outcome["reason_code"] = "AMBIGUOUS_RESPONSE"
+                        outcome["detail"] = reason
+                        if s6_entry_lifecycle.is_s6(order_intent.strategy_id):
+                            try:
+                                s6_entry_lifecycle.record_entry_submission(
+                                    conn, symbol=symbol,
+                                    session=order_intent.session,
+                                    client_order_id=order_intent.internal_order_id,
+                                    candidate_row=_s6_candidate_row(source, symbol),
+                                    now=current)
+                            except Exception:  # noqa: BLE001
+                                logger.exception(
+                                    "S6 entry could not be recorded after an "
+                                    "UNKNOWN response for %s -- reconcile "
+                                    "against KIS order history before any "
+                                    "further entry", symbol)
+                        continue
                     results["submitted"].append(symbol)
                     shadow_mode.persist(_shadow_record("APPROVED"))
                     # GATE_APPROVED and EXECUTION_PLANNED were already

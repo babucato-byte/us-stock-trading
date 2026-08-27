@@ -55,6 +55,41 @@ def _finite(value) -> Optional[float]:
     return None if number != number else number
 
 
+#: Ledger statuses that mean the order will never fill, ever.
+#:
+#: A rejected order has no broker order id, so the fill lookup has
+#: nothing to ask KIS about and answers "no fills yet" forever. The row
+#: then sits at SUBMITTED, counts against the symbol lock, and blocks
+#: that symbol for the rest of the session -- which is exactly what
+#: happened to BTG, PBR and PTEN on 2026-08-27.
+#:
+#: A rejection is STRONGER evidence than an empty fill lookup, not
+#: weaker: the broker positively refused the order. Only REJECTED and
+#: CANCELLED qualify. UNKNOWN never does -- that is the state that
+#: exists precisely because nobody knows.
+_TERMINAL_LEDGER_STATUSES = ("REJECTED", "CANCELLED")
+
+
+def _order_will_never_fill(conn, row):
+    """True when the order ledger says this row's order was refused."""
+    client_order_id = row.get("client_order_id")
+    if not client_order_id:
+        return False
+    try:
+        found = conn.execute(
+            "SELECT status FROM kis_order_idempotency "
+            "WHERE internal_order_id = ?", (client_order_id,)).fetchone()
+    except Exception:  # noqa: BLE001 - an unreadable ledger is not
+        # evidence of anything, and must never abandon a live row.
+        logger.warning("S6 could not read the order ledger for %s",
+                       client_order_id, exc_info=True)
+        return False
+    if found is None:
+        return False
+    status = str(found["status"] if hasattr(found, "keys") else found[0] or "")
+    return status.upper() in _TERMINAL_LEDGER_STATUSES
+
+
 def sync_buy_fills(conn, *, fills_for, now=None) -> List[Dict[str, Any]]:
     """SUBMITTED -> OPEN from the broker's own fills.
 
@@ -82,6 +117,19 @@ def sync_buy_fills(conn, *, fills_for, now=None) -> List[Dict[str, Any]]:
     applied = []
     for row in pending:
         pid, symbol = row["position_id"], row["symbol"]
+        # Asked BEFORE the broker lookup, because for a refused order
+        # there is nothing to look up: no broker order id was ever
+        # issued, so the lookup returns "no fills yet" every time and the
+        # row can never reach a terminal state on its own.
+        if (row.get("status") == position_store.SUBMITTED
+                and _order_will_never_fill(conn, row)):
+            position_store.abandon_submission(
+                conn, pid, reason="BUY_NEVER_FILLED", now=now)
+            logger.info("S6 abandoned %s (%s): the order ledger reports it "
+                        "was refused, so it can never fill", pid, symbol)
+            applied.append({"position_id": pid, "symbol": symbol,
+                            "status": "ABANDONED"})
+            continue
         try:
             fill = fills_for(row)
         except Exception as exc:  # noqa: BLE001 - one symbol's lookup
