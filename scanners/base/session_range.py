@@ -141,6 +141,32 @@ def session_start_date(moment, session) -> Optional[date]:
     return moment.date() if moment.time() >= start else moment.date() - timedelta(days=1)
 
 
+def current_session_date(session, now=None) -> Optional[date]:
+    """The date of the session happening NOW, in Eastern terms.
+
+    The distinction this exists for
+    -------------------------------
+    `slice_session_bars` with no `session_date` takes the most recent
+    date that HAS bars for the session. That is not the same as the
+    current session, and on 2026-08-27 the difference was the whole
+    problem: the provider had published nothing for the day, so a
+    PREMARKET slice returned eight bars from 2026-08-26 09:25 ET and the
+    scanner described them as today's premarket.
+
+    Passing this instead makes an absent session an EMPTY slice, which
+    the caller can report as NO_CURRENT_SESSION_DATA rather than
+    silently analysing yesterday.
+    """
+    from datetime import datetime, timezone
+
+    from market_hours import EASTERN
+
+    moment = now or datetime.now(timezone.utc)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return session_start_date(moment.astimezone(EASTERN), session)
+
+
 def slice_session_bars(df, session, *, session_date: Optional[date] = None):
     """Every bar belonging to one session, oldest first.
 

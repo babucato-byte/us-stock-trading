@@ -13,8 +13,24 @@
 # trading runtime read shared/state/candidates, and both reported
 # success.
 set -u
+# The script's own location decides where shared_env.sh is, and NOTHING
+# else. It used to decide the project root too, which is how the scanner
+# spent twenty commits running a mutable checkout while the trading
+# runtime ran a validated release -- deployed scanner changes were inert
+# in production and nothing errored, because both halves reported success
+# about different code.
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$SCRIPT_DIR/shared_env.sh"
+
+# Code from the release, verified against the deployed and validated
+# SHAs. No fallback to a checkout: falling back is what produced the
+# drift, and a scan that does not run is visible in a way that one
+# running old code is not.
+resolve_release_root || exit 1
+
+# Writes go to shared mutable data, so running release code cannot
+# dirty the release it is running.
+resolve_scanner_data_dirs || exit 1
 
 cd "$SCANNER_RUNTIME_ROOT" || exit 1
 
@@ -35,7 +51,7 @@ print(scan_window.probe())
 " 2>/dev/null)
 [ -n "$SESSION" ] || exit 0
 
-LOG="$SCANNER_RUNTIME_ROOT/logs/cron/s6_scan.log"
+LOG="${SCANNER_DATA_ROOT}/logs/cron/s6_scan.log"
 case "$SESSION" in
   PREMARKET|REGULAR|AFTER_HOURS|OVERNIGHT_DAYTIME) ;;
   *)
@@ -51,10 +67,13 @@ esac
 # are siblings by construction.
 MANIFEST_PATH="$(dirname "$SCANNER_CANDIDATE_DIR")/discovery/manifest.json"
 
-echo "$(date -u +%FT%TZ) session=$SESSION candidates=$SCANNER_CANDIDATE_DIR manifest=$MANIFEST_PATH" >> "$LOG"
+echo "$(date -u +%FT%TZ) session=$SESSION scanner_sha=$SCANNER_SHA root=$SCANNER_RUNTIME_ROOT candidates=$SCANNER_CANDIDATE_DIR manifest=$MANIFEST_PATH" >> "$LOG"
 flock -n /home/ubuntu/logs/cron/s6_scan.lock \
   env SCANNER_CANDIDATE_DIR="$SCANNER_CANDIDATE_DIR" \
       TRADING_PROJECT_ROOT="$SCANNER_RUNTIME_ROOT" \
+      SCANNER_ANALYTICS_DIR="$SCANNER_ANALYTICS_DIR" \
+      SCANNER_LOG_DIR="$SCANNER_LOG_DIR" \
+      SCANNER_UNIVERSE_FILE="$SCANNER_UNIVERSE_FILE" \
   venv/bin/python scripts/run_scanners.py --scanners orb \
     --session "$SESSION" --universe manifest \
     --manifest-path "$MANIFEST_PATH" \

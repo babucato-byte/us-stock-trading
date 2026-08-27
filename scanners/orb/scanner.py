@@ -113,13 +113,27 @@ class OpeningRangeBreakoutScanner(BaseScanner):
         else:
             from scanners.base import session_range as srange
 
-            session = srange.slice_session_bars(data.intraday, requested)
+            # Scoped to the session happening NOW. Without the date,
+            # `slice_session_bars` takes the most recent date that HAS
+            # bars for this session -- so on a morning when the provider
+            # has published nothing, a PREMARKET slice returns
+            # YESTERDAY's premarket and the scan describes an
+            # eighteen-hour-old market as current. That produced a live
+            # PTC candidate on 2026-08-27 whose data was from
+            # 2026-08-26 19:30 ET.
+            session_date = srange.current_session_date(requested)
+            session = srange.slice_session_bars(data.intraday, requested,
+                                                session_date=session_date)
             if session is None or len(session) == 0:
+                # NO_CURRENT_SESSION_DATA, not "no setups". The previous
+                # session's bars are never offered in its place.
                 raise ScannerDataError(
-                    f"{data.symbol}: no {requested} bars for this session")
+                    f"{data.symbol}: NO_CURRENT_SESSION_DATA -- no "
+                    f"{requested} bars for {session_date}")
 
             window = srange.opening_range(data.intraday, requested,
-                                          minutes=minutes)
+                                          minutes=minutes,
+                                          session_date=session_date)
             if not window.complete:
                 # Not a rejection. A session whose range has not formed
                 # yet has nothing to say; calling it a market judgement

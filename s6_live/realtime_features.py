@@ -61,6 +61,15 @@ VOLUME_OK = "VOLUME_OK"
 VOLUME_ZERO_CONFIRMED = "ZERO_VOLUME_CONFIRMED"
 VOLUME_DATA_UNAVAILABLE = "VOLUME_DATA_UNAVAILABLE"
 
+#: The session happening now has published no bars at all.
+#:
+#: Deliberately not the same as a stale view: a stale view describes a
+#: real moment that has passed, and this describes nothing. The previous
+#: session's bars are never offered in its place -- that substitution is
+#: what made a PREMARKET candidate on 2026-08-27 carry data from
+#: 2026-08-26 19:30 ET while claiming to be current.
+NO_CURRENT_SESSION_DATA = "NO_CURRENT_SESSION_DATA"
+
 #: How old the newest intraday bar may be before the view is stale.
 #: Deliberately generous: this is a data-integrity bound, not a trading
 #: threshold, and a 5-minute bar feed is normally a few minutes behind.
@@ -222,18 +231,28 @@ def build(symbol, *, session=None, now=None, provider=None,
                               "volume_expansion")},
                 error="no intraday bars")
 
-        bars = srange.slice_session_bars(intraday, resolved)
+        # Scoped to the session happening NOW, not to the most recent
+        # date that happens to have bars for it. Without the date,
+        # `slice_session_bars` takes max(candidates) -- so on a morning
+        # when the provider has published nothing, a PREMARKET slice
+        # returns YESTERDAY's premarket and every value below describes
+        # a session that ended eighteen hours ago.
+        session_date = srange.current_session_date(resolved, moment)
+        bars = srange.slice_session_bars(intraday, resolved,
+                                         session_date=session_date)
         if bars is None or len(bars) == 0:
-            # The session has published nothing yet. Distinct from "the
-            # feed is broken": named separately so a report can tell an
-            # operator which it is.
+            # The current session has published nothing. Distinct from
+            # "the feed is broken", and distinct again from "yesterday
+            # had bars" -- which is not an answer to what is happening
+            # now, and is never substituted for one.
             return SessionFeatures(
                 symbol=symbol, session=resolved, built_at=moment,
-                market_data_asof=_as_utc(intraday.index[-1]),
-                unavailable={k: f"no {resolved} bars" for k in
+                market_data_asof=None,
+                unavailable={k: NO_CURRENT_SESSION_DATA for k in
                              ("price", "vwap", "ema9", "ema21", "volume",
                               "volume_expansion")},
-                error=f"no {resolved} bars")
+                error=f"{NO_CURRENT_SESSION_DATA}: no {resolved} bars for "
+                      f"{session_date}")
 
         closes = ind.close_series(bars)
         price = _finite(ind.last_valid(closes))
