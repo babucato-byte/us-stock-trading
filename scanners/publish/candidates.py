@@ -82,6 +82,20 @@ class PublishedCandidate:
     rank: int
     score: Optional[float]
     price: Optional[float]
+    #: When the MARKET this row describes was last observed -- the newest
+    #: bar's timestamp -- as distinct from when the row was made.
+    #:
+    #: DT, 2026-08-26: this file carried a new `generated_at` every
+    #: fifteen minutes for three hours while the price, volume, VWAP and
+    #: EMAs inside it were bit-identical, because the scanner was
+    #: re-serving regular-session data after the close. A consumer had no
+    #: way to tell a fresh row from a fresh timestamp, and one of them
+    #: bought at 52.75 on a thesis computed at 51.64.
+    #:
+    #: None when the producer did not supply it. Left None rather than
+    #: defaulted to `generated_at`, which would restate the very error
+    #: this field exists to expose.
+    market_data_asof: Optional[str] = None
     volume: Optional[float] = None
     avg_volume: Optional[float] = None
     volume_multiple: Optional[float] = None
@@ -296,6 +310,11 @@ def build_rows(signals: Iterable[Any], *, strategy_id: str, trading_day: str,
             trading_day=trading_day,
             session=session,
             generated_at=stamp,
+            # From the producer, never defaulted to `stamp`: a row whose
+            # market age is unknown must say so rather than claim to be
+            # as fresh as its own timestamp.
+            market_data_asof=(metrics.get("market_data_asof")
+                              or getattr(signal, "market_data_asof", None)),
             symbol=str(getattr(signal, "symbol", "")),
             rank=position,
             score=_number(getattr(signal, "scanner_score", None)),
