@@ -269,6 +269,38 @@ class TestTheEntryTickIsScheduledAndSafe:
         assert 'exit "$STATUS"' in text
 
 
+class TestTheCheckerDoesNotNeedAPreApprovedSymbol:
+    """The fourth remnant. Two checks were retired and a third still
+    required the list to hold exactly one symbol -- to have something to
+    price -- so the checker went on blocking for the same reason under a
+    different code."""
+
+    CHECK = REPO_ROOT / "scripts" / "final_pre_live_check.sh"
+
+    def test_an_absent_list_is_not_an_unevaluated_cash_failure(self):
+        text = self.CHECK.read_text(encoding="utf-8")
+        assert "ORDERABLE_CASH_PER_CANDIDATE" in text
+        assert "does not hold exactly one symbol" not in text
+
+    def test_a_set_but_empty_list_still_cannot_be_priced(self):
+        """Nothing was priced there either, but for a reason that IS a
+        blocker: the list denies every symbol."""
+        text = self.CHECK.read_text(encoding="utf-8")
+        assert "ORDERABLE_CASH_NOT_EVALUATED" in text
+        assert "set but empty, so no candidate could be priced" in text
+
+    def test_every_listed_symbol_is_priced_not_only_the_first(self):
+        text = self.CHECK.read_text(encoding="utf-8")
+        assert "for symbol in symbols:" in text
+
+    def test_one_affordable_name_is_enough(self):
+        """The entry evaluates candidates in rank order and skips the
+        ones it cannot afford, so a single expensive name on a list is
+        not a reason to refuse to go live."""
+        text = self.CHECK.read_text(encoding="utf-8")
+        assert "any(ok for _s, _c, _p, ok in affordable)" in text
+
+
 class TestTheTickIsLegibleAfterwards:
     """§8, §13, §16 -- "no BUY today" has several explanations and the
     log could not tell them apart."""

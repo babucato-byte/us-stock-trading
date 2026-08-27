@@ -560,8 +560,16 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                            detail=reason, now=current)
                     continue
                 if classification is not None:
-                    logger.info("S1 entry candidate %s verified as %s on %s "
-                                "(KIS master %s)", symbol, classification.security_type,
+                    # No strategy in the message. This path is shared and
+                    # the line said "S1" for every strategy that used it,
+                    # so an S6 entry's security check read as S1 to anyone
+                    # reading the log for evidence of what a strategy did.
+                    # The strategy is not yet known here either -- it
+                    # arrives with qualification below -- and naming the
+                    # wrong one is worse than naming none.
+                    logger.info("entry candidate %s verified as %s on %s "
+                                "(KIS master %s)", symbol,
+                                classification.security_type,
                                 classification.exchange, classification.asof)
 
                 # PHASE 4A: qualification is the ONLY source-specific step.

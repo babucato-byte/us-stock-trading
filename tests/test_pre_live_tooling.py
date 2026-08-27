@@ -560,7 +560,18 @@ class TestTheCheckerDistinguishesCashOutcomes:
         """"Nothing was priced" and "the account is short" are different
         findings; reporting the first as the second is an invented one."""
         assert "ORDERABLE_CASH_NOT_EVALUATED" in CHECK_SOURCE
-        assert "no candidate to price" in CHECK_SOURCE
+        assert "no candidate could be priced" in CHECK_SOURCE
+
+    def test_nothing_to_price_and_nothing_priced_yet_are_separate(self):
+        """A third outcome arrived with NORMAL LIVE: no allow-list means
+        there is no pre-approved symbol to price AND nothing is missing,
+        because orderable cash is read per candidate at entry. That is
+        not the same as an allow-list that denies everything, and it must
+        not inherit its blocking code."""
+        assert "ORDERABLE_CASH_PER_CANDIDATE" in CHECK_SOURCE
+        per_candidate = CHECK_SOURCE.index("ORDERABLE_CASH_PER_CANDIDATE")
+        assert CHECK_SOURCE[per_candidate - 200:per_candidate].count("check(") == 0, (
+            "the absent-allowlist case must report, not check")
 
     def test_a_real_shortfall_keeps_its_own_code(self):
         assert "INSUFFICIENT_ORDERABLE_CASH" in CHECK_SOURCE

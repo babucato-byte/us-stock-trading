@@ -382,22 +382,44 @@ try:
     open_orders = broker.get_open_orders()
     check("OPEN_ORDERS_NOT_ZERO", len(open_orders) == 0, f"open orders={len(open_orders)}")
 
-    symbols = [s.strip().upper() for s in
-               (os.environ.get("LIVE_ROLLOUT_ALLOWED_SYMBOLS") or "").split(",") if s.strip()]
-    if len(symbols) == 1:
+    raw_allowlist = os.environ.get("LIVE_ROLLOUT_ALLOWED_SYMBOLS")
+    symbols = [s.strip().upper() for s in (raw_allowlist or "").split(",")
+               if s.strip()]
+    if symbols:
+        # An operator-set list is small by nature, so every symbol on it
+        # is priced rather than only the first -- a list whose second
+        # name is unaffordable is worth knowing before going live.
         from market_data.exchange_registry import build_kis_instrument
 
-        instrument, _record = build_kis_instrument(symbols[0])
-        price = broker.get_current_price(instrument)
-        orderable = broker.get_orderable_usd(instrument, price)
-        check("INSUFFICIENT_ORDERABLE_CASH", orderable >= price,
-              f"orderable={orderable} price={price}")
+        affordable = []
+        for symbol in symbols:
+            instrument, _record = build_kis_instrument(symbol)
+            price = broker.get_current_price(instrument)
+            orderable = broker.get_orderable_usd(instrument, price)
+            affordable.append((symbol, orderable, price, orderable >= price))
+        detail = " ".join(f"{sym}:orderable={cash}/price={px}"
+                          for sym, cash, px, _ok in affordable)
+        # ANY affordable name is enough: the entry evaluates candidates
+        # in rank order and skips the ones it cannot afford, so a single
+        # expensive name on the list is not a blocker.
+        check("INSUFFICIENT_ORDERABLE_CASH",
+              any(ok for _s, _c, _p, ok in affordable), detail)
+    elif raw_allowlist is None:
+        # NORMAL LIVE. There is no pre-approved symbol to price, and
+        # there is nothing missing either: orderable cash is read per
+        # candidate at the moment of entry, against the exact limit
+        # price the order will carry. A single account-level figure was
+        # never the question -- the same $20.96 buys one share of an
+        # $11 name and none of a $40 one.
+        print("INFO::ORDERABLE_CASH_PER_CANDIDATE::"
+              "no operator allow-list; orderable cash is read per candidate at entry")
     else:
-        # Not the same as "the account is short". Nothing was priced,
-        # so nothing is known about the cash -- reporting a shortfall
-        # here would be an invented finding.
+        # Set but empty: the allow-list denies every symbol, so there is
+        # genuinely nothing this account could buy. That is reported by
+        # the shell check above; nothing was priced, and claiming a
+        # shortfall here would be an invented finding on top of it.
         check("ORDERABLE_CASH_NOT_EVALUATED", False,
-              "no candidate to price: the allow-list does not hold exactly one symbol")
+              "the allow-list is set but empty, so no candidate could be priced")
 
     conn = state_db.open_db()
     try:

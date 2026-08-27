@@ -36,13 +36,18 @@ SCANNER_LIVE_MODE = {
     "gap_pullback": MODE_DISCOVERY_ONLY,
     # S6. Promoted from DISCOVERY_ONLY as a reviewed decision, not a
     # config drift: the ORB scanner publishes a per-session breakout row
-    # carrying its own range, `s6_live` has the qualification, position
-    # store and exit policy behind it, and the entry it can now reach is
-    # bounded by a per-strategy cap of one position and a per-order
-    # quantity of one share (config/live_rollout_config.py). Ordering is
-    # still restricted to the sessions `config/s6_sessions.py` marks
-    # LIMITED_LIVE -- scanning happens in every session, ordering does
-    # not, and this table does not widen that.
+    # carrying its own range, and `s6_live` has the qualification,
+    # position store and exit policy behind it.
+    #
+    # This constant does NOT mean the retired LIMITED_LIVE test posture,
+    # whose one-position and one-share caps are gone. It means only that
+    # this scanner may reach the live entry path at all, as against
+    # DISCOVERY_ONLY. What bounds an entry now is orderable cash, the
+    # per-symbol lock, same-day re-entry, ownership and reconciliation.
+    #
+    # Ordering is still restricted to the sessions `config/s6_sessions.py`
+    # marks live -- scanning happens in every session, ordering does not,
+    # and this table does not widen that.
     "orb": MODE_LIMITED_LIVE,
 }
 
