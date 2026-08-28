@@ -60,6 +60,52 @@ FEED_UNKNOWN = "UNKNOWN"
 DEFAULT_STALE_AFTER_SECONDS = 180.0
 
 
+class FeedLag:
+    """How far behind the feed actually runs, measured continuously.
+
+    The constant is 70 seconds and it is not trusted. "Delayed" could
+    mean fifteen minutes on another account, on another day, or after a
+    KIS change, and a freshness rule built on a number nobody re-checks
+    is the same mistake as the zero-volume assumption -- a measurement
+    frozen into a belief.
+
+    So the lag is observed per trade and kept as a distribution. The
+    median says what normal is; p95 and max say what the freshness
+    threshold has to tolerate before it starts rejecting good data.
+    """
+
+    #: Enough to characterise a session without unbounded growth.
+    WINDOW = 512
+
+    def __init__(self):
+        self._samples: List[float] = []
+
+    def observe(self, *, market_timestamp, received_at):
+        if market_timestamp is None or received_at is None:
+            return None
+        lag = (received_at - market_timestamp).total_seconds()
+        # A negative lag means the clocks disagree, not that data arrived
+        # before it happened. Recording it would corrupt the median that
+        # a freshness rule is built on.
+        if lag < 0:
+            return None
+        self._samples.append(lag)
+        if len(self._samples) > self.WINDOW:
+            del self._samples[:len(self._samples) - self.WINDOW]
+        return lag
+
+    def describe(self) -> dict:
+        if not self._samples:
+            return {"samples": 0, "median": None, "p95": None, "max": None}
+        ordered = sorted(self._samples)
+        return {
+            "samples": len(ordered),
+            "median": ordered[len(ordered) // 2],
+            "p95": ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))],
+            "max": ordered[-1],
+        }
+
+
 @dataclass
 class Bar:
     symbol: str
@@ -276,6 +322,10 @@ class RealtimeBarStore:
         self.gaps: List[dict] = []
         self.layout_mismatches = 0
         self.dropped_unparsable = 0
+        self.feed_lag = FeedLag()
+        #: Which feed each symbol's data actually arrived on, so a dual
+        #: subscription can never have its data credited to the wrong one.
+        self.feeds_seen: Dict[str, str] = {}
 
     # -- ingest ----------------------------------------------------------
 
@@ -307,6 +357,15 @@ class RealtimeBarStore:
         accumulator.add(price=price, size=size, at=at,
                         cumulative=wire.as_number(record.get(wire.FIELD_CUMULATIVE)),
                         amount=wire.as_number(record.get(wire.FIELD_AMOUNT)))
+
+        # Attribution and lag, per trade. `at` is the market's own
+        # timestamp and `received_at` is ours, so the difference is the
+        # feed's real delay rather than an assumption about its name.
+        self.feed_lag.observe(market_timestamp=at,
+                              received_at=now or datetime.now(timezone.utc))
+        feed = wire.feed_of(record.get("RSYM") or record.get("tr_key"))
+        if feed:
+            self.feeds_seen[symbol] = feed
         return at.replace(second=0, microsecond=0)
 
     # -- read ------------------------------------------------------------
@@ -343,6 +402,10 @@ class RealtimeBarStore:
             "gaps": list(self.gaps),
             "layout_mismatches": self.layout_mismatches,
             "dropped_unparsable": self.dropped_unparsable,
+            "feed_lag_seconds": self.feed_lag.describe(),
+            "feeds_seen": dict(self.feeds_seen),
+            "symbols_with_data": sum(
+                1 for a in self._accumulators.values() if a.trade_count > 0),
         }
 
     # -- connection lifecycle -------------------------------------------

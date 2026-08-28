@@ -134,6 +134,55 @@ def is_pingpong(message):
         return False
 
 
+#: What a feed is actually doing, which is not what it agreed to do.
+#:
+#: The distinction that cost a session: KIS accepted an RBAQ
+#: registration this account is not entitled to and then sent nothing.
+#: "SUBSCRIBE SUCCESS" only ever establishes SUBSCRIPTION_ACCEPTED, and
+#: readiness requires DATA_FLOWING -- a message actually received.
+SUBSCRIPTION_ACCEPTED = "SUBSCRIPTION_ACCEPTED"
+DATA_FLOWING = "DATA_FLOWING"
+NO_DATA_FLOW = "NO_DATA_FLOW"
+ENTITLEMENT_SUSPECTED = "ENTITLEMENT_SUSPECTED"
+FEED_FAILED = "FAILED"
+
+
+def feed_capability(*, accepted, messages, seconds_observed,
+                    expect_data_after=45.0):
+    """What this feed has PROVEN, not what it acknowledged.
+
+    `expect_data_after` is the window past which silence on a liquid
+    subscription stops being plausible. Below it the honest answer is
+    still "accepted, nothing yet" -- an illiquid premarket name can go
+    minutes without a print, and calling that an entitlement problem
+    would be the same species of guess in the other direction.
+    """
+    if not accepted:
+        return FEED_FAILED
+    if messages > 0:
+        return DATA_FLOWING
+    if seconds_observed >= expect_data_after:
+        # Accepted, observed long enough, and silent. Suspected, never
+        # concluded: only KIS can say whether this is entitlement.
+        return ENTITLEMENT_SUSPECTED
+    return SUBSCRIPTION_ACCEPTED
+
+
+def feed_of(tr_key):
+    """Which feed a message's tr_key came from.
+
+    Recorded per message so a dual subscription can never again have its
+    data credited to the wrong feed -- which is exactly how the collector
+    ended up configured for one that sends nothing.
+    """
+    text = str(tr_key or "").upper()
+    if text[:1] == "D":
+        return FEED_DELAYED
+    if text[:1] == "R":
+        return FEED_REALTIME
+    return None
+
+
 def parse_trades(payload):
     """An HDFSCNT0 frame -> list of trade records.
 
@@ -164,7 +213,7 @@ def parse_trades(payload):
         chunk = fields[index * width:(index + 1) * width]
         record = {"raw_field_count": len(fields), "declared_count": declared,
                   "records_in_frame": total, "layout_mismatch": False,
-                  "source": SOURCE}
+                  "source": SOURCE, "tr_id": parts[1]}
         record.update(dict(zip(FIELDS, chunk)))
         records.append(record)
     return records
