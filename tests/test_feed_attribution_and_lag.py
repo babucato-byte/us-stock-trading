@@ -149,3 +149,50 @@ class TestSymbolsWithDataIsTheNumberThatMatters:
 
     def test_it_is_zero_before_any_trade(self):
         assert rb.RealtimeBarStore().describe(now=NOW)["symbols_with_data"] == 0
+
+
+class TestTheInstrumentationSurvivesPersistence:
+    """It read empty in production while the live collector had it.
+
+    Both measurements are computed in `add_trade` and were kept only in
+    memory, so the snapshot — the only thing a reader ever sees — carried
+    neither. Instrumentation invisible to its audience is not
+    instrumentation.
+    """
+
+    def _store_with_trades(self):
+        store = rb.RealtimeBarStore()
+        values = {name: "" for name in wire.FIELDS}
+        values.update({"SYMB": "AAPL", "RSYM": "DNASAAPL",
+                       wire.FIELD_PRICE: "100", wire.FIELD_TRADE_SIZE: "5",
+                       wire.FIELD_LOCAL_DATE: "20260828",
+                       wire.FIELD_LOCAL_TIME: "103815"})
+        values["layout_mismatch"] = False
+        store.add_trade(values, session="REGULAR", now=NOW)
+        return store
+
+    def test_the_lag_samples_survive(self):
+        restored = rb.RealtimeBarStore.restore(self._store_with_trades().snapshot())
+        assert restored.feed_lag.describe()["samples"] == 1
+
+    def test_the_feed_attribution_survives(self):
+        restored = rb.RealtimeBarStore.restore(self._store_with_trades().snapshot())
+        assert restored.feeds_seen["AAPL"] == wire.FEED_DELAYED
+
+    def test_a_reader_sees_both_in_describe(self):
+        restored = rb.RealtimeBarStore.restore(self._store_with_trades().snapshot())
+        described = restored.describe(now=NOW)
+        assert described["feed_lag_seconds"]["samples"] == 1
+        assert described["feeds_seen"]["AAPL"] == wire.FEED_DELAYED
+
+    def test_a_snapshot_without_them_still_restores(self):
+        """Older snapshots predate the fields."""
+        store = rb.RealtimeBarStore.restore({"version": 1, "accumulators": []})
+        assert store.feed_lag.describe()["samples"] == 0
+        assert store.feeds_seen == {}
+
+    def test_garbage_samples_are_ignored(self):
+        store = rb.RealtimeBarStore.restore(
+            {"version": 1, "accumulators": [],
+             "feed_lag_samples": [1.0, "x", None, 2.0]})
+        assert store.feed_lag.describe()["samples"] == 2

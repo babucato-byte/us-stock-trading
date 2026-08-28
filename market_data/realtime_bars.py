@@ -94,6 +94,13 @@ class FeedLag:
             del self._samples[:len(self._samples) - self.WINDOW]
         return lag
 
+    def samples(self):
+        return list(self._samples)
+
+    def restore(self, values):
+        self._samples = [float(v) for v in values
+                         if isinstance(v, (int, float))][-self.WINDOW:]
+
     def describe(self) -> dict:
         if not self._samples:
             return {"samples": 0, "median": None, "p95": None, "max": None}
@@ -363,7 +370,9 @@ class RealtimeBarStore:
         # feed's real delay rather than an assumption about its name.
         self.feed_lag.observe(market_timestamp=at,
                               received_at=now or datetime.now(timezone.utc))
-        feed = wire.feed_of(record.get("RSYM") or record.get("tr_key"))
+        feed = (wire.feed_of(record.get("RSYM"))
+                or wire.feed_of(record.get("tr_key"))
+                or wire.feed_of(record.get("TSYM")))
         if feed:
             self.feeds_seen[symbol] = feed
         return at.replace(second=0, microsecond=0)
@@ -461,6 +470,11 @@ class RealtimeBarStore:
             "gaps": list(self.gaps),
             "layout_mismatches": self.layout_mismatches,
             "dropped_unparsable": self.dropped_unparsable,
+            # Instrumentation is written for the reader, and the reader
+            # only ever sees the snapshot. Leaving these in memory made
+            # them invisible to the one audience they exist for.
+            "feed_lag_samples": list(self.feed_lag.samples()),
+            "feeds_seen": dict(self.feeds_seen),
         }
 
     @classmethod
@@ -497,6 +511,8 @@ class RealtimeBarStore:
         store.gaps = list(payload.get("gaps") or ())
         store.layout_mismatches = int(payload.get("layout_mismatches") or 0)
         store.dropped_unparsable = int(payload.get("dropped_unparsable") or 0)
+        store.feed_lag.restore(payload.get("feed_lag_samples") or ())
+        store.feeds_seen = dict(payload.get("feeds_seen") or {})
         return store
 
 
