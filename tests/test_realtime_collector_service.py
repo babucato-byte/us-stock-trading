@@ -83,8 +83,13 @@ class TestItSurvivesADroppedFeed:
         assert "resume=store" in RUNNER
         assert "resume if resume is not None else _load(path)" in RUNNER
 
-    def test_the_backoff_is_bounded(self):
-        assert "min(5.0 * reconnects, 30.0)" in RUNNER
+    def test_the_backoff_starts_above_the_appkey_hold_and_is_bounded(self):
+        """KIS holds the connection slot after a disconnect and refuses a
+        second one with OPSP8996 ALREADY IN USE. A tight loop would spend
+        the session being refused, so the first retry waits longer than
+        that hold rather than racing it."""
+        assert "min(15.0 * st.reconnect_count, 120.0)" in RUNNER
+        assert "OPSP8996" in RUNNER
 
     def test_the_keepalive_is_answered(self):
         assert "is_pingpong(message)" in RUNNER

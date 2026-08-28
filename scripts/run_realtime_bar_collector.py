@@ -30,6 +30,7 @@ if str(REPO_ROOT) not in sys.path:
 from execution.secret_redaction import install_logging_redaction  # noqa: E402
 from market_data import kis_hdfscnt0 as wire  # noqa: E402
 from market_data.kis_realtime_ws import WebSocket, WebSocketError  # noqa: E402
+from market_data import collector_status as status_module  # noqa: E402
 from market_data.realtime_bars import RealtimeBarStore  # noqa: E402
 
 logger = logging.getLogger("realtime_bars")
@@ -132,7 +133,8 @@ def _persist(store, path):
 
 
 def collect(symbols, *, session, trading_day, seconds, env=None,
-            persist_every=30.0, resume=None):
+            persist_every=30.0, resume=None, status=None,
+            heartbeat_every=status_module.DEFAULT_HEARTBEAT_INTERVAL_SECONDS):
     env = env if env is not None else os.environ
     app_key = env.get("KIS_APP_KEY")
     app_secret = env.get("KIS_APP_SECRET")
@@ -148,9 +150,29 @@ def collect(symbols, *, session, trading_day, seconds, env=None,
 
     started = time.time()
     last_persist = started
+    last_heartbeat = 0.0
+
+    st = status or status_module.CollectorStatus()
+    st.collector_started_at = st.collector_started_at or datetime.now(timezone.utc)
+    st.market_session = session
+    st.collector_sha = env.get("DEPLOYED_COMMIT")
+    st.subscription_requested = len(symbols)
+
+    def beat(now=None):
+        """Liveness, written on a timer and never conditional on trades.
+
+        A quiet market and a dead collector produced the same empty file
+        before this existed, which is the one confusion this whole layer
+        is built to avoid.
+        """
+        st.last_heartbeat_at = now or datetime.now(timezone.utc)
+        st.write(env=env)
+
     try:
         with WebSocket(REALTIME_HOST, port, "/", timeout=15.0) as ws:
             store.mark_connected()
+            st.connection_state = status_module.CONNECTION_CONNECTED
+            beat()
             subscribed = 0
             for symbol, exchange in symbols:
                 # One symbol we cannot address must not cost the session
@@ -173,19 +195,34 @@ def collect(symbols, *, session, trading_day, seconds, env=None,
                     break
                 ws.send_text(wire.subscribe_frame(approval, key))
                 subscribed += 1
+            st.subscription_count = subscribed
+            st.subscribed_symbols = [s for s, _e in symbols][:subscribed]
+            beat()
             logger.info("subscribed %d of %d symbols for %s", subscribed,
                         len(symbols), session)
             if not subscribed:
                 logger.error("no symbol could be subscribed; nothing to collect")
+                st.connection_state = status_module.CONNECTION_FAILED
+                st.last_error = "no symbol could be subscribed"
+                beat()
                 return store, path
 
             while time.time() - started < seconds:
+                # BEFORE the receive, so a socket that delivers nothing
+                # for minutes still proves the process is alive. Putting
+                # this after the message handling is what made a quiet
+                # market indistinguishable from a dead collector.
+                if time.time() - last_heartbeat >= heartbeat_every:
+                    beat()
+                    last_heartbeat = time.time()
+
                 try:
                     message = ws.recv()
                 except (TimeoutError, OSError):
                     continue
                 if message is None:
                     continue
+                st.last_message_at = datetime.now(timezone.utc)
                 if wire.is_pingpong(message):
                     ws.send_text(message)
                     continue
@@ -195,14 +232,20 @@ def collect(symbols, *, session, trading_day, seconds, env=None,
                     continue
                 for trade in trades:
                     store.add_trade(trade, session=session)
+                st.trades_observed += len(trades)
+                st.last_trade_at = datetime.now(timezone.utc)
                 if time.time() - last_persist >= persist_every:
                     _persist(store, path)
                     last_persist = time.time()
     except WebSocketError as exc:
         store.mark_disconnected()
+        st.connection_state = status_module.CONNECTION_DISCONNECTED
+        st.error_count += 1
+        st.last_error = str(exc)[:200]
         logger.warning("feed ended: %s", exc)
     finally:
         _persist(store, path)
+        beat()
 
     return store, path
 
@@ -251,20 +294,31 @@ def main(argv=None):
     # gap is what makes the missing volume visible rather than silently
     # absent.
     deadline = time.time() + args.seconds
-    reconnects = 0
+    st = status_module.CollectorStatus()
     store = path = None
     while True:
         remaining = deadline - time.time()
         if remaining <= 0:
             break
         store, path = collect(pairs, session=session, trading_day=trading_day,
-                              seconds=remaining, resume=store)
+                              seconds=remaining, resume=store, status=st)
         if time.time() >= deadline:
             break
-        reconnects += 1
-        logger.warning("reconnecting (%d) after a dropped feed", reconnects)
-        time.sleep(min(5.0 * reconnects, 30.0))
+        st.reconnect_count += 1
+
+        # KIS holds the connection slot for a while after a disconnect --
+        # a second connection on the same appkey is refused with
+        # OPSP8996 ALREADY IN USE. A tight reconnect loop would spend the
+        # session being refused, so the backoff starts above that hold
+        # and grows.
+        delay = min(15.0 * st.reconnect_count, 120.0)
+        logger.warning("reconnecting (%d) in %.0fs after a dropped feed",
+                       st.reconnect_count, delay)
+        st.last_heartbeat_at = datetime.now(timezone.utc)
+        st.write()
+        time.sleep(delay)
     lock.close()
+    reconnects = st.reconnect_count
     summary = {"session": session, "trading_day": trading_day,
                "snapshot": str(path), "reconnects": reconnects,
                "feed": store.describe()}
