@@ -36,6 +36,42 @@ SOURCE = rb.SOURCE
 USABLE_FEED_STATES = (rb.FEED_LIVE,)
 
 
+def _gap_overlaps(store, bars):
+    """Does any recorded collector gap fall inside these bars?
+
+    Compared against the bars actually used, not the whole session: a
+    disconnect an hour ago says nothing about the volume in the last
+    twenty minutes, and treating it as permanent contamination would
+    stand the strategy down for the rest of a session over a blip.
+    """
+    if not bars:
+        return False
+    gaps = getattr(store, "gaps", None) or ()
+    if not gaps:
+        return False
+    first = bars[0].minute
+    last = bars[-1].last_trade_at
+    for gap in gaps:
+        start = _parse_iso(gap.get("from"))
+        end = _parse_iso(gap.get("to"))
+        if start is None or end is None:
+            # A gap we cannot place is a gap we cannot rule out.
+            return True
+        if end >= first and start <= last:
+            return True
+    return False
+
+
+def _parse_iso(text):
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
 def _ema(values, span):
     if not values:
         return None
@@ -55,7 +91,7 @@ def build_from_bars(symbol, *, store, session, now=None,
     receiving an empty snapshot that looks like a measured emptiness.
     """
     from s6_live.realtime_features import (
-        SessionFeatures, VOLUME_DATA_UNAVAILABLE, VOLUME_OK,
+        DATA_INCOMPLETE, SessionFeatures, VOLUME_DATA_UNAVAILABLE, VOLUME_OK,
         VOLUME_ZERO_CONFIRMED,
     )
 
@@ -115,8 +151,23 @@ def build_from_bars(symbol, *, store, session, now=None,
     # definition S6 already uses -- the latest bar against the mean of
     # the preceding ones. Undefined with a single bar, and stated as
     # such rather than defaulted to 1.0, which would read as "average".
+    # A gap INSIDE the window these features are computed over makes the
+    # volume a lower bound where it matters. Expansion is a ratio of one
+    # bar's volume to the average of the preceding ones, so trades we did
+    # not hear deflate the denominator, inflate the ratio, and push a
+    # candidate towards READY for a reason that is an artefact of our own
+    # downtime. That is worse than not trading.
+    #
+    # Only the window matters, not the session: once the gap has aged out
+    # of the bars being compared, the comparison is sound again and this
+    # recovers on its own.
+    window_bars = bars[-(average_window + 1):]
+    gap_detected = _gap_overlaps(store, window_bars)
+
     volume_expansion = None
-    if len(volumes) >= 2:
+    if gap_detected:
+        unavailable["volume_expansion"] = DATA_INCOMPLETE
+    elif len(volumes) >= 2:
         window = volumes[-(average_window + 1):-1]
         average = sum(window) / len(window) if window else 0.0
         if average > 0:
@@ -152,7 +203,8 @@ def build_from_bars(symbol, *, store, session, now=None,
         range_high=range_high, range_low=range_low,
         extension_pct=extension_pct, bar_count=len(bars),
         price_source=SOURCE, volume_source=SOURCE, feed_status=feed_status,
-        volume_cross_check=cross_check, unavailable=unavailable)
+        volume_cross_check=cross_check, gap_detected=gap_detected,
+        unavailable=unavailable)
 
 
 def load_store(session, trading_day, *, env=None, stale_after_seconds=None):

@@ -34,9 +34,43 @@ from market_data.realtime_bars import RealtimeBarStore  # noqa: E402
 
 logger = logging.getLogger("realtime_bars")
 
+#: One collector per account, enforced with a file lock held for the
+#: process's life. Two collectors on one snapshot file would each write
+#: their own view of the session and the last writer would win --
+#: producing a volume that is neither of them and belongs to no
+#: measurement anyone made.
+SINGLETON_LOCK = "/home/ubuntu/logs/cron/s6_realtime_collector.lock"
+
 REALTIME_HOST = "ops.koreainvestment.com"
 PORT_LIVE = 21000
 PORT_PAPER = 31000
+
+
+class AlreadyRunning(Exception):
+    """Another collector holds the singleton lock."""
+
+
+def acquire_singleton(path=None):
+    """Hold the collector lock for this process's lifetime, or raise.
+
+    Returned handle must stay referenced: closing it releases the lock.
+    """
+    import fcntl
+
+    target = Path(path or os.environ.get("COLLECTOR_LOCK") or SINGLETON_LOCK)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(target, "a+")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        handle.close()
+        raise AlreadyRunning(
+            f"another collector already holds {target}") from exc
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"{os.getpid()}\n")
+    handle.flush()
+    return handle
 
 
 def snapshot_path(session, trading_day, *, env=None):
@@ -98,7 +132,7 @@ def _persist(store, path):
 
 
 def collect(symbols, *, session, trading_day, seconds, env=None,
-            persist_every=30.0):
+            persist_every=30.0, resume=None):
     env = env if env is not None else os.environ
     app_key = env.get("KIS_APP_KEY")
     app_secret = env.get("KIS_APP_SECRET")
@@ -107,7 +141,7 @@ def collect(symbols, *, session, trading_day, seconds, env=None,
         raise PermissionError("KIS_APP_KEY / KIS_APP_SECRET are not set")
 
     path = snapshot_path(session, trading_day, env=env)
-    store = _load(path)
+    store = resume if resume is not None else _load(path)
     approval = _approval_key(app_key, app_secret, base_url)
     live = str(env.get("KIS_ENV", "")).strip().lower() == "live"
     port = PORT_LIVE if live else PORT_PAPER
@@ -181,10 +215,37 @@ def main(argv=None):
         logger.error("no symbols given; nothing to collect")
         return 1
 
-    store, path = collect(pairs, session=session, trading_day=trading_day,
-                          seconds=args.seconds)
+    try:
+        lock = acquire_singleton()
+    except AlreadyRunning as exc:
+        logger.error("refusing to start: %s", exc)
+        return 2
+
+    # Reconnect rather than exit. A dropped socket is ordinary -- KIS
+    # closes idle connections and networks blip -- and a collector that
+    # died on the first one would leave the rest of the session with no
+    # volume at all, which is exactly the state that stops S6 trading
+    # premarket. Each reconnect re-subscribes and records its gap; the
+    # gap is what makes the missing volume visible rather than silently
+    # absent.
+    deadline = time.time() + args.seconds
+    reconnects = 0
+    store = path = None
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        store, path = collect(pairs, session=session, trading_day=trading_day,
+                              seconds=remaining, resume=store)
+        if time.time() >= deadline:
+            break
+        reconnects += 1
+        logger.warning("reconnecting (%d) after a dropped feed", reconnects)
+        time.sleep(min(5.0 * reconnects, 30.0))
+    lock.close()
     summary = {"session": session, "trading_day": trading_day,
-               "snapshot": str(path), "feed": store.describe()}
+               "snapshot": str(path), "reconnects": reconnects,
+               "feed": store.describe()}
     for symbol, _exchange in pairs:
         accumulator = store.accumulator(symbol, session)
         if accumulator is None:

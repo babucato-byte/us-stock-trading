@@ -116,6 +116,10 @@ class SessionFeatures:
     #: dangerous to forget, so the comparison travels with the snapshot
     #: rather than being left in a log nobody reads.
     volume_cross_check: Optional[Dict[str, Any]] = None
+    #: True when a collector gap overlaps the bars these features were
+    #: computed over. The numbers are real; they are just not all of
+    #: them.
+    gap_detected: bool = False
     #: Names of the inputs that could not be computed, and why.
     unavailable: Dict[str, str] = field(default_factory=dict)
     error: Optional[str] = None
@@ -162,6 +166,7 @@ class SessionFeatures:
             "volume_source": self.volume_source,
             "feed_status": self.feed_status,
             "volume_cross_check": self.volume_cross_check,
+            "gap_detected": self.gap_detected,
             "unavailable": dict(self.unavailable),
             "error": self.error,
         }
@@ -217,6 +222,49 @@ def _volume_status(session_bars) -> Tuple[str, Optional[float]]:
     return VOLUME_OK, latest
 
 
+#: Sessions whose features come from KIS's trade stream. REGULAR is
+#: deliberately absent: its existing source is validated and in use, and
+#: swapping it here would be an unrelated change to the one session that
+#: currently works.
+KIS_AUTHORITATIVE_SESSIONS = frozenset(
+    {"PREMARKET", "AFTER_HOURS", "OVERNIGHT_DAYTIME"})
+
+KIS_STREAM_SOURCE = "KIS_HDFSCNT0"
+
+#: No collected bars for this session at all. Distinct from a stale feed
+#: and from a session that genuinely had no trades.
+NO_REALTIME_STREAM = "NO_REALTIME_STREAM"
+
+#: The feed is connected but its newest trade is too old to act on.
+REALTIME_FEED_STALE = "REALTIME_FEED_STALE"
+
+#: Volume is a LOWER BOUND because a collector gap sits inside the window
+#: these features were computed over. The numbers are real; they are just
+#: not all of them, and a volume-expansion test on a partial denominator
+#: is not the test S6 thinks it is running.
+DATA_INCOMPLETE = "DATA_INCOMPLETE"
+
+
+def _build_from_kis_stream(symbol, *, session, now, range_minutes):
+    """Features from the collected stream, or None if there are none."""
+    try:
+        from market_hours import us_trading_day
+        from s6_live import kis_bar_features
+
+        store = kis_bar_features.load_store(session, us_trading_day(now))
+        if store is None:
+            return None
+        return kis_bar_features.build_from_bars(
+            symbol, store=store, session=session, now=now,
+            range_minutes=range_minutes)
+    except Exception:  # noqa: BLE001 - a broken read is "no stream", and
+        # the caller then refuses rather than reaching for the provider
+        # whose zero volume is the reason this exists.
+        logger.warning("could not build %s features from the KIS stream for %s",
+                       session, symbol, exc_info=True)
+        return None
+
+
 def build(symbol, *, session=None, now=None, provider=None,
           intraday_interval="5m", intraday_lookback_days=2,
           range_minutes=15) -> SessionFeatures:
@@ -231,6 +279,35 @@ def build(symbol, *, session=None, now=None, provider=None,
 
     resolved = scan_session.normalize(session) or scan_session.session_at(moment)
     missing: Dict[str, str] = {}
+
+    # Sessions where KIS's trade stream is the AUTHORITY, not one option
+    # among several.
+    #
+    # The daily-bar provider reports zero volume outside regular hours --
+    # a number that reads as "nobody traded" rather than "no data" -- so
+    # for these sessions it is not a weaker source, it is a wrong one.
+    # Falling back to it when the stream is missing would answer the
+    # volume question with a fabricated zero, which is the single failure
+    # this whole layer exists to prevent.
+    #
+    # So when the stream has nothing, this returns UNAVAILABLE and the
+    # candidate does not become READY. That is a worse outcome than a
+    # trade and a much better one than a wrong trade.
+    if resolved in KIS_AUTHORITATIVE_SESSIONS and provider is None:
+        streamed = _build_from_kis_stream(symbol, session=resolved, now=moment,
+                                          range_minutes=range_minutes)
+        if streamed is not None:
+            return streamed
+        return SessionFeatures(
+            symbol=symbol, session=resolved, built_at=moment,
+            price_source=KIS_STREAM_SOURCE, volume_source=KIS_STREAM_SOURCE,
+            feed_status=None,
+            unavailable={k: NO_REALTIME_STREAM for k in
+                         ("price", "vwap", "ema9", "ema21", "volume",
+                          "volume_expansion")},
+            error=f"{NO_REALTIME_STREAM}: no {resolved} bars collected; "
+                  "the daily provider reports zero volume outside regular "
+                  "hours and is not substituted here")
 
     try:
         from scanners.base import indicators as ind
