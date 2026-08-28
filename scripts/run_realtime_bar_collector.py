@@ -180,7 +180,7 @@ def collect(symbols, *, session, trading_day, seconds, env=None,
                 # "NASDAQ" where the wire wants "NAS", and the collector
                 # never started at all.
                 try:
-                    key = wire.tr_key(symbol, exchange, wire.FEED_REALTIME)
+                    key = wire.tr_key(symbol, exchange, wire.DEFAULT_FEED)
                 except ValueError as exc:
                     logger.warning("skipping %s: %s", symbol, exc)
                     continue

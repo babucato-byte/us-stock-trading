@@ -156,3 +156,46 @@ class TestTheCollectorRecordsWhatItDid:
         truth rather than the last healthy moment."""
         block = RUNNER[RUNNER.index("finally:"):]
         assert "beat()" in block[:200]
+
+
+class TestTheCollectorUsesTheFeedThatDelivers:
+    """Measured one feed at a time during REGULAR on 2026-08-28:
+    RBAQ (realtime) returned SUBSCRIBE SUCCESS and 0 trades in seventy
+    seconds; DNAS (delayed) returned 1124. The realtime subscription is a
+    false positive -- KIS accepts it and sends nothing -- so
+    "SUBSCRIBE SUCCESS" is not evidence that data will arrive.
+
+    An earlier probe subscribed both at once and the trades were credited
+    to realtime without proof. The collector was then configured for
+    realtime alone and collected nothing while truthfully reporting
+    41 of 41 subscribed.
+    """
+
+    def test_the_default_feed_is_the_one_that_delivered(self):
+        from market_data import kis_hdfscnt0 as wire
+
+        assert wire.DEFAULT_FEED == wire.FEED_DELAYED
+
+    def test_the_collector_subscribes_with_it(self):
+        assert "wire.DEFAULT_FEED" in RUNNER
+        assert "wire.FEED_REALTIME" not in RUNNER
+
+    def test_the_measurement_is_recorded_beside_the_constant(self):
+        source = (REPO_ROOT / "market_data" / "kis_hdfscnt0.py").read_text(
+            encoding="utf-8")
+        assert "1124" in source
+        assert "FALSE POSITIVE" in source
+
+    def test_the_measured_lag_is_recorded(self):
+        """"Delayed" implies fifteen minutes; it is about seventy
+        seconds. Downstream freshness thresholds have to allow for it or
+        they reject everything."""
+        from market_data import kis_hdfscnt0 as wire
+
+        assert wire.OBSERVED_FEED_LAG_SECONDS == 70.0
+
+    def test_the_bar_staleness_threshold_tolerates_the_lag(self):
+        from market_data import kis_hdfscnt0 as wire
+        from market_data import realtime_bars as rb
+
+        assert rb.DEFAULT_STALE_AFTER_SECONDS > wire.OBSERVED_FEED_LAG_SECONDS

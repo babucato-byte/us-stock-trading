@@ -83,6 +83,29 @@ REALTIME_PREFIX = {name: prefix for names, prefix in (
 FEED_DELAYED = "delayed"
 FEED_REALTIME = "realtime"
 
+#: The feed that actually carries data for this account.
+#:
+#: MEASURED on 2026-08-28 during REGULAR, one feed at a time:
+#:   RBAQ (realtime) -> SUBSCRIBE SUCCESS, and 0 trades in 70 seconds
+#:   DNAS (delayed)  -> 1124 trades in 70 seconds
+#:
+#: The realtime subscription is a FALSE POSITIVE: KIS accepts it and
+#: sends nothing, so "SUBSCRIBE SUCCESS" is not evidence that data will
+#: arrive. An earlier dual-feed probe subscribed both at once and I
+#: credited the trades to realtime without proving it -- the collector
+#: was then configured for realtime alone and collected nothing while
+#: reporting 41 of 41 subscribed.
+#:
+#: The lag is about 70 seconds, not the fifteen minutes "delayed"
+#: usually implies: trades stamped 10:38:15 arrived at 10:39:26. That is
+#: usable for a one-minute watch, but it is a real offset and every
+#: freshness threshold downstream has to allow for it.
+DEFAULT_FEED = FEED_DELAYED
+
+#: How far behind the delayed feed runs, measured. Downstream freshness
+#: checks must be looser than this or they reject everything.
+OBSERVED_FEED_LAG_SECONDS = 70.0
+
 
 def tr_key(symbol, exchange, feed=FEED_REALTIME):
     table = REALTIME_PREFIX if feed == FEED_REALTIME else DELAYED_PREFIX
