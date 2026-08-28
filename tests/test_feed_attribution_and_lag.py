@@ -128,7 +128,7 @@ class TestTheLagIsMeasuredNotAssumed:
     def test_the_observed_constant_is_recorded_but_not_relied_on(self):
         """It is documentation of one measurement, and the running
         statistics are what a threshold should consult."""
-        assert wire.OBSERVED_FEED_LAG_SECONDS == 70.0
+        assert wire.OBSERVED_FEED_LAG_SECONDS == 0.57
         source = (REPO_ROOT / "market_data" / "realtime_bars.py").read_text(
             encoding="utf-8")
         assert "OBSERVED_FEED_LAG_SECONDS" not in source

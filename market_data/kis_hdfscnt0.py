@@ -96,15 +96,24 @@ FEED_REALTIME = "realtime"
 #: was then configured for realtime alone and collected nothing while
 #: reporting 41 of 41 subscribed.
 #:
-#: The lag is about 70 seconds, not the fifteen minutes "delayed"
-#: usually implies: trades stamped 10:38:15 arrived at 10:39:26. That is
-#: usable for a one-minute watch, but it is a real offset and every
-#: freshness threshold downstream has to allow for it.
+#: Despite the name, this feed is effectively real time.
 DEFAULT_FEED = FEED_DELAYED
 
-#: How far behind the delayed feed runs, measured. Downstream freshness
-#: checks must be looser than this or they reject everything.
-OBSERVED_FEED_LAG_SECONDS = 70.0
+#: How far behind it runs, measured PER TRADE at ingest:
+#: median 0.57s, p95 1.20s, max 1.27s over 512 samples during REGULAR.
+#:
+#: An earlier reading here said 70 seconds and was wrong, in a way worth
+#: keeping written down. It compared a probe's summary timestamp --
+#: written when the run ENDED -- against trades captured when it began,
+#: so it measured the length of the observation window and called it
+#: lag. The number was plausible for something labelled "delayed", which
+#: is exactly why nothing questioned it.
+#:
+#: This constant is documentation of one measurement. Nothing consults
+#: it: `realtime_bars.FeedLag` observes the distribution continuously,
+#: because a threshold built on a frozen number is the zero-volume
+#: assumption in another costume.
+OBSERVED_FEED_LAG_SECONDS = 0.57
 
 
 def tr_key(symbol, exchange, feed=FEED_REALTIME):

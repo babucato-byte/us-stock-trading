@@ -187,12 +187,17 @@ class TestTheCollectorUsesTheFeedThatDelivers:
         assert "FALSE POSITIVE" in source
 
     def test_the_measured_lag_is_recorded(self):
-        """"Delayed" implies fifteen minutes; it is about seventy
-        seconds. Downstream freshness thresholds have to allow for it or
-        they reject everything."""
+        """Despite the name, the feed is effectively real time: median
+        0.57s per trade at ingest.
+
+        An earlier value of 70s was an artefact of the measurement -- it
+        compared a probe summary written at the END of a run against
+        trades from its start, so it measured the window, not the lag.
+        Plausible for something called "delayed", which is why it went
+        unchallenged."""
         from market_data import kis_hdfscnt0 as wire
 
-        assert wire.OBSERVED_FEED_LAG_SECONDS == 70.0
+        assert wire.OBSERVED_FEED_LAG_SECONDS == 0.57
 
     def test_the_bar_staleness_threshold_tolerates_the_lag(self):
         from market_data import kis_hdfscnt0 as wire
