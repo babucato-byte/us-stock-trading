@@ -127,16 +127,46 @@ class TestItRunsVerifiedCode:
         assert code.index("ENV_FILE=") < code.index("resolve_release_root")
 
 
-class TestTheWatchlistFollowsTheScanner:
-    def test_symbols_come_from_the_published_candidates(self):
-        """A hand-maintained list drifts from what S6 is actually
-        watching, and the drift is invisible until a candidate has no
-        volume for a reason nobody can find."""
-        assert "publisher.read" in WRAPPER
-        assert "scan_session.session_at()" in WRAPPER
+class TestTheWatchlistDoesNotDependOnThisSessionsCandidates:
+    """This class previously asserted the opposite, and was right about
+    the wrong thing.
 
-    def test_no_candidates_means_no_collector(self):
-        assert "no published candidates for this session" in WRAPPER
+    Taking the watchlist from the published candidates does follow what
+    S6 is watching -- during REGULAR, where candidates exist because the
+    daily provider has data. For premarket it is circular: discovering a
+    premarket candidate needs premarket data, and premarket data is what
+    the collector supplies. Measured on 2026-08-28: the collector
+    declined to start every five minutes while the scanner rejected 593
+    of 593 symbols for DATA_ERROR.
 
-    def test_the_symbol_count_is_bounded(self):
-        assert "out[:40]" in WRAPPER
+    The pool is now seeded from what exists BEFORE the session opens.
+    """
+
+    def test_it_no_longer_reads_this_sessions_candidates(self):
+        assert "publisher.read" not in WRAPPER
+
+    def test_it_seeds_from_the_bootstrap_pool(self):
+        assert "bootstrap.build" in WRAPPER
+        assert "prior_session=prior_session" in WRAPPER
+
+    def test_premarket_seeds_from_the_previous_days_after_hours(self):
+        assert '"PREMARKET": ("AFTER_HOURS"' in WRAPPER
+
+    def test_an_empty_pool_means_no_collector(self):
+        """Still true, and now it means the seed produced nothing rather
+        than that this session has not discovered anything yet."""
+        assert "bootstrap produced no symbols; not starting" in WRAPPER
+
+    def test_the_symbol_count_is_bounded_by_the_measured_cap(self):
+        """41, because the 42nd subscription was refused. Not a tuning
+        choice, and not something a larger universe can be given."""
+        from market_data import kis_hdfscnt0 as wire
+
+        assert wire.MAX_SUBSCRIPTIONS == 41
+        source = (REPO_ROOT / "market_data" / "bootstrap_watchlist.py").read_text(
+            encoding="utf-8")
+        assert "MAX_SUBSCRIPTIONS" in source
+
+    def test_the_seed_choice_is_logged(self):
+        """A premarket funnel needs to say where its pool came from."""
+        assert "bootstrap %s" in WRAPPER

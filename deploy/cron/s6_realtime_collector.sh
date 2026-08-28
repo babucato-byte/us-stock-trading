@@ -46,42 +46,55 @@ fi
 
 echo "$(date -u +%FT%TZ) starting collector sha=$SCANNER_SHA" >> "$LOG"
 
-# Watchlist comes from the published candidates for the session we are
-# in, so the collector follows what S6 is actually watching rather than
-# a hand-maintained list that drifts.
-SYMBOLS=$("$SCANNER_RUNTIME_ROOT/venv/bin/python" - <<'PY' 2>/dev/null
+# The watchlist must not depend on this session's own candidates.
+#
+# It did, and for premarket that is circular: discovering a premarket
+# candidate needs premarket data, and premarket data is what this
+# collector supplies. The result was a collector declining to start every
+# five minutes while the scanner rejected 593 of 593 symbols for
+# DATA_ERROR -- a session that looked like it had nothing to trade when
+# nothing had been measured.
+#
+# So the pool is seeded from what exists BEFORE the session opens: the
+# prior session's ranked candidates plus statically eligible universe
+# names. At most 41, which is not a tuning choice but the measured
+# ceiling on how many symbols one appkey can stream.
+SYMBOLS=$("$SCANNER_RUNTIME_ROOT/venv/bin/python" - <<'PYBOOT' 2>>"$LOG"
 import os, sys
 sys.path.insert(0, os.environ.get("TRADING_PROJECT_ROOT", ""))
 try:
-    from datetime import datetime, timezone
+    from datetime import datetime, timedelta, timezone
+
+    from market_data import bootstrap_watchlist as bootstrap
     from market_hours import us_trading_day
     from scanners.base import scan_session
-    from scanners.publish import candidates as publisher
-    from market_data.exchange_registry import build_kis_instrument
 
     now = datetime.now(timezone.utc)
     session = scan_session.session_at()
-    rows = publisher.read(us_trading_day(now), session) or []
-    seen, out = set(), []
-    for row in rows:
-        symbol = str(row.get("symbol") or "").upper()
-        if not symbol or symbol in seen:
-            continue
-        seen.add(symbol)
-        try:
-            instrument, _ = build_kis_instrument(symbol)
-            exchange = getattr(instrument, "exchange", None) or "NAS"
-        except Exception:
-            continue
-        out.append(f"{symbol}:{exchange}")
-    print(",".join(out[:40]))
-except Exception:
+    day = us_trading_day(now)
+
+    # Premarket seeds from the PREVIOUS day's after-hours; the other
+    # sessions seed from the one before them on the same day.
+    prior_session, prior_day = {
+        "PREMARKET": ("AFTER_HOURS", us_trading_day(now - timedelta(days=1))),
+        "REGULAR": ("PREMARKET", day),
+        "AFTER_HOURS": ("REGULAR", day),
+        "OVERNIGHT_DAYTIME": ("AFTER_HOURS", day),
+    }.get(session, (None, None))
+
+    pairs, why = bootstrap.build(session=session, trading_day=day,
+                                 prior_session=prior_session,
+                                 prior_trading_day=prior_day)
+    sys.stderr.write("bootstrap %s\n" % why)
+    print(",".join("%s:%s" % (sym, exch) for sym, exch in pairs))
+except Exception as exc:
+    sys.stderr.write("bootstrap failed: %r\n" % (exc,))
     print("")
-PY
+PYBOOT
 )
 
 if [ -z "${SYMBOLS:-}" ]; then
-    echo "$(date -u +%FT%TZ) no published candidates for this session; not starting" >> "$LOG"
+    echo "$(date -u +%FT%TZ) bootstrap produced no symbols; not starting" >> "$LOG"
     exit 0
 fi
 

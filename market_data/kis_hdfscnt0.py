@@ -22,6 +22,28 @@ was a provider limitation, not a fact about the market.
 
 import json
 
+#: How many symbols one appkey may stream at once. MEASURED, not read
+#: from a document: on 2026-08-28 the 42nd subscription was refused with
+#: `OPSP0008 MAX SUBSCRIBE OVER` after 41 were accepted.
+#:
+#: This number decides an architecture. A universe of six hundred cannot
+#: be watched in real time, so discovery for premarket and after-hours
+#: cannot work by streaming everything and filtering: the pool has to be
+#: narrowed to at most this many BEFORE any realtime data exists, and
+#: only then does the stream refine it.
+MAX_SUBSCRIPTIONS = 41
+
+#: One WebSocket per appkey, also measured: a second connection is
+#: refused with `OPSP8996 ALREADY IN USE appkey`, and KIS holds the slot
+#: for a while after a disconnect. So the collector must be a single
+#: long-lived process rather than something restarted per tick, and any
+#: diagnostic that opens a stream competes with production for the one
+#: slot.
+ONE_CONNECTION_PER_APPKEY = True
+
+MSG_MAX_SUBSCRIBE_OVER = "OPSP0008"
+MSG_APPKEY_IN_USE = "OPSP8996"
+
 TR_TRADE = "HDFSCNT0"
 SOURCE = "KIS_HDFSCNT0"
 
