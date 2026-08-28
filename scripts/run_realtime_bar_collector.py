@@ -151,11 +151,33 @@ def collect(symbols, *, session, trading_day, seconds, env=None,
     try:
         with WebSocket(REALTIME_HOST, port, "/", timeout=15.0) as ws:
             store.mark_connected()
+            subscribed = 0
             for symbol, exchange in symbols:
-                ws.send_text(wire.subscribe_frame(
-                    approval, wire.tr_key(symbol, exchange,
-                                          wire.FEED_REALTIME)))
-            logger.info("subscribed %d symbols for %s", len(symbols), session)
+                # One symbol we cannot address must not cost the session
+                # its data. The first live bootstrap died on a single
+                # "NASDAQ" where the wire wants "NAS", and the collector
+                # never started at all.
+                try:
+                    key = wire.tr_key(symbol, exchange, wire.FEED_REALTIME)
+                except ValueError as exc:
+                    logger.warning("skipping %s: %s", symbol, exc)
+                    continue
+                if subscribed >= wire.MAX_SUBSCRIPTIONS:
+                    # The cap is the broker's, measured. Asking beyond it
+                    # is refused per-symbol and would fill the log with
+                    # errors that say nothing new.
+                    logger.warning(
+                        "subscription cap %d reached; %s and any after it "
+                        "are not streamed this session",
+                        wire.MAX_SUBSCRIPTIONS, symbol)
+                    break
+                ws.send_text(wire.subscribe_frame(approval, key))
+                subscribed += 1
+            logger.info("subscribed %d of %d symbols for %s", subscribed,
+                        len(symbols), session)
+            if not subscribed:
+                logger.error("no symbol could be subscribed; nothing to collect")
+                return store, path
 
             while time.time() - started < seconds:
                 try:

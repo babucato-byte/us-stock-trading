@@ -160,3 +160,45 @@ class TestItDegradesWithoutInventing:
         source = inspect.getsource(bootstrap.build)
         for key in ("from_prior_session", "from_manifest", "total", "cap"):
             assert key in source, key
+
+
+class TestOneBadSymbolDoesNotCostTheSession:
+    """The first live bootstrap produced symbols, then died on a single
+    exchange spelling -- `exchange_registry` says "NASDAQ" where the KIS
+    wire wants "NAS" -- and the collector never started. Both halves of
+    that are fixed: the spelling is known, and an unknown one is skipped
+    rather than fatal."""
+
+    def test_every_spelling_the_registry_produces_is_mapped(self):
+        for name in ("NASDAQ", "NAS", "NASD"):
+            assert wire.tr_key("AAPL", name) == "RBAQAAPL", name
+        for name in ("NYSE", "NYS", "NEW YORK STOCK EXCHANGE"):
+            assert wire.tr_key("GE", name) == "RBAYGE", name
+        for name in ("AMEX", "AMS", "NYSE AMERICAN", "NYSE MKT"):
+            assert wire.tr_key("BTG", name) == "RBAABTG", name
+
+    def test_the_delayed_table_covers_the_same_spellings(self):
+        assert wire.tr_key("AAPL", "NASDAQ", wire.FEED_DELAYED) == "DNASAAPL"
+
+    def test_a_genuinely_unknown_exchange_is_still_refused(self):
+        import pytest
+
+        with pytest.raises(ValueError):
+            wire.tr_key("AAPL", "LSE")
+
+    def test_the_collector_skips_rather_than_dies(self):
+        runner = (REPO_ROOT / "scripts" / "run_realtime_bar_collector.py").read_text(
+            encoding="utf-8")
+        block = runner[runner.index("for symbol, exchange in symbols:"):]
+        assert "except ValueError" in block[:600]
+        assert "continue" in block[:700]
+
+    def test_it_stops_at_the_measured_cap(self):
+        runner = (REPO_ROOT / "scripts" / "run_realtime_bar_collector.py").read_text(
+            encoding="utf-8")
+        assert "subscribed >= wire.MAX_SUBSCRIPTIONS" in runner
+
+    def test_subscribing_nothing_is_reported_not_silent(self):
+        runner = (REPO_ROOT / "scripts" / "run_realtime_bar_collector.py").read_text(
+            encoding="utf-8")
+        assert "no symbol could be subscribed" in runner

@@ -68,10 +68,18 @@ FIELD_LOCAL_TIME = "XHMS"
 #: A feed prefix selects a PRODUCT, not a spelling: `D...` is the
 #: delayed quote included with the account, `R...` the separately
 #: purchased real-time one. Both answered SUBSCRIBE SUCCESS here.
-DELAYED_PREFIX = {"NAS": "DNAS", "NASD": "DNAS", "NYS": "DNYS",
-                  "NYSE": "DNYS", "AMS": "DAMS", "AMEX": "DAMS"}
-REALTIME_PREFIX = {"NAS": "RBAQ", "NASD": "RBAQ", "NYS": "RBAY",
-                   "NYSE": "RBAY", "AMS": "RBAA", "AMEX": "RBAA"}
+#: Keyed by every spelling the rest of the system actually produces.
+#: `exchange_registry` answers "NASDAQ" where the KIS wire codes are
+#: "NAS", and the first live run of the bootstrap died on exactly that --
+#: one unmappable name, and the collector never started.
+_NASDAQ = ("NAS", "NASD", "NASDAQ")
+_NYSE = ("NYS", "NYSE", "NEW YORK STOCK EXCHANGE")
+_AMEX = ("AMS", "AMEX", "NYSE AMERICAN", "NYSE MKT")
+
+DELAYED_PREFIX = {name: prefix for names, prefix in (
+    (_NASDAQ, "DNAS"), (_NYSE, "DNYS"), (_AMEX, "DAMS")) for name in names}
+REALTIME_PREFIX = {name: prefix for names, prefix in (
+    (_NASDAQ, "RBAQ"), (_NYSE, "RBAY"), (_AMEX, "RBAA")) for name in names}
 FEED_DELAYED = "delayed"
 FEED_REALTIME = "realtime"
 
