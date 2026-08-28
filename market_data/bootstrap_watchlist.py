@@ -87,23 +87,43 @@ def prior_session_symbols(*, trading_day, session, limit) -> List[str]:
 def manifest_symbols(*, limit, exclude=()) -> List[str]:
     """Statically eligible universe names, no realtime data consulted."""
     try:
+        import os
+        from datetime import datetime, timezone
+        from pathlib import Path
+
         from discovery import manifest as manifest_module
         from market_hours import us_trading_day
         from scanners.runner import MANIFEST_DEFAULT_PATH
 
-        from datetime import datetime, timezone
+        # Derived the way the scanner cron derives it -- from the shared
+        # candidate directory -- not from the module default. That
+        # default is a RELATIVE path, so it resolves against whatever
+        # cwd the caller happens to have; the scanner runs from the
+        # release root and the manifest lives beside the shared candidate
+        # store, outside the release. Reading the default silently found
+        # nothing and reported MISSING, which is indistinguishable from
+        # "discovery has not run today".
+        candidate_dir = os.environ.get("SCANNER_CANDIDATE_DIR")
+        data_root = os.environ.get("SCANNER_DATA_ROOT")
+        if candidate_dir:
+            path = Path(candidate_dir).parent / "discovery" / "manifest.json"
+        elif data_root:
+            path = Path(data_root).parent / "state" / "discovery" / "manifest.json"
+        else:
+            path = Path(MANIFEST_DEFAULT_PATH)
 
         verdict = manifest_module.validate(
-            manifest_module.read(MANIFEST_DEFAULT_PATH),
+            manifest_module.read(str(path)),
             trading_day=us_trading_day(datetime.now(timezone.utc)))
+        manifest_source = str(path)
         # PARTIAL is usable for the same reason the scanner accepts it:
         # part of today's market beats all of yesterday's. Anything else
         # yields nothing rather than a stale pool -- an unusable manifest
         # must not quietly seed the stream with names nobody re-derived.
         if verdict.get("status") not in (manifest_module.VALID,
                                          manifest_module.PARTIAL):
-            logger.warning("bootstrap: manifest unusable (%s)",
-                           verdict.get("status"))
+            logger.warning("bootstrap: manifest unusable (%s) at %s",
+                           verdict.get("status"), manifest_source)
             return []
         entries = verdict.get("symbols") or ()
     except Exception:  # noqa: BLE001
