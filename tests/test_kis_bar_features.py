@@ -225,3 +225,39 @@ class TestItIsNotASecondStrategy:
         from s6_live.realtime_features import SessionFeatures
 
         assert isinstance(features, SessionFeatures)
+
+
+class TestTheVolumeCrossCheckTravelsWithTheDecision:
+    """Proven live on 2026-08-28: restarting the collector mid-session
+    resumed correctly (NVDA 3 bars/1104 shares, then 6 bars/2691) AND
+    left AAPL's cross-check disagreeing, because trades happened during
+    the restart gap. The resume is right and the volume is a LOWER BOUND,
+    and both of those need to reach whoever reads the READY decision."""
+
+    def test_the_snapshot_carries_the_comparison(self):
+        store = _store([("100", "10", "081500"), ("101", "3", "081600")])
+        features = kbf.build_from_bars("AAPL", store=store, session=PRE,
+                                       now=_now_after("0816"))
+        assert features.volume_cross_check is not None
+        assert features.volume_cross_check["summed_volume"] == 13.0
+
+    def test_a_gap_shows_up_as_a_disagreement(self):
+        """The cumulative counter spans the gap; our sum does not."""
+        store = rb.RealtimeBarStore()
+        record = _record(price="100", size="10", local_time="081500")
+        record[wire.FIELD_CUMULATIVE] = "1000"
+        store.add_trade(record, session=PRE)
+        later = _record(price="100", size="10", local_time="081600")
+        later[wire.FIELD_CUMULATIVE] = "5000"     # 4000 traded while away
+        store.add_trade(later, session=PRE)
+
+        features = kbf.build_from_bars("AAPL", store=store, session=PRE,
+                                       now=_now_after("0816"))
+        assert features.volume_cross_check["agrees"] is False
+        assert features.volume == 20.0, "our sum is still what we heard"
+
+    def test_it_reaches_the_observability_record(self):
+        store = _store([("100", "10", "081500"), ("101", "3", "081600")])
+        record = kbf.build_from_bars("AAPL", store=store, session=PRE,
+                                     now=_now_after("0816")).as_record()
+        assert record["volume_cross_check"]["summed_volume"] == 13.0

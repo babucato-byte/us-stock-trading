@@ -81,6 +81,12 @@ def build_from_bars(symbol, *, store, session, now=None,
                           "volume_expansion")},
             error=f"realtime feed is {feed_status}")
 
+    # Carried into the snapshot, not just logged. A restart gap makes
+    # our summed volume a lower bound on the session's real volume, and
+    # whoever reads a READY decision afterwards needs to know that from
+    # the decision itself.
+    cross_check = accumulator.volume_cross_check()
+
     closes = [b.close for b in bars]
     volumes = [b.volume for b in bars]
     price = closes[-1]
@@ -146,7 +152,7 @@ def build_from_bars(symbol, *, store, session, now=None,
         range_high=range_high, range_low=range_low,
         extension_pct=extension_pct, bar_count=len(bars),
         price_source=SOURCE, volume_source=SOURCE, feed_status=feed_status,
-        unavailable=unavailable)
+        volume_cross_check=cross_check, unavailable=unavailable)
 
 
 def load_store(session, trading_day, *, env=None, stale_after_seconds=None):

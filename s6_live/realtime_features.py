@@ -109,6 +109,13 @@ class SessionFeatures:
     #: LIVE / STALE / DISCONNECTED / UNKNOWN for a streaming source;
     #: None when the source does not stream.
     feed_status: Optional[str] = None
+    #: Our summed volume against the broker's own cumulative counter.
+    #: After a collector restart the two legitimately disagree -- the
+    #: counter spans the gap and our sum does not -- which makes the
+    #: summed volume a LOWER BOUND. That is fine to trade on and
+    #: dangerous to forget, so the comparison travels with the snapshot
+    #: rather than being left in a log nobody reads.
+    volume_cross_check: Optional[Dict[str, Any]] = None
     #: Names of the inputs that could not be computed, and why.
     unavailable: Dict[str, str] = field(default_factory=dict)
     error: Optional[str] = None
@@ -154,6 +161,7 @@ class SessionFeatures:
             "price_source": self.price_source,
             "volume_source": self.volume_source,
             "feed_status": self.feed_status,
+            "volume_cross_check": self.volume_cross_check,
             "unavailable": dict(self.unavailable),
             "error": self.error,
         }
