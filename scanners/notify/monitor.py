@@ -202,6 +202,29 @@ def _session_execution_status(session):
         return None
 
 
+def _data_source_lines(session):
+    """What is actually feeding this session's features.
+
+    Printed because the previous silence was read as absence. Premarket
+    and after-hours carried no volume line, and an operator reasonably
+    concluded there was no volume -- which was true of the daily provider
+    and never true of the market. Now that the trade stream supplies it,
+    saying so is the only way the message stops implying the old answer.
+    """
+    try:
+        from s6_live import realtime_features as rf
+        from scanners.base import scan_session
+
+        resolved = scan_session.normalize(session)
+        if resolved is None or resolved not in rf.KIS_AUTHORITATIVE_SESSIONS:
+            return []
+        return [f"{labels.field('Data source')}: {rf.KIS_STREAM_SOURCE}",
+                f"{labels.field('Volume')}: AVAILABLE"]
+    except Exception:  # noqa: BLE001 - a missing provenance line must not
+        # cost the report the counts it exists to carry.
+        return []
+
+
 def _fmt(value, digits=2, dash="-"):
     if value is None:
         return dash
@@ -247,10 +270,15 @@ def format_scan(*, scanner_name, session, trading_day, scanned, candidates,
     # question differently on 2026-08-21: S6 found one candidate and it
     # was an ETP, so "후보 수: 1" read as an opportunity while the number
     # an operator could act on was zero.
+    lines += _data_source_lines(session)
     if live_candidates is not None:
         lines.append(f"실거래 가능 후보: {live_candidates}")
         if candidates and not live_candidates:
-            lines.append("  (전체 후보는 있으나 COMMON_STOCK 없음 — 연구용만)")
+            # Says which filter removed them. "연구용만" read as a
+            # statement about the scan's purpose -- research rather than
+            # trading -- when the scan is live and it was the instrument
+            # type that disqualified every candidate.
+            lines.append("  (후보는 있으나 전부 COMMON_STOCK 아님 — 실거래 대상 없음)")
     lines.append("")
     ranked = list(top or [])[:TOP_N]
     if ranked:

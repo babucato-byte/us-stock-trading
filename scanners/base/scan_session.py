@@ -93,6 +93,18 @@ ORDER_VERIFIED_SESSIONS = frozenset(
 STATUS_ORDER_VERIFIED = "REFERENCE_VERIFIED"
 STATUS_SCAN_ONLY = "SCAN_ONLY / LIVE UNVERIFIED"
 
+#: The route is defined and reference-verified, but no live response has
+#: confirmed it yet, so a new BUY there fails closed.
+#:
+#: Distinct from SCAN_ONLY, and the distinction matters to whoever reads
+#: the message. SCAN_ONLY says "this session cannot be traded"; a reader
+#: takes that as a fact about the market or the data. The daytime session
+#: has live data, live volume and valid features -- what it lacks is one
+#: confirmed BUY response, which is a fact about our evidence and nobody
+#: else's. Printing the first when the second is true sends people
+#: looking for a data problem that does not exist.
+STATUS_ROUTE_AWAITING_EVIDENCE = "ROUTE_AWAITING_LIVE_EVIDENCE"
+
 
 def is_session(value) -> bool:
     return str(value) in SESSIONS
@@ -145,6 +157,21 @@ def order_route_verified(session) -> bool:
 
 
 def execution_status(session) -> str:
-    """The line a monitor prints so nobody has to infer the answer."""
-    return (STATUS_ORDER_VERIFIED if order_route_verified(session)
-            else STATUS_SCAN_ONLY)
+    """The line a monitor prints so nobody has to infer the answer.
+
+    Three answers, not two. A route can be defined and still be waiting
+    for its first confirmed live response, and that is a different thing
+    from a session nobody can trade.
+    """
+    if not order_route_verified(session):
+        return STATUS_SCAN_ONLY
+    try:
+        from config import session_capability
+
+        if session_capability.route_awaiting_live_evidence(session):
+            return STATUS_ROUTE_AWAITING_EVIDENCE
+    except Exception:  # noqa: BLE001 - the evidence check is an extra
+        # refinement; losing it must not downgrade a verified session to
+        # SCAN_ONLY, which would understate what is actually usable.
+        pass
+    return STATUS_ORDER_VERIFIED

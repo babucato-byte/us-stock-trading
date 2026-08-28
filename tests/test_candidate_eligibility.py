@@ -155,12 +155,22 @@ class TestTheMessageSeparatesTheCounts:
         assert "후보 수: 1" in text
         assert "실거래 가능 후보: 0" in text
 
-    def test_a_research_only_result_says_so(self):
-        """The exact case: candidates exist and none is tradeable."""
+    def test_a_result_with_no_tradeable_candidate_says_so(self):
+        """The exact case: candidates exist and none is tradeable.
+
+        The sentence now names the FILTER rather than calling the scan
+        research. "연구용만" read as a statement about the scan's purpose
+        when the scan is live and it was the instrument type that
+        disqualified every candidate -- but the requirement it was
+        written for is unchanged: this case must be said in words, not
+        left to a reader comparing two numbers.
+        """
         text = monitor.format_scan(
             scanner_name="orb", session="REGULAR", trading_day="d",
             scanned=299, candidates=1, status="SUCCESS", live_candidates=0)
-        assert "COMMON_STOCK 없음" in text
+        assert "COMMON_STOCK" in text
+        assert "실거래 대상 없음" in text
+        assert "연구용만" not in text
 
     def test_a_tradeable_result_does_not_carry_the_warning(self):
         text = monitor.format_scan(

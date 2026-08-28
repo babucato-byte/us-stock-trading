@@ -83,6 +83,9 @@ STATUS_LABELS = {
     "DISCOVERY_ONLY": "분석 전용",
     "LIMITED_LIVE": "제한 실거래",
     "SCAN_ONLY": "스캔 전용",
+    # Not "스캔 전용". The daytime session has live data, live volume and
+    # valid features; what it is missing is one confirmed BUY response.
+    "ROUTE_AWAITING_LIVE_EVIDENCE": "주문경로 실거래 응답 대기 (데이터/전략 정상)",
     # The composite string scan_session builds. Translated whole rather
     # than by parts: splitting on "/" here would put a formatting rule
     # in a lookup table and break the moment the phrasing changes.

@@ -128,8 +128,19 @@ class TestScanningIsNotPermissionToTrade:
     @pytest.mark.parametrize(
         "session", [ss.PREMARKET, ss.REGULAR, ss.AFTER_HOURS, ss.OVERNIGHT_DAYTIME])
     def test_routed_sessions_say_so(self, session):
+        """A session with a defined route is never reported as scan-only.
+
+        Which of the two positive answers it gets depends on whether a
+        live response has confirmed the route yet -- the daytime BUY leg
+        has not, so it reports ROUTE_AWAITING_LIVE_EVIDENCE. Both are
+        statements that the route exists; SCAN_ONLY would be a statement
+        that the session cannot be traded at all, and a reader takes that
+        as a fact about the data.
+        """
         assert ss.order_route_verified(session) is True
-        assert ss.execution_status(session) == ss.STATUS_ORDER_VERIFIED
+        assert ss.execution_status(session) in (
+            ss.STATUS_ORDER_VERIFIED, ss.STATUS_ROUTE_AWAITING_EVIDENCE)
+        assert ss.execution_status(session) != ss.STATUS_SCAN_ONLY
 
     def test_an_unknown_session_fails_closed(self):
         """Not verified is the safe answer to a question about a session
