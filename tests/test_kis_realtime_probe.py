@@ -166,3 +166,53 @@ class TestTheSymbolAddressing:
 
         with pytest.raises(ValueError):
             probe._tr_key("AAPL", "LSE")
+
+
+class TestAFrameCanCarrySeveralTrades:
+    """`count` in `0|HDFSCNT0|<count>|...` is not decoration. The first
+    live run logged `fields=156` for one NVDA frame -- six trades
+    flattened into one record, five silently dropped.
+
+    For a probe answering "is there volume at all", losing five trades
+    changes nothing. For the aggregation this feeds, it understates
+    volume by whatever fraction arrives in bursts -- which is largest
+    exactly when the market is busy, and volume expansion is the thing
+    S6 is looking for.
+    """
+
+    def _frame(self, count, **fields):
+        values = {name: "" for name in probe.HDFSCNT0_FIELDS}
+        values.update(fields)
+        one = "^".join(values[name] for name in probe.HDFSCNT0_FIELDS)
+        return f"0|{probe.TR_TRADE}|{count:03d}|" + "^".join([one] * count)
+
+    def test_six_trades_in_one_frame_become_six_records(self):
+        records = probe.parse_trades(self._frame(6, SYMB="NVDA", EVOL="3"))
+        assert len(records) == 6
+        assert all(r["SYMB"] == "NVDA" for r in records)
+        assert all(r[probe.FIELD_TRADE_SIZE] == "3" for r in records)
+        assert records[0]["records_in_frame"] == 6
+
+    def test_a_single_trade_frame_is_unchanged(self):
+        records = probe.parse_trades(self._frame(1, SYMB="AAPL", EVOL="9"))
+        assert len(records) == 1
+        assert records[0]["records_in_frame"] == 1
+
+    def test_the_declared_count_is_kept_for_cross_checking(self):
+        records = probe.parse_trades(self._frame(3, SYMB="META"))
+        assert records[0]["declared_count"] == 3
+        assert records[0]["records_in_frame"] == 3
+
+    def test_a_ragged_frame_is_flagged_not_chopped(self):
+        """A layout change must be visible. Splitting a body that is not
+        a whole number of records would map fields positionally onto the
+        wrong names and the probe would answer confidently."""
+        ragged = f"0|{probe.TR_TRADE}|002|" + "^".join(["x"] * 40)
+        records = probe.parse_trades(ragged)
+        assert len(records) == 1
+        assert records[0]["layout_mismatch"] is True
+
+    def test_every_trade_in_a_burst_counts_toward_the_verdict(self):
+        records = probe.parse_trades(self._frame(4, SYMB="NVDA", EVOL="5"))
+        assert probe.classify(records, control_messages=[]) == probe.VOLUME_AVAILABLE
+        assert len(records) == 4

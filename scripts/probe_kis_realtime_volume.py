@@ -75,9 +75,25 @@ FIELD_TRADE_SIZE = "EVOL"        # this trade's size
 FIELD_CUMULATIVE = "TVOL"        # cumulative session volume
 FIELD_AMOUNT = "TAMT"            # cumulative traded amount
 
-#: KIS addresses overseas symbols as D + exchange + symbol.
-EXCHANGE_PREFIX = {"NAS": "DNAS", "NASD": "DNAS", "NYS": "DNYS",
-                   "NYSE": "DNYS", "AMS": "DAMS", "AMEX": "DAMS"}
+#: KIS addresses an overseas symbol by a FEED prefix plus the ticker,
+#: and the prefix chooses which feed you get:
+#:
+#:   D...  delayed quotes  (included with the account)
+#:   R...  real-time       (a separately purchased subscription)
+#:
+#: They are different products, not different spellings, and the
+#: distinction is the whole question this probe exists to settle. A
+#: delayed feed can answer SUBSCRIBE SUCCESS and then deliver nothing
+#: outside regular hours, which looks exactly like "extended hours carry
+#: no volume" while actually meaning "this feed does not cover them".
+#: So both are asked, and what each one answers is reported separately.
+DELAYED_PREFIX = {"NAS": "DNAS", "NASD": "DNAS", "NYS": "DNYS",
+                  "NYSE": "DNYS", "AMS": "DAMS", "AMEX": "DAMS"}
+REALTIME_PREFIX = {"NAS": "RBAQ", "NASD": "RBAQ", "NYS": "RBAY",
+                   "NYSE": "RBAY", "AMS": "RBAA", "AMEX": "RBAA"}
+FEED_DELAYED = "delayed"
+FEED_REALTIME = "realtime"
+EXCHANGE_PREFIX = DELAYED_PREFIX
 
 
 def _approval_key(app_key, app_secret, base_url):
@@ -114,10 +130,12 @@ def _subscribe_frame(approval_key, tr_key, *, tr_id=TR_TRADE, subscribe=True):
     })
 
 
-def _tr_key(symbol, exchange):
-    prefix = EXCHANGE_PREFIX.get(str(exchange or "").upper())
+def _tr_key(symbol, exchange, feed=FEED_DELAYED):
+    table = REALTIME_PREFIX if feed == FEED_REALTIME else DELAYED_PREFIX
+    prefix = table.get(str(exchange or "").upper())
     if not prefix:
-        raise ValueError(f"no KIS realtime prefix for exchange {exchange!r}")
+        raise ValueError(
+            f"no KIS {feed} prefix for exchange {exchange!r}")
     return f"{prefix}{str(symbol).upper()}"
 
 
@@ -152,25 +170,57 @@ def _is_pingpong(message):
         return False
 
 
-def parse_trade(payload):
-    """One HDFSCNT0 record -> dict, or None if this is not one.
+def parse_trades(payload):
+    """An HDFSCNT0 frame -> list of records.
 
-    The wire format is `0|HDFSCNT0|<count>|<caret-delimited fields>`. A
-    record whose field count does not match the published layout is
-    returned with `layout_mismatch` set rather than being mapped
-    positionally onto the wrong names.
+    The wire format is `0|HDFSCNT0|<count>|<caret-delimited fields>`, and
+    `count` is not decoration: KIS packs SEVERAL trades into one frame
+    when they arrive together. The first run of this probe read the whole
+    body as a single record and logged `fields=156` for one NVDA frame --
+    six trades flattened into one, five of them silently dropped.
+
+    For a probe answering "is there volume at all", losing five trades
+    changes nothing. For the aggregation this is meant to feed, it would
+    understate volume by whatever fraction of trades arrive in bursts --
+    which is largest exactly when the market is busy, and volume
+    expansion is what S6 is looking for.
+
+    A frame whose length is not a whole number of records is returned as
+    one flagged record rather than chopped: a changed layout must be
+    visible, not mapped positionally onto the wrong names.
     """
     if not payload or payload[0] not in "01":
-        return None
+        return []
     parts = payload.split("|")
     if len(parts) < 4 or parts[1] != TR_TRADE:
-        return None
+        return []
     fields = parts[3].split("^")
-    record = {"raw_field_count": len(fields),
-              "layout_mismatch": len(fields) < len(HDFSCNT0_FIELDS)}
-    for name, value in zip(HDFSCNT0_FIELDS, fields):
-        record[name] = value
-    return record
+    width = len(HDFSCNT0_FIELDS)
+    try:
+        declared = int(parts[2])
+    except (TypeError, ValueError):
+        declared = None
+
+    if len(fields) < width or len(fields) % width:
+        return [{"raw_field_count": len(fields), "declared_count": declared,
+                 "layout_mismatch": True}]
+
+    records = []
+    for index in range(len(fields) // width):
+        chunk = fields[index * width:(index + 1) * width]
+        record = {"raw_field_count": len(fields), "declared_count": declared,
+                  "records_in_frame": len(fields) // width,
+                  "layout_mismatch": False}
+        record.update(dict(zip(HDFSCNT0_FIELDS, chunk)))
+        records.append(record)
+    return records
+
+
+def parse_trade(payload):
+    """The first record of a frame, or None. Kept for callers that want
+    one; `parse_trades` is what the collector uses."""
+    found = parse_trades(payload)
+    return found[0] if found else None
 
 
 def _as_number(value):
@@ -205,7 +255,7 @@ def classify(records, *, control_messages):
     return VOLUME_UNAVAILABLE
 
 
-def probe(symbols, *, seconds, env=None, port=None):
+def probe(symbols, *, seconds, env=None, port=None, feeds=(FEED_DELAYED,)):
     env = env if env is not None else os.environ
     app_key = env.get("KIS_APP_KEY")
     app_secret = env.get("KIS_APP_SECRET")
@@ -232,9 +282,11 @@ def probe(symbols, *, seconds, env=None, port=None):
     started = time.time()
     with WebSocket(REALTIME_HOST, ws_port, "/", timeout=15.0) as ws:
         for symbol, exchange in symbols:
-            frame = _subscribe_frame(approval, _tr_key(symbol, exchange))
-            ws.send_text(frame)
-            logger.info("subscribed %s (%s) to %s", symbol, exchange, TR_TRADE)
+            for feed in feeds:
+                key = _tr_key(symbol, exchange, feed)
+                ws.send_text(_subscribe_frame(approval, key))
+                logger.info("subscribed %s (%s) as %s [%s]", symbol,
+                            exchange, key, feed)
 
         while time.time() - started < seconds:
             try:
@@ -257,24 +309,26 @@ def probe(symbols, *, seconds, env=None, port=None):
                 ws.send_text(message)
                 pongs[0] += 1
                 continue
-            parsed = parse_trade(message)
-            if parsed is None:
+            parsed_all = parse_trades(message)
+            if not parsed_all:
                 safe = _scrub_control(message)
                 control.append(safe[:600])
                 logger.info("control: %s", safe[:300])
                 continue
-            records.append(parsed)
-            per_symbol[parsed.get("SYMB") or parsed.get("RSYM")].append(parsed)
-            if len(records) <= 12:
-                logger.info(
-                    "TRADE %s local=%s/%s last=%s trade_size(%s)=%s "
-                    "cumulative(%s)=%s amount(%s)=%s fields=%d%s",
-                    parsed.get("SYMB"), parsed.get("XYMD"), parsed.get("XHMS"),
-                    parsed.get("LAST"), FIELD_TRADE_SIZE,
-                    parsed.get(FIELD_TRADE_SIZE), FIELD_CUMULATIVE,
-                    parsed.get(FIELD_CUMULATIVE), FIELD_AMOUNT,
-                    parsed.get(FIELD_AMOUNT), parsed["raw_field_count"],
-                    " LAYOUT_MISMATCH" if parsed["layout_mismatch"] else "")
+            for parsed in parsed_all:
+                records.append(parsed)
+                per_symbol[parsed.get("SYMB") or parsed.get("RSYM")].append(parsed)
+                if len(records) <= 12:
+                    logger.info(
+                        "TRADE %s local=%s/%s last=%s trade_size(%s)=%s "
+                        "cumulative(%s)=%s amount(%s)=%s in_frame=%s%s",
+                        parsed.get("SYMB"), parsed.get("XYMD"),
+                        parsed.get("XHMS"), parsed.get("LAST"),
+                        FIELD_TRADE_SIZE, parsed.get(FIELD_TRADE_SIZE),
+                        FIELD_CUMULATIVE, parsed.get(FIELD_CUMULATIVE),
+                        FIELD_AMOUNT, parsed.get(FIELD_AMOUNT),
+                        parsed.get("records_in_frame"),
+                        " LAYOUT_MISMATCH" if parsed["layout_mismatch"] else "")
 
     verdict = classify(records, control_messages=control)
     return {
@@ -282,6 +336,7 @@ def probe(symbols, *, seconds, env=None, port=None):
         "observed_at": datetime.now(timezone.utc).isoformat(),
         "window_seconds": seconds,
         "subscribed": [f"{s}:{e}" for s, e in symbols],
+        "feeds": list(feeds),
         "trade_records": len(records),
         "keepalives_answered": pongs[0],
         "symbols_with_trades": {k: len(v) for k, v in per_symbol.items()},
@@ -302,6 +357,8 @@ def main(argv=None):
     parser.add_argument("--symbols", default="META:NAS,AAPL:NAS,NVDA:NAS",
                         help="comma-separated SYMBOL:EXCHANGE pairs")
     parser.add_argument("--seconds", type=float, default=60.0)
+    parser.add_argument("--feeds", default=FEED_DELAYED,
+                        help="comma-separated: delayed, realtime, or both")
     parser.add_argument("--out", default=None,
                         help="write the JSON result here as well")
     parser.add_argument("--log-level", default="INFO")
@@ -320,7 +377,8 @@ def main(argv=None):
         pairs.append((symbol.strip(), (exchange or "NAS").strip()))
 
     try:
-        result = probe(pairs, seconds=args.seconds)
+        feeds = tuple(f.strip() for f in args.feeds.split(",") if f.strip())
+        result = probe(pairs, seconds=args.seconds, feeds=feeds)
     except PermissionError as exc:
         result = {"verdict": PERMISSION_REQUIRED, "detail": str(exc)}
     except Exception as exc:  # noqa: BLE001 -- a probe reports, never raises
