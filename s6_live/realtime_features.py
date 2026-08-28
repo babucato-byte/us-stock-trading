@@ -99,6 +99,16 @@ class SessionFeatures:
     range_low: Optional[float] = None
     extension_pct: Optional[float] = None
     bar_count: int = 0
+    #: Where each number came from. A READY candidate has to be
+    #: traceable to a source: the same feature computed from the daily
+    #: provider and from the KIS trade stream are different measurements,
+    #: and "which one said this was READY" is the first question after a
+    #: surprising trade.
+    price_source: Optional[str] = None
+    volume_source: Optional[str] = None
+    #: LIVE / STALE / DISCONNECTED / UNKNOWN for a streaming source;
+    #: None when the source does not stream.
+    feed_status: Optional[str] = None
     #: Names of the inputs that could not be computed, and why.
     unavailable: Dict[str, str] = field(default_factory=dict)
     error: Optional[str] = None
@@ -141,6 +151,9 @@ class SessionFeatures:
             "range_low": self.range_low,
             "extension_pct": self.extension_pct,
             "bar_count": self.bar_count,
+            "price_source": self.price_source,
+            "volume_source": self.volume_source,
+            "feed_status": self.feed_status,
             "unavailable": dict(self.unavailable),
             "error": self.error,
         }

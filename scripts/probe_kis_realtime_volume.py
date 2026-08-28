@@ -42,6 +42,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from execution.secret_redaction import install_logging_redaction  # noqa: E402
+from market_data import kis_hdfscnt0 as wire  # noqa: E402
 from market_data.kis_realtime_ws import WebSocket, WebSocketError  # noqa: E402
 
 logger = logging.getLogger("kis_realtime_probe")
@@ -58,42 +59,40 @@ REALTIME_HOST = "ops.koreainvestment.com"
 REALTIME_PORT_LIVE = 21000
 REALTIME_PORT_PAPER = 31000
 
-TR_TRADE = "HDFSCNT0"
-
-#: HDFSCNT0's field order, from KIS's published layout. Named here so a
-#: shifted or shortened record is visible as a mismatch rather than
-#: silently read as different values.
-HDFSCNT0_FIELDS = (
-    "RSYM", "SYMB", "ZDIV", "TSYM", "XYMD", "XHMS", "KYMD", "KHMS",
-    "OPEN", "HIGH", "LOW", "LAST", "SIGN", "DIFF", "RATE",
-    "PBID", "PASK", "VBID", "VASK",
-    "EVOL", "TVOL", "TAMT", "BIVL", "ASVL", "STRN", "MTYP",
-)
-
-#: The three that decide the question.
-FIELD_TRADE_SIZE = "EVOL"        # this trade's size
-FIELD_CUMULATIVE = "TVOL"        # cumulative session volume
-FIELD_AMOUNT = "TAMT"            # cumulative traded amount
-
-#: KIS addresses an overseas symbol by a FEED prefix plus the ticker,
-#: and the prefix chooses which feed you get:
-#:
-#:   D...  delayed quotes  (included with the account)
-#:   R...  real-time       (a separately purchased subscription)
-#:
-#: They are different products, not different spellings, and the
-#: distinction is the whole question this probe exists to settle. A
-#: delayed feed can answer SUBSCRIBE SUCCESS and then deliver nothing
-#: outside regular hours, which looks exactly like "extended hours carry
-#: no volume" while actually meaning "this feed does not cover them".
-#: So both are asked, and what each one answers is reported separately.
-DELAYED_PREFIX = {"NAS": "DNAS", "NASD": "DNAS", "NYS": "DNYS",
-                  "NYSE": "DNYS", "AMS": "DAMS", "AMEX": "DAMS"}
-REALTIME_PREFIX = {"NAS": "RBAQ", "NASD": "RBAQ", "NYS": "RBAY",
-                   "NYSE": "RBAY", "AMS": "RBAA", "AMEX": "RBAA"}
-FEED_DELAYED = "delayed"
-FEED_REALTIME = "realtime"
+# The wire format lives in market_data/kis_hdfscnt0.py so this probe and
+# the production feed cannot drift apart. Re-exported here because the
+# probe's own tests and CLI refer to them by these names.
+TR_TRADE = wire.TR_TRADE
+HDFSCNT0_FIELDS = wire.FIELDS
+FIELD_TRADE_SIZE = wire.FIELD_TRADE_SIZE
+FIELD_CUMULATIVE = wire.FIELD_CUMULATIVE
+FIELD_AMOUNT = wire.FIELD_AMOUNT
+DELAYED_PREFIX = wire.DELAYED_PREFIX
+REALTIME_PREFIX = wire.REALTIME_PREFIX
 EXCHANGE_PREFIX = DELAYED_PREFIX
+FEED_DELAYED = wire.FEED_DELAYED
+FEED_REALTIME = wire.FEED_REALTIME
+
+parse_trades = wire.parse_trades
+_is_pingpong = wire.is_pingpong
+_scrub_control = wire.scrub_control
+_as_number = wire.as_number
+
+
+def parse_trade(payload):
+    """The first record of a frame, or None."""
+    found = wire.parse_trades(payload)
+    return found[0] if found else None
+
+
+def _tr_key(symbol, exchange, feed=FEED_DELAYED):
+    return wire.tr_key(symbol, exchange, feed)
+
+
+def _subscribe_frame(approval_key, key, *, tr_id=None, subscribe=True):
+    return wire.subscribe_frame(approval_key, key,
+                                tr_id=tr_id or wire.TR_TRADE,
+                                subscribe=subscribe)
 
 
 def _approval_key(app_key, app_secret, base_url):
