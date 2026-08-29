@@ -32,6 +32,7 @@ from s6_live import position_store as s6ps  # noqa: E402
 NOW = datetime(2026, 8, 26, 16, 0, tzinfo=timezone.utc)
 S1 = "S1_HMA_EARLY_TREND_V1"
 S6 = "S6_ORB_BREAKOUT_V1"
+S2 = "S2_VOLUME_ACCUMULATION_V1"
 
 
 @pytest.fixture
@@ -312,6 +313,23 @@ class TestTheRepairWorksAgainstEveryStore:
         ).fetchone()
         assert row["status"] == "CLOSED"
         assert row["exit_reason"] == ownership.RELEASED_WRONGLY_ATTRIBUTED
+
+    def test_releasing_a_misattributed_S2_row(self, conn):
+        """The third store, and the other one that takes `reason=`."""
+        from s2_live import position_store as s2ps
+
+        _ledger(conn, "DT", S1)
+        s2ps.open_position(conn, symbol="DT", quantity=1,
+                           average_fill_price=50.79, venue="NYSE",
+                           entry_session="REGULAR", now=NOW)
+        s1ps.open_position(conn, symbol="DT", strategy_id=S1,
+                           signal_id="s1-DT", entry_price=50.79, quantity=1,
+                           now=NOW)
+        out = ownership.release_misattributed(
+            conn, symbol="DT", strategy_id=S2, now=NOW, audit=False)
+        assert out["released"] is True
+        assert [s for s, _v, _q in s1ps.holdings(conn)] == ["DT"]
+        assert s2ps.holdings(conn) == []
 
     def test_every_store_can_be_closed_through_the_shim(self):
         """Guards the mismatch itself rather than one instance of it."""

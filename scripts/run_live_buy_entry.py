@@ -396,6 +396,14 @@ def _record_closed_bar_shadow(source, symbols, *, session, day, since):
                 symbol, store=store, session=session, now=since)
             if comparison is not None:
                 closed_bar_shadow.append(comparison, trading_day=day)
+            # Whether the difference reaches the DECISION, which the
+            # feature deltas alone cannot say: a large gap in a field no
+            # gate consults changes nothing, and a small one that
+            # crosses a threshold changes everything.
+            verdict = closed_bar_shadow.compare_readiness(
+                symbol, store=store, session=session, now=since)
+            if verdict is not None:
+                closed_bar_shadow.append(verdict, trading_day=day)
     except Exception:  # noqa: BLE001 - research, and the cycle is over
         logger.warning("could not record the closed-bar comparison",
                        exc_info=True)

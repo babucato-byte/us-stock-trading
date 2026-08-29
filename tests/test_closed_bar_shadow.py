@@ -204,3 +204,175 @@ class TestTheSummaryDoesNotHideTheEarlySessionGap:
         with open(shadow.log_path("D", env=env), "a", encoding="utf-8") as fh:
             fh.write("{not json\n")
         assert shadow.disagreements("D", env=env)["compared"] == 1
+
+
+class TestWhetherTheDifferenceReachesTheDecision:
+    """The feature deltas say the two readings differ. This says whether
+    the difference changes the answer -- a 900bps gap in a field no gate
+    consults changes nothing, and a small one that crosses a threshold
+    changes everything."""
+
+    def test_both_ready_is_agreement(self):
+        assert shadow.classify(live_ready=True, shadow_ready=True) \
+            == shadow.CLASS_BOTH
+
+    def test_neither_ready_is_also_agreement(self):
+        assert shadow.classify(live_ready=False, shadow_ready=False) \
+            == shadow.CLASS_NEITHER
+
+    def test_a_signal_the_partial_bar_created(self):
+        """The shape that matters: a breakout that can un-break before
+        the minute closes."""
+        assert shadow.classify(live_ready=True, shadow_ready=False) \
+            == shadow.CLASS_LIVE_ONLY
+
+    def test_a_signal_the_partial_bar_is_suppressing(self):
+        assert shadow.classify(live_ready=False, shadow_ready=True) \
+            == shadow.CLASS_SHADOW_ONLY
+
+    def test_the_comparison_records_both_verdicts(self, monkeypatch):
+        from s6_live import precision_watch
+
+        class _Eval:
+            def __init__(self, ready):
+                self.state = "READY_TO_BUY" if ready else "WATCHING"
+                self.blocking = [] if ready else ["volume_expansion"]
+
+            @property
+            def ready(self):
+                return self.state == "READY_TO_BUY"
+
+        seen = []
+
+        def _fake(symbol, *, session, now, features, conn=None, **k):
+            # The live view has three bars, the shadow two.
+            ready = features.bar_count == 3
+            seen.append(features.bar_count)
+            return _Eval(ready)
+
+        monkeypatch.setattr(precision_watch, "evaluate", _fake)
+        store = _Store([_bar(-2, close=10.0), _bar(-1, close=11.0),
+                        _bar(0, close=12.0)])
+        out = shadow.compare_readiness("OWL", store=store, session="REGULAR",
+                                       now=NOW)
+        assert sorted(seen) == [2, 3]
+        assert out["live_ready"] is True
+        assert out["shadow_ready"] is False
+        assert out["classification"] == shadow.CLASS_LIVE_ONLY
+        assert out["shadow_blocking"] == ["volume_expansion"]
+
+    def test_a_failing_evaluation_does_not_raise(self, monkeypatch):
+        from s6_live import precision_watch
+
+        monkeypatch.setattr(
+            precision_watch, "evaluate",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+        store = _Store([_bar(-1, close=11.0), _bar(0, close=12.0)])
+        out = shadow.compare_readiness("OWL", store=store, session="REGULAR",
+                                       now=NOW)
+        assert out["live_ready"] is False
+        assert out["classification"] == shadow.CLASS_NEITHER
+
+    def test_no_bars_is_None(self):
+        assert shadow.compare_readiness("OWL", store=_Store([]),
+                                        session="REGULAR", now=NOW) is None
+
+
+class TestCountingWhoSignalled:
+    @pytest.fixture
+    def env(self, tmp_path):
+        return {"CLOSED_BAR_SHADOW_DIR": str(tmp_path)}
+
+    def test_it_counts_each_classification(self, env):
+        for name in (shadow.CLASS_BOTH, shadow.CLASS_LIVE_ONLY,
+                     shadow.CLASS_LIVE_ONLY, shadow.CLASS_SHADOW_ONLY):
+            shadow.append({"classification": name}, trading_day="D", env=env)
+        counts = shadow.classification_counts("D", env=env)
+        assert counts[shadow.CLASS_LIVE_ONLY] == 2
+        assert counts[shadow.CLASS_SHADOW_ONLY] == 1
+        assert counts[shadow.CLASS_BOTH] == 1
+        assert counts[shadow.CLASS_NEITHER] == 0
+
+    def test_feature_only_rows_are_not_counted_as_agreement(self, env):
+        """A plain feature comparison carries no readiness. Folding those
+        into NEITHER would report the readings agreeing every time
+        nobody asked the question."""
+        shadow.append({"fields": {"price": {"delta_bps": 10.0}}},
+                      trading_day="D", env=env)
+        assert shadow.classification_counts("D", env=env) == {
+            shadow.CLASS_BOTH: 0, shadow.CLASS_LIVE_ONLY: 0,
+            shadow.CLASS_SHADOW_ONLY: 0, shadow.CLASS_NEITHER: 0}
+
+
+class TestScoringTheSignalsAfterTheFact:
+    """Classification says the two readings disagreed. This says which
+    of them was right -- the entire point of collecting the dataset."""
+
+    def test_forward_returns_at_each_mark(self):
+        store = _Store([_bar(0, close=10.0), _bar(5, close=11.0),
+                        _bar(15, close=9.0)])
+        out = shadow.forward_returns("OWL", store=store, session="REGULAR",
+                                     signal_at=NOW.replace(second=0),
+                                     signal_price=10.0)
+        assert out["T+5"] == pytest.approx(10.0)
+        assert out["T+15"] == pytest.approx(-10.0)
+
+    def test_a_mark_with_no_nearby_bar_is_None_not_flat(self):
+        """Substituting a distant bar would let a quiet symbol look like
+        it held its move."""
+        store = _Store([_bar(0, close=10.0)])
+        out = shadow.forward_returns("OWL", store=store, session="REGULAR",
+                                     signal_at=NOW.replace(second=0),
+                                     signal_price=10.0)
+        assert out["T+60"] is None
+
+    def test_no_signal_price_scores_nothing(self):
+        store = _Store([_bar(5, close=11.0)])
+        out = shadow.forward_returns("OWL", store=store, session="REGULAR",
+                                     signal_at=NOW, signal_price=None)
+        assert all(v is None for v in out.values())
+
+    def test_an_unreadable_store_does_not_raise(self):
+        class _Broken:
+            def bars(self, *a):
+                raise RuntimeError("gone")
+
+        out = shadow.forward_returns("OWL", store=_Broken(), session="REGULAR",
+                                     signal_at=NOW, signal_price=10.0)
+        assert set(out) == {"T+5", "T+15", "T+30", "T+60"}
+
+
+class TestTheScoreboardDoesNotFlattenTheGaps:
+    @pytest.fixture
+    def env(self, tmp_path):
+        return {"CLOSED_BAR_SHADOW_DIR": str(tmp_path)}
+
+    def test_each_classification_is_scored_separately(self, env):
+        """LIVE_ONLY signals are the ones the partial bar created;
+        pooling them with BOTH hides exactly what is being asked."""
+        for name, ret in ((shadow.CLASS_LIVE_ONLY, -2.0),
+                          (shadow.CLASS_LIVE_ONLY, -1.0),
+                          (shadow.CLASS_BOTH, 3.0)):
+            shadow.append({"classification": name,
+                           "forward_returns": {"T+15": ret}},
+                          trading_day="D", env=env)
+        out = shadow.score_classifications("D", env=env)["by_classification"]
+        assert out[shadow.CLASS_LIVE_ONLY]["signals"] == 2
+        assert out[shadow.CLASS_LIVE_ONLY]["median_return_pct"] == pytest.approx(-1.0)
+        assert out[shadow.CLASS_LIVE_ONLY]["win_rate"] == pytest.approx(0.0)
+        assert out[shadow.CLASS_BOTH]["win_rate"] == pytest.approx(1.0)
+
+    def test_an_unreadable_mark_is_counted_but_not_scored(self, env):
+        """A mark that could not be read is not a flat return, and
+        averaging it in as zero drags every group toward 'no difference'."""
+        shadow.append({"classification": shadow.CLASS_LIVE_ONLY,
+                       "forward_returns": {"T+15": None}},
+                      trading_day="D", env=env)
+        out = shadow.score_classifications("D", env=env)["by_classification"]
+        assert out[shadow.CLASS_LIVE_ONLY]["signals"] == 1
+        assert out[shadow.CLASS_LIVE_ONLY]["scored"] == 0
+        assert out[shadow.CLASS_LIVE_ONLY]["unscored"] == 1
+        assert out[shadow.CLASS_LIVE_ONLY]["median_return_pct"] is None
+
+    def test_an_empty_day_scores_nothing(self, env):
+        assert shadow.score_classifications("D", env=env)["by_classification"] == {}
