@@ -136,7 +136,41 @@ def open_from_fill(conn, position_id, *, quantity, average_fill_price,
     if changed:
         logger.info("S6 position opened: %s qty=%d @ %.4f", position_id,
                     qty, price)
+        _record_fill_for_slippage(conn, position_id, quantity=qty,
+                                  price=price, now=stamp)
     return bool(changed)
+
+
+def _record_fill_for_slippage(conn, position_id, *, quantity, price, now):
+    """Complete the execution-quality row this fill belongs to.
+
+    Slippage needs both halves and they arrive at different times: the
+    signal price is known when the order is accepted, the fill price
+    only when the broker reports it -- sometimes hours later, through
+    reconciliation. This is where the second half is handed over.
+
+    Observation only, and silent on failure. A position that opened is
+    open whether or not anybody is measuring what it cost.
+    """
+    try:
+        from s6_live import slippage_log
+
+        row = load(conn, position_id)
+        # `load` yields a sqlite3.Row, which indexes but has no `.get`.
+        order_id = None
+        if row is not None and "client_order_id" in row.keys():
+            order_id = row["client_order_id"]
+        if not order_id:
+            return
+        # This store's `_now` yields an ISO string, not a datetime.
+        day = (now.strftime("%Y-%m-%d") if hasattr(now, "strftime")
+               else str(now)[:10])
+        slippage_log.attach_fill(
+            internal_order_id=order_id, fill_price=price,
+            qty_filled=quantity, fill_at=now, trading_day=day)
+    except Exception:  # noqa: BLE001
+        logger.warning("could not record the fill for %s in the slippage log",
+                       position_id, exc_info=True)
 
 
 def apply_fill(conn, position_id, *, filled_quantity, average_fill_price,

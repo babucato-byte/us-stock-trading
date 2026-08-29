@@ -108,6 +108,30 @@ class KISLiveTradingError(Exception):
 _CYCLE_LEVEL_SYMBOL = "__CYCLE__"
 
 
+def _record_slippage(*, now, **fields):
+    """Record what an order cost against what it was meant to cost.
+
+    Observation only. It writes one line to a JSONL file beside the
+    shared state and returns whatever happens -- no order-DB write, no
+    broker call, no bearing on any execution decision. A failure here
+    must never cost a trade, so every failure is swallowed.
+
+    The fill price is deliberately absent: at this point the broker has
+    ACCEPTED, not filled. Reconciliation supplies the fill later, and
+    recording the limit price as a fill would report zero slippage on
+    every order.
+    """
+    try:
+        from s6_live import slippage_log
+
+        trading_day = now.strftime("%Y-%m-%d")
+        slippage_log.append(slippage_log.build_record(now=now, **fields),
+                            trading_day=trading_day)
+    except Exception:  # noqa: BLE001
+        logger.warning("could not record slippage for %s",
+                       fields.get("symbol"), exc_info=True)
+
+
 def _persist_blocked_record(*, symbol, side="buy", strategy_id="PAPER_STRATEGY_ORDER_SCORE_V1",
                              signal_price=None, kis_price=None, price_diff_percent=None,
                              planned_quantity=None, planned_limit_price=None, stop_price=None,
@@ -902,6 +926,13 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                         existing_open_order=has_open_order_for_symbol, now=current,
                     )
 
+                # Stamped HERE rather than reused from `current`.
+                # `current` is the cycle's start -- the same value every
+                # symbol in the loop shares -- which is exactly how the
+                # order events ended up with four transitions carrying
+                # one timestamp and no measurable latency between them.
+                submit_at = datetime.now(timezone.utc)
+
                 try:
                     # CODEX-048: audit_run_id lets the Execution Engine
                     # record GATE_APPROVED and EXECUTION_PLANNED BEFORE it
@@ -985,6 +1016,19 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                                     "against KIS order history before any "
                                     "further entry", symbol)
                         continue
+                    accepted_at = datetime.now(timezone.utc)
+                    _record_slippage(
+                        symbol=symbol, side="buy", session=order_intent.session,
+                        strategy_id=order_intent.strategy_id,
+                        signal_price=signal.signal_price,
+                        gate_price=kis_quote.price_usd,
+                        order_price=order_intent.limit_price,
+                        qty_requested=order_intent.quantity,
+                        internal_order_id=order_intent.internal_order_id,
+                        submit_at=submit_at, accepted_at=accepted_at,
+                        broker_order_id=getattr(result.execution_record,
+                                                "broker_order_id", None),
+                        now=current)
                     results["submitted"].append(symbol)
                     shadow_mode.persist(_shadow_record("APPROVED"))
                     # GATE_APPROVED and EXECUTION_PLANNED were already

@@ -144,6 +144,23 @@ def may_adopt(conn, symbol, *, strategy_id) -> Tuple[bool, str]:
 RELEASED_WRONGLY_ATTRIBUTED = "RELEASED_WRONGLY_ATTRIBUTED"
 
 
+
+def _close(store, conn, position_id, *, reason, now):
+    """Close a row through whichever keyword its store accepts.
+
+    S1's `close_position` takes `exit_reason`, S2's and S6's take
+    `reason`. Rather than guess, the signature is inspected -- a guess
+    here fails with a TypeError in the middle of a repair, leaving the
+    conflict it was called to resolve still in place.
+    """
+    import inspect
+
+    parameters = inspect.signature(store.close_position).parameters
+    keyword = "exit_reason" if "exit_reason" in parameters else "reason"
+    return store.close_position(conn, position_id, now=now,
+                                **{keyword: reason})
+
+
 def release_misattributed(conn, *, symbol, strategy_id, now=None,
                           audit=True) -> Dict[str, object]:
     """Retire a position row that belongs to a different strategy.
@@ -193,9 +210,13 @@ def release_misattributed(conn, *, symbol, strategy_id, now=None,
             return {"released": False, "symbol": wanted,
                     "reason": f"{position_id} has an exit in flight; "
                               "refusing to retire a row being acted on"}
-        store.close_position(conn, position_id,
-                             exit_reason=RELEASED_WRONGLY_ATTRIBUTED,
-                             now=current)
+        # The stores do not agree on the keyword. S1 takes
+        # `exit_reason`; S2 and S6 take `reason`. Calling either name
+        # blindly raises TypeError against two of the three stores --
+        # and this is the repair path for the double-ownership incident,
+        # so it would fail exactly when it was needed.
+        _close(store, conn, position_id, reason=RELEASED_WRONGLY_ATTRIBUTED,
+               now=current)
         released.append(position_id)
         if audit:
             try:

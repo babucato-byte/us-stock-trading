@@ -278,3 +278,49 @@ class TestReleasingAMisattributedRow:
         ownership.release_misattributed(conn, symbol="DT", strategy_id=S1,
                                         now=NOW, audit=False)
         assert [s for s, _v, _q in s1ps.holdings(conn)] == ["TX"]
+
+
+class TestTheRepairWorksAgainstEveryStore:
+    """The stores disagree on the keyword: S1's `close_position` takes
+    `exit_reason`, S2's and S6's take `reason`. Every existing test
+    released from S1, so the S6 and S2 paths raised TypeError untested --
+    in the repair path for the very incident this module exists for."""
+
+    def test_releasing_a_misattributed_S6_row(self, conn):
+        _ledger(conn, "DT", S1)
+        _s6_open(conn, "DT")
+        s1ps.open_position(conn, symbol="DT", strategy_id=S1,
+                           signal_id="s1-DT", entry_price=50.79, quantity=1,
+                           now=NOW)
+        out = ownership.release_misattributed(
+            conn, symbol="DT", strategy_id=S6, now=NOW, audit=False)
+        assert out["released"] is True
+        assert ownership.conflicts(conn) == []
+        # S1, the real owner by the ledger, keeps its position.
+        assert [s for s, _v, _q in s1ps.holdings(conn)] == ["DT"]
+
+    def test_the_S6_row_is_retired_under_the_release_reason(self, conn):
+        _ledger(conn, "DT", S1)
+        _s6_open(conn, "DT")
+        s1ps.open_position(conn, symbol="DT", strategy_id=S1,
+                           signal_id="s1-DT", entry_price=50.79, quantity=1,
+                           now=NOW)
+        ownership.release_misattributed(conn, symbol="DT", strategy_id=S6,
+                                        now=NOW, audit=False)
+        row = conn.execute(
+            "SELECT status, exit_reason FROM s6_positions WHERE symbol='DT'"
+        ).fetchone()
+        assert row["status"] == "CLOSED"
+        assert row["exit_reason"] == ownership.RELEASED_WRONGLY_ATTRIBUTED
+
+    def test_every_store_can_be_closed_through_the_shim(self):
+        """Guards the mismatch itself rather than one instance of it."""
+        import inspect
+
+        from s1_live import position_store as s1
+        from s2_live import position_store as s2
+        from s6_live import position_store as s6
+
+        for store in (s1, s2, s6):
+            parameters = inspect.signature(store.close_position).parameters
+            assert "exit_reason" in parameters or "reason" in parameters

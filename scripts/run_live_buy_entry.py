@@ -353,6 +353,8 @@ def _record_shadow_signals(source, results, *, since):
                 watch_blocking=getattr(evaluation, "blocking", ()),
                 now=since)
             ssl.append(record, trading_day=day)
+        _record_closed_bar_shadow(source, sorted(evaluations), session=session,
+                                  day=day, since=since)
     except Exception:  # noqa: BLE001 -- an observation that fails must
         # not alter a cycle that has already finished trading.
         logger.warning("could not record shadow signals", exc_info=True)
@@ -364,6 +366,39 @@ def _record_shadow_signals(source, results, *, since):
         logger.error(
             "EXECUTION_DEFECT_SUSPECTED ready=%d executable=%d submitted=0 -- "
             "the gate approved an order that was never submitted", ready, executable)
+
+
+
+def _record_closed_bar_shadow(source, symbols, *, session, day, since):
+    """The same features read off closed bars only, recorded beside the
+    live reading.
+
+    Every live feature is computed over ALL bars, and the last of those
+    is the minute in progress -- its close is whatever the latest print
+    was, and its volume a fraction of what the minute will finish with.
+    A breakout read off a partial bar can un-break before the minute
+    ends. Whether that actually happens here has never been measured.
+
+    Production is untouched: this records what the other reading WOULD
+    have said, so a later argument for closed bars can be made from
+    evidence rather than from that plausible story.
+    """
+    try:
+        from s6_live import closed_bar_shadow, kis_bar_features
+
+        if not session:
+            return
+        store = kis_bar_features.load_store(session, day)
+        if store is None:
+            return
+        for symbol in symbols:
+            comparison = closed_bar_shadow.compare(
+                symbol, store=store, session=session, now=since)
+            if comparison is not None:
+                closed_bar_shadow.append(comparison, trading_day=day)
+    except Exception:  # noqa: BLE001 - research, and the cycle is over
+        logger.warning("could not record the closed-bar comparison",
+                       exc_info=True)
 
 
 def run_once(broker=None, *, strategy="s1"):
