@@ -48,6 +48,23 @@ PRIOR_SESSION_SHARE = 0.5
 
 SOURCE_PRIOR = "PRIOR_SESSION_CANDIDATES"
 SOURCE_MANIFEST = "UNIVERSE_MANIFEST"
+SOURCE_HELD = "HELD_POSITION"
+
+#: Priority order for the 41 slots. Positions we are IN come before
+#: candidates we might enter, and an exit already decided comes before
+#: everything.
+#:
+#: This was missing and it showed: RIG sat EXIT_PENDING with a latched
+#: EMA_STRUCTURE_FAILURE while all 41 slots went to discovery
+#: candidates, so the one symbol the account actually held had no
+#: realtime data at all. Its exit was safe only because a latched retry
+#: re-submits the stored reason without needing features -- the next
+#: position would not have been so lucky, because evaluating an exit in
+#: premarket or after-hours DOES need the stream.
+PRIORITY_EXIT_PENDING = 0
+PRIORITY_OPEN = 1
+PRIORITY_PRIOR = 2
+PRIORITY_MANIFEST = 3
 
 
 def _exchange_for(symbol):
@@ -143,26 +160,81 @@ def manifest_symbols(*, limit, exclude=()) -> List[str]:
     return out
 
 
+def held_position_symbols(conn=None):
+    """Symbols the account is IN, exits-first.
+
+    A local SQLite read: no broker call, so asking costs nothing from
+    the budget the stream is competing for. Returns (symbol, priority)
+    so an exit already decided outranks a position merely open.
+    """
+    try:
+        from state_store import db as state_db
+
+        owns = conn is None
+        conn = conn or state_db.open_db()
+        try:
+            rows = conn.execute(
+                "SELECT symbol, status FROM s6_positions "
+                "WHERE status IN ('EXIT_PENDING', 'EXIT_SUBMITTED', 'OPEN', "
+                "'SUBMITTED')").fetchall()
+        finally:
+            if owns:
+                conn.close()
+    except Exception:  # noqa: BLE001 - an unreadable store must not stop
+        # the stream starting; the pool is simply chosen without it.
+        logger.warning("bootstrap: could not read held positions",
+                       exc_info=True)
+        return []
+
+    out = []
+    for row in rows or ():
+        symbol = str((row["symbol"] if hasattr(row, "keys") else row[0])
+                     or "").upper()
+        status = str((row["status"] if hasattr(row, "keys") else row[1]) or "")
+        if not symbol:
+            continue
+        priority = (PRIORITY_EXIT_PENDING
+                    if status in ("EXIT_PENDING", "EXIT_SUBMITTED")
+                    else PRIORITY_OPEN)
+        out.append((symbol, priority))
+    out.sort(key=lambda pair: (pair[1], pair[0]))
+    return out
+
+
 def build(*, session, trading_day, prior_session=None, prior_trading_day=None,
-          limit=None) -> Tuple[List[Tuple[str, str]], dict]:
+          limit=None, conn=None) -> Tuple[List[Tuple[str, str]], dict]:
     """(symbol, exchange) pairs to subscribe, and how they were chosen.
 
-    Never consults the CURRENT session's candidates. That is the
-    dependency this exists to break, and a "just in case" fallback to
-    them would quietly restore it.
+    Held positions first, then candidates. Never consults the CURRENT
+    session's candidates -- that is the dependency this exists to break,
+    and a "just in case" fallback would quietly restore it.
     """
     cap = int(limit or wire.MAX_SUBSCRIPTIONS)
-    prior_cap = max(1, int(cap * PRIOR_SESSION_SHARE))
+
+    # Positions we are IN claim their slots before anything we might
+    # enter. They are never evicted for a better-ranked candidate: the
+    # cost of losing a candidate is a missed opportunity, and the cost of
+    # losing an open position's data is an exit evaluated blind.
+    held = held_position_symbols(conn=conn)
+    held_symbols = [symbol for symbol, _priority in held][:cap]
+    remaining = cap - len(held_symbols)
+
+    prior_cap = max(1, int(remaining * PRIOR_SESSION_SHARE)) if remaining else 0
 
     prior = []
-    if prior_session and prior_trading_day:
-        prior = prior_session_symbols(trading_day=prior_trading_day,
-                                      session=prior_session, limit=prior_cap)
+    if prior_session and prior_trading_day and prior_cap:
+        prior = [s for s in prior_session_symbols(
+            trading_day=prior_trading_day, session=prior_session,
+            limit=prior_cap) if s not in held_symbols]
 
-    filler = manifest_symbols(limit=cap - len(prior), exclude=prior)
+    filler = []
+    if remaining - len(prior) > 0:
+        filler = manifest_symbols(limit=remaining - len(prior),
+                                  exclude=held_symbols + prior)
 
     pairs, chosen_from = [], {}
-    for symbol, origin in ([(s, SOURCE_PRIOR) for s in prior]
+    for symbol, origin in ([(s, SOURCE_HELD) for s in held_symbols]
+                           + [(s, SOURCE_PRIOR) for s in prior]
                            + [(s, SOURCE_MANIFEST) for s in filler]):
         exchange = _exchange_for(symbol)
         if exchange is None:
@@ -176,6 +248,13 @@ def build(*, session, trading_day, prior_session=None, prior_trading_day=None,
         "session": session,
         "trading_day": trading_day,
         "cap": cap,
+        "from_held_positions": sum(1 for v in chosen_from.values()
+                                   if v == SOURCE_HELD),
+        "held_symbols": list(held_symbols),
+        "exit_pending_slots": sum(1 for _s, p in held
+                                  if p == PRIORITY_EXIT_PENDING),
+        "open_slots": sum(1 for _s, p in held if p == PRIORITY_OPEN),
+        "unused_slots": max(0, cap - len(pairs)),
         "from_prior_session": sum(1 for v in chosen_from.values()
                                   if v == SOURCE_PRIOR),
         "from_manifest": sum(1 for v in chosen_from.values()

@@ -1316,3 +1316,52 @@ class ReportBrokerSnapshotStub:
 
     def count(self, name):
         self.calls[name] = self.calls.get(name, 0) + 1
+
+
+class TestAReportDescribesItsOwnMoment:
+    """`scan_window.evaluate()` was called with no argument in both
+    report builders, so a report built for a given instant carried
+    WALL-CLOCK calendar and market state instead of its own.
+
+    It surfaced as a test that changed answer when a run crossed
+    midnight Eastern: `test_an_open_market_without_a_tick_is_a_failure`
+    passed on a weekday and failed on the weekend, for a report whose
+    own `now` was a Monday either way. The test was right and the
+    builders were wrong -- a replayed or historical report was reading
+    today's calendar.
+    """
+
+    def test_final_check_uses_the_supplied_moment(self, production,
+                                                  handoff, master):
+        publish(["AAPL"])
+        report = final_check.build(trading_day=DAY, session="REGULAR",
+                                   modes=live_modes(), now=T0)
+        # T0 is a Monday; whatever day the suite actually runs on, the
+        # report must describe T0.
+        assert report["calendar_trading_day"] is True
+        assert report["scan_window_reason"] == "VALID_TRADING_DAY"
+
+    def test_session_report_uses_the_supplied_moment(self, production,
+                                                     handoff, master):
+        publish(["AAPL"])
+        report = session_report.build(trading_day=DAY, session="REGULAR",
+                                      now=T0)
+        assert report["calendar_trading_day"] is True
+
+    def test_a_weekend_moment_still_reports_a_weekend(self, production,
+                                                      handoff, master):
+        """The fix must not make every report claim a trading day."""
+        from datetime import datetime, timezone
+
+        saturday = datetime(2026, 8, 29, 14, 0, tzinfo=timezone.utc)
+        report = final_check.build(trading_day="2026-08-29", session="REGULAR",
+                                   modes=live_modes(), now=saturday)
+        assert report["calendar_trading_day"] is False
+        assert report["scan_window_reason"] == "WEEKEND"
+
+    def test_neither_builder_evaluates_the_window_without_a_moment(self):
+        for name in ("final_check", "session_report"):
+            source = (REPO_ROOT / "s6_live" / f"{name}.py").read_text(
+                encoding="utf-8")
+            assert "scan_window.evaluate()" not in source, name
+            assert "scan_window.evaluate(now)" in source, name

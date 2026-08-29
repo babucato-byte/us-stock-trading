@@ -175,3 +175,13 @@ class TestTheWatchlistDoesNotDependOnThisSessionsCandidates:
     def test_the_seed_choice_is_logged(self):
         """A premarket funnel needs to say where its pool came from."""
         assert "bootstrap %s" in WRAPPER
+
+    def test_held_positions_are_part_of_the_seed(self):
+        """RIG sat EXIT_PENDING with no stream slot while 41 went to
+        discovery candidates. A position the account is IN outranks a
+        candidate it might enter."""
+        from market_data import bootstrap_watchlist as bootstrap
+
+        assert bootstrap.PRIORITY_EXIT_PENDING < bootstrap.PRIORITY_OPEN
+        assert bootstrap.PRIORITY_OPEN < bootstrap.PRIORITY_PRIOR
+        assert bootstrap.PRIORITY_PRIOR < bootstrap.PRIORITY_MANIFEST

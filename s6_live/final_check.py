@@ -289,7 +289,8 @@ def build(*, conn=None, broker=None, trading_day=None, session=None,
         "errors": [],
     }
 
-    for name, step in (("scan", lambda: _scan_facts(day, resolved_session)),
+    for name, step in (("scan", lambda: _scan_facts(day, resolved_session,
+                                                    now=moment)),
                        ("market", lambda: _market_facts(market, resolved_session))):
         try:
             report.update(step())
@@ -340,7 +341,7 @@ def _market_facts(market: str, session: str) -> Dict[str, Any]:
     }
 
 
-def _scan_facts(day: str, session: str) -> Dict[str, Any]:
+def _scan_facts(day: str, session: str, *, now=None) -> Dict[str, Any]:
     """When the scan started, when it finished, and whether one ran."""
     from scanners.publish import candidates as publisher
     from scanners.publish import scan_cycle
@@ -374,7 +375,12 @@ def _scan_facts(day: str, session: str) -> Dict[str, Any]:
     # report so a supplier never has to re-derive them.
     from scanners.base import scan_window
 
-    window = scan_window.evaluate()
+    # Evaluated at the report's OWN moment. It took no argument, so a
+    # report built for a given instant carried a different instant's
+    # calendar -- and the observation tests changed answer whenever a run
+    # crossed midnight Eastern, passing on a weekday and failing on the
+    # weekend for a report whose own `now` was a Monday either way.
+    window = scan_window.evaluate(now)
 
     return {
         "calendar_trading_day": window.calendar_trading_day,

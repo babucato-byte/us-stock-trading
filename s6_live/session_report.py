@@ -121,7 +121,7 @@ def build(*, conn=None, trading_day=None, session=None, now=None,
     report["expected"] = _expectations(resolved)
 
     for name, step in (
-        ("scan", lambda: _scan(day, resolved)),
+        ("scan", lambda: _scan(day, resolved, now=moment)),
         ("candidates", lambda: _candidates(day, resolved, variant)),
         ("runtime", lambda: _runtime(runtime_report)),
         ("reconciliation", lambda: _reconciliation(conn)),
@@ -185,7 +185,7 @@ PRODUCER_MISSING = "PRODUCER_MISSING"
 CLEAN_ZERO = "CLEAN_ZERO"
 
 
-def _scan(day: str, session: str) -> Dict[str, Any]:
+def _scan(day: str, session: str, *, now=None) -> Dict[str, Any]:
     from scanners.base import scan_window
     from scanners.publish import candidates as publisher
     from scanners.publish import scan_cycle
@@ -194,7 +194,15 @@ def _scan(day: str, session: str) -> Dict[str, Any]:
     marker = scan_cycle.latest_run(day, session,
                                    strategy_id=s6_sessions.STRATEGY_ID) or {}
     ran = publisher.scan_ran(day, session)
-    window = scan_window.evaluate()
+    # Evaluated at the report's OWN moment, not at wall-clock time.
+    #
+    # It took no argument, so a report built for a given instant
+    # described a different instant's calendar and market state. Any
+    # replayed or historical report carried today's calendar, and the
+    # observation tests silently changed answer when a run crossed
+    # midnight Eastern -- passing on a weekday and failing on the
+    # weekend for a report whose own `now` was neither.
+    window = scan_window.evaluate(now)
 
     status = NOT_MEASURED
     if ran:

@@ -202,3 +202,120 @@ class TestOneBadSymbolDoesNotCostTheSession:
         runner = (REPO_ROOT / "scripts" / "run_realtime_bar_collector.py").read_text(
             encoding="utf-8")
         assert "no symbol could be subscribed" in runner
+
+
+class TestHeldPositionsClaimSlotsFirst:
+    """The gap this closes was live: RIG sat EXIT_PENDING with a latched
+    EMA_STRUCTURE_FAILURE while all 41 slots went to discovery
+    candidates. The account's only held symbol had no realtime data.
+
+    Its exit survived because a latched retry re-submits the stored
+    reason without needing features. The next position would not be so
+    lucky -- evaluating an exit in premarket or after-hours DOES need the
+    stream, and an exit evaluated blind is the failure this ordering
+    exists to prevent.
+    """
+
+    def _held(self, monkeypatch, rows):
+        monkeypatch.setattr(bootstrap, "held_position_symbols",
+                            lambda conn=None: rows)
+        monkeypatch.setattr(bootstrap, "_exchange_for", lambda s: "NAS")
+
+    def test_a_held_position_is_in_the_pool(self, monkeypatch):
+        self._held(monkeypatch, [("RIG", bootstrap.PRIORITY_EXIT_PENDING)])
+        monkeypatch.setattr(bootstrap, "prior_session_symbols",
+                            lambda **k: ["AAA", "BBB"])
+        monkeypatch.setattr(bootstrap, "manifest_symbols",
+                            lambda limit, exclude=(): ["CCC"])
+        pairs, why = bootstrap.build(session="PREMARKET",
+                                     trading_day="2026-08-31",
+                                     prior_session="AFTER_HOURS",
+                                     prior_trading_day="2026-08-28")
+        assert [s for s, _e in pairs][0] == "RIG"
+        assert why["from_held_positions"] == 1
+        assert why["exit_pending_slots"] == 1
+
+    def test_an_exit_pending_symbol_outranks_a_merely_open_one(self, monkeypatch):
+        self._held(monkeypatch, [("OPENSYM", bootstrap.PRIORITY_OPEN),
+                                 ("EXITSYM", bootstrap.PRIORITY_EXIT_PENDING)])
+        monkeypatch.setattr(bootstrap, "prior_session_symbols", lambda **k: [])
+        monkeypatch.setattr(bootstrap, "manifest_symbols",
+                            lambda limit, exclude=(): [])
+        pairs, _why = bootstrap.build(session="PREMARKET",
+                                      trading_day="2026-08-31")
+        # held_position_symbols is stubbed, so the ORDER it returns is what
+        # build preserves -- the real one sorts exits first.
+        assert {s for s, _e in pairs} == {"OPENSYM", "EXITSYM"}
+
+    def test_the_real_reader_sorts_exits_before_open(self, monkeypatch):
+        class _Result:
+            def fetchall(self):
+                return [{"symbol": "OPENSYM", "status": "OPEN"},
+                        {"symbol": "EXITSYM", "status": "EXIT_PENDING"}]
+
+        class _Conn:
+            def execute(self, *a, **k):
+                return _Result()
+            def close(self):
+                pass
+
+        held = bootstrap.held_position_symbols(conn=_Conn())
+        assert held[0][0] == "EXITSYM"
+        assert held[0][1] == bootstrap.PRIORITY_EXIT_PENDING
+
+    def test_a_held_position_is_never_evicted_by_a_better_candidate(self, monkeypatch):
+        """Losing a candidate costs an opportunity; losing a position's
+        data costs an exit evaluated blind."""
+        self._held(monkeypatch, [("HELD", bootstrap.PRIORITY_OPEN)])
+        monkeypatch.setattr(bootstrap, "prior_session_symbols",
+                            lambda **k: [f"P{i}" for i in range(60)][:k["limit"]])
+        monkeypatch.setattr(bootstrap, "manifest_symbols",
+                            lambda limit, exclude=(): [f"M{i}" for i in range(60)][:limit])
+        pairs, why = bootstrap.build(session="PREMARKET",
+                                     trading_day="2026-08-31",
+                                     prior_session="AFTER_HOURS",
+                                     prior_trading_day="2026-08-28")
+        assert "HELD" in [s for s, _e in pairs]
+        assert len(pairs) <= wire.MAX_SUBSCRIPTIONS
+        assert why["from_held_positions"] == 1
+
+    def test_a_held_symbol_is_not_duplicated_by_the_other_sources(self, monkeypatch):
+        self._held(monkeypatch, [("DUP", bootstrap.PRIORITY_OPEN)])
+        monkeypatch.setattr(bootstrap, "prior_session_symbols",
+                            lambda **k: ["DUP", "OTHER"])
+        monkeypatch.setattr(bootstrap, "manifest_symbols",
+                            lambda limit, exclude=(): [s for s in ["DUP", "M1"]
+                                                       if s not in exclude])
+        pairs, _why = bootstrap.build(session="PREMARKET",
+                                      trading_day="2026-08-31",
+                                      prior_session="AFTER_HOURS",
+                                      prior_trading_day="2026-08-28")
+        symbols = [s for s, _e in pairs]
+        assert symbols.count("DUP") == 1
+
+    def test_slot_accounting_is_reported(self):
+        import inspect
+
+        source = inspect.getsource(bootstrap.build)
+        for key in ("exit_pending_slots", "open_slots", "unused_slots",
+                    "from_held_positions", "held_symbols"):
+            assert key in source, key
+
+    def test_an_unreadable_store_does_not_stop_the_stream(self):
+        """The pool is simply chosen without position awareness rather
+        than the collector failing to start."""
+        class _Boom:
+            def execute(self, *a, **k):
+                raise RuntimeError("db gone")
+            def close(self):
+                pass
+
+
+        assert bootstrap.held_position_symbols(conn=_Boom()) == []
+
+    def test_it_costs_no_broker_call(self):
+        import inspect
+
+        source = inspect.getsource(bootstrap.held_position_symbols)
+        for forbidden in ("KISBroker", "get_positions", "get_orderable_usd"):
+            assert forbidden not in source, forbidden
