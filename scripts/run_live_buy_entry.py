@@ -302,6 +302,61 @@ def _funnel(source, results, *, since):
     for symbol in (results.get("submitted") or ()):
         logger.info("FUNNEL_SUBMITTED %s", symbol)
 
+    _record_shadow_signals(source, results, since=since)
+
+
+def _record_shadow_signals(source, results, *, since):
+    """Persist what happened to every candidate this tick.
+
+    Written here, after the cycle, for the same reason the funnel is:
+    everything is known and nothing left can be affected by it. A
+    candidate refused at a gate otherwise leaves no trace at all, which
+    makes "is this gate blocking good trades" a question nobody can
+    answer.
+    """
+    try:
+        from market_hours import us_trading_day
+        from s6_live import shadow_signal_log as ssl
+        from s6_live import s6_sessions
+
+        session = getattr(source, "_session", None) or getattr(
+            source, "session", None)
+        day = us_trading_day(since)
+        evaluations = getattr(source, "evaluations", None) or {}
+        blocked = {str(sym): reason
+                   for sym, reason in (results.get("blocked") or ())}
+        skipped = {str(sym): reason
+                   for sym, reason in (results.get("skipped") or ())}
+        submitted = {str(s) for s in (results.get("submitted") or ())}
+
+        for symbol, evaluation in sorted(evaluations.items()):
+            ready = bool(getattr(evaluation, "ready", False))
+            if symbol in submitted:
+                outcome, first = ssl.OUTCOME_SUBMITTED, None
+            elif symbol in blocked or symbol in skipped:
+                outcome = ssl.OUTCOME_BLOCKED
+                first = blocked.get(symbol) or skipped.get(symbol)
+            elif ready:
+                outcome, first = ssl.OUTCOME_EXECUTABLE, None
+            else:
+                outcome = ssl.OUTCOME_NOT_READY
+                blocking = list(getattr(evaluation, "blocking", ()) or ())
+                first = blocking[0] if blocking else None
+
+            record = ssl.build_record(
+                symbol=symbol, session=session, outcome=outcome,
+                strategy_id=s6_sessions.STRATEGY_ID,
+                features=getattr(evaluation, "features", None),
+                candidate=(source.candidate_row(symbol)
+                           if hasattr(source, "candidate_row") else None),
+                first_blocked_by=first,
+                watch_blocking=getattr(evaluation, "blocking", ()),
+                now=since)
+            ssl.append(record, trading_day=day)
+    except Exception:  # noqa: BLE001 -- an observation that fails must
+        # not alter a cycle that has already finished trading.
+        logger.warning("could not record shadow signals", exc_info=True)
+
     # §16: READY candidates that reached the gate and were approved, and
     # then produced no order, is the one combination that is a defect
     # rather than a market condition.
