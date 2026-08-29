@@ -113,6 +113,26 @@ class IdempotencyError(Exception):
     DuplicateOrderAttemptError subclass) when a duplicate is detected."""
 
 
+class IdempotencyLockBusy(IdempotencyError):
+    # Defined below IdempotencyError and re-parented to it at the end of
+    # this block, so every existing `except IdempotencyError` keeps
+    # catching contention exactly as before. A new, narrower class that
+    # silently escaped the old handlers would be a behaviour change
+    # dressed as a classification.
+    """Another process holds the order idempotency lock right now.
+
+    Deliberately NOT an IdempotencyError. It says nothing about this
+    order's validity -- the lock is contended, which is transient and
+    expected when several strategies register orders on one account.
+    Classified as UNEXPECTED it polluted the error signal three times on
+    2026-08-28 and read as a defect in the candidate rather than as two
+    processes arriving together.
+
+    The correct response is to leave the candidate alone and let the
+    next tick re-evaluate it, exactly like a busy broker.
+    """
+
+
 class DuplicateOrderAttemptError(IdempotencyError):
     """Raised when an order attempt for an already-recorded key is
     detected. Callers must treat this as a hard block -- never as a
@@ -176,7 +196,7 @@ def _acquire_owned_lock(lock_path, deadline, timeout):
                     break
                 except OSError:
                     if time.monotonic() >= deadline:
-                        raise IdempotencyError(
+                        raise IdempotencyLockBusy(
                             f"Could not acquire KIS order idempotency lock within {timeout}s -- "
                             "another instance of this process may already be running."
                         )
@@ -194,7 +214,7 @@ def _acquire_owned_lock(lock_path, deadline, timeout):
         # and race for the real one.
         _release_and_close(handle)
         if time.monotonic() >= deadline:
-            raise IdempotencyError(
+            raise IdempotencyLockBusy(
                 f"Could not acquire KIS order idempotency lock within {timeout}s -- "
                 "the lock file kept being replaced by another instance."
             )

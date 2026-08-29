@@ -70,7 +70,7 @@ from domain.cash_sizing import (
 from domain.instrument import Instrument, InstrumentError, build_instrument
 from domain.order_intent import OrderIntent, OrderIntentError
 from domain.signal import Signal, SignalError, build_signal
-from execution import entry_limits, execution_engine, order_gate
+from execution import entry_limits, execution_engine, idempotency, order_gate
 from market_data.exchange_registry import (
     ExchangeResolutionError,
     build_kis_instrument,
@@ -310,6 +310,11 @@ def _s6_candidate_row(source, symbol):
         logger.warning("S6 candidate row for %s unreadable; the position will "
                        "carry no range measurements", symbol, exc_info=True)
         return None
+
+
+#: Another process held the order idempotency lock. A collision, not a
+#: fault in the candidate.
+IDEMPOTENCY_LOCK_BUSY = "IDEMPOTENCY_LOCK_BUSY"
 
 
 def _session_permitted(source, rollout) -> bool:
@@ -1094,6 +1099,19 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                                    "reason_code": "FATAL_REPOSITORY_CONNECTION",
                                    "detail": None}, symbol=symbol, now=current)
                 raise
+            except idempotency.IdempotencyLockBusy as exc:
+                # Two processes registering orders on one account at the
+                # same instant. Transient, candidate-specific, and it
+                # says nothing about this candidate -- filing it as
+                # UNEXPECTED made three ordinary collisions look like
+                # defects. The next tick re-evaluates it.
+                reason = f"{IDEMPOTENCY_LOCK_BUSY}: {exc}"
+                logger.info("%s for %s; the next tick re-evaluates it",
+                            IDEMPOTENCY_LOCK_BUSY, symbol)
+                results["blocked"].append((symbol, reason))
+                outcome = {"result": shadow_audit.RESULT_BLOCKED,
+                           "reason_code": IDEMPOTENCY_LOCK_BUSY,
+                           "detail": str(exc)[:200]}
             except Exception as exc:  # noqa: BLE001 -- audited, then reported as a blocked result
                 outcome = {"result": shadow_audit.RESULT_ERROR, "reason_code": "UNEXPECTED"}
                 results["blocked"].append((symbol, f"unexpected error: {exc}"))

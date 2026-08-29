@@ -73,8 +73,15 @@ FIELD_LOCAL_TIME = "XHMS"
 #: "NAS", and the first live run of the bootstrap died on exactly that --
 #: one unmappable name, and the collector never started.
 _NASDAQ = ("NAS", "NASD", "NASDAQ")
-_NYSE = ("NYS", "NYSE", "NEW YORK STOCK EXCHANGE")
-_AMEX = ("AMS", "AMEX", "NYSE AMERICAN", "NYSE MKT")
+_NYSE = ("NYS", "NYSE", "NEW YORK STOCK EXCHANGE",
+         "NEW_YORK_STOCK_EXCHANGE")
+#: Underscored variants included: `exchange_registry` produced
+#: "NYSE_AMERICAN" and one symbol was skipped for want of it. The skip
+#: behaved correctly -- one symbol, not the session -- but a mapping
+#: that only knows the spaced spelling is a mapping that will be
+#: incomplete again.
+_AMEX = ("AMS", "AMEX", "NYSE AMERICAN", "NYSE_AMERICAN",
+         "NYSE MKT", "NYSE_MKT", "AMERICAN")
 
 DELAYED_PREFIX = {name: prefix for names, prefix in (
     (_NASDAQ, "DNAS"), (_NYSE, "DNYS"), (_AMEX, "DAMS")) for name in names}
