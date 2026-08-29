@@ -51,9 +51,24 @@ UNKNOWN = None
 
 
 def log_path(trading_day, *, env=None):
+    """Where today's records live, or None if nowhere is configured.
+
+    There is deliberately NO default production path. An earlier version
+    fell back to the shared scanner directory, and the host test run
+    then wrote 13 rows of fixture data -- AAPL at 100.0, strategy
+    PAPER_STRATEGY_ORDER_SCORE_V1 -- straight into the real
+    observability dataset, because `open_from_fill` records a fill and
+    the suite opens positions constantly.
+
+    Nothing about that failed. The tests passed, the file was valid, and
+    the fabricated rows sat alongside the real ones looking exactly like
+    them. A process that has not been told where to write does not get
+    to guess at a production location.
+    """
     env = env if env is not None else os.environ
-    root = (env.get("SLIPPAGE_LOG_DIR") or env.get("SCANNER_DATA_ROOT")
-            or "/home/ubuntu/releases/us-stock-trading/shared/scanner")
+    root = env.get("SLIPPAGE_LOG_DIR") or env.get("SCANNER_DATA_ROOT")
+    if not root:
+        return None
     return Path(root) / "slippage" / f"{trading_day}.jsonl"
 
 
@@ -167,6 +182,8 @@ def append(record, *, trading_day, env=None) -> bool:
     """Append one row. Never raises: an observation must not cost a trade."""
     try:
         path = log_path(trading_day, env=env)
+        if path is None:
+            return False
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, default=str) + "\n")
@@ -180,7 +197,7 @@ def read(trading_day, *, env=None) -> List[Dict[str, Any]]:
     path = log_path(trading_day, env=env)
     rows = []
     try:
-        if not path.exists():
+        if path is None or not path.exists():
             return rows
         for line in path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
