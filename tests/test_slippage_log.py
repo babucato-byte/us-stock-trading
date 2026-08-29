@@ -402,3 +402,42 @@ class TestTheTwoLegsOfATradeStayApart:
         source = (REPO_ROOT / "scripts" / "backfill_slippage.py").read_text()
         sell = source[source.index('side="sell"'):]
         assert "internal_order_id" not in sell[:400]
+
+
+class TestThreeFillMomentsNeverCollapse:
+    """For OWL the broker's fill time was never captured, a
+    reconciliation pass noticed the fill two hours later, and that pass
+    ran at 17:49:59. Recording the last as the first reports a two-hour
+    execution latency for an order that filled in seconds."""
+
+    def test_the_three_moments_are_separate_fields(self):
+        record = _record(
+            fill_price=12.0, submit_at=NOW,
+            fill_detected_at=NOW + timedelta(hours=2),
+            reconciliation_at=NOW + timedelta(hours=2, seconds=1))
+        assert record["broker_fill_at"] is None
+        assert record["fill_detected_at"] is not None
+        assert record["reconciliation_at"] is not None
+
+    def test_latency_comes_only_from_the_brokers_own_fill_time(self):
+        record = _record(fill_price=12.0, submit_at=NOW,
+                         fill_detected_at=NOW + timedelta(hours=2),
+                         reconciliation_at=NOW + timedelta(hours=2))
+        assert record["submit_to_fill_ms"] is slippage_log.UNKNOWN
+
+    def test_a_real_broker_fill_time_does_measure(self):
+        record = _record(fill_price=12.0, submit_at=NOW,
+                         fill_at=NOW + timedelta(seconds=2),
+                         fill_detected_at=NOW + timedelta(hours=2))
+        assert record["submit_to_fill_ms"] == pytest.approx(2000.0)
+        assert record["broker_fill_at"] is not None
+
+    def test_the_historical_orders_keep_UNKNOWN_latency(self):
+        """OWL/RIG/SBS/DT were built from timestamps that cannot support
+        a latency. They must not acquire one now."""
+        record = _record(fill_price=12.1381,
+                         evidence="BACKFILL_FROM_POSITION_STORE",
+                         fill_detected_at=NOW)
+        assert record["submit_to_fill_ms"] is slippage_log.UNKNOWN
+        assert record["signal_to_gate_ms"] is slippage_log.UNKNOWN
+        assert record["gate_to_submit_ms"] is slippage_log.UNKNOWN

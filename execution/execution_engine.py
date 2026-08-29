@@ -349,8 +349,17 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
 
         record = order_repository.load(conn, order_intent.internal_order_id)
         try:
+            # Deliberately WITHOUT now=current, here and at every other
+            # transition below. `current` is the cycle's timestamp --
+            # every symbol in the entry loop shares it -- so stamping a
+            # transition with it records when the CYCLE began, not when
+            # the order moved. Passing it produced the OWL order's
+            # history, where VALIDATING, APPROVED, SUBMITTING and
+            # ACCEPTED all read 15:13:06.630 and no latency between any
+            # two steps could be measured. The repository stamps the
+            # moment instead.
             record = order_repository.advance(
-                conn, record, "VALIDATING", event_type="VALIDATION_STARTED", now=current,
+                conn, record, "VALIDATING", event_type="VALIDATION_STARTED",
             )
         except FatalRepositoryConnectionError:
             raise  # CODEX-059: fatal outranks the ordinary persistence path
@@ -394,7 +403,7 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
 
         try:
             record = order_repository.advance(
-                conn, record, "APPROVED", event_type="GATE_APPROVED", now=current,
+                conn, record, "APPROVED", event_type="GATE_APPROVED",
             )
         except FatalRepositoryConnectionError:
             raise  # CODEX-059
@@ -412,7 +421,7 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
 
         try:
             record = order_repository.advance(
-                conn, record, "SUBMITTING", event_type="TRANSPORT_SUBMITTING", now=current,
+                conn, record, "SUBMITTING", event_type="TRANSPORT_SUBMITTING",
             )
         except FatalRepositoryConnectionError:
             raise  # CODEX-059
@@ -513,7 +522,7 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
             record = order_repository.advance(
                 conn, record, execution_record.status, event_type="TRANSPORT_RESULT",
                 event_payload={"broker_order_id": execution_record.broker_order_id},
-                broker_order_id=execution_record.broker_order_id, now=current,
+                broker_order_id=execution_record.broker_order_id,
             )
         except FatalRepositoryConnectionError:
             raise  # CODEX-059: no UNKNOWN fallback on a poisoned connection
@@ -1039,7 +1048,7 @@ def _cancel_inner(*, order_intent, broker_order_id, cancel_gate_context_builder,
             record = order_repository.advance(
                 conn, record, "CANCEL_PENDING", event_type="CANCEL_REQUESTED",
                 event_payload={"broker_order_id": broker_order_id},
-                broker_order_id=broker_order_id, now=current,
+                broker_order_id=broker_order_id,
             )
         except FatalRepositoryConnectionError:
             raise  # CODEX-059
@@ -1120,7 +1129,7 @@ def _cancel_inner(*, order_intent, broker_order_id, cancel_gate_context_builder,
         try:
             record = order_repository.advance(
                 conn, record, "CANCELLED", event_type="CANCEL_CONFIRMED",
-                event_payload={"broker_order_id": broker_order_id}, now=current,
+                event_payload={"broker_order_id": broker_order_id},
             )
         except FatalRepositoryConnectionError:
             # CODEX-059: the connection could neither be rolled back nor

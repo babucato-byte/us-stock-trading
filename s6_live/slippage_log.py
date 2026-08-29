@@ -101,7 +101,8 @@ def build_record(*, symbol, side, session, strategy_id,
                  order_price=None, fill_price=None,
                  signal_at=None, gate_at=None, submit_at=None,
                  accepted_at=None, fill_at=None,
-                 fill_detected_at=None, market_data_asof=None,
+                 fill_detected_at=None, reconciliation_at=None,
+                 market_data_asof=None,
                  qty_requested=None, qty_filled=None,
                  broker_order_id=None, internal_order_id=None,
                  exit_reason=None, evidence=None, now=None) -> Dict[str, Any]:
@@ -128,11 +129,20 @@ def build_record(*, symbol, side, session, strategy_id,
         "gate_at": _iso(gate_at),
         "submit_at": _iso(submit_at),
         "accepted_at": _iso(accepted_at),
+        # THREE different moments, never collapsed into one. For OWL
+        # the broker's fill time was never captured, a reconciliation
+        # pass noticed the fill two hours later, and that pass ran at
+        # 17:49:59. Recording the last as the first reports a two-hour
+        # execution latency for an order that filled in seconds.
+        #
+        #   broker_fill_at     when KIS says it filled -- UNKNOWN unless
+        #                      the broker actually told us
+        #   fill_detected_at   when our side first saw the fill
+        #   reconciliation_at  when the pass that saw it ran
         "fill_at": _iso(fill_at),
-        # Named apart from `fill_at` because they are different events.
-        # The order events' FILLED transition is when a reconciliation
-        # pass NOTICED the fill, which for OWL was two hours later.
+        "broker_fill_at": _iso(fill_at),
         "fill_detected_at": _iso(fill_detected_at),
+        "reconciliation_at": _iso(reconciliation_at),
 
         "market_data_asof": _iso(market_data_asof),
         "qty_requested": qty_requested,
@@ -140,6 +150,9 @@ def build_record(*, symbol, side, session, strategy_id,
 
         "signal_to_gate_ms": _ms_between(signal_at, gate_at),
         "gate_to_submit_ms": _ms_between(gate_at, submit_at),
+        # From the BROKER's fill time only. Deriving it from
+        # `fill_detected_at` would measure how long our reconciliation
+        # took to notice, and call it execution latency.
         "submit_to_fill_ms": _ms_between(submit_at, fill_at),
 
         "slippage_bps": bps,
