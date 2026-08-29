@@ -318,7 +318,9 @@ class TestAccountAndPositions:
         session.queue("/oauth2/tokenP", TOKEN_OK)
         session.queue(
             "/uapi/overseas-stock/v1/trading/inquire-psamount",
-            _StubResponse(200, {"output": {"ord_psbl_frcr_amt": "543.21"}}),
+            _StubResponse(200, {"output": {"ovrs_ord_psbl_amt": "543.21",
+                                           "ord_psbl_frcr_amt": "20.96",
+                                           "sll_ruse_psbl_amt": "522.25"}}),
         )
         amount = _broker(session=session).get_orderable_usd(_instrument(), 100.0)
         assert amount == pytest.approx(543.21)
@@ -330,7 +332,9 @@ class TestAccountAndPositions:
         session.queue("/oauth2/tokenP", TOKEN_OK)
         session.queue(
             "/uapi/overseas-stock/v1/trading/inquire-psamount",
-            _StubResponse(200, {"output": {"ord_psbl_frcr_amt": "543.21"}}),
+            _StubResponse(200, {"output": {"ovrs_ord_psbl_amt": "543.21",
+                                           "ord_psbl_frcr_amt": "20.96",
+                                           "sll_ruse_psbl_amt": "522.25"}}),
         )
         _broker(session=session).get_orderable_usd(_instrument(), 100.0)
         call = next(r for r in session.requests if r[1].endswith("/inquire-psamount"))

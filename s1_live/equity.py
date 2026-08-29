@@ -13,8 +13,12 @@ strategy is sitting on. Neither is the quantity `risk_config`'s -2% and
 Currency, decided rather than assumed
 -------------------------------------
 USD, and only USD. `brokers/kis_broker.py` queries the balance with
-`TR_CRCY_CD="USD"` and reads `ord_psbl_frcr_amt` (foreign-currency
-orderable amount) from the per-symbol endpoint; `AccountSnapshot.krw_cash`
+`TR_CRCY_CD="USD"` and reads `ovrs_ord_psbl_amt` (the overseas orderable
+amount, which includes reusable sell proceeds) from the per-symbol
+endpoint for SIZING. Risk equity here deliberately stays on the cash
+deposit instead: what may be ordered and what the account actually holds
+are different questions, and a risk denominator inflated by unsettled
+proceeds would understate every risk figure; `AccountSnapshot.krw_cash`
 is never populated by that path at all. So nothing here converts, and
 `assert_single_currency()` refuses a mixed input rather than applying a
 rate. No FX rate is read, stored or assumed, because none is needed --

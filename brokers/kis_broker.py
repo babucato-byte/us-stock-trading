@@ -127,7 +127,41 @@ ACCOUNT_CASH_CURRENCY_FIELD = "crcy_cd"
 TR_ID_PSAMOUNT = {"live": "TTTS3007R", "paper": "VTTS3007R"}
 # The single field the orderable amount is read from, named once so the
 # parser, the verification matrix and the read-only probe cannot disagree.
-ORDERABLE_AMOUNT_FIELD = "ord_psbl_frcr_amt"
+#
+# `ovrs_ord_psbl_amt`, NOT `ord_psbl_frcr_amt`. Measured 2026-08-29 on
+# the live account, same response, same instant:
+#
+#     ord_psbl_frcr_amt   20.96   foreign CASH only
+#     sll_ruse_psbl_amt   33.78   sell proceeds reusable for new orders
+#     ovrs_ord_psbl_amt   54.44   what the account may actually order with
+#     max_ord_psbl_qty        1   at a $40 limit price
+#
+# 54.44 is the figure the KIS app shows as 주문가능달러, and
+# `max_ord_psbl_qty` tracks floor(54.44 / price) exactly across a sweep
+# from $5 to $60. Reading the cash field instead understated buying power
+# by the whole reusable balance: at $40 it computed zero shares where KIS
+# itself answered one, so every candidate priced between the cash figure
+# and the real one was refused for INSUFFICIENT_CASH that did not exist.
+#
+# The earlier reasoning that "unsettled sell proceeds are not buying
+# power here" was wrong, and wrong in the expensive direction. It came
+# from reading one extracted field rather than the whole response --
+# `sll_ruse_psbl_amt` was sitting beside it the entire time.
+ORDERABLE_AMOUNT_FIELD = "ovrs_ord_psbl_amt"
+
+#: Read alongside it and cross-checked, never used in place of it. KIS
+#: answers the share count itself, so if our own division ever disagrees
+#: with it the discrepancy is real information rather than a rounding
+#: detail to shrug at.
+ORDERABLE_QTY_FIELD = "max_ord_psbl_qty"
+
+#: The two components, recorded for provenance. They sum to $0.30 MORE
+#: than the orderable figure (20.96 + 33.78 = 54.74 vs 54.44) and no
+#: field in the response accounts for the difference, so it is named and
+#: left alone rather than explained away as fees.
+ORDERABLE_CASH_COMPONENT_FIELD = "ord_psbl_frcr_amt"
+ORDERABLE_SELL_REUSE_FIELD = "sll_ruse_psbl_amt"
+UNKNOWN_ADJUSTMENT = "UNKNOWN_ADJUSTMENT"
 TR_ID_NCCS = {"live": "TTTS3018R", "paper": "TTTS3018R"}
 TR_ID_CCNL = {"live": "TTTS3035R", "paper": "VTTS3035R"}
 TR_ID_PRICE = "HHDFS00000300"
@@ -553,7 +587,7 @@ VERIFICATION_MATRIX = (
     # gate runs. The three entries were confirmed together by one live
     # read on the Oracle host (2026-08-06): TTTS3007R on PSAMOUNT_PATH
     # answered for AAPL/NASD at a real limit price with
-    # output.ord_psbl_frcr_amt carrying a positive float.
+    # output.ovrs_ord_psbl_amt carrying a positive float.
     WireValueVerification(
         "orderable_amount_path", PSAMOUNT_PATH, REFERENCE_VERIFIED, LIVE_RESPONSE_CONFIRMED,
         "live read-only probe: inquire-psamount answered on the live account "
@@ -569,8 +603,12 @@ VERIFICATION_MATRIX = (
     WireValueVerification(
         "orderable_amount_field", f"output.{ORDERABLE_AMOUNT_FIELD}", REFERENCE_VERIFIED,
         LIVE_RESPONSE_CONFIRMED,
-        "live read-only probe: output.ord_psbl_frcr_amt carried a positive float "
-        "(Oracle, 2026-08-06)",
+        "live read-only probe: output.ovrs_ord_psbl_amt carried a positive float "
+        "matching the account's own 주문가능달러 (54.44), with "
+        "max_ord_psbl_qty tracking floor(amount/price) across a $5-$60 "
+        "sweep (2026-08-29). The 2026-08-06 evidence was for "
+        "ord_psbl_frcr_amt and is NOT carried over -- it confirmed a "
+        "different field.",
     ),
     # The DISPROVED value, recorded so it cannot quietly come back. This
     # one was never in the matrix, which is exactly why a wrong field name
@@ -843,7 +881,7 @@ class KISOrderableCashUnavailableError(KISBrokerError):
 
 
 def _parse_orderable_amount(body, *, symbol=None):
-    """Strict: `output.ord_psbl_frcr_amt` as a finite, non-negative float.
+    """Strict: `output.ovrs_ord_psbl_amt` as a finite, non-negative float.
 
     Everything else raises -- missing `output`, wrong `output` type,
     missing field, None, "", "NaN", "Infinity", a negative amount, a bool,
