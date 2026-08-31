@@ -20,6 +20,30 @@ set -u
 # in production and nothing errored, because both halves reported success
 # about different code.
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+# The KIS read-only environment, exactly as every other production
+# wrapper loads it -- s6_buy_entry.sh, reconciliation.sh and
+# s6_realtime_collector.sh all source this file before shared_env.sh.
+# This one did not, and the omission was invisible: the scan reported
+# `provider : kis` and SUCCESS while every chart request failed
+# authentication, so all four PREMARKET symbols became DATA_ERROR and
+# it read as a market with no setups.
+#
+# Measured on 2026-08-31, same command, same minute:
+#
+#   without this env   signals=0 candidates=0 DATA_ERROR=4  2.1s
+#   with this env      signals=1 candidates=1 DATA_ERROR=1 14.4s
+#
+# The 2.1s was the tell: four KIS fetches cannot complete that fast,
+# because they never happened.
+#
+# `shared_env.sh` deliberately does not carry credentials -- it resolves
+# the release root and the data dirs -- so sourcing it is not a
+# substitute for this.
+ENV_FILE=/home/ubuntu/releases/us-stock-trading/shared/env/kis-readonly.env
+[ -r "$ENV_FILE" ] || exit 1
+set -a; . "$ENV_FILE"; set +a
+
 . "$SCRIPT_DIR/shared_env.sh"
 
 # Code from the release, verified against the deployed and validated
