@@ -42,7 +42,7 @@ from execution.order_repository import (  # noqa: E402
     FatalRepositoryConnectionError,
 )
 from execution.secret_redaction import install_logging_redaction  # noqa: E402
-from reconciliation import fill_window  # noqa: E402
+from reconciliation import exit_intent_resolution, fill_window  # noqa: E402
 from reconciliation import reconciliation_state  # noqa: E402
 from reconciliation import snapshot as reconciliation_snapshot  # noqa: E402
 from reconciliation.order_reconciler import (  # noqa: E402
@@ -197,6 +197,16 @@ def run_once(*, broker=None, now=None, conn=None, account_id=None):
         # order -- otherwise the first clean result is always one pass
         # late, and the gates read the stale dirty one in between.
         settled = settle_live_orders(conn, broker, now=current)
+        # Exit intents whose submission was never confirmed. The exit
+        # path marks them SUBMISSION_UNKNOWN and refuses to retry,
+        # saying "reconciliation decides" -- and until now nothing here
+        # decided. A RIG intent sat in that state from Friday 19:54,
+        # and `reserve()` refused every subsequent exit for the
+        # position while this pass reported "clean", because by its own
+        # measure it was: internal and broker agreed and no orders were
+        # open. The disagreement was in a ledger nobody read.
+        exit_intents = exit_intent_resolution.resolve_unknown_exit_intents(
+            conn, broker, now=current)
         try:
             snapshot = reconciliation_snapshot.build_snapshot(
                 broker=broker, conn=conn,
@@ -208,7 +218,8 @@ def run_once(*, broker=None, now=None, conn=None, account_id=None):
             # timestamp the order gates read (CODEX-044).
             logger.error("reconciliation could not be performed: %s", exc)
             return {"status": "kis_unavailable", "resolved": resolved,
-                    "settled": settled, "snapshot": None}
+                    "settled": settled, "exit_intents": exit_intents,
+                    "snapshot": None}
 
         try:
             from operations import kill_switch
@@ -229,6 +240,7 @@ def run_once(*, broker=None, now=None, conn=None, account_id=None):
         return {
             "status": "clean" if snapshot.is_clean() else "mismatch",
             "resolved": resolved, "settled": settled, "snapshot": snapshot,
+            "exit_intents": exit_intents,
             "purged_audit_rows": purged_rows, "purged_log_files": len(purged_files),
         }
     finally:
@@ -261,9 +273,17 @@ def main(argv=None):
 
     if result["status"] == "kis_unavailable":
         return EXIT_KIS_UNAVAILABLE
+    intents = result.get("exit_intents") or ()
+    # Counted separately from `resolved`, which is about ORDERS. An exit
+    # intent left unresolved is a position that cannot be sold, and
+    # folding it into a total would let "clean" keep being printed over
+    # a jammed exit -- which is exactly what happened for three days.
     logger.info(
-        "reconciliation %s; resolved=%d settled=%d purged_audit_rows=%s purged_log_files=%s",
+        "reconciliation %s; resolved=%d settled=%d exit_intents_resolved=%d "
+        "exit_intents_stuck=%d purged_audit_rows=%s purged_log_files=%s",
         result["status"], len(result["resolved"]), len(result.get("settled") or ()),
+        sum(1 for i in intents if i.get("resolved")),
+        sum(1 for i in intents if not i.get("resolved")),
         result.get("purged_audit_rows"), result.get("purged_log_files"),
     )
     return EXIT_OK
