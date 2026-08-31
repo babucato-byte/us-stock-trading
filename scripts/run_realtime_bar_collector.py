@@ -262,12 +262,17 @@ def main(argv=None):
                         format="%(asctime)s %(levelname)s %(message)s")
     install_logging_redaction()
 
+    from config.operational_calendar import operational_trading_day
     from market_hours import us_trading_day
     from scanners.base import scan_session
 
     now = datetime.now(timezone.utc)
     session = args.session or scan_session.session_at()
-    trading_day = us_trading_day(now)
+    # The OPERATIONAL trading day. An overnight window that began on
+    # Sunday evening belongs to Monday, and storing its bars under
+    # Sunday puts them where nothing will look for them -- the features
+    # layer loads by (session, trading_day) and would find no file.
+    trading_day = operational_trading_day(now) or us_trading_day(now)
 
     pairs = []
     for token in args.symbols.split(","):

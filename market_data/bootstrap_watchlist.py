@@ -109,6 +109,7 @@ def manifest_symbols(*, limit, exclude=()) -> List[str]:
         from pathlib import Path
 
         from discovery import manifest as manifest_module
+        from config.operational_calendar import operational_trading_day
         from market_hours import us_trading_day
         from scanners.runner import MANIFEST_DEFAULT_PATH
 
@@ -129,9 +130,17 @@ def manifest_symbols(*, limit, exclude=()) -> List[str]:
         else:
             path = Path(MANIFEST_DEFAULT_PATH)
 
+        # The OPERATIONAL trading day, not the Eastern calendar date.
+        # A daytime window on a Sunday evening belongs to Monday's
+        # session; dating the manifest to Sunday made every entry look
+        # like it was for the wrong day, so the pool was discarded and
+        # discovery produced nothing. Falls back to the calendar date
+        # only when the calendar cannot be resolved at all, which is the
+        # same answer this had before.
+        operational = (operational_trading_day(datetime.now(timezone.utc))
+                       or us_trading_day(datetime.now(timezone.utc)))
         verdict = manifest_module.validate(
-            manifest_module.read(str(path)),
-            trading_day=us_trading_day(datetime.now(timezone.utc)))
+            manifest_module.read(str(path)), trading_day=operational)
         manifest_source = str(path)
         # PARTIAL is usable for the same reason the scanner accepts it:
         # part of today's market beats all of yesterday's. Anything else

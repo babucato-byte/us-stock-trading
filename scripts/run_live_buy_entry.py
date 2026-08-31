@@ -131,23 +131,101 @@ def _s1_is_falling_behind(now=None):
         return False
 
 
-def _exit_in_flight():
-    """True when any S6 position has an exit submitted or pending."""
+def _exit_in_flight(now=None):
+    """True when an exit is actually able to run and compete for the lock.
+
+    The original rule deferred entries whenever ANY position had an exit
+    submitted or pending, because entry and exit share `s6_exec.lock` and
+    an entry cycle holding it delays the exit behind it.
+
+    That reasoning holds only while the exit CAN run. RIG latched
+    EXIT_PENDING on Friday at 19:52 and its route was unavailable all
+    weekend, so this returned True continuously for three days and
+    deferred every entry -- protecting an exit cycle that was never going
+    to start. Nothing was being contended for.
+
+    So the two cases are separated:
+
+      an order already at the broker (`exit_submitted`)
+          always defers. Something is live and a second order must not
+          race it, whatever the session says.
+
+      a latched exit that cannot be submitted right now
+          does not defer. It is not competing for the lock, and blocking
+          on it stops trading for a reason that no longer exists.
+
+    Everything else -- slot caps, ownership, reconciliation, the gate --
+    is unchanged and still applies to any entry that proceeds.
+    """
     try:
         from s6_live import position_store
         from state_store import db as state_db
 
+        pending = False
         with state_db.open_db() as conn:
             for _pid, row in position_store.load_live(conn):
-                if row.get("exit_submitted") or row.get("pending_exit_reason"):
+                if row.get("exit_submitted"):
                     return True
-        return False
+                if row.get("pending_exit_reason"):
+                    pending = True
+        if not pending:
+            return False
+        return _exit_can_run_now(now)
     except Exception:  # noqa: BLE001 -- an unreadable store is not a
         # reason to refuse the entry; the gate and the runtime have their
         # own, stronger refusals, and failing the tick over a diagnostic
         # would stop trading for the wrong reason.
         logger.warning("could not check for exits in flight", exc_info=True)
         return False
+
+
+
+def _exit_can_run_now(now=None):
+    """Can a latched exit actually be submitted at this moment?
+
+    Asked of `session_capability`, the same authority the order path
+    uses, so the entry cycle and the exit runtime cannot disagree about
+    whether a sell is possible.
+
+    Fails CLOSED: if capability cannot be determined, the answer is that
+    an exit may well be about to run, and deferring the entry is the
+    cheaper mistake.
+    """
+    try:
+        from config import session_capability
+
+        capability = session_capability.capability_at(now)
+        return bool(capability.exit_supported)
+    except Exception:  # noqa: BLE001
+        logger.warning("could not determine exit capability; deferring the "
+                       "entry as the safer direction", exc_info=True)
+        return True
+
+
+
+def _log_calendar(now, declared_session):
+    """One line naming every date fact, so a calendar fault is readable.
+
+    The 2026-08-30 incident printed session=OVERNIGHT_DAYTIME and
+    trading_day=2026-08-30 -- a Sunday -- and the symptom everyone saw
+    was "candidates=0". Four components then failed for four
+    different-looking reasons. Printing the facts together means the
+    next one is one line instead of an investigation.
+    """
+    try:
+        from config.operational_calendar import resolve_operational_trading_day
+
+        c = resolve_operational_trading_day(now, session=declared_session)
+        logger.info(
+            "[SYSTEM][S6 CALENDAR] session=%s declared=%s disagreement=%s "
+            "session_date=%s operational_trading_day=%s calendar_trading_day=%s "
+            "orders_allowed=%s entry_supported=%s exit_supported=%s reason=%s",
+            c["session"], c["declared_session"], c["session_disagreement"],
+            c["session_date"], c["operational_trading_day"],
+            c["calendar_trading_day"], c["orders_allowed"],
+            c["entry_supported"], c["exit_supported"], c["reason"])
+    except Exception:  # noqa: BLE001 - a log line never stops a tick
+        logger.warning("could not describe the trading calendar", exc_info=True)
 
 
 def _fail_stop(stage, exc):
@@ -438,6 +516,7 @@ def run_once(broker=None, *, strategy="s1"):
         now.isoformat(), strategy, session,
         os.environ.get("DEPLOYED_COMMIT", "<unset>"),
         os.environ.get("TRADING_PROJECT_ROOT", "<unset>"))
+    _log_calendar(now, session)
 
     results = klt.run_live_buy_entry_cycle(
         broker=broker or KISBroker(), candidate_source=source)
