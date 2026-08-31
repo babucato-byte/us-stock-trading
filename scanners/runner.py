@@ -412,7 +412,17 @@ def run_scanners(
     # Extrapolated to the 13,362-symbol universe that is ~1.5 GB against
     # a 956 MB server -- the full daily scan would have been killed part
     # way through, which is the failure this line prevents.
-    provider = provider or default_provider(cached=False)
+    # Session-aware, because the default provider has no usable
+    # extended-hours intraday data. S6's premarket scan on 2026-08-31
+    # read: universe 83, DATA_ERROR 77, evaluated 6, signals 0 -- 93% of
+    # candidates dying before any strategy rule ran, for weeks read as a
+    # quiet market. In PREMARKET, AFTER_HOURS and OVERNIGHT_DAYTIME the
+    # bars come from KIS instead, which does have them.
+    #
+    # REGULAR is untouched and still uses the default: it works, and it
+    # produced every live S6 trade so far.
+    if provider is None:
+        provider = _session_provider(cached=False)
     started = time.monotonic()
     # Minted here, before anything can fail, so a run that dies during
     # startup still has an identity in the run log. Section 5: never
@@ -942,6 +952,36 @@ PUBLISHING_SCANNERS = {
     "accumulation": "S2_VOLUME_ACCUMULATION_V1",
     "orb": "S6_ORB_BREAKOUT_V1",
 }
+
+
+
+def _session_provider(*, cached=False):
+    """The bar provider for the session we are actually in.
+
+    Falls back to the default on ANY problem -- an unknown session, no
+    broker, a KIS module that will not import. A scan running on the
+    previous provider is the behaviour that existed before this
+    function; a scan that cannot start because provider selection failed
+    is strictly worse.
+    """
+    base = default_provider(cached=cached)
+    try:
+        from market_data.kis_bar_provider import provider_for_session
+        from scanners.base import scan_session
+
+        session = scan_session.session_at()
+        from market_data.kis_bar_provider import KIS_AUTHORITATIVE_SESSIONS
+
+        if session not in KIS_AUTHORITATIVE_SESSIONS:
+            return base
+
+        from brokers.kis_broker import KISBroker
+
+        return provider_for_session(session, broker=KISBroker(), fallback=base)
+    except Exception:  # noqa: BLE001
+        logger.warning("could not select a session provider; using %s",
+                       getattr(base, "provider_name", "?"), exc_info=True)
+        return base
 
 
 def publish_report_candidates(report) -> int:
