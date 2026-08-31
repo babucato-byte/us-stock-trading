@@ -150,7 +150,17 @@ class TestPublisherNeverTouchesTheTradingCandidateStore:
                           "config_fingerprint": "fp", "failed": False}],
         }, trading_day="2026-08-17")
 
-        publisher.publish("2026-08-17")
+        # S1 is DISCOVERY_ONLY in production since 2026-08-31. This test
+        # is about the publisher not touching the trading candidate
+        # store, which is a property of publishing at all -- so the
+        # scenario where it publishes is injected rather than inherited
+        # from whichever strategy the deployment has promoted.
+        from config import scanner_live_mode
+
+        publisher.publish("2026-08-17", modes={
+            **scanner_live_mode.SCANNER_LIVE_MODE,
+            scanner_live_mode.S1_SCANNER_NAME:
+                scanner_live_mode.MODE_LIMITED_LIVE})
 
         written = sorted(p.name for p in shared.iterdir())
         assert written == ["s1_live_candidates.csv", "s1_live_candidates.manifest.json"]

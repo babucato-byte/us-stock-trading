@@ -35,6 +35,14 @@ def log_dir() -> Path:
     return Path(ROOT) / "logs" / "s1_live"
 
 
+#: Which half of a cycle a record describes. The watchdog reads both --
+#: it wants the most recent evidence that management is happening, and a
+#: cycle that has begun is exactly that. Anything counting completed
+#: ticks filters on PHASE_COMPLETED.
+PHASE_STARTED = "CYCLE_STARTED"
+PHASE_COMPLETED = "CYCLE_COMPLETED"
+
+
 def record(report_dict) -> Path:
     directory = log_dir()
     directory.mkdir(parents=True, exist_ok=True)
@@ -59,6 +67,39 @@ def main(argv=None) -> int:
     from s1_live import executor
 
     started = datetime.now(timezone.utc)
+
+    # Recorded BEFORE the cycle runs, not after it finishes.
+    #
+    # The completion record carries a `started_at` stamped here, but is
+    # only appended once `run_cycle()` returns. The position watchdog
+    # measures silence against the newest recorded `started_at`, so its
+    # view lagged by one whole cycle -- and cycles now take 14-17
+    # minutes against a 15-minute schedule.
+    #
+    # On 2026-08-31 that fired the kill switch on a healthy account. The
+    # 14:00 cycle ran 17 minutes, so `flock -n` skipped the 14:15
+    # invocation entirely; the 14:30 cycle started and was still running
+    # when the watchdog checked at 14:40:08 and read 14:00:05 as the
+    # newest tick -- 40.05 minutes, three seconds over the limit.
+    # ENTRY_DISABLED, account-wide, while TX was being actively managed
+    # by the cycle then in flight. The same false positive had already
+    # happened on 2026-08-27.
+    #
+    # A start marker does not weaken the check. Its timestamp never
+    # advances, so a cycle that HANGS still crosses the threshold and
+    # still trips the watchdog -- which is the case the watchdog exists
+    # for. What it stops is calling a running cycle silent.
+    try:
+        from scanners.base.trading_calendar import us_trading_day as _day
+
+        record({"started_at": started.isoformat(), "trading_day": _day(),
+                "phase": PHASE_STARTED, "dry_run": args.dry})
+    except Exception:  # noqa: BLE001 - a heartbeat that cannot be written
+        # must not stop a cycle from running; the completion record is
+        # still written and the watchdog still has its old signal.
+        logger.warning("could not record the cycle start marker",
+                       exc_info=True)
+
     try:
         from brokers.kis_broker import KISBroker
 
@@ -98,11 +139,13 @@ def main(argv=None) -> int:
     except Exception as exc:  # noqa: BLE001 - a cycle failure must be recorded
         logger.error("S1 live cycle failed: %s", exc, exc_info=True)
         record({"started_at": started.isoformat(), "trading_day": None,
-                "error": f"CYCLE_FAILED: {exc}", "dry_run": args.dry})
+                "error": f"CYCLE_FAILED: {exc}", "dry_run": args.dry,
+                "phase": PHASE_COMPLETED})
         return 1
 
     payload = report.as_dict()
     payload["dry_run"] = args.dry
+    payload["phase"] = PHASE_COMPLETED
     path = record(payload)
 
     logger.info("tick: session=%s orderable=%s entry=%s submitted=%s exits=%d "

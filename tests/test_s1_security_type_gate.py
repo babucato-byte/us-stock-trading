@@ -22,13 +22,28 @@ from s1_live import security_type as sectype  # noqa: E402
 from s1_live import same_day_publisher as publisher  # noqa: E402
 from s1_live import same_day_scan as sds  # noqa: E402
 
+#: Fixed, for anything about WHICH DAY a scan belongs to.
 NOW = datetime(2026, 8, 17, 14, 0, tzinfo=timezone.utc)
+
+#: Relative, for anything about HOW OLD the security-type master is.
+#:
+#: `SecurityTypeIndex.validate()` compares the master's `asof` against
+#: the real clock, so a fixture stamped with a fixed calendar date ages
+#: in place: these tests passed for two weeks and then began failing
+#: with "master is 14 days old (limit 14)" on the day the wall clock
+#: crossed `MAX_CACHE_AGE_DAYS` past 2026-08-17. Nothing about the code
+#: changed. Freshness is a property relative to now, and the fixture has
+#: to say so.
+#:
+#: The limit itself is untouched -- the staleness test below still
+#: builds a master deliberately older than it.
+FRESH = datetime.now(timezone.utc)
 
 
 def master(symbols, *, asof=None, source=sectype.SOURCE_KIS_MASTER):
     return {
         "source": source,
-        "security_type_asof": (asof or NOW).isoformat(),
+        "security_type_asof": (asof or FRESH).isoformat(),
         "counts": {},
         "symbols": symbols,
     }
@@ -111,7 +126,7 @@ class TestTheCacheItselfMustBeTrustworthy:
 
     def test_a_stale_master_is_refused(self, tmp_path):
         old = master({"AAPL": entry("AAPL", sectype.COMMON_STOCK)},
-                     asof=NOW - timedelta(days=sectype.MAX_CACHE_AGE_DAYS + 1))
+                     asof=FRESH - timedelta(days=sectype.MAX_CACHE_AGE_DAYS + 1))
         path = tmp_path / "old.json"
         path.write_text(json.dumps(old))
         with pytest.raises(sectype.SecurityTypeUnavailable) as caught:

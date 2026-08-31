@@ -62,8 +62,22 @@ def write_run(day=DAY, run_id=RUN_ID, scanners=(S1,), status=run_context.SUCCESS
     }, trading_day=day)
 
 
+#: The mode table these tests exercise against.
+#:
+#: S1 stood down from LIVE in production on 2026-08-31, but the
+#: publisher's MECHANICS under "S1 is live" are still the thing this
+#: file tests -- and a test of those mechanics must not depend on which
+#: strategy the deployment happens to have promoted. So the scenario is
+#: injected. `TestTheProductionTable` below asserts the real deployment
+#: separately, which is the assertion that should move when production
+#: does.
+S1_LIVE_MODES = {**scanner_live_mode.SCANNER_LIVE_MODE,
+                 S1: scanner_live_mode.MODE_LIMITED_LIVE}
+
+
 def publish_default(**kw):
     write_run()
+    kw.setdefault("modes", S1_LIVE_MODES)
     return publisher.publish(DAY, **kw)
 
 
@@ -101,27 +115,36 @@ class TestOnlyS1Publishes:
 
 
 class TestLiveModeConfiguration:
-    def test_s1_is_live_and_asks_for_itself_by_name(self):
+    def test_s1_asks_for_itself_by_name_not_by_being_the_only_one(self):
         """S1's publisher asks for S1 BY NAME rather than for "the only
-        live scanner". The two were the same thing until a second
-        strategy was promoted; inferring identity from being alone broke
-        the moment that stopped being true, and would break again on the
-        next promotion. S2 has since stood down and S1 is alone again --
-        which is exactly why the name is checked rather than the count.
+        live scanner". That distinction is what lets S1 stand down
+        without the publisher silently adopting whichever strategy is
+        live instead -- it refuses, which is the correct outcome for a
+        strategy that is no longer live.
         """
-        assert scanner_live_mode.is_limited_live(S1) is True
-        assert scanner_live_mode.require_limited_live(S1) == S1
-        # Four now: `orb` was promoted to LIMITED_LIVE beside S1, which
-        # is exactly the situation this test says the publisher must
-        # survive -- it asks for S1 by NAME, not for "the only live one".
-        assert len(scanner_live_mode.discovery_only_scanners()) == 4
+        import inspect
+
+        source = inspect.getsource(publisher.build)
+        assert "S1_SCANNER_NAME" in source
+        assert "limited_live_scanner()" not in source
+        # Asked by name against a table where S1 IS live, it returns S1.
+        assert scanner_live_mode.require_limited_live(S1, S1_LIVE_MODES) == S1
+
+    def test_the_production_table_has_s6_live_and_s1_not(self):
+        """The deployment as it actually stands since 2026-08-31: S6 is
+        the only live strategy and S1 runs without a route to an order.
+        This is the assertion that moves when production moves."""
+        assert scanner_live_mode.limited_live_scanner() == "orb"
+        assert scanner_live_mode.is_limited_live(S1) is False
+        assert S1 in scanner_live_mode.discovery_only_scanners()
+        assert len(scanner_live_mode.discovery_only_scanners()) == 5
 
     def test_s1s_publisher_refuses_when_s1_itself_is_not_live(self):
         """The failure that still matters. A second strategy going live
         is no longer an error -- S1 being switched OFF while its
         publisher runs is, because an empty candidate file from a
         stood-down strategy is indistinguishable from a quiet day."""
-        modes = dict(scanner_live_mode.SCANNER_LIVE_MODE)
+        modes = dict(S1_LIVE_MODES)
         modes[S1] = scanner_live_mode.MODE_DISCOVERY_ONLY
         with pytest.raises(scanner_live_mode.ScannerLiveModeError,
                            match="not LIMITED_LIVE"):
@@ -137,7 +160,7 @@ class TestLiveModeConfiguration:
         exactly one scanner is live, so promoting S2 would have made S1
         read as not-live too, silently stopping the checks that decide
         whether to place an order."""
-        modes = dict(scanner_live_mode.SCANNER_LIVE_MODE,
+        modes = dict(S1_LIVE_MODES,
                      orb=scanner_live_mode.MODE_LIMITED_LIVE)
         assert scanner_live_mode.is_limited_live(S1, modes) is True
         assert scanner_live_mode.require_limited_live(S1, modes) == S1
@@ -151,14 +174,14 @@ class TestLiveModeConfiguration:
             scanner_live_mode.require_limited_live(S1, modes)
 
     def test_an_unknown_mode_value_fails_closed(self):
-        modes = dict(scanner_live_mode.SCANNER_LIVE_MODE, orb="SORT_OF_LIVE")
+        modes = dict(S1_LIVE_MODES, orb="SORT_OF_LIVE")
         with pytest.raises(scanner_live_mode.ScannerLiveModeError, match="unknown live mode"):
             scanner_live_mode.limited_live_scanner(modes)
 
     def test_is_limited_live_is_false_on_a_malformed_table(self):
         """A table with an unknown mode value cannot be trusted about any
         scanner in it, so the answer is False rather than a guess."""
-        broken = dict(scanner_live_mode.SCANNER_LIVE_MODE, orb="SORT_OF_LIVE")
+        broken = dict(S1_LIVE_MODES, orb="SORT_OF_LIVE")
         assert scanner_live_mode.is_limited_live(S1, broken) is False
 
 
@@ -169,13 +192,13 @@ class TestProvenance:
         """Signals with no corresponding successful run have no provenance."""
         write_signals([signal("NVDA")])
         with pytest.raises(publisher.S1PublishRefused, match="no successful"):
-            publisher.publish(DAY)
+            publisher.publish(DAY, modes=S1_LIVE_MODES)
 
     def test_a_failed_s1_run_refuses_publication(self):
         write_signals([signal("NVDA")])
         write_run(scanner_status="FAILED", failed=True)
         with pytest.raises(publisher.S1PublishRefused):
-            publisher.publish(DAY)
+            publisher.publish(DAY, modes=S1_LIVE_MODES)
 
     def test_signals_from_a_superseded_run_are_excluded(self):
         """A re-run gets a new id; mixing the two would publish a set no
@@ -208,7 +231,8 @@ class TestOrderingAndCap:
         write_signals([signal("ZZZ", score=50.0), signal("AAA", score=50.0),
                        signal("MMM", score=50.0)])
         first = [r["symbol"] for r in publish_default()["rows"]]
-        second = [r["symbol"] for r in publisher.publish(DAY)["rows"]]
+        second = [r["symbol"] for r in publisher.publish(
+            DAY, modes=S1_LIVE_MODES)["rows"]]
         assert first == ["AAA", "MMM", "ZZZ"] == second
 
     def test_default_cap_is_ten(self):
@@ -222,7 +246,8 @@ class TestOrderingAndCap:
     def test_the_cap_is_configurable(self):
         write_signals([signal(f"S{i:03d}", score=float(100 - i)) for i in range(25)])
         write_run()
-        assert len(publisher.publish(DAY, limit=3)["rows"]) == 3
+        assert len(publisher.publish(
+            DAY, limit=3, modes=S1_LIVE_MODES)["rows"]) == 3
 
     def test_rank_is_one_based_and_contiguous(self):
         write_signals([signal(f"S{i}", score=float(90 - i)) for i in range(5)])
@@ -346,7 +371,7 @@ class TestDynamicAllowlist:
         write_signals([signal("NVDA", score=88.0), signal("AMD", score=70.0)])
         publish_default()
         source = candidate_source.S1CandidateSource(
-            trading_day=DAY, rollout=self.Rollout())
+            trading_day=DAY, rollout=self.Rollout(), modes=S1_LIVE_MODES)
         assert source.allowed_symbols() == {"NVDA", "AMD"}
         assert source.symbols() == ["NVDA", "AMD"], "ranked order preserved"
 
@@ -376,7 +401,7 @@ class TestDynamicAllowlist:
         live. Another strategy being live is now normal."""
         write_signals([signal("NVDA")])
         publish_default()
-        modes = dict(scanner_live_mode.SCANNER_LIVE_MODE)
+        modes = dict(S1_LIVE_MODES)
         modes[S1] = scanner_live_mode.MODE_DISCOVERY_ONLY
         source = candidate_source.S1CandidateSource(
             trading_day=DAY, rollout=self.Rollout(), modes=modes)
@@ -385,7 +410,7 @@ class TestDynamicAllowlist:
     def test_a_second_live_strategy_leaves_s1s_allowlist_intact(self):
         write_signals([signal("NVDA")])
         publish_default()
-        modes = dict(scanner_live_mode.SCANNER_LIVE_MODE,
+        modes = dict(S1_LIVE_MODES,
                      orb=scanner_live_mode.MODE_LIMITED_LIVE)
         source = candidate_source.S1CandidateSource(
             trading_day=DAY, rollout=self.Rollout(), modes=modes)
@@ -395,7 +420,8 @@ class TestDynamicAllowlist:
         write_signals([signal("NVDA", score=88.0), signal("AMD", score=70.0)])
         publish_default()
         source = candidate_source.S1CandidateSource(
-            trading_day=DAY, rollout=self.Rollout({"NVDA", "TSLA"}))
+            trading_day=DAY, rollout=self.Rollout({"NVDA", "TSLA"}),
+            modes=S1_LIVE_MODES)
         assert source.allowed_symbols() == {"NVDA"}, "intersection, not union"
         assert "TSLA" not in source.allowed_symbols()
 
@@ -403,12 +429,13 @@ class TestDynamicAllowlist:
         write_signals([signal("NVDA")])
         publish_default()
         source = candidate_source.S1CandidateSource(
-            trading_day=DAY, rollout=self.Rollout({"TSLA"}))
+            trading_day=DAY, rollout=self.Rollout({"TSLA"}),
+            modes=S1_LIVE_MODES)
         assert source.allowed_symbols() == frozenset()
 
     def test_describe_reports_the_refusal(self):
         source = candidate_source.S1CandidateSource(
-            trading_day=DAY, rollout=self.Rollout())
+            trading_day=DAY, rollout=self.Rollout(), modes=S1_LIVE_MODES)
         described = source.describe()
         assert described["validated"] is False
         assert described["allowed_symbol_count"] == 0

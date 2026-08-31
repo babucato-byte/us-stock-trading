@@ -29,7 +29,22 @@ VALID_MODES = frozenset({MODE_LIMITED_LIVE, MODE_DISCOVERY_ONLY})
 
 #: Every scanner in `scanners/registry.py` must appear here.
 SCANNER_LIVE_MODE = {
-    "hma_early_trend": MODE_LIMITED_LIVE,
+    # S1. Moved off LIVE on 2026-08-31, after its last live position (TX)
+    # was closed and the account reconciled flat.
+    #
+    # It is not retired: the scanner, its executor, its exits and its
+    # position lifecycle all keep running, and its signals keep being
+    # recorded. What it no longer has is a route to a real order --
+    # `require_limited_live("hma_early_trend")` now raises, and its
+    # publisher and candidate source both treat that as "not live".
+    #
+    # This also restores this table's own invariant. With S1 and S6 both
+    # LIMITED_LIVE, `limited_live_scanner()` raised on every call --
+    # "exactly one scanner may be LIMITED_LIVE; found 2" -- and every
+    # caller of it was reading that raise as an empty candidate set. Two
+    # live scanners is the exact condition this table exists to make
+    # impossible, and it had been true in production.
+    "hma_early_trend": MODE_DISCOVERY_ONLY,
     "accumulation": MODE_DISCOVERY_ONLY,
     "breakout_ready": MODE_DISCOVERY_ONLY,
     "premarket_momentum": MODE_DISCOVERY_ONLY,
