@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 PRIOR_SESSION_SHARE = 0.5
 
 SOURCE_PRIOR = "PRIOR_SESSION_CANDIDATES"
+SOURCE_DISCOVERY = "COARSE_DISCOVERY"
 SOURCE_MANIFEST = "UNIVERSE_MANIFEST"
 SOURCE_HELD = "HELD_POSITION"
 
@@ -241,10 +242,37 @@ def build(*, session, trading_day, prior_session=None, prior_trading_day=None,
         filler = manifest_symbols(limit=remaining - len(prior),
                                   exclude=held_symbols + prior)
 
+    # Coarse discovery, for the slots the first three sources could not
+    # fill. This is what makes a session independent of the ones before
+    # it: on 2026-08-31 the Monday DAYTIME session had no usable manifest
+    # (it was dated to Friday) and no prior-session candidates, so the
+    # collector subscribed only what was already held and S6 had nothing
+    # to look at for hours -- until the premarket profile happened to
+    # run. A session that can rank the universe itself never waits for
+    # another producer.
+    #
+    # It is last on purpose. A current manifest is better evidence than a
+    # ranking, so this fills the remainder rather than competing.
+    discovered, discovery = [], {}
+    still_free = remaining - len(prior) - len(filler)
+    if still_free > 0:
+        from s6_live import session_discovery
+
+        discovery = session_discovery.build_pool(
+            session=session, operational_trading_day=trading_day,
+            limit=still_free,
+            held_symbols=(), prior_symbols=(),
+            eligibility=None)
+        taken = set(held_symbols) | set(prior) | set(filler)
+        discovered = [s for s in discovery.get("symbols") or ()
+                      if s not in taken]
+        logger.info("%s", session_discovery.describe(discovery))
+
     pairs, chosen_from = [], {}
     for symbol, origin in ([(s, SOURCE_HELD) for s in held_symbols]
                            + [(s, SOURCE_PRIOR) for s in prior]
-                           + [(s, SOURCE_MANIFEST) for s in filler]):
+                           + [(s, SOURCE_MANIFEST) for s in filler]
+                           + [(s, SOURCE_DISCOVERY) for s in discovered]):
         exchange = _exchange_for(symbol)
         if exchange is None:
             continue
@@ -266,6 +294,12 @@ def build(*, session, trading_day, prior_session=None, prior_trading_day=None,
         "unused_slots": max(0, cap - len(pairs)),
         "from_prior_session": sum(1 for v in chosen_from.values()
                                   if v == SOURCE_PRIOR),
+        "from_coarse_discovery": sum(1 for v in chosen_from.values()
+                                     if v == SOURCE_DISCOVERY),
+        #: Why the pool is the size it is. "0 candidates" without this
+        #: reads as a quiet market and was a configuration problem.
+        "discovery_reason": discovery.get("reason"),
+        "activity_store": discovery.get("activity_store"),
         "from_manifest": sum(1 for v in chosen_from.values()
                              if v == SOURCE_MANIFEST),
         "total": len(pairs),

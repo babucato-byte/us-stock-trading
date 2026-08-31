@@ -106,6 +106,20 @@ resolve_scanner_data_dirs() {
     }
     : "${SCANNER_ANALYTICS_DIR:=$SCANNER_DATA_ROOT/logs/scanners}"
     : "${SCANNER_LOG_DIR:=$SCANNER_DATA_ROOT/logs/scanners}"
+    # Where the activity ranking ALSO lives.
+    #
+    # The daily profile still runs from /home/ubuntu/trading and writes
+    # its ranking into that tree. The release scanner reads
+    # SCANNER_ANALYTICS_DIR, in shared state, and on 2026-08-31 found an
+    # empty directory two paths away from a 2MB ranking -- reporting "no
+    # active universe" that was true of the directory and false of the
+    # system, and leaving S6 with nothing to watch.
+    #
+    # This is a BRIDGE while the profiles still run from the legacy
+    # tree, and it is searched last: a ranking in shared state always
+    # wins. Removing it is safe once the profiles run from the release.
+    : "${SCANNER_LEGACY_ANALYTICS_DIR:=/home/ubuntu/trading/logs/scanners}"
+    export SCANNER_LEGACY_ANALYTICS_DIR
     : "${SCANNER_UNIVERSE_FILE:=$SCANNER_DATA_ROOT/universe.csv}"
     export SCANNER_ANALYTICS_DIR SCANNER_LOG_DIR SCANNER_UNIVERSE_FILE
     if [ ! -r "$SCANNER_UNIVERSE_FILE" ]; then
