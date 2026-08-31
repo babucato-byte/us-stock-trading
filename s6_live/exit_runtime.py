@@ -336,9 +336,29 @@ def evaluate_position(conn, *, broker_adapter, position_id, row,
         return ExitOutcome(position_id, symbol, ACTION_LATCHED,
                            decision.reason, "session does not permit orders")
 
+    # A position that is ALREADY leaving sells for the reason it latched
+    # on, not for whatever fired most recently.
+    #
+    # RIG latched EMA_STRUCTURE_FAILURE on 2026-08-28 at 19:52. It sold
+    # three days later, and because this passed `decision.reason`, the
+    # trade was recorded as RANGE_REENTRY -- the condition that happened
+    # to fire on the tick that got the order out. The sale itself was
+    # correct; the attribution was not, and post-exit analytics key on
+    # (strategy_id, exit_reason), so the exit would have been studied
+    # under a rule that did not cause it.
+    #
+    # The fresh decision still decides WHETHER to sell. It does not get
+    # to relabel a decision already made.
+    latched = (refreshed.get("pending_exit_reason")
+               if refreshed.get("status") == position_store.EXIT_PENDING
+               else None)
+    if latched and latched != decision.reason:
+        logger.info(
+            "S6 %s: selling on the latched reason %s, not this tick's %s",
+            symbol, latched, decision.reason)
     return _submit_sell(conn, broker_adapter=broker_adapter,
                         position_id=position_id, row=refreshed,
-                        reason=decision.reason, now=now,
+                        reason=latched or decision.reason, now=now,
                         store=position_store, prefix=CLIENT_ORDER_PREFIX)
 
 

@@ -138,3 +138,85 @@ class TestWhatTheRetryActuallySubmits:
         row = ps.load(conn, pid)
         assert (row["exit_reason"] or row["pending_exit_reason"]) \
             == "EMA_STRUCTURE_FAILURE"
+
+
+class TestTheSaleRecordsTheLatchedReason:
+    """RIG's actual outcome, which the earlier tests did not cover.
+
+    `pending_exit_reason` stayed EMA_STRUCTURE_FAILURE throughout -- the
+    latch was never overwritten. But the SALE went out under
+    `decision.reason`, the condition that happened to fire on the tick
+    that got the order out, and RIG was recorded as RANGE_REENTRY three
+    days after deciding to leave for a structure failure.
+
+    The trade was correct: sold once, at a fair price. The attribution
+    was not, and post-exit analytics key on (strategy_id, exit_reason),
+    so the exit would have been studied under a rule that did not cause
+    it.
+    """
+
+    def test_a_latched_position_sells_on_its_latched_reason(self, conn):
+        from s6_live import exit_runtime
+
+        pid = _open_rig(conn)
+        ps.latch_pending_exit(conn, pid, "EMA_STRUCTURE_FAILURE", now=LATCH)
+
+        seen = {}
+
+        class _Adapter:
+            def submit_order(self, symbol, quantity, *, side, client_order_id):
+                seen["client_order_id"] = client_order_id
+
+                class _R:
+                    status_code = 200
+
+                    def json(self):
+                        return {"output": {"ODNO": "0000008968"}}
+
+                return _R()
+
+        captured = {}
+        original = exit_runtime._submit_sell
+
+        def _spy(conn_, **kwargs):
+            captured["reason"] = kwargs.get("reason")
+            return original(conn_, **kwargs)
+
+        exit_runtime._submit_sell = _spy
+        try:
+            exit_runtime.retry_latched_exits(
+                conn, broker_adapter=_Adapter(),
+                now=LATCH + timedelta(days=3), orders_allowed=True)
+        finally:
+            exit_runtime._submit_sell = original
+        assert captured["reason"] == "EMA_STRUCTURE_FAILURE"
+
+    def test_the_fresh_decision_still_decides_whether_to_sell(self):
+        """Only the LABEL is taken from the latch. A tick that decides to
+        hold must still hold."""
+        import inspect
+
+        from s6_live import exit_runtime
+
+        source = inspect.getsource(exit_runtime.evaluate_position)
+        assert "if not decision.sells" in source
+        # The latch is consulted only at the submit, after that check.
+        assert source.index("if not decision.sells") < source.index("latched =")
+
+    def test_the_substitution_is_logged(self):
+        """A reason that differs from this tick's is worth seeing."""
+        import inspect
+
+        from s6_live import exit_runtime
+
+        source = inspect.getsource(exit_runtime.evaluate_position)
+        assert "not this tick" in source
+
+    def test_an_unlatched_position_uses_its_own_decision(self):
+        """A position selling for the first time has no latch to honour."""
+        import inspect
+
+        from s6_live import exit_runtime
+
+        source = inspect.getsource(exit_runtime.evaluate_position)
+        assert "latched or decision.reason" in source
