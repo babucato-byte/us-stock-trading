@@ -368,6 +368,22 @@ def _funnel(source, results, *, since):
         "FUNNEL scanned=%d watching=%d ready=%d executable=%s submitted=%d",
         scanned, watching, ready,
         "unavailable" if executable < 0 else executable, submitted)
+
+    # §16: READY candidates that reached the gate and were approved, and
+    # then produced no order, is the one combination that is a defect
+    # rather than a market condition.
+    #
+    # This lives HERE, with the counts. It had drifted into
+    # `_record_shadow_signals`, where `ready` is a per-symbol boolean
+    # from the loop rather than a count -- so it read the LAST symbol's
+    # readiness, and raised UnboundLocalError outright on any tick with
+    # no candidates at all. Which is every tick when discovery is empty:
+    # the check meant to catch a silent execution defect was itself
+    # failing silently, once a minute.
+    if ready > 0 and executable > 0 and submitted == 0:
+        logger.error(
+            "EXECUTION_DEFECT_SUSPECTED ready=%d executable=%d submitted=0 -- "
+            "the gate approved an order that was never submitted", ready, executable)
     for symbol, evaluation in sorted(evaluations.items()):
         if not getattr(evaluation, "ready", False):
             logger.info("FUNNEL_WATCHING %s state=%s blocking=%s", symbol,
@@ -436,14 +452,6 @@ def _record_shadow_signals(source, results, *, since):
     except Exception:  # noqa: BLE001 -- an observation that fails must
         # not alter a cycle that has already finished trading.
         logger.warning("could not record shadow signals", exc_info=True)
-
-    # §16: READY candidates that reached the gate and were approved, and
-    # then produced no order, is the one combination that is a defect
-    # rather than a market condition.
-    if ready > 0 and executable > 0 and submitted == 0:
-        logger.error(
-            "EXECUTION_DEFECT_SUSPECTED ready=%d executable=%d submitted=0 -- "
-            "the gate approved an order that was never submitted", ready, executable)
 
 
 
