@@ -161,6 +161,10 @@ class TestEscalationBlocksEntryNotExit:
         monkeypatch.setenv("KILL_SWITCH_STATE_FILE", str(tmp_path / "ks.json"))
         import kill_switch_state as kss
 
+        # Escalation is for a LIVE strategy. S1 became DISCOVERY_ONLY on
+        # 2026-08-31; the behaviour under test is what happens while a
+        # strategy IS live, so that is what is set up.
+        monkeypatch.setattr(wd, "s1_is_live", lambda: True)
         assert wd.escalate({"detail": "test"}) is True
         assert kss.get_state() == kss.ENTRY_DISABLED
         assert kss.is_entry_allowed() is False
@@ -209,3 +213,48 @@ class TestItPlacesNoOrders:
                     assert str(name).split(".")[0] not in forbidden, name
         for banned in ("submit_order", "submit_buy_order", "submit_sell_order"):
             assert banned not in source, banned
+
+
+class TestANonLiveStrategyDoesNotDisableTheAccount:
+    """The escalation is account-wide: it stops S6's entries too.
+
+    On 2026-08-31 it did exactly that for forty minutes over an S1
+    reading that was false. Once S1 is DISCOVERY_ONLY it holds no real
+    position and cannot place a real order, so an S1 cycle going quiet
+    is a paper-side problem -- worth reporting, never worth disabling
+    the one strategy that is actually trading.
+    """
+
+    def test_a_non_live_strategy_reports_without_escalating(self, tmp_path,
+                                                            monkeypatch):
+        monkeypatch.setenv("KILL_SWITCH_STATE_FILE", str(tmp_path / "ks.json"))
+        import kill_switch_state as kss
+
+        monkeypatch.setattr(wd, "s1_is_live", lambda: False)
+        assert wd.escalate({"detail": "stale"}) is False
+        assert kss.get_state() == "ACTIVE"
+        assert kss.is_entry_allowed() is True
+
+    def test_the_production_table_has_s1_not_live(self):
+        """So in production today this path does not escalate."""
+        from config import scanner_live_mode
+
+        assert scanner_live_mode.is_limited_live("hma_early_trend") is False
+        assert wd.s1_is_live() is False
+
+    def test_an_unreadable_table_keeps_the_escalation(self, monkeypatch):
+        """Fails closed: a config that cannot be read must not silently
+        disarm the watchdog."""
+        from config import scanner_live_mode
+
+        monkeypatch.setattr(
+            scanner_live_mode, "is_limited_live",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("unreadable")))
+        assert wd.s1_is_live() is True
+
+    def test_the_stale_status_is_still_produced(self):
+        """Not escalating is not the same as not noticing."""
+        source = (REPO_ROOT / "scripts"
+                  / "run_s1_position_watchdog.py").read_text()
+        assert "STATUS_STALE" in source
+        assert "notify_monitor" in source

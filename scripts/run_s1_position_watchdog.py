@@ -51,6 +51,9 @@ STATUS_HEALTHY = "WATCHDOG_HEALTHY"
 STATUS_NO_POSITION = "WATCHDOG_NOT_APPLICABLE_NO_POSITION"
 STATUS_SESSION_IDLE = "WATCHDOG_NOT_APPLICABLE_SESSION_IDLE"
 STATUS_STALE = "S1_POSITION_UNMANAGED"
+#: S1 is not a live strategy, so a stale S1 cycle is not an account-wide
+#: emergency. Reported, never escalated.
+STATUS_NOT_LIVE = "WATCHDOG_NOT_APPLICABLE_STRATEGY_NOT_LIVE"
 STATUS_UNKNOWN = "WATCHDOG_CHECK_FAILED"
 
 
@@ -157,10 +160,46 @@ def check(*, max_silence_minutes=DEFAULT_MAX_SILENCE_MINUTES, now=None):
     return result
 
 
+def s1_is_live() -> bool:
+    """May S1 reach a real order at all?
+
+    Fails CLOSED -- an unreadable live-mode table is treated as S1 being
+    live, so a config that cannot be read keeps the old escalating
+    behaviour rather than silently disarming the watchdog.
+    """
+    try:
+        from config import scanner_live_mode
+
+        return scanner_live_mode.is_limited_live(
+            scanner_live_mode.S1_SCANNER_NAME)
+    except Exception:  # noqa: BLE001
+        logger.warning("could not read the live-mode table; treating S1 as "
+                       "live so the watchdog keeps its escalation",
+                       exc_info=True)
+        return True
+
+
 def escalate(result) -> bool:
-    """Block new entries, leave exits alone. Returns True if it changed."""
+    """Block new entries, leave exits alone. Returns True if it changed.
+
+    Only for a LIVE strategy. This escalation is account-wide: it stops
+    S6's entries too, and on 2026-08-31 it did exactly that for forty
+    minutes over an S1 reading that was false. Once S1 is DISCOVERY_ONLY
+    it holds no real position and cannot place a real order, so an S1
+    cycle going quiet is a paper-side problem -- worth reporting, never
+    worth disabling the one strategy that is actually trading.
+
+    The stale status is still returned and still announced; what changes
+    is that it no longer reaches for the kill switch.
+    """
     import kill_switch_state as kss
 
+    if not s1_is_live():
+        logger.error(
+            "%s but S1 is not a live strategy -- reporting without "
+            "escalating; disabling entries account-wide would stop S6 for "
+            "a strategy that cannot place an order", STATUS_STALE)
+        return False
     if kss.get_state() != "ACTIVE":
         logger.info("kill switch already %s -- no escalation needed", kss.get_state())
         return False
