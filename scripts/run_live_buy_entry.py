@@ -409,9 +409,9 @@ def _record_shadow_signals(source, results, *, since):
     answer.
     """
     try:
+        from config import s6_sessions
         from market_hours import us_trading_day
         from s6_live import shadow_signal_log as ssl
-        from s6_live import s6_sessions
 
         session = getattr(source, "_session", None) or getattr(
             source, "session", None)
@@ -447,11 +447,25 @@ def _record_shadow_signals(source, results, *, since):
                 watch_blocking=getattr(evaluation, "blocking", ()),
                 now=since)
             ssl.append(record, trading_day=day)
-        _record_closed_bar_shadow(source, sorted(evaluations), session=session,
-                                  day=day, since=since)
     except Exception:  # noqa: BLE001 -- an observation that fails must
         # not alter a cycle that has already finished trading.
         logger.warning("could not record shadow signals", exc_info=True)
+
+    # In its OWN try. It used to sit inside the block above, after the
+    # shadow-signal import -- so when that import was wrong, this never
+    # ran either, and two independent observations were lost to one
+    # bug. Neither of them can take the other down now.
+    try:
+        from market_hours import us_trading_day
+        from scanners.base import scan_session
+
+        _record_closed_bar_shadow(
+            source, sorted(getattr(source, "evaluations", None) or {}),
+            session=scan_session.session_at(),
+            day=us_trading_day(since), since=since)
+    except Exception:  # noqa: BLE001
+        logger.warning("could not record the closed-bar comparison",
+                       exc_info=True)
 
 
 
