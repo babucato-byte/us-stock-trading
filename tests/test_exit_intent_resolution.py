@@ -69,7 +69,10 @@ class _Broker:
     def get_open_orders(self):
         return self._open
 
-    def get_fills(self):
+    def get_fills(self, *, start_date=None, end_date=None):
+        # The real signature. The first version of this fake took no
+        # arguments, which hid that the resolver was calling `get_fills()`
+        # bare -- it raised in production and the intent stayed stuck.
         return self._fills
 
 
@@ -139,7 +142,7 @@ class TestPositiveEvidenceIsRequired:
             def get_open_orders(self):
                 raise RuntimeError("KIS unreachable")
 
-            def get_fills(self):
+            def get_fills(self, *, start_date=None, end_date=None):
                 raise RuntimeError("KIS unreachable")
 
         pid = _rig(conn)
@@ -191,3 +194,37 @@ class TestReconciliationReportsIt:
     def test_the_pass_calls_the_resolver(self):
         source = (REPO_ROOT / "scripts" / "run_reconciliation.py").read_text()
         assert "resolve_unknown_exit_intents" in source
+
+
+class TestItAsksTheBrokerTheWayTheBrokerExpects:
+    """The first version called `broker.get_fills()` bare. `get_fills`
+    requires start_date and end_date, so it raised on every real pass:
+    the intent stayed stuck with BROKER_UNREADABLE -- failing closed,
+    which is correct and completely useless. A fake with the wrong
+    signature hid it, so the signature is now checked against the real
+    broker."""
+
+    def test_the_resolver_reads_fills_through_the_shared_window(self):
+        source = (REPO_ROOT / "reconciliation"
+                  / "exit_intent_resolution.py").read_text()
+        assert "fill_window.read_fills" in source
+        assert "broker.get_fills()" not in source
+
+    def test_the_real_broker_requires_a_date_window(self):
+        import inspect
+
+        from brokers.kis_broker import KISBroker
+
+        parameters = inspect.signature(KISBroker.get_fills).parameters
+        assert "start_date" in parameters
+        assert "end_date" in parameters
+        assert parameters["start_date"].kind == inspect.Parameter.KEYWORD_ONLY
+
+    def test_both_reconciliation_readers_use_the_same_window(self):
+        """So the lookback cannot drift back to today-only in one of
+        them and silently stop finding older fills."""
+        source = (REPO_ROOT / "scripts" / "run_reconciliation.py").read_text()
+        resolver = (REPO_ROOT / "reconciliation"
+                    / "exit_intent_resolution.py").read_text()
+        assert "fill_window.read_fills" in source
+        assert "fill_window.read_fills" in resolver

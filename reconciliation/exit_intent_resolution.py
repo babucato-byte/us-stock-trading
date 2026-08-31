@@ -49,6 +49,8 @@ row, and the exit runtime does the selling on its next tick.
 import logging
 from typing import Any, Dict, List
 
+from reconciliation import fill_window
+
 logger = logging.getLogger(__name__)
 
 RESOLVED_LANDED = "ORDER_FOUND_AT_BROKER"
@@ -116,7 +118,12 @@ def resolve_unknown_exit_intents(conn, broker, *, now=None) -> List[dict]:
 
     try:
         open_orders = broker.get_open_orders() or []
-        fills = broker.get_fills() or []
+        # Through `fill_window`, the same helper `resolve_unknown_orders`
+        # uses. `get_fills` requires an explicit start/end date, and
+        # calling it bare raises -- which fails closed and leaves the
+        # intent stuck, correct but useless. The window belongs to the
+        # module that knows how far back a fill can matter.
+        fills = fill_window.read_fills(broker, conn, now=now) or []
     except Exception as exc:  # noqa: BLE001
         logger.warning("cannot resolve exit intents this pass: %s", exc)
         return [{"intent_id": r["intent_id"], "resolved": False,
