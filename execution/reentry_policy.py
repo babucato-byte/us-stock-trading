@@ -34,6 +34,24 @@ entirely and must never trigger the block:
 Treating either as "sold today" would block a symbol the strategy has
 never actually traded.
 
+The reason alone is not enough
+------------------------------
+On 2026-08-31 RBLX was blocked from re-entry having never owned a share.
+Its BUY was ACCEPTED, filled nothing, hit its TTL and was cancelled, and
+the row closed as BUY_FILL_TTL_EXPIRED -- a reason not on the list
+above, so the block applied to a trade that never happened.
+
+Adding that reason to the list would be wrong. `entry_timeout` raises
+the same reason for a PARTIALLY filled order it cancels
+(ACTION_PARTIAL_CANCELLED), and those shares are real: exempting the
+reason would let a symbol the strategy genuinely holds be bought again
+the same day.
+
+So the question is not what the row was called. It is whether any
+shares ever changed hands -- a row that closed holding nothing is not a
+completed trade whatever its reason, and a row that held something is,
+whatever its reason.
+
 Scope
 -----
 Per (strategy, symbol). A different strategy holding the same symbol is
@@ -108,7 +126,7 @@ def exits_today(conn, *, strategy_id, trading_day=None, now=None):
     day = trading_day or us_trading_day(now)
     try:
         rows = conn.execute(
-            f"SELECT symbol, exit_reason, closed_at, position_id, "  # noqa: S608
+            f"SELECT symbol, exit_reason, closed_at, position_id, quantity, "  # noqa: S608
             f"       {'exit_price' if _has_column(conn, table, 'exit_price') else 'NULL'} AS exit_price "
             f"FROM {table} WHERE status = 'CLOSED' AND closed_at IS NOT NULL "
             f"ORDER BY closed_at"
@@ -122,6 +140,10 @@ def exits_today(conn, *, strategy_id, trading_day=None, now=None):
     for row in rows:
         reason = (row["exit_reason"] if hasattr(row, "keys") else row[1])
         if reason in NON_TRADE_EXIT_REASONS:
+            continue
+        if not _held_shares(row):
+            # Closed without ever holding anything -- an intent, not a
+            # trade. See "The reason alone is not enough" above.
             continue
         symbol = str((row["symbol"] if hasattr(row, "keys") else row[0]) or "").upper()
         if not symbol:
@@ -137,6 +159,27 @@ def exits_today(conn, *, strategy_id, trading_day=None, now=None):
             "exit_price": row["exit_price"] if hasattr(row, "keys") else row[4],
         }
     return found
+
+
+
+def _held_shares(row) -> bool:
+    """Did this position ever actually hold shares?
+
+    A quantity that is NULL or zero means the entry never filled, so the
+    close records an abandoned intent rather than a completed trade.
+    Anything unreadable counts as HELD: the block exists to refuse, and
+    a value we cannot interpret must not become permission.
+    """
+    try:
+        quantity = row["quantity"] if hasattr(row, "keys") else None
+    except (KeyError, IndexError):
+        return True
+    if quantity is None:
+        return False
+    try:
+        return float(quantity) > 0
+    except (TypeError, ValueError):
+        return True
 
 
 def _has_column(conn, table, column) -> bool:

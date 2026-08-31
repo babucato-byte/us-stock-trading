@@ -211,7 +211,7 @@ class TestScanningIsNotOrdering:
         # promotion; S2 has not been promoted and S1 was not touched.
         assert slm.SCANNER_LIVE_MODE["orb"] == slm.MODE_LIMITED_LIVE
         assert slm.SCANNER_LIVE_MODE["accumulation"] == slm.MODE_DISCOVERY_ONLY
-        assert slm.SCANNER_LIVE_MODE["hma_early_trend"] == slm.MODE_LIMITED_LIVE
+        assert slm.SCANNER_LIVE_MODE["hma_early_trend"] == slm.MODE_DISCOVERY_ONLY
 
     def test_the_rollout_policy_is_untouched(self):
         from config.live_rollout_config import LiveRolloutConfig

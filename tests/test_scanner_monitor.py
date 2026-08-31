@@ -355,7 +355,11 @@ class TestRunnerWiring:
         monitor.notify_run(self.Report([
             self.Outcome("hma_early_trend", []),
             self.Outcome("accumulation", [])]))
-        assert "운영 모드: 제한 실거래" in sent[0], "S1 is a live strategy"
+        # S1 stood down to DISCOVERY_ONLY on 2026-08-31, so the monitor
+        # now reports it as analysis-only. The property under test is
+        # that the mode is reported PER SCANNER at all, not which mode
+        # S1 happens to hold.
+        assert "운영 모드: 분석 전용" in sent[0], "S1 is analysis-only"
         assert "운영 모드: 분석 전용" in sent[1], "S2 is discovery only"
 
     def test_a_promoted_scanner_reports_limited_live(self, monkeypatch):

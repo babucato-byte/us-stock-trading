@@ -547,6 +547,9 @@ class TestS2HasStoodDown:
         from config import position_limits as pl
         from config import scanner_live_mode
 
+        # S1 has since stood down too (2026-08-31), leaving S6 as the
+        # only live strategy. What this test guards is unchanged: S2 is
+        # DISCOVERY_ONLY and cannot submit.
         assert scanner_live_mode.SCANNER_LIVE_MODE["hma_early_trend"] == \
-            "LIMITED_LIVE"
+            "DISCOVERY_ONLY"
         assert pl.check_entry("S1_HMA_EARLY_TREND_V1", {}).allowed is True

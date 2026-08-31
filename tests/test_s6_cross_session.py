@@ -480,7 +480,7 @@ class TestS1IsUnaffected:
             assert "s1_live.store" not in text
 
     def test_the_live_modes_are_unchanged(self):
-        assert slm.SCANNER_LIVE_MODE["hma_early_trend"] == slm.MODE_LIMITED_LIVE
+        assert slm.SCANNER_LIVE_MODE["hma_early_trend"] == slm.MODE_DISCOVERY_ONLY
         assert slm.SCANNER_LIVE_MODE["accumulation"] == slm.MODE_DISCOVERY_ONLY
         # `orb` is deliberately absent: S6 is promoted now, and the
         # subject of this test is that S1 was not touched by it.

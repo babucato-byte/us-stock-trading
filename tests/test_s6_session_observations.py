@@ -209,7 +209,7 @@ class TestNothingHerePromotes:
         from config import scanner_live_mode as slm
 
         assert slm.SCANNER_LIVE_MODE["orb"] == slm.MODE_LIMITED_LIVE
-        assert slm.SCANNER_LIVE_MODE["hma_early_trend"] == slm.MODE_LIMITED_LIVE
+        assert slm.SCANNER_LIVE_MODE["hma_early_trend"] == slm.MODE_DISCOVERY_ONLY
         # All four routed sessions may ATTEMPT an order -- premarket and
         # aftermarket share the general family with the regular session.
         # That is still a statement about the SESSION route, not about

@@ -462,7 +462,7 @@ class TestStrategyEntryPolicy:
         positions" means."""
         from config import scanner_live_mode as slm
 
-        assert slm.SCANNER_LIVE_MODE["hma_early_trend"] == slm.MODE_LIMITED_LIVE
+        assert slm.SCANNER_LIVE_MODE["hma_early_trend"] == slm.MODE_DISCOVERY_ONLY
         assert slm.SCANNER_LIVE_MODE["orb"] == slm.MODE_LIMITED_LIVE
 
 

@@ -221,7 +221,7 @@ class TestTheRangeIsNotSilentlyCopied:
 
 class TestTheStrategyTransition:
     def test_s1_is_untouched(self):
-        assert slm.SCANNER_LIVE_MODE["hma_early_trend"] == "LIMITED_LIVE"
+        assert slm.SCANNER_LIVE_MODE["hma_early_trend"] == "DISCOVERY_ONLY"
         assert pl.check_entry(S1, {}).allowed is True
         assert pl.check_entry(S1, {S1: 1}).allowed is False
 

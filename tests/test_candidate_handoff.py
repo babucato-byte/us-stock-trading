@@ -518,7 +518,7 @@ class TestS2IsUnchanged:
 
     def test_every_live_mode_is_unchanged(self):
         assert slm.SCANNER_LIVE_MODE == {
-            "hma_early_trend": slm.MODE_LIMITED_LIVE,
+            "hma_early_trend": slm.MODE_DISCOVERY_ONLY,
             "accumulation": slm.MODE_DISCOVERY_ONLY,
             "breakout_ready": slm.MODE_DISCOVERY_ONLY,
             "premarket_momentum": slm.MODE_DISCOVERY_ONLY,
