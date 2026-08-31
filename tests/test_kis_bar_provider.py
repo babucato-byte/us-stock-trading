@@ -184,41 +184,64 @@ class TestTheScannerActuallyUsesIt:
     """A provider nothing calls fixes nothing. The runner previously did
     `default_provider(cached=False)` unconditionally, so every session
     got yfinance -- including the ones where 77 of 83 candidates were
-    dying on missing data."""
+    dying on missing data.
 
-    def test_the_runner_selects_by_session(self):
+    Selection lives in the ENTRYPOINT, not in `scanners/`. Choosing it
+    inside the package would mean the package importing a broker, and
+    `test_scanner_trading_isolation` forbids that: an import that does
+    not exist cannot be reached by a path nobody thought of.
+    """
+
+    def _entrypoint(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "run_scanners_entry", REPO_ROOT / "scripts" / "run_scanners.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_the_scanner_package_imports_no_broker(self):
+        """The invariant this had to be shaped around."""
+        source = (REPO_ROOT / "scanners" / "runner.py").read_text()
+        assert "brokers" not in source
+        assert "KISBroker" not in source
+
+    def test_the_runner_accepts_an_injected_provider(self):
         import inspect
 
         from scanners import runner
 
-        source = inspect.getsource(runner.run_scanners)
-        assert "_session_provider" in source
-        assert "default_provider(cached=False)" not in source
+        assert "provider" in inspect.signature(runner.main).parameters
+
+    def test_the_entrypoint_passes_one_in(self):
+        source = (REPO_ROOT / "scripts" / "run_scanners.py").read_text()
+        assert "main(provider=session_provider())" in source
 
     def test_an_extended_session_gets_the_KIS_provider(self, monkeypatch):
-        from scanners import runner
+        entry = self._entrypoint()
         from scanners.base import scan_session
 
         monkeypatch.setattr(scan_session, "session_at",
                             lambda *a, **k: "PREMARKET")
         monkeypatch.setattr("brokers.kis_broker.KISBroker",
                             lambda *a, **k: _Broker([]))
-        assert isinstance(runner._session_provider(), KISBarMarketDataProvider)
+        assert isinstance(entry.session_provider(), KISBarMarketDataProvider)
 
-    def test_regular_keeps_the_default_provider(self, monkeypatch):
-        from scanners import runner
+    def test_regular_gets_no_override(self, monkeypatch):
+        """None means "use the runner's own default" -- the path that
+        works and produced every live S6 trade."""
+        entry = self._entrypoint()
         from scanners.base import scan_session
 
         monkeypatch.setattr(scan_session, "session_at",
                             lambda *a, **k: "REGULAR")
-        assert not isinstance(runner._session_provider(),
-                              KISBarMarketDataProvider)
+        assert entry.session_provider() is None
 
-    def test_a_broker_that_cannot_be_built_falls_back(self, monkeypatch,
-                                                      caplog):
+    def test_a_broker_that_cannot_be_built_falls_back(self, monkeypatch):
         """A scan running on the previous provider is what existed
         before; a scan that cannot start is strictly worse."""
-        from scanners import runner
+        entry = self._entrypoint()
         from scanners.base import scan_session
 
         monkeypatch.setattr(scan_session, "session_at",
@@ -228,15 +251,13 @@ class TestTheScannerActuallyUsesIt:
             raise RuntimeError("no credentials")
 
         monkeypatch.setattr("brokers.kis_broker.KISBroker", _boom)
-        with caplog.at_level("WARNING"):
-            provider = runner._session_provider()
-        assert not isinstance(provider, KISBarMarketDataProvider)
+        assert entry.session_provider() is None
 
     def test_a_broken_session_lookup_falls_back(self, monkeypatch):
-        from scanners import runner
+        entry = self._entrypoint()
         from scanners.base import scan_session
 
         monkeypatch.setattr(
             scan_session, "session_at",
             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("clock")))
-        assert runner._session_provider() is not None
+        assert entry.session_provider() is None

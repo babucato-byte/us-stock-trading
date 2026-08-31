@@ -412,17 +412,18 @@ def run_scanners(
     # Extrapolated to the 13,362-symbol universe that is ~1.5 GB against
     # a 956 MB server -- the full daily scan would have been killed part
     # way through, which is the failure this line prevents.
-    # Session-aware, because the default provider has no usable
-    # extended-hours intraday data. S6's premarket scan on 2026-08-31
-    # read: universe 83, DATA_ERROR 77, evaluated 6, signals 0 -- 93% of
-    # candidates dying before any strategy rule ran, for weeks read as a
-    # quiet market. In PREMARKET, AFTER_HOURS and OVERNIGHT_DAYTIME the
-    # bars come from KIS instead, which does have them.
+    # The provider is INJECTED, never chosen here. In the extended
+    # sessions the entrypoint supplies a KIS-backed one, because the
+    # default has no usable extended-hours intraday data -- S6's
+    # premarket scan on 2026-08-31 read universe 83, DATA_ERROR 77,
+    # evaluated 6, signals 0.
     #
-    # REGULAR is untouched and still uses the default: it works, and it
-    # produced every live S6 trade so far.
-    if provider is None:
-        provider = _session_provider(cached=False)
+    # Selecting it here would mean this module importing a broker, and
+    # `tests/test_scanner_trading_isolation.py` forbids that for a good
+    # reason: an import that does not exist cannot be reached by a path
+    # nobody thought of. The scanner observes; it does not get the
+    # capability to trade in order to read a bar.
+    provider = provider or default_provider(cached=False)
     started = time.monotonic()
     # Minted here, before anything can fail, so a run that dies during
     # startup still has an identity in the run log. Section 5: never
@@ -955,34 +956,6 @@ PUBLISHING_SCANNERS = {
 
 
 
-def _session_provider(*, cached=False):
-    """The bar provider for the session we are actually in.
-
-    Falls back to the default on ANY problem -- an unknown session, no
-    broker, a KIS module that will not import. A scan running on the
-    previous provider is the behaviour that existed before this
-    function; a scan that cannot start because provider selection failed
-    is strictly worse.
-    """
-    base = default_provider(cached=cached)
-    try:
-        from market_data.kis_bar_provider import provider_for_session
-        from scanners.base import scan_session
-
-        session = scan_session.session_at()
-        from market_data.kis_bar_provider import KIS_AUTHORITATIVE_SESSIONS
-
-        if session not in KIS_AUTHORITATIVE_SESSIONS:
-            return base
-
-        from brokers.kis_broker import KISBroker
-
-        return provider_for_session(session, broker=KISBroker(), fallback=base)
-    except Exception:  # noqa: BLE001
-        logger.warning("could not select a session provider; using %s",
-                       getattr(base, "provider_name", "?"), exc_info=True)
-        return base
-
 
 def publish_report_candidates(report) -> int:
     """Write one candidate file per publishing scanner. Returns rows written.
@@ -1087,7 +1060,16 @@ def _snapshot_safely(rows, *, scanner_name, report) -> None:
                        exc_info=True)
 
 
-def main(argv=None) -> int:
+def main(argv=None, *, provider=None) -> int:
+    """`provider` is INJECTED by the caller, never built here.
+
+    The extended sessions need KIS-backed bars, and selecting them here
+    would mean this module importing a broker --
+    `tests/test_scanner_trading_isolation.py` forbids that, because an
+    import that does not exist cannot be reached by a path nobody
+    thought of. The operational entrypoint lives outside this package
+    and is where that choice belongs.
+    """
     args = parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
@@ -1170,10 +1152,11 @@ def main(argv=None) -> int:
             logger.error("candidate hand-off cannot be locked: %s",
                          cycle.detail())
         return _run_and_report(args, names=names, symbols=symbols, day=day,
-                               session=session)
+                               session=session, provider=provider)
 
 
-def _run_and_report(args, *, names, symbols, day, session) -> int:
+def _run_and_report(args, *, names, symbols, day, session,
+                    provider=None) -> int:
     """One scan, its notifications and its publication.
 
     Split out of `main` so the cycle lock wraps the whole of it -- the
@@ -1182,6 +1165,7 @@ def _run_and_report(args, *, names, symbols, day, session) -> int:
     interval.
     """
     report = run_scanners(
+        provider=provider,
         scanners=names or None,
         symbols=symbols,
         limit=args.limit,
