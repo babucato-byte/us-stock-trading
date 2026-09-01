@@ -65,6 +65,10 @@ HELD_UNRESOLVED_ORDER = "UNRESOLVED_ORDER_IN_LEDGER"
 HELD_UNRESOLVED_INTENT = "UNRESOLVED_EXIT_INTENT"
 HELD_EXIT_IN_FLIGHT = "EXIT_ALREADY_SUBMITTED"
 HELD_BROKER_UNREADABLE = "BROKER_UNREADABLE"
+#: A state from which external closure is not an honest conclusion:
+#: either nothing was ever held (pre-fill), or a human is already
+#: adjudicating it (MANUAL_REVIEW, RECOVERY_REQUIRED).
+HELD_STATE_NOT_RETIRABLE = "STATE_NOT_EXTERNALLY_RETIRABLE"
 RETIRED = "RETIRED_EXTERNALLY_CLOSED"
 
 
@@ -222,3 +226,102 @@ def _audit(record, *, now):
         # losing its audit row must not undo it.
         logger.warning("external-close audit failed for %s",
                        record.get("position_id"), exc_info=True)
+
+
+def retire_general_store(broker, conn, *, store=None, now=None,
+                         apply=True) -> List[Dict[str, Any]]:
+    """The same retirement, for the general lifecycle book.
+
+    There are two books, and S1 writes to both: `positions/store.py` and
+    the per-strategy store above. Retiring only the per-strategy row left
+    the position visible to `reconciliation.snapshot.load_internal_positions`,
+    which reads both -- so the account still reconciled as
+    "internal=1 KIS=0" with nothing left to point at.
+
+    The general book is a validated state machine, so this cannot simply
+    write a status the way the per-strategy store does. It takes the
+    store's own lock, validates the transition, and appends to the
+    record's history like every other transition in the system.
+
+    EXIT_SUBMITTED is deliberately NOT retirable: an exit in flight
+    settles to CLOSED through the normal path, and a settled exit has a
+    real price this must not pre-empt. Nor are MANUAL_REVIEW and
+    RECOVERY_REQUIRED, where a human already owns the decision.
+    """
+    from positions import states, store as position_store
+
+    store = store or position_store
+    current = now or datetime.now(timezone.utc)
+    stamp = current.isoformat()
+
+    try:
+        broker_positions = _symbols_of(broker.get_positions())
+        broker_orders = _symbols_of(broker.get_open_orders())
+    except Exception as exc:  # noqa: BLE001 - unreadable is not flat
+        logger.warning("broker unreadable; retiring nothing: %s", exc)
+        return [{"outcome": HELD_BROKER_UNREADABLE, "detail": str(exc)[:200]}]
+
+    try:
+        unresolved_orders = _unresolved_order_symbols(conn)
+        unresolved_intents = _unresolved_intent_positions(conn)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("order state unreadable; retiring nothing: %s", exc)
+        return [{"outcome": HELD_UNRESOLVED_ORDER, "detail": str(exc)[:200]}]
+
+    outcomes: List[Dict[str, Any]] = []
+    for position_id, record in (store.load_non_terminal() or {}).items():
+        if not record.get("remaining_qty"):
+            continue
+        symbol = str(record.get("symbol") or "").upper()
+        state = record.get("state")
+        report = {
+            "position_id": position_id,
+            "strategy_id": record.get("strategy_id"),
+            "symbol": symbol,
+            "previous_state": state,
+            "previous_quantity": record.get("remaining_qty"),
+            "reconciled_at": stamp,
+            "broker_positions_seen": sorted(broker_positions),
+            "broker_open_orders_seen": sorted(broker_orders),
+        }
+
+        held = evaluate(
+            {"exit_submitted": state == states.EXIT_SUBMITTED},
+            symbol=symbol, position_id=position_id,
+            broker_positions=broker_positions, broker_orders=broker_orders,
+            unresolved_orders=unresolved_orders,
+            unresolved_intents=unresolved_intents)
+        if held is None and states.EXTERNALLY_CLOSED not in states.TRANSITIONS.get(state, set()):
+            # Asked of the state machine rather than a list kept here, so
+            # the two cannot drift apart.
+            held = HELD_STATE_NOT_RETIRABLE
+        if held is not None:
+            outcomes.append({**report, "outcome": held})
+            continue
+
+        report["outcome"] = RETIRED
+        report["source"] = EXTERNALLY_CLOSED
+        if not apply:
+            outcomes.append(report)
+            continue
+
+        logger.warning(
+            "%s %s %s: broker reports no position and no open order; "
+            "retiring the general-book row without an exit price -- "
+            "this system did not sell these shares",
+            EXTERNALLY_CLOSED, record.get("strategy_id"), symbol)
+        with store.locked_position(position_id, conn=conn) as locked:
+            # Re-read under the lock: the state may have moved between the
+            # scan above and here, and a position that started exiting in
+            # that window must not be retired out from under its exit.
+            states.validate_transition(locked["state"], states.EXTERNALLY_CLOSED)
+            locked["state"] = states.EXTERNALLY_CLOSED
+            locked["state_history"].append({
+                "state": states.EXTERNALLY_CLOSED,
+                "at": stamp,
+                "reason": "broker reports no position and no open order; "
+                          "closed outside this system",
+            })
+        outcomes.append(report)
+
+    return outcomes

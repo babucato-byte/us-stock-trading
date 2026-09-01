@@ -202,3 +202,129 @@ class TestItTouchesOnlyWhatItShould:
         for store in (s1ps, s2ps, s6ps):
             parameters = inspect.signature(store.close_position).parameters
             assert "exit_reason" in parameters or "reason" in parameters
+
+
+class TestGeneralLifecycleBook:
+    """The second book -- `positions/store.py`.
+
+    Retiring only the per-strategy row left TX visible to
+    `reconciliation.snapshot.load_internal_positions`, which reads both
+    books, so the account still reconciled as "internal=1 KIS=0" with
+    nothing left to point at. This is a validated state machine, so the
+    retirement has to go through a real transition rather than a status
+    write.
+    """
+
+    @pytest.fixture
+    def book(self, conn, monkeypatch, tmp_path):
+        monkeypatch.setenv("POSITION_STORE_FILE", str(tmp_path / "positions.json"))
+        from positions import states, store
+
+        def _held(symbol="TX", qty=1, state=states.STOP_ACTIVE):
+            record = store.create_position(S1, "v1", symbol, f"cid-{symbol}", qty)
+            pid = record["position_id"]
+            walk = [states.ARMED, states.ENTRY_RESERVED, states.ENTRY_SUBMITTED,
+                    states.FILLED]
+            if state != states.FILLED:
+                walk.append(states.STOP_ACTIVE)
+            if state not in (states.FILLED, states.STOP_ACTIVE):
+                walk.append(state)
+            for step in walk:
+                with store.locked_position(pid) as locked:
+                    states.validate_transition(locked["state"], step)
+                    locked["state"] = step
+                    locked["state_history"].append(
+                        {"state": step, "at": NOW.isoformat(), "reason": "test"})
+                    if step == states.FILLED:
+                        locked["filled_qty"] = qty
+                        locked["remaining_qty"] = qty
+                        locked["average_fill_price"] = 53.68
+            return pid
+
+        return _held
+
+    def test_a_held_row_the_broker_no_longer_reports_is_retired(self, conn, book):
+        from positions import states, store
+
+        pid = book()
+        out = ec.retire_general_store(_Broker(), conn, now=NOW)
+
+        assert [r["outcome"] for r in out] == [ec.RETIRED]
+        assert store.load_position(pid)["state"] == states.EXTERNALLY_CLOSED
+        assert pid not in store.load_non_terminal()
+
+    def test_the_retirement_invents_no_exit_price_and_no_pnl(self, conn, book):
+        pid = book()
+        ec.retire_general_store(_Broker(), conn, now=NOW)
+
+        from positions import store
+
+        record = store.load_position(pid)
+        assert not record.get("exit_price")
+        assert not record.get("realized_pnl")
+        last = record["state_history"][-1]
+        assert "closed outside this system" in last["reason"]
+
+    def test_a_position_the_broker_still_reports_is_left_alone(self, conn, book):
+        from positions import states, store
+
+        pid = book()
+        out = ec.retire_general_store(_Broker(positions=["TX"]), conn, now=NOW)
+
+        assert [r["outcome"] for r in out] == [ec.HELD_BROKER_POSITION]
+        assert store.load_position(pid)["state"] == states.STOP_ACTIVE
+
+    def test_an_open_broker_order_stops_the_retirement(self, conn, book):
+        book()
+        out = ec.retire_general_store(_Broker(orders=["TX"]), conn, now=NOW)
+        assert [r["outcome"] for r in out] == [ec.HELD_OPEN_ORDER]
+
+    def test_an_exit_already_submitted_is_not_externally_closed(self, conn, book):
+        """It settles to CLOSED with a real price; this must not pre-empt it."""
+        from positions import states, store
+
+        pid = book(state=states.EXIT_SUBMITTED)
+        out = ec.retire_general_store(_Broker(), conn, now=NOW)
+
+        assert [r["outcome"] for r in out] == [ec.HELD_EXIT_IN_FLIGHT]
+        assert store.load_position(pid)["state"] == states.EXIT_SUBMITTED
+
+    def test_a_state_under_human_adjudication_is_not_retired(self, conn, book):
+        from positions import states, store
+
+        pid = book(state=states.MANUAL_REVIEW)
+        out = ec.retire_general_store(_Broker(), conn, now=NOW)
+
+        assert [r["outcome"] for r in out] == [ec.HELD_STATE_NOT_RETIRABLE]
+        assert store.load_position(pid)["state"] == states.MANUAL_REVIEW
+
+    def test_a_dry_run_changes_nothing(self, conn, book):
+        from positions import states, store
+
+        pid = book()
+        out = ec.retire_general_store(_Broker(), conn, now=NOW, apply=False)
+
+        assert [r["outcome"] for r in out] == [ec.RETIRED]
+        assert store.load_position(pid)["state"] == states.STOP_ACTIVE
+
+    def test_an_unreadable_broker_retires_nothing(self, conn, book):
+        from positions import states, store
+
+        pid = book()
+        out = ec.retire_general_store(_Broker(fail=True), conn, now=NOW)
+
+        assert [r["outcome"] for r in out] == [ec.HELD_BROKER_UNREADABLE]
+        assert store.load_position(pid)["state"] == states.STOP_ACTIVE
+
+    def test_the_retired_row_leaves_the_reconciler_s_internal_view(self, conn, book):
+        """The whole point: internal=1 KIS=0 must stop being reported."""
+        from reconciliation.snapshot import load_internal_positions
+
+        book()
+        before = load_internal_positions(now=NOW, conn=conn)
+        assert [p.symbol for p in before] == ["TX"]
+
+        ec.retire_general_store(_Broker(), conn, now=NOW)
+
+        after = load_internal_positions(now=NOW, conn=conn)
+        assert [p.symbol for p in after] == []

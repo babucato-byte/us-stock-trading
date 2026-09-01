@@ -193,8 +193,16 @@ def _check_with_position(module, monkeypatch, *, now):
     # alone and fail after any test that imports s1_live.
     import s1_live
     import state_store.db as sdb
+    import scanners.base.trading_calendar as calendar
 
     monkeypatch.setattr(s1_live, "position_store", _PS, raising=False)
     monkeypatch.setitem(sys.modules, "s1_live.position_store", _PS)
     monkeypatch.setattr(sdb, "open_db", lambda *a, **k: _Conn())
+    # `check()` reads the log for whatever `us_trading_day()` says TODAY
+    # is, while this file's timeline is pinned to the day it reconstructs.
+    # Those agreed only while the real clock still read 2026-08-31, so
+    # these tests passed on the day they were written and began failing
+    # at the next UTC midnight -- against code that had not changed.
+    # The timeline is the fixture; the calendar is not.
+    monkeypatch.setattr(calendar, "us_trading_day", lambda *a, **k: DAY)
     return module.check(now=now)

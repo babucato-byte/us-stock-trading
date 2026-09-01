@@ -9,8 +9,10 @@ from positions import states
 
 
 def test_valid_states_count_matches_spec():
-    # 13 lifecycle states + 6 exception states, per the roadmap directive.
-    assert len(states.VALID_STATES) == 19
+    # 13 lifecycle states + 6 exception states, per the roadmap directive,
+    # plus EXTERNALLY_CLOSED -- added when the operator sold TX by hand and
+    # the machine had no honest terminal state for shares it did not sell.
+    assert len(states.VALID_STATES) == 20
 
 
 def test_transitions_cover_every_valid_state():
@@ -78,3 +80,42 @@ def test_terminal_states_have_no_outgoing_transitions():
 def test_fail_closed_state_is_recovery_required():
     assert states.FAIL_CLOSED_STATE == states.RECOVERY_REQUIRED
     assert states.FAIL_CLOSED_STATE in states.NON_TERMINAL_STATES
+
+
+class TestExternallyClosed:
+    """Terminal, and deliberately not CLOSED.
+
+    CLOSED asserts this system sold and knows what the shares fetched.
+    When someone closes a position elsewhere, reusing CLOSED would put an
+    exit this system never made into the strategy's realized record --
+    and, with no price to record, one that reads as a scratch.
+    """
+
+    def test_it_is_terminal(self):
+        assert states.EXTERNALLY_CLOSED in states.TERMINAL_STATES
+        assert states.TRANSITIONS[states.EXTERNALLY_CLOSED] == set()
+
+    def test_only_states_that_actually_hold_shares_can_reach_it(self):
+        reachable = {name for name, targets in states.TRANSITIONS.items()
+                     if states.EXTERNALLY_CLOSED in targets}
+        assert reachable == {
+            states.PARTIALLY_FILLED, states.FILLED, states.STOP_ACTIVE,
+            states.TARGET_1_ACTIVE, states.PARTIAL_EXITED, states.TRAILING,
+        }
+
+    def test_a_position_that_never_filled_cannot_be_externally_closed(self):
+        for origin in (states.SETUP_DETECTED, states.ARMED,
+                       states.ENTRY_RESERVED, states.ENTRY_SUBMITTED):
+            with pytest.raises(states.InvalidTransitionError):
+                states.validate_transition(origin, states.EXTERNALLY_CLOSED)
+
+    def test_an_exit_in_flight_cannot_be_externally_closed(self):
+        """It settles to CLOSED with a real fill price instead."""
+        with pytest.raises(states.InvalidTransitionError):
+            states.validate_transition(states.EXIT_SUBMITTED,
+                                       states.EXTERNALLY_CLOSED)
+
+    def test_a_state_a_human_is_adjudicating_cannot_be_externally_closed(self):
+        for origin in (states.MANUAL_REVIEW, states.RECOVERY_REQUIRED):
+            with pytest.raises(states.InvalidTransitionError):
+                states.validate_transition(origin, states.EXTERNALLY_CLOSED)
