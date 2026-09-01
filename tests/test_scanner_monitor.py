@@ -1,4 +1,4 @@
-"""#scanner-monitor: what it prints, and what it refuses to claim.
+"""#stock-scanner: what it prints, and what it refuses to claim.
 
 Two properties matter more than the formatting.
 
@@ -414,7 +414,7 @@ KIS_LIVE_PRESENT = _kis_live_present()
 @pytest.mark.skipif(not KIS_LIVE_PRESENT,
                     reason="KIS live lifecycle is not part of the scanner runtime")
 class TestOperationalEventsReachTheSameChannel:
-    """§6: the live lifecycle is mirrored into #scanner-monitor.
+    """§6: the live lifecycle is mirrored into #stock-scanner.
 
     Mirrored, not rerouted. The KIS live channels are where a real order
     is announced and they keep receiving exactly what they received

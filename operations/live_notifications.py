@@ -144,7 +144,7 @@ KIS_LIVE_PREFIX = "[KIS LIVE]"
 KIS_LIVE_CRITICAL_PREFIX = "[KIS LIVE][CRITICAL]"
 
 
-#: Which lifecycle events are ALSO mirrored into #scanner-monitor, and
+#: Which lifecycle events are ALSO mirrored into #stock-scanner, and
 #: under which tag. The KIS live channels keep receiving everything they
 #: received before -- this is a copy, never a reroute.
 #:
@@ -180,7 +180,7 @@ _MONITOR_TAGS = {
 
 
 def monitor_tag_for(event, fields=None):
-    """The #scanner-monitor tag for a lifecycle event, or None to skip."""
+    """The #stock-scanner tag for a lifecycle event, or None to skip."""
     if event not in _MONITOR_TAGS:
         return None
     tag = _MONITOR_TAGS[event]

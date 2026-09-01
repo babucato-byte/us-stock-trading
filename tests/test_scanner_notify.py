@@ -23,6 +23,32 @@ from scanners.base import run_context  # noqa: E402
 from scanners.notify import slack as notify  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _isolated_candidate_store(tmp_path, monkeypatch):
+    """A candidate store of this module's own, never the shared one.
+
+    `runner.main` takes the publishing scanners' cycle locks before it
+    reaches anything these tests control, and `candidate_dir` resolves
+    those locks from the environment. On a release host that is the LIVE
+    store: on 2026-09-01 a host gate run collided with the live `orb`
+    scan --
+
+        [SCAN CYCLE] skipped -- orb: a orb scan started at
+        2026-09-01T06:17:29 (pid 3697118) is still running
+
+    -- and the test read a refusal as its own result. These files never
+    went red for it only because they assert == 0, which is also what a
+    refused overlap returns; they were insensitive, not correct.
+
+    The direction that matters more is the other one: without this, a
+    test run can take the live S6 cycle lock and stand a real scan down.
+    """
+    store = tmp_path / "candidates"
+    store.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("SCANNER_CANDIDATE_DIR", str(store))
+
+
+
 class FakeOutcome:
     def __init__(self, name, failed=False, breaker=False):
         self.scanner_name = name

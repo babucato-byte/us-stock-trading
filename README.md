@@ -21,7 +21,7 @@
 - `paper_strategy_order.py`: Paper 주문 검토 및 중복 주문 차단
 - `order_monitor.py`: Alpaca 주문 상태 모니터링
 - `gpt_analysis.py`: 후보 상위 종목 분석 보조
-- `slack_report.py`: `#value-report` 일일 요약
+- `slack_report.py`: `#stock-trading-report` 일일 요약
 - `slack_utils.py`: Slack webhook 전송
 - `dashboard/`: Flask 운영 대시보드
 - `tests/`: 안전장치와 핵심 로직 테스트
@@ -105,7 +105,7 @@ AI_ANALYSIS_LIMIT=10
 
 ## Slack Channels
 
-- `SLACK_ALERT_WEBHOOK_URL`: `#realtime-alerts`
+- `SLACK_ALERT_WEBHOOK_URL`: `#stock-system-health`
   - 전체 후보 수
   - 수급 강한 후보 수
   - 거래량 2배 이상 후보 수
@@ -113,7 +113,7 @@ AI_ANALYSIS_LIMIT=10
   - 신규/반복 후보
   - smart-money 상위 후보
   - 정규장 주문 가능 여부
-- `SLACK_WEBHOOK_URL`: `#value-report`
+- `SLACK_WEBHOOK_URL`: `#stock-trading-report`
   - 한국어 기준 `일일 운영 리포트`를 전송합니다.
   - 시장 상태
   - 거래 모드

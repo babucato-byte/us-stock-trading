@@ -1,4 +1,4 @@
-"""Korean display text for #scanner-monitor. Display only.
+"""Korean display text for #stock-scanner. Display only.
 
 The boundary this module defends
 --------------------------------

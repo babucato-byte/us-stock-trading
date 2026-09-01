@@ -1,4 +1,4 @@
-"""One channel that shows what every scanner is doing -- #scanner-monitor.
+"""One channel that shows what every scanner is doing -- #stock-scanner.
 
 Why this is not `scanners/notify/slack.py`
 ------------------------------------------

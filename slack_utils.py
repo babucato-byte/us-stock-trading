@@ -104,7 +104,7 @@ def scanner_monitor_configured():
 
 
 def send_scanner_monitor_message(message):
-    """The #scanner-monitor channel. Never falls back to another webhook."""
+    """The #stock-scanner channel. Never falls back to another webhook."""
     return _send(_env_webhook(SCANNER_MONITOR_WEBHOOK_ENV), message)
 
 

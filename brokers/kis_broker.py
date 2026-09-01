@@ -1606,10 +1606,16 @@ class KISBroker:
             # msg1 goes through redact_text like everywhere else, and no
             # credential or header is included.
             logger.warning(
-                "KIS_ORDER_REJECTED symbol=%s side=buy qty=%s limit=%s "
+                # `side` was hardcoded to "buy". On 2026-09-01 a SELL
+                # rejection (JBS, tr_id=TTTT1006U, APTR0057) was logged as
+                # side=buy, so the line contradicted the TR beside it and
+                # anyone reading it would have looked for a buy that never
+                # existed. Nothing branches on this string; it is the
+                # record that was wrong, not the behaviour.
+                "KIS_ORDER_REJECTED symbol=%s side=%s qty=%s limit=%s "
                 "tr_id=%s exchange=%s session=%s rt_cd=%s msg_cd=%s msg1=%s "
                 "requested_at=%s",
-                order_intent.symbol, order_intent.quantity,
+                order_intent.symbol, order_intent.side, order_intent.quantity,
                 order_intent.limit_price, tr_id,
                 getattr(instrument, "kis_exchange_code", None)
                 or getattr(instrument, "exchange", None),

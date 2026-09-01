@@ -211,7 +211,7 @@ def escalate(result) -> bool:
 
 
 def notify_monitor(result, *, escalated: bool) -> bool:
-    """Announce a stale watchdog on #scanner-monitor.
+    """Announce a stale watchdog on #stock-scanner.
 
     Only the STALE case. A watchdog that reports HEALTHY every ten minutes
     into a channel is how a channel stops being read, and the escalation

@@ -30,7 +30,7 @@
 daily_candidate_scanner.py (전체 시장 스캔, RSI/MA200/거래량/breakout/trend/momentum)
   → candidates.csv → strong_candidates.csv → order_candidates.csv
   → gpt_analysis.py (참고용 AI 분석, 주문 결정권 없음)
-  → slack_report.py (#value-report 일일 요약)
+  → slack_report.py (#stock-trading-report 일일 요약)
   → paper_strategy_order.py (독립 재점수화 + Paper 주문 검토/제출)
       → account_risk.py (일일 손실 한도)
       → order_safety.py (trading mode/position size/trade count/open positions)

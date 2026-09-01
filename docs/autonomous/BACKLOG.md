@@ -179,3 +179,91 @@ unset이어야 성립)가 깨지므로, 파일별 적용이거나 opt-out 있는
 
 관측은 read-only였고 프로세스에 손대지 않았다. 확인:
 `ps -o pid,lstart,etime -p <pid>`, `logs/cron/scanner_daily.log`.
+
+### T10. Slack 채널 역할 정리 — rename 대기 — `status: blocked` (2026-09-01)
+
+채널 rename은 **이 시스템 권한으로 불가능**하다. 프로덕션에는 webhook URL 5개만 있고
+Slack API token이 0개다. `conversations.rename`은 bot token + `channels:manage`가 필요하고
+incoming webhook으로는 rename도, channel ID 조회도 할 수 없다.
+
+현재 매핑(채널명이 아니라 webhook 기준):
+
+| env key | 역할 | producer |
+|---|---|---|
+| `KIS_LIVE_SLACK_WEBHOOK_URL` | LIVE_TRADING (routine) | `operations/live_notifications.py` |
+| `KIS_LIVE_SLACK_ALERT_WEBHOOK_URL` | LIVE_TRADING (urgent) | 동일 |
+| `SCANNER_MONITOR_SLACK_WEBHOOK_URL` | SCANNER | `scanners/notify/monitor.py` |
+| `SLACK_ALERT_WEBHOOK_URL` | 혼재 → SYSTEM_HEALTH 목표 | `ops_dashboard/snapshot.py` 외 |
+| `SLACK_WEBHOOK_URL` | 혼재 → PAPER_RESEARCH 목표 | `backtest_report_slack.py` 외 |
+
+4개 역할 중 3개는 이미 분리돼 있고 fallback 금지 규칙까지 명시돼 있다. 남은 간극은
+SYSTEM_HEALTH와 PAPER_RESEARCH가 legacy webhook 2개를 공유한다는 점이다.
+
+**라우팅 변경은 일부러 하지 않았다.** rename 전에 health 메시지를 paper alert 이름의
+채널로 보내면 지금보다 더 헷갈린다. §E 라우팅 / §F 메시지 감축 / §G 포맷 표준화는 전부
+rename 이후 작업이다.
+
+해제 조건: `channels:manage` scope를 가진 Slack bot token 제공, 또는 운영자가 직접 rename.
+webhook은 rename 후에도 유효하므로 **rotate 하지 말 것**.
+
+### T11. S6 position cap이 선언과 다르게 강제되지 않는다 — `status: open` (2026-09-01)
+
+`config/position_limits`는 `S6_ORB_BREAKOUT_V1: 1`, `ACTIVE = True`라고 선언한다.
+실제로는 강제되지 않는다:
+
+- account-scoped cap 3종(`LIVE_ROLLOUT_MAX_POSITIONS`, `..._PER_STRATEGY`,
+  `..._MAX_DAILY_ENTRIES`)은 `order_gate._check_entry_limits`에서 OPTIONAL로 문서화돼
+  있고, 배포 env에서 전부 비어 있어 실행되지 않는다.
+- `position_limits.check_entry`의 호출자는 `s2_live/executor.py` 뿐이다. S6 모듈 어디서도
+  참조하지 않는다.
+- `s6_live.entry_timeout.entry_is_blocked`는 두 번째 포지션을 막도록 작성돼 있으나
+  **호출부가 없다**.
+
+관측: 2026-09-01 S6가 MTCH+PEGA를 동시 보유, 이어서 MTCH+VALE를 동시 보유했다.
+
+여전히 유효한 보호는 always-on 계층 — 종목별 position lock과 당일 재진입 차단 — 이고
+익스포저는 orderable cash(약 $126), 정수주, 무레버리지로 제한된다. 즉 위험 폭주는 아니다.
+
+선택지 3가지이며 **결정 사항이지 정리 작업이 아니다**: (a) env cap을 1/1/2로 설정,
+(b) `entry_is_blocked`를 entry path에 연결, (c) 동시 보유를 의도된 동작으로 인정하고
+`position_limits`가 강제되지 않는 한도를 선언하지 않도록 수정.
+
+### T12. Slack 유지보수 이월 항목 — `status: deferred` (2026-09-01)
+
+2026-09-01 채널 rename(수동) 및 문서 정리 이후 **의도적으로 남긴** 항목들이다.
+각각 판단이 필요한 사안이지 정리 누락이 아니다.
+
+**(a) `DAILY_SUMMARY` 목적지 재검토**
+현재 `stock-live-trading`(routine)으로 간다. 목표 역할표는 주기적 성과 보고를
+`stock-trading-report`에 두지만, live-trading 역할에도 "realized trade result"가
+포함돼 있어 지금 위치도 방어 가능하다. "증명된 오배치"가 아니므로 옮기지 않았다.
+결정하면 `operations/live_notifications.py`의 `_webhook_for` 분기만 바꾸면 된다.
+
+**(b) cross-cycle Slack dedup (TTL 방식) — 선택**
+`_scan_is_duplicate`는 메시지 **내용** digest로 중복을 막지만 in-process다. 스캐너는
+cron 주기마다 새 프로세스라 주기 간 반복(0-candidate 연속)은 억제되지 않는다.
+이는 버그가 아니라 명시된 설계 결정이다:
+
+> "Persisting across processes would mean a crashed run's state could silence
+>  the re-run that replaces it, which is worse than an occasional repeat."
+
+관측 가능성을 로그 줄 수와 맞바꾸는 것이라 임의로 뒤집지 않았다. 진행한다면
+`_mark_scan_sent`가 **전송 성공 후에만** 기록한다는 점이 위 위험을 상당히 줄여주므로,
+짧은 TTL을 가진 영속 digest가 현실적인 형태다.
+
+**(c) Alpaca/PAPER Slack 라우팅 정리**
+`stock-trading-report`(`SLACK_WEBHOOK_URL`)가 일일 리포트와 Alpaca PAPER 체결을
+함께 싣고 있다. 이번 작업에서는 **동작 변경 없이 관측만** 했다. 분리하려면 PAPER 전용
+목적지 결정이 선행돼야 한다.
+
+**(d) UNKNOWN Alpaca/support 경로**
+실행 증거가 없어 분류를 확정하지 못한 것들. 삭제/비활성화하지 않았다.
+
+- `trading_health_check.py` — cron에는 있으나 로그 파일이 한 번도 기록되지 않음, mtime 71일
+- `order_monitor.py` — cron 없음, importer 없음
+- `daily_pipeline.py` — cron 없음, importer 없음
+- `slack_report.py` — cron 없음, importer 없음 (README는 `#stock-trading-report` 발행이라고 기술)
+
+**(e) position cap 결정 — T11 참조**
+`config/position_limits`가 선언한 `S6:1`이 강제되지 않는 건은 별도 항목 T11에 있다.
+정리 작업이 아니라 결정 사항이므로 여기서 다시 다루지 않는다.
