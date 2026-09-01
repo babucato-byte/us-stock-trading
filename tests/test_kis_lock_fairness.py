@@ -268,3 +268,55 @@ class TestANewEntryYieldsToEveryoneElse:
         runner = (REPO_ROOT / "scripts" / "run_live_buy_entry.py").read_text(
             encoding="utf-8")
         assert "dropped, not queued" in runner
+
+
+class TestDiscoveryAndPositionManagementCannotBlockEachOther:
+    """The 37-minute scan and the 1-minute position check share nothing.
+
+    A full-universe pass now takes ~37 minutes against real KIS data. If
+    it held the same lock the exit monitor takes, an open position would
+    go unchecked for the length of a scan -- and the whole point of a
+    per-minute monitor is that an exit never waits on discovery.
+
+    Pinned on the wrappers because this is a deployment property, not a
+    library one: the lock names live in the cron scripts, and the two
+    production incidents in this area were both a cron pointing at the
+    wrong file rather than a function behaving wrongly.
+    """
+
+    CRON = REPO_ROOT / "deploy" / "cron"
+
+    def _lock_of(self, wrapper):
+        import re
+        text = (self.CRON / wrapper).read_text(encoding="utf-8")
+        found = re.findall(r"flock[^\n]*?(/\S+\.lock)", text)
+        assert found, f"{wrapper} takes no flock"
+        return found[0]
+
+    def test_discovery_and_the_exit_monitor_take_different_locks(self):
+        assert self._lock_of("s6_scan.sh") != self._lock_of("s6_exit_monitor.sh")
+
+    def test_the_exit_monitor_does_not_take_the_discovery_lock(self):
+        """So a position check can never make a scan stand down."""
+        assert "s6_scan.lock" not in (
+            self.CRON / "s6_exit_monitor.sh").read_text(encoding="utf-8")
+
+    def test_discovery_does_not_take_the_execution_lock(self):
+        """So a 37-minute scan can never delay an exit."""
+        assert "s6_exec.lock" not in (
+            self.CRON / "s6_scan.sh").read_text(encoding="utf-8")
+
+    def test_the_exit_monitor_runs_release_code_not_a_checkout(self):
+        """Both production incidents here were a wrapper resolving a
+        mutable checkout: the scan wrapper ran 2026-08-27 code with no
+        credentials for days while reporting SUCCESS."""
+        text = (self.CRON / "s6_exit_monitor.sh").read_text(encoding="utf-8")
+        assert 'ROOT="${TRADING_PROJECT_ROOT:?}"' in text
+        assert "/home/ubuntu/trading/" not in text
+
+    def test_the_monitor_makes_no_broker_call_while_flat(self):
+        """It must stay cheap enough to run every minute: no position
+        means no KIS request at all, not a universe scan."""
+        text = (self.CRON / "s6_exit_monitor.sh").read_text(encoding="utf-8")
+        assert "s6_positions" in text
+        assert "0)        exit 0" in text or "0) exit 0" in text
