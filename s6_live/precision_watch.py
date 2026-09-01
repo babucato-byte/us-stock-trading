@@ -41,7 +41,7 @@ import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from s6_live import realtime_features as rf
 
@@ -351,14 +351,19 @@ class WatchedCandidateSource:
     """
 
     def __init__(self, inner, *, conn=None, session=None, now=None,
-                 provider=None, max_age_seconds=None):
+                 provider=None, max_age_seconds=None, budget_seconds=None):
         self._inner = inner
         self._conn = conn
         self._session = session
         self._now = now
         self._provider = provider
         self._max_age = max_age_seconds
+        self._budget_seconds = budget_seconds
         self.evaluations: Dict[str, WatchEvaluation] = {}
+        #: Candidates this tick could not afford to ask about. Never a
+        #: rejection -- see s6_live/pretrade_validation.py.
+        self.waiting_for_data: List[str] = []
+        self.validation_report: Dict[str, Any] = {}
 
     # -- everything the entry cycle asks that this does not change.
     #
@@ -373,15 +378,38 @@ class WatchedCandidateSource:
         return getattr(self._inner, item)
 
     def symbols(self):
+        """Validate in the STRATEGY's rank order, within one tick's budget.
+
+        Candidate data is fetched per symbol and costs real broker time
+        (a measured 2.44s for the KIS chart), so a tick cannot ask about
+        every candidate when there are fifty of them. It asks in the order
+        the strategy ranked them and leaves the rest for the next tick.
+
+        A candidate the budget did not reach is WAITING_FOR_DATA, not a
+        rejection: the strategy was never asked about it. Reporting those
+        two the same way is how an infrastructure limit starts looking
+        like a market with no setups.
+        """
+        from s6_live import pretrade_validation as ptv
+
         offered = self._inner.symbols() or []
+        session = self._session or getattr(self._inner, "_session", None)
+        order = ptv.ordered(offered, rank_of=self._rank_of)
+        budget = ptv.Budget(self._budget_seconds)
+        self.waiting_for_data = []
         ready = []
-        for symbol in offered:
+
+        for symbol in order:
+            if not budget.allows():
+                budget.defer(symbol)
+                self.waiting_for_data.append(symbol)
+                continue
             evaluation = evaluate(
-                symbol, session=self._session or getattr(
-                    self._inner, "_session", None),
+                symbol, session=session,
                 now=self._now, conn=self._conn, provider=self._provider,
                 max_age_seconds=self._max_age,
                 candidate=self._inner.candidate_row(symbol))
+            budget.spent_on(symbol)
             self.evaluations[symbol] = evaluation
             if evaluation.ready:
                 ready.append(symbol)
@@ -390,7 +418,20 @@ class WatchedCandidateSource:
                     "S6 precision watch: %s is %s, not offered for entry "
                     "(blocking: %s)", symbol, evaluation.state,
                     ", ".join(evaluation.blocking))
+
+        if budget.skipped:
+            logger.info(
+                "S6 precision watch: %s candidate(s) WAITING_FOR_DATA -- not "
+                "evaluated this tick (budget %.0fs spent in %.1fs): %s",
+                len(budget.skipped), budget.report()["budget_seconds"],
+                budget.report()["elapsed_seconds"],
+                ", ".join(budget.skipped[:12]))
+        self.validation_report = budget.report()
         return ready
+
+    def _rank_of(self, symbol):
+        row = self._inner.candidate_row(symbol) or {}
+        return row.get("rank")
 
     def allowed_symbols(self):
         # The allow-list is the operator's; readiness is the market's.

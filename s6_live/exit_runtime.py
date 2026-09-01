@@ -37,6 +37,11 @@ from s6_live import exit_diagnostics, exit_policy, position_store
 
 logger = logging.getLogger(__name__)
 
+#: The held symbol's market data could not be obtained at all this tick.
+#: Distinct from a rule that read the data and said no: this is the
+#: absence of evidence, and it must never be recorded as a calm market.
+POSITION_DATA_UNAVAILABLE = "POSITION_DATA_UNAVAILABLE"
+
 ACTION_HELD = "HELD"
 ACTION_SOLD = "SOLD"
 ACTION_BLOCKED = "BLOCKED"
@@ -316,10 +321,21 @@ def evaluate_position(conn, *, broker_adapter, position_id, row,
             features, current_price),
         session=session, now=now, decision=decision)
     if diagnostics.get("unavailable_rules"):
+        # Named explicitly when NOTHING could be read, because "every
+        # rule abstained" and "the market was calm" are the same silence
+        # otherwise -- and on a position holding real money they call for
+        # opposite responses. JBS was held live on 2026-09-01 with no
+        # stream subscription at all; REGULAR's provider fallback covered
+        # it, an extended session would not have.
+        whole_view_missing = features is None or not _finite(
+            getattr(features, "price", None))
         logger.warning(
-            "S6 %s: %d exit rule(s) could not be evaluated this tick: %s",
-            symbol, len(diagnostics["unavailable_rules"]),
+            "S6 %s: %s%d exit rule(s) could not be evaluated this tick: %s",
+            symbol,
+            (POSITION_DATA_UNAVAILABLE + " -- ") if whole_view_missing else "",
+            len(diagnostics["unavailable_rules"]),
             ", ".join(diagnostics["unavailable_rules"]))
+        diagnostics["position_data_unavailable"] = bool(whole_view_missing)
 
     if not decision.sells:
         # The diagnostics ARE the detail. An empty string here is what

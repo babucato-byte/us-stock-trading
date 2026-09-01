@@ -210,11 +210,30 @@ def _dependencies():
     # VWAP_FAILURE, EMA_STRUCTURE_FAILURE and VOLUME_DECAY_PRICE_WEAKNESS
     # could never fire -- three of S6's seven rules, silently disabled by
     # a data source that was correct for a different strategy.
+    from market_data.kis_bar_provider import provider_for_session
     from s6_live import realtime_features
     from scanners.base import scan_session
 
+    session = scan_session.session_at()
+    # A HELD position must never depend on membership in a preselected
+    # realtime watchlist to stay manageable.
+    #
+    # Without a provider, `realtime_features.build` reads the stream
+    # alone in PREMARKET/AFTER_HOURS/OVERNIGHT_DAYTIME, and that stream
+    # carries at most 41 symbols chosen before the session opened. JBS
+    # was held live on 2026-09-01 with ZERO subscription frames to its
+    # name; in REGULAR the provider fallback covered it, but in an
+    # extended session the same position would have had no VWAP, no EMA
+    # and no volume for as long as it was open -- silently disabling
+    # VWAP_FAILURE, EMA_STRUCTURE_FAILURE and
+    # VOLUME_DECAY_PRICE_WEAKNESS on a position holding real money.
+    #
+    # Only held symbols are fetched: `features_fn` is called per position
+    # by the exit runtime, never over a universe.
     return (armed.build_adapter(broker),
-            realtime_features.make_features_fn(session=scan_session.session_at()),
+            realtime_features.make_features_fn(
+                session=session,
+                provider=provider_for_session(session, broker=broker)),
             s1_executor.make_price_fn(broker), broker)
 
 

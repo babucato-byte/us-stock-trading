@@ -275,12 +275,13 @@ def refusal_reason():
 #: it on by default would change which strategy the live cycle trades
 #: without anyone saying so.
 SOURCE_FACTORIES = {
-    "s1": lambda rollout, now: None,  # None -> the cycle's own default
-    "s6": lambda rollout, now: _s6_source(rollout, now),
+    "s1": lambda rollout, now, broker=None: None,  # None -> cycle default
+    "s6": lambda rollout, now, broker=None: _s6_source(rollout, now,
+                                                       broker=broker),
 }
 
 
-def _s6_source(rollout, now):
+def _s6_source(rollout, now, *, broker=None):
     """S6's own published breakout rows for the session we are in.
 
     `s6_live.candidate_source.S6CandidateSource`, not the same-named
@@ -320,9 +321,25 @@ def _s6_source(rollout, now):
     from s6_live.precision_watch import WatchedCandidateSource
     from state_store import db as state_db
 
+    # The session's data adapter, injected HERE rather than resolved
+    # inside the watch. Without it `realtime_features.build` takes its
+    # stream-only branch in PREMARKET/AFTER_HOURS/OVERNIGHT_DAYTIME, and
+    # the stream carries only the ~41 symbols chosen before the session
+    # opened -- so a candidate discovered this morning had no feed and
+    # every data gate closed against it, whatever the strategy thought.
+    #
+    # Measured 2026-09-01 PREMARKET: 30 of 32 candidates sat at zero open
+    # gates purely for being absent from that list. Realtime is a data
+    # delivery mechanism; it does not select stocks.
+    from s6_live import pretrade_validation as ptv
+
+    session = scan_session.session_at()
     return WatchedCandidateSource(
         source, conn=state_db.open_db(),
-        session=scan_session.session_at(), now=now)
+        session=session, now=now,
+        provider=ptv.provider_for(session, broker=broker,
+                                  trading_day=us_trading_day(now)),
+        budget_seconds=ptv.budget_seconds())
 
 
 def _funnel(source, results, *, since):
@@ -525,7 +542,10 @@ def run_once(broker=None, *, strategy="s1"):
 
     now = datetime.now(timezone.utc)
     factory = SOURCE_FACTORIES[strategy]
-    source = factory(LiveRolloutConfig.from_env(), now)
+    # The cycle's own broker, so pre-trade validation reuses this
+    # authenticated client rather than standing up a second one.
+    resolved_broker = broker or KISBroker()
+    source = factory(LiveRolloutConfig.from_env(), now, resolved_broker)
 
     try:
         from scanners.base import scan_session
@@ -541,7 +561,7 @@ def run_once(broker=None, *, strategy="s1"):
     _log_calendar(now, session)
 
     results = klt.run_live_buy_entry_cycle(
-        broker=broker or KISBroker(), candidate_source=source)
+        broker=resolved_broker, candidate_source=source)
     try:
         _funnel(source, results, since=now)
     except Exception:  # noqa: BLE001 -- a reporting fault must not
