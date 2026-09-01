@@ -1532,10 +1532,26 @@ class KISBroker:
             getattr(order_intent, "session", None) or self._session_hint,
             self._env_key(), order_intent.side)
         excg = _order_excg_for(order_intent.exchange)
+        # The strategy's price, expressed the way KIS accepts it. KIS
+        # refuses more than two decimals at $1 and above (APTR0057), and
+        # LUMN was rejected at 6.405 while JBS went through at 13.75 in
+        # the same minute -- acceptance was decided by how many decimals
+        # the last trade happened to print. The strategy's own decision
+        # price is NOT changed; only what goes on the wire.
+        from brokers.order_price import wire_price
+
+        broker_order_price = wire_price(order_intent.limit_price,
+                                        side=order_intent.side)
+        if str(broker_order_price) != str(order_intent.limit_price):
+            logger.info(
+                "ORDER_PRICE_NORMALIZED symbol=%s side=%s strategy_price=%s "
+                "broker_order_price=%s", instrument.kis_symbol,
+                order_intent.side, order_intent.limit_price,
+                broker_order_price)
         payload = {
             "CANO": self.config.account_no, "ACNT_PRDT_CD": self.config.account_product_cd,
             "OVRS_EXCG_CD": excg, "PDNO": instrument.kis_symbol,
-            "ORD_QTY": str(order_intent.quantity), "OVRS_ORD_UNPR": str(order_intent.limit_price),
+            "ORD_QTY": str(order_intent.quantity), "OVRS_ORD_UNPR": broker_order_price,
             "ORD_SVR_DVSN_CD": "0", "ORD_DVSN": "00",
         }
         current = self._now()
