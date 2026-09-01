@@ -145,3 +145,37 @@ INFO(잔여, 이미 `96e9236` 커밋 메시지가 공개한 항목): marker의 �
 간격은 POSIX에 inode 지정 unlink가 없어 닫을 수 없다. `shared/state` 0700 owner-only이며
 unlink는 snapshot durable 이후에만 도달하므로 gate 안전성에는 영향이 없다. 운영자용 설명을
 `ORACLE_KIS_MIGRATION_RUNBOOK.md`에 추가하고 경계를 회귀 테스트로 고정했다.
+
+### T8. 테스트가 아직 라이브 candidate store를 만진다 — `status: open` (2026-09-01)
+
+`03de626d1` 배포와 **분리된** 후속 건이다. 이번 배포는 `TestCliGate` 한 클래스만 격리했다.
+
+`runner.main()`을 호출하면서 candidate store를 격리하지 않는 테스트가 3개 남아 있다:
+`tests/test_scanner_edge_cases.py`(222, 257, 274), `tests/test_scanner_notify.py`(286),
+`tests/test_scanner_provenance.py`(300). 호스트 게이트는 `TRADING_PROJECT_ROOT`가 릴리스를
+가리키는 채로 돌기 때문에 `candidate_dir()`가 **운영 공용 store**로 해석되고, 이 테스트들은
+실제 cycle lock을 잡는다.
+
+이들이 지금까지 red가 아니었던 이유는 통과했기 때문이 아니라 **전부 `== 0`을 단언**하기
+때문이다. 겹침 거부(refused overlap)의 반환값도 0이라서, 스캔이 실제로 돌았는지 겹침으로
+스킵됐는지를 구분하지 못한다. 즉 조용히 무감각해진 상태이고, 동시에 게이트 실행이 라이브 S6
+스캔을 stand down 시킬 수 있는 경로가 열려 있다(이쪽이 더 위험한 방향).
+
+수정은 `TestCliGate.isolated_candidate_store`와 동일한 fixture면 된다. 다만 conftest 전역
+autouse로 올리면 `tests/test_candidate_handoff.py`의 misconfiguration 거부 테스트(env가
+unset이어야 성립)가 깨지므로, 파일별 적용이거나 opt-out 있는 형태여야 한다. 별도 커밋 필요.
+
+근거: `03de626d1` 커밋 메시지, `tests/test_scanner_runner.py::TestCliGateIsolationFromLiveScans`.
+
+### T9. `scanner_profile.sh daily`가 6시간 넘게 락을 쥔 채 실행 — `status: open` (2026-09-01)
+
+2026-08-31 20:17:00Z에 시작된 daily profile 스캔(pid 3395053, 릴리스 `cdad78cc7`)이
+2026-09-01 03:0x 시점까지 **6시간 49분** 실행 중이었고, 그동안 shared store의
+`hma_early_trend` cycle lock을 계속 점유했다.
+
+거래 영향은 없다 — `hma_early_trend`는 `DISCOVERY_ONLY`이고 S6(`orb`) 락과는 별개다.
+다만 (a) 그 시간 동안 `hma_early_trend` 후보 발행이 전부 거부되고, (b) 위 T8의 테스트들이
+그 락에 걸린다. 정상 소요 시간과 대조해 hang인지 정당한 장시간 작업인지 먼저 확인할 것.
+
+관측은 read-only였고 프로세스에 손대지 않았다. 확인:
+`ps -o pid,lstart,etime -p <pid>`, `logs/cron/scanner_daily.log`.
