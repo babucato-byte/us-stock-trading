@@ -27,6 +27,7 @@ from scanners.base.market_data_provider import (  # noqa: E402
     MarketDataUnavailable,
     StaticMarketDataProvider,
 )
+from scanners.publish import candidates as publisher  # noqa: E402
 from scanners.universe import UniverseUnavailable, load_symbols  # noqa: E402
 from tests import scanner_fixtures as fx  # noqa: E402
 
@@ -261,6 +262,31 @@ class TestProfilesAndUniverse:
 
 
 class TestCliGate:
+    @pytest.fixture(autouse=True)
+    def isolated_candidate_store(self, tmp_path, monkeypatch):
+        """A candidate store of this class's own, never the shared one.
+
+        `main` takes the publishing scanners' cycle locks before it
+        reaches anything these tests monkeypatch, and `candidate_dir`
+        resolves those locks from the environment. On a host where
+        `TRADING_PROJECT_ROOT` points at a release that is the LIVE
+        shared store, so a production scan holding one publishing
+        scanner's lock made `main` return 0 for a refused overlap --
+        correct behaviour, measured against a precondition this class
+        never established. It failed in the full suite and passed in
+        isolation purely because the two runs landed either side of a
+        long daily scan.
+
+        The reverse direction is the worse one: without this, the tests
+        take real cycle locks, and a live scan can stand down for a test
+        run. Overlap semantics are pinned in
+        `tests/test_s6_long_scan_overlap.py`; what belongs here is the
+        exit code a failed scanner produces.
+        """
+        store = tmp_path / "handoff"
+        store.mkdir()
+        monkeypatch.setenv(publisher.CANDIDATE_DIR_ENV, str(store))
+
     def test_the_market_calendar_gate_stops_a_holiday_run(self, monkeypatch):
         import market_guard
 
@@ -285,3 +311,56 @@ class TestCliGate:
 
         monkeypatch.setattr(runner, "run_scanners", failing)
         assert runner.main([]) == 1
+
+
+class TestCliGateIsolationFromLiveScans:
+    """The CLI gate's exit code must not depend on what else is running.
+
+    This reproduces the failure directly rather than asserting the fix:
+    it holds the cycle locks a production scan holds, leaves
+    `SCANNER_CANDIDATE_DIR` pointing at that store in the environment
+    the way a release host does, and runs the exit-code test as a
+    subprocess. Before the isolation fixture the child resolved the
+    ambient store, found the locks held, and `main` returned 0 for a
+    refused overlap -- the exact `assert 0 == 1` seen on the host.
+    """
+
+    def test_a_held_cycle_lock_cannot_change_the_cli_exit_code(
+            self, tmp_path, monkeypatch):
+        import os
+        import subprocess
+        from contextlib import ExitStack
+
+        from scanners.base import scan_session
+        from scanners.base.trading_calendar import us_trading_day
+        from scanners.publish import scan_cycle
+
+        store = tmp_path / "shared-store"
+        store.mkdir()
+        monkeypatch.setenv(publisher.CANDIDATE_DIR_ENV, str(store))
+
+        day = us_trading_day()
+        names = sorted(runner.PUBLISHING_SCANNERS)
+        target = (f"{Path(__file__).name}::TestCliGate"
+                  "::test_a_failed_scanner_produces_a_nonzero_exit")
+
+        # Every session, not just the current one: the child resolves its
+        # own session moments later, and a boundary crossed mid-test
+        # would otherwise silently hold the wrong lock and prove nothing.
+        with ExitStack() as holding:
+            for session in scan_session.SESSIONS:
+                cycle = holding.enter_context(
+                    scan_cycle.hold_all(day, session, scanners=names))
+                assert cycle.acquired, f"could not hold {session} locks"
+
+            environment = dict(os.environ)
+            environment[publisher.CANDIDATE_DIR_ENV] = str(store)
+            finished = subprocess.run(
+                [sys.executable, "-m", "pytest", f"tests/{target}",
+                 "-q", "-p", "no:randomly", "--no-header"],
+                cwd=str(REPO_ROOT), env=environment,
+                capture_output=True, text=True, timeout=600)
+
+        assert finished.returncode == 0, (
+            "the CLI exit-code test changed its answer because another "
+            f"scan held the cycle locks:\n{finished.stdout}")
