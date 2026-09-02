@@ -339,6 +339,56 @@ def mark_exit_submitted(conn, position_id, reason, *, now=None) -> bool:
     return bool(changed)
 
 
+def release_dead_exit(conn, position_id, *, reason=None, now=None) -> bool:
+    """EXIT_SUBMITTED -> EXIT_PENDING when the SELL is provably dead.
+
+    The ONLY path that clears `exit_submitted`, and it exists because
+    `mark_exit_submitted` is deliberately one-way. That one-wayness is
+    the duplicate-SELL defence and it is right: a latch that any tick
+    could clear would not defend anything. But it left a position whose
+    SELL died with nowhere to go.
+
+    FLS, 2026-09-02: SELL 0030759096 accepted at 19:59, filled ZERO,
+    then gone from the open-order book. The shares were still held. The
+    row stayed EXIT_SUBMITTED for hours -- `retry_latched_exits` skips
+    anything that is not EXIT_PENDING and skips anything already
+    submitted, and `reconcile_unconfirmed_exits` only retires a position
+    the broker no longer holds. Reconciliation reported clean throughout,
+    because nothing was inconsistent; the position was simply stuck.
+
+    What this does NOT do
+    ---------------------
+    It does not close, does not price, does not sell, and does not touch
+    the entry. It returns the row to EXIT_PENDING -- the state the
+    EXISTING retry path already owns -- and lets that path decide. There
+    is no second exit model here: the exit that fires afterwards is the
+    same `_submit_sell` through the same gate and the same intent ledger.
+
+    The caller must have PROOF the order is dead: an authoritative
+    terminal fill report whose cumulative quantity is below what the row
+    still holds. This function cannot see the broker and does not guess.
+
+    The original exit reason is preserved -- the condition that fired
+    still fired, and re-deriving it later would let a position leave for
+    a reason it never met.
+    """
+    stamp = _now(now)
+    changed = conn.execute(
+        f"""UPDATE {TABLE}
+            SET status = ?, exit_submitted = 0,
+                pending_exit_reason = COALESCE(pending_exit_reason, exit_reason, ?),
+                pending_exit_since = COALESCE(pending_exit_since, ?),
+                updated_at = ?
+            WHERE position_id = ? AND status = ? AND exit_submitted = 1""",
+        (EXIT_PENDING, reason, stamp, stamp, position_id, EXIT_SUBMITTED)
+    ).rowcount
+    conn.commit()
+    if changed:
+        logger.info("S6 dead exit released: %s -> %s (retryable)",
+                    position_id, EXIT_PENDING)
+    return bool(changed)
+
+
 def close_position(conn, position_id, *, reason=None, exit_price=None,
                    exit_session=None, now=None) -> bool:
     """Close a position, recording the SELL's actual average fill.

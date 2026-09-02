@@ -95,11 +95,28 @@ class TestTheSilentBranchIsGone:
             position_store.EXIT_SUBMITTED
 
 
+def _dead_sell(order_id="0030447726"):
+    """What an inquiry returns for MTCH's actual order.
+
+    Not `None`. None means the inquiry could not resolve -- UNKNOWN, or
+    inside the fill-publication window -- and retiring on that is how
+    HBAN lost its exit price on 2026-09-02, 101 seconds after its SELL
+    was sent and four minutes before the fill appeared.
+
+    MTCH's order was five and a half hours old with no execution rows
+    anywhere, so the inquiry reports it TERMINAL with zero filled. That
+    is evidence; None is the absence of it.
+    """
+    return {"filled_quantity": 0, "average_fill_price": None,
+            "venue": None, "order_id": order_id, "terminal": True,
+            "status": "NO_FILL"}
+
+
 class TestUncorroboratedRetirement:
     def test_broker_flat_and_no_fill_evidence_retires_without_a_price(self, conn):
         pid = _exit_submitted(conn)
         out = exit_runtime.reconcile_unconfirmed_exits(
-            conn, broker=_Broker(), fills_for=lambda row: None,
+            conn, broker=_Broker(), fills_for=lambda row: _dead_sell(),
             session="REGULAR", now=NOW)
 
         assert out[0]["status"] == exit_runtime.EXTERNALLY_CLOSED_SELL_UNCONFIRMED
@@ -112,7 +129,7 @@ class TestUncorroboratedRetirement:
         """A NULL exit price is an absent result, never a breakeven one."""
         pid = _exit_submitted(conn)
         exit_runtime.reconcile_unconfirmed_exits(
-            conn, broker=_Broker(), fills_for=lambda row: None, now=NOW)
+            conn, broker=_Broker(), fills_for=lambda row: _dead_sell(), now=NOW)
         row = position_store.load(conn, pid)
         assert row["exit_price"] is None
         assert row["entry_price"] is not None
@@ -161,7 +178,8 @@ class TestUncorroboratedRetirement:
         pid = _exit_submitted(conn)
         for _ in range(3):
             exit_runtime.reconcile_unconfirmed_exits(
-                conn, broker=_Broker(), fills_for=lambda row: None, now=NOW)
+                conn, broker=_Broker(), fills_for=lambda row: _dead_sell(),
+                now=NOW)
         row = position_store.load(conn, pid)
         assert row["status"] == position_store.CLOSED
         assert row["exit_price"] is None

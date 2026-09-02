@@ -477,6 +477,131 @@ def retry_latched_exits(conn, *, broker_adapter, session=None, now=None,
     return outcomes
 
 
+#: A SELL that is provably dead, on a position the broker still holds.
+DEAD_SELL_RELEASED = "DEAD_SELL_RELEASED"
+DEAD_SELL_QUANTITY_MISMATCH = "DEAD_SELL_QUANTITY_MISMATCH"
+
+
+def recover_dead_exits(conn, *, broker, fills_for, positions=None,
+                       now=None) -> List[Dict[str, Any]]:
+    """Return a position whose SELL died to a state that can exit again.
+
+    The gap this closes, measured on FLS on 2026-09-02:
+
+        SELL accepted 19:59 -> filled ZERO -> gone from the book
+        row EXIT_SUBMITTED, broker still holding 1 share, for hours
+        `retry_latched_exits`  skips it: not EXIT_PENDING, already submitted
+        `reconcile_unconfirmed_exits` skips it: the broker still holds it
+        `sync_sell_fills` logs SELL_FILL_REPORTS_ZERO and continues
+        reconciliation reports CLEAN, because nothing is inconsistent
+
+    Nothing was wrong. Nothing was going to happen either.
+
+    What must ALL hold before the latch is cleared:
+
+      * the fill report is AUTHORITATIVE and TERMINAL -- past the
+        publication window, so absence is finally evidence rather than
+        latency (brokers/kis_fill_inquiry.NO_FILL_CONFIRMATION_GRACE_SECONDS)
+      * cumulative filled is BELOW what the row still says it holds, so
+        there is real remaining exposure
+      * the broker independently confirms it still holds that remainder
+
+    The last one is the one that makes oversell impossible: the quantity
+    that may be retried is the broker's own number, and a row claiming
+    more than the account holds is refused outright rather than reduced
+    to fit. Disagreement is a reconciliation question, not something to
+    paper over on the way to sending an order.
+
+    Partial fills keep their economics. `sync_sell_fills` has already
+    reduced the row to the unsold remainder and settled the intent for
+    what did fill, so what is retried here is the remainder only -- the
+    filled shares are never sold twice.
+    """
+    current = now or datetime.now(timezone.utc)
+    outcomes: List[Dict[str, Any]] = []
+
+    try:
+        book = {}
+        for p in (positions if positions is not None else broker.get_positions()) or ():
+            symbol = str(getattr(p, "symbol", "") or "").upper()
+            try:
+                book[symbol] = int(getattr(p, "quantity", 0) or 0)
+            except (TypeError, ValueError):
+                book[symbol] = 0
+    except Exception as exc:  # noqa: BLE001 - an unreadable broker is not
+        # a confirmation of anything, and this releases nothing without one.
+        logger.warning("S6 dead-exit recovery: broker unreadable: %s",
+                       type(exc).__name__)
+        return [{"status": "BROKER_UNREADABLE"}]
+
+    for pid, row in position_store.load_live(conn):
+        if row.get("status") != position_store.EXIT_SUBMITTED:
+            continue
+        if not row.get("exit_submitted"):
+            continue
+        symbol = str(row.get("symbol") or "").upper()
+        held_row = int(row.get("quantity") or 0)
+
+        try:
+            fill = fills_for(row)
+        except Exception:  # noqa: BLE001 - unreadable is not dead
+            logger.warning("S6 %s: dead-exit fill lookup failed; releasing "
+                           "nothing", symbol, exc_info=True)
+            outcomes.append({"position_id": pid, "symbol": symbol,
+                             "status": "FILL_LOOKUP_FAILED"})
+            continue
+
+        # None means the inquiry could not resolve -- UNKNOWN, or inside
+        # the publication window. Neither is proof the order is dead.
+        if not fill or not fill.get("terminal"):
+            outcomes.append({"position_id": pid, "symbol": symbol,
+                             "status": "SELL_NOT_TERMINAL"})
+            continue
+
+        sold = int(fill.get("filled_quantity") or 0)
+        if sold >= held_row:
+            # The ordinary path owns this: it has a fill that answers the
+            # whole position and will close it with the real price.
+            outcomes.append({"position_id": pid, "symbol": symbol,
+                             "status": "FILL_AVAILABLE_NORMAL_PATH"})
+            continue
+
+        broker_qty = book.get(symbol, 0)
+        if broker_qty < held_row:
+            # The account holds less than the row claims. Retrying would
+            # risk selling shares that are not there; retiring would claim
+            # an execution nobody corroborated. Report and leave it.
+            logger.warning(
+                "S6 %s: %s -- row holds %s, broker holds %s; not releasing",
+                symbol, DEAD_SELL_QUANTITY_MISMATCH, held_row, broker_qty)
+            outcomes.append({"position_id": pid, "symbol": symbol,
+                             "status": DEAD_SELL_QUANTITY_MISMATCH,
+                             "row_quantity": held_row,
+                             "broker_quantity": broker_qty})
+            continue
+
+        # The old order stays in the ledger exactly as the broker
+        # reported it. Only the intent is ended, so the next attempt can
+        # reserve its own.
+        _abort_intent(conn, pid)
+        released = position_store.release_dead_exit(
+            conn, pid, reason=row.get("exit_reason"), now=current)
+        logger.warning(
+            "S6 %s: %s -- SELL %s is terminal with %s of %s filled and the "
+            "broker still holds %s; returned to EXIT_PENDING for retry",
+            symbol, DEAD_SELL_RELEASED, fill.get("order_id"), sold,
+            held_row, broker_qty)
+        outcomes.append({
+            "position_id": pid, "symbol": symbol,
+            "status": DEAD_SELL_RELEASED, "released": bool(released),
+            "dead_broker_order_id": fill.get("order_id"),
+            "previously_filled": sold,
+            "retryable_quantity": held_row,
+            "exit_reason": row.get("exit_reason"),
+        })
+    return outcomes
+
+
 def reconcile_unconfirmed_exits(conn, *, broker, positions=None,
                                 open_orders=None, fills_for=None,
                                 session=None, now=None) -> List[Dict[str, Any]]:
@@ -558,6 +683,26 @@ def reconcile_unconfirmed_exits(conn, *, broker, positions=None,
             if fill and int(fill.get("filled_quantity") or 0) > 0:
                 outcomes.append({"position_id": pid, "symbol": symbol,
                                  "status": "FILL_AVAILABLE_NORMAL_PATH"})
+                continue
+            # PUBLICATION GRACE, the SELL side of the BUY fix.
+            #
+            # `as_store_fill()` returns None while an order has neither
+            # filled nor terminated -- which is exactly the window where
+            # KIS has stopped listing an order and has not yet published
+            # its executions. Reading that None as "no fill" retires a
+            # position whose SELL is about to be confirmed.
+            #
+            # HBAN, 2026-09-02: SELL submitted 16:27:59, retired here at
+            # 16:29:41 -- 101 seconds -- and the authoritative fill
+            # appeared at 16:32:23. The trade was real and its exit price
+            # was thrown away; the row still says PnL UNKNOWN.
+            #
+            # So absence is not resolution until the inquiry itself says
+            # the order is finished. The grace lives in
+            # `kis_fill_inquiry`, so BUY and SELL wait the same way.
+            if not fill or not fill.get("terminal"):
+                outcomes.append({"position_id": pid, "symbol": symbol,
+                                 "status": "SELL_FILL_UNRESOLVED"})
                 continue
 
         logger.warning(

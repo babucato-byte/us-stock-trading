@@ -66,6 +66,7 @@ def run_once(*, now=None) -> dict:
               "buy_fills": [], "exits": [], "retried": [], "sell_fills": [],
               "unconfirmed_exits": [],
               "adopted_fills": [],
+              "recovered_exits": [],
               "errors": []}
 
     with open_db() as conn:
@@ -150,6 +151,16 @@ def run_once(*, now=None) -> dict:
                 conn, fills_for=_sell_fill_lookup(
                     conn, broker, now=moment, open_orders=open_orders),
                 session=session, now=moment)),
+            # AFTER the sell sync, so a SELL that actually filled has
+            # already closed its position and never reaches this. What is
+            # left is an exit that is finished at the broker and did NOT
+            # fill, on shares the account still holds -- FLS on
+            # 2026-09-02. Returns the row to EXIT_PENDING so the ordinary
+            # retry path owns it on the next tick; sends nothing itself.
+            ("recovered_exits", lambda: exit_runtime.recover_dead_exits(
+                conn, broker=broker, fills_for=_sell_fill_lookup(
+                    conn, broker, now=moment, open_orders=open_orders),
+                now=moment)),
             # Last, and only ever after the priced path has had its
             # chance: a row it could close belongs to it, with the real
             # price. This retires only what the broker no longer backs
