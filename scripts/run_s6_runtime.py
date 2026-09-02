@@ -64,6 +64,7 @@ def run_once(*, now=None) -> dict:
               "orders_allowed": capability.orders_allowed,
               "mode": s6_sessions.mode_for(session),
               "buy_fills": [], "exits": [], "retried": [], "sell_fills": [],
+              "unconfirmed_exits": [],
               "errors": []}
 
     with open_db() as conn:
@@ -112,6 +113,15 @@ def run_once(*, now=None) -> dict:
                 orders_allowed=exits_allowed)),
             ("sell_fills", lambda: exit_runtime.sync_sell_fills(
                 conn, fills_for=_sell_fill_lookup(
+                    conn, broker, now=moment, open_orders=open_orders),
+                session=session, now=moment)),
+            # Last, and only ever after the priced path has had its
+            # chance: a row it could close belongs to it, with the real
+            # price. This retires only what the broker no longer backs
+            # and no inquiry can account for -- MTCH's five-and-a-half
+            # hour stall on 2026-09-01.
+            ("unconfirmed_exits", lambda: exit_runtime.reconcile_unconfirmed_exits(
+                conn, broker=broker, fills_for=_sell_fill_lookup(
                     conn, broker, now=moment, open_orders=open_orders),
                 session=session, now=moment)),
         ):

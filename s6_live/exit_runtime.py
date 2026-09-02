@@ -42,6 +42,21 @@ logger = logging.getLogger(__name__)
 #: absence of evidence, and it must never be recorded as a calm market.
 POSITION_DATA_UNAVAILABLE = "POSITION_DATA_UNAVAILABLE"
 
+#: A live fill inquiry answered, and answered zero, while the book still
+#: holds shares. Visible on purpose: this is the state MTCH was stuck in.
+SELL_FILL_REPORTS_ZERO = "SELL_FILL_REPORTS_ZERO"
+
+#: The broker has no position and no open order, but this system cannot
+#: independently confirm its own SELL executed. Deliberately NOT the
+#: normal CLOSED-with-a-price path: KIS returned full execution detail
+#: for every other S6 sell in the window and none for this order, so
+#: "the sell filled" is a claim only our ledger makes.
+#:
+#: Recorded with no exit price, which is also how realised PnL stays
+#: unknown -- `s6_positions` derives PnL from entry and exit price, so a
+#: NULL exit price is an absent result rather than a breakeven one.
+EXTERNALLY_CLOSED_SELL_UNCONFIRMED = "EXTERNALLY_CLOSED_SELL_UNCONFIRMED"
+
 ACTION_HELD = "HELD"
 ACTION_SOLD = "SOLD"
 ACTION_BLOCKED = "BLOCKED"
@@ -258,6 +273,29 @@ def sync_sell_fills(conn, *, fills_for, session=None, now=None) -> List[Dict[str
         sold = int(fill.get("filled_quantity") or 0)
         held = int(row.get("quantity") or 0)
         if sold <= 0:
+            # Was a bare `continue`. MTCH sat EXIT_SUBMITTED for five and a
+            # half hours on 2026-09-01 taking exactly this branch about
+            # fifty times: the inquiry answered usable-but-NO_FILL, the row
+            # produced no result, no log and no escalation, and every S6
+            # entry deferred behind it. A retry that cannot say it is
+            # retrying is indistinguishable from nothing happening.
+            #
+            # Deliberately does NOT close anything. A live inquiry
+            # reporting zero is not evidence of a fill; it is evidence
+            # that this tick learned nothing.
+            results.append({
+                "position_id": pid, "symbol": symbol,
+                "status": SELL_FILL_REPORTS_ZERO,
+                "broker_order_id": fill.get("order_id"),
+                "inquiry_status": fill.get("status"),
+                "inquiry_filled_quantity": sold,
+                "held_quantity": held,
+            })
+            logger.warning(
+                "S6 %s: %s -- inquiry says %s (filled=%s) while the book "
+                "still holds %s; position stays %s",
+                symbol, SELL_FILL_REPORTS_ZERO, fill.get("status"), sold,
+                held, row.get("status"))
             continue
         if sold >= held:
             # The broker's own average fill, carried through instead of
@@ -437,3 +475,127 @@ def retry_latched_exits(conn, *, broker_adapter, session=None, now=None,
                              "symbol": row["symbol"],
                              "action": ACTION_BLOCKED, "detail": str(exc)})
     return outcomes
+
+
+def reconcile_unconfirmed_exits(conn, *, broker, positions=None,
+                                open_orders=None, fills_for=None,
+                                session=None, now=None) -> List[Dict[str, Any]]:
+    """Retire an EXIT_SUBMITTED row the broker no longer backs.
+
+    The case this exists for, from 2026-09-01:
+
+      * MTCH sat EXIT_SUBMITTED qty 2 for five and a half hours
+      * the broker held no MTCH and had no open order
+      * our ledger said the sell settled FILLED 2.0 of 2.0
+      * KIS's execution history contained no such sell -- while returning
+        full detail for all ten other S6 sells in the same window
+      * every S6 entry deferred behind the stale row
+
+    So the position is provably gone and provably not exitable, but the
+    execution this system believes it performed cannot be corroborated.
+    That is a weaker claim than a fill, and it is recorded as the weaker
+    claim: no exit price, no derived PnL, and a reason that says what is
+    actually known.
+
+    What must hold before anything is retired:
+
+      * the broker reports no position in the symbol
+      * the broker reports no open order in the symbol
+      * a live fill inquiry does NOT report a usable fill -- if it does,
+        the ordinary `sync_sell_fills` path owns this row and closes it
+        with the real price
+      * the row is EXIT_SUBMITTED with an exit already submitted
+
+    Broker-flat alone is deliberately not sufficient anywhere here: it is
+    the precondition, never the evidence. A position can vanish from a
+    balance for reasons that are not a fill, which is the whole reason
+    this does not claim one.
+    """
+    current = now or datetime.now(timezone.utc)
+    outcomes: List[Dict[str, Any]] = []
+
+    try:
+        held = {str(getattr(p, "symbol", "") or "").upper()
+                for p in (positions if positions is not None
+                          else broker.get_positions())}
+        resting = {str((o.get("symbol") if isinstance(o, dict)
+                        else getattr(o, "symbol", "")) or "").upper()
+                   for o in (open_orders if open_orders is not None
+                             else broker.get_open_orders())}
+    except Exception as exc:  # noqa: BLE001 - an unreadable broker is not
+        # a flat one. Retiring on a failed read would be the fabrication
+        # this function exists to avoid.
+        logger.warning("broker unreadable; retiring nothing: %s", exc)
+        return [{"status": "BROKER_UNREADABLE", "detail": str(exc)[:200]}]
+
+    for pid, row in position_store.load_live(conn):
+        symbol = str(row.get("symbol") or "").upper()
+        if row.get("status") != position_store.EXIT_SUBMITTED:
+            continue
+        if not row.get("exit_submitted"):
+            continue
+        if symbol in held:
+            outcomes.append({"position_id": pid, "symbol": symbol,
+                             "status": "BROKER_STILL_HOLDS"})
+            continue
+        if symbol in resting:
+            outcomes.append({"position_id": pid, "symbol": symbol,
+                             "status": "BROKER_HAS_OPEN_ORDER"})
+            continue
+
+        # A usable fill means the ordinary path owns this row and will
+        # close it with the price the trade actually ended at. Only the
+        # absence of one gets the weaker terminal state.
+        if fills_for is not None:
+            try:
+                fill = fills_for(row)
+            except Exception:  # noqa: BLE001 - unreadable is not absent
+                logger.warning("S6 %s: fill lookup failed; not retiring",
+                               symbol, exc_info=True)
+                outcomes.append({"position_id": pid, "symbol": symbol,
+                                 "status": "FILL_LOOKUP_FAILED"})
+                continue
+            if fill and int(fill.get("filled_quantity") or 0) > 0:
+                outcomes.append({"position_id": pid, "symbol": symbol,
+                                 "status": "FILL_AVAILABLE_NORMAL_PATH"})
+                continue
+
+        logger.warning(
+            "S6 %s: %s -- broker holds none and has no open order, but this "
+            "system cannot confirm its own SELL executed; retiring without "
+            "an exit price",
+            symbol, EXTERNALLY_CLOSED_SELL_UNCONFIRMED)
+        closed = position_store.close_position(
+            conn, pid, reason=EXTERNALLY_CLOSED_SELL_UNCONFIRMED,
+            exit_price=None, exit_session=_session_name(session), now=current)
+        # The intent is ABORTED, not CONFIRMED: confirming would assert the
+        # very execution that could not be corroborated.
+        _abort_intent(conn, pid)
+        outcomes.append({
+            "position_id": pid, "symbol": symbol,
+            "status": EXTERNALLY_CLOSED_SELL_UNCONFIRMED,
+            "closed": bool(closed),
+            "previous_quantity": row.get("quantity"),
+            "exit_price": None,
+            "reconciled_at": current.isoformat(),
+        })
+    return outcomes
+
+
+def _abort_intent(conn, position_id) -> None:
+    """End the exit intent without claiming the fill was confirmed.
+
+    `mark_confirmed` takes a confirmed_filled_qty and means exactly that.
+    There is no confirmed quantity here, so the intent is aborted instead:
+    a terminal state that does not assert an execution.
+    """
+    from state_store import exit_intent_ledger as eil
+
+    try:
+        intent = eil.get_active_intent(conn, position_id)
+        if intent:
+            eil.mark_aborted(conn, intent["intent_id"])
+    except Exception:  # noqa: BLE001 - the position is already terminal;
+        # losing the ledger's copy must not undo that.
+        logger.warning("could not abort exit intent for %s", position_id,
+                       exc_info=True)
