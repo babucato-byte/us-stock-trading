@@ -413,10 +413,15 @@ def _revalidate_before_submit(*, symbol, broker, conn, instrument, order_intent,
 
     Everything here is either a local read or a broker read that the
     submission is about to depend on anyway. What it does NOT re-do is
-    the gate: `entry_limits.collect()` and the reconciliation snapshot
-    are gathered by the context builder, which runs inside this same
-    lock, so the caps, SYMBOL_ALREADY_HELD and reconciliation are
-    already evaluated against current state and are not duplicated here.
+    the gate: the entry-limit state and the reconciliation snapshot are
+    gathered by the context builder, which runs inside this same lock,
+    so the caps, SYMBOL_ALREADY_HELD and reconciliation are already
+    evaluated against current state and are not duplicated here.
+
+    Naming the collector in prose here is deliberately avoided:
+    tests/test_s1_live_isolation.py counts its call sites in this file
+    to prove there is ONE pipeline rather than two, and a mention in a
+    docstring reads to that check exactly like a second call.
 
     Fails CLOSED. A read that cannot be completed drops the entry --
     an entry is an opportunity, and the cost of missing one is a tick.
