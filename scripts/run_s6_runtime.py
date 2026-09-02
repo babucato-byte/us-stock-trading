@@ -65,19 +65,39 @@ def run_once(*, now=None) -> dict:
               "mode": s6_sessions.mode_for(session),
               "buy_fills": [], "exits": [], "retried": [], "sell_fills": [],
               "unconfirmed_exits": [],
+              "adopted_fills": [],
               "errors": []}
 
     with open_db() as conn:
-        from s6_live import position_store
+        from s6_live import monitor_health, position_store
+
+        # Asked BEFORE the tick does its work, so it measures the gap
+        # since the LAST evaluation rather than reporting on itself.
+        report["monitor_health"] = monitor_health.check(conn, now=moment)
 
         if not position_store.load_live(conn) and \
                 not position_store.load_unconfirmed(conn):
-            report["status"] = "NO_S6_POSITIONS"
-            _attach_session_report(report, conn=conn, session=session,
-                                   now=moment)
-            return report
+            # "No rows" is not "nothing held". A fill this system failed
+            # to record leaves shares that no row mentions, and every
+            # check above this line reads rows -- so the one state that
+            # most needs attention is the one that looks like an idle
+            # tick. Ask the broker before believing it.
+            #
+            # On 2026-09-02 seven HBAN shares sat in exactly this state:
+            # the position row had been closed BUY_NEVER_FILLED, so the
+            # runtime returned NO_S6_POSITIONS on every tick while the
+            # account held them.
+            report["adopted_fills"] = _adopt_untracked_when_flat(
+                conn, now=moment)
+            if not position_store.load_live(conn) and \
+                    not position_store.load_unconfirmed(conn):
+                report["status"] = "NO_S6_POSITIONS"
+                _attach_session_report(report, conn=conn, session=session,
+                                       now=moment)
+                return report
 
         from s6_live import exit_runtime
+        from s6_live import fill_adoption
 
         adapter, features_fn, price_fn, broker = _dependencies()
         # ONE open-order sweep for the whole tick, shared by both fill
@@ -98,6 +118,21 @@ def run_once(*, now=None) -> dict:
                 conn, fills_for=_buy_fill_lookup(
                     conn, broker, now=moment, open_orders=open_orders),
                 now=moment)),
+            # BETWEEN the fill sync and the timeout, deliberately.
+            #
+            # The fill sync can only promote a row it still has. When a
+            # fill is missed and the row is closed, the shares become
+            # untracked and nothing downstream can ever act on them --
+            # not the exit rules, not reconciliation, which can report
+            # the mismatch but not repair it. This is the repair, and it
+            # runs before the timeout so an adopted position is visible
+            # to it rather than being re-abandoned.
+            # EXTENDS rather than replaces: the flat path above may
+            # already have adopted, and overwriting its result would
+            # erase the record of the repair from the tick that made it.
+            ("adopted_fills", lambda: report["adopted_fills"] + (
+                fill_adoption.adopt_untracked_fills(
+                    conn, broker=broker, now=moment) or [])),
             # AFTER the fill sync: anything that filled is already
             # applied, so what this sees is genuinely unfilled and the
             # only questions left are the clock and the candidate.
@@ -133,8 +168,38 @@ def run_once(*, now=None) -> dict:
                 logger.error("S6 %s stage failed", stage, exc_info=True)
                 report["errors"].append(f"{stage}: {exc}")
         report["status"] = "ERROR" if report["errors"] else "OK"
+        # Stamped only when a tick actually evaluated held positions --
+        # which is what `monitor_health` is asked about. A tick that
+        # could not take the lock never reaches this line, and that is
+        # precisely the silence the heartbeat exists to make visible.
+        try:
+            held_now = position_store.load_live(conn) or ()
+            if held_now:
+                monitor_health.record_evaluation(held_count=len(held_now),
+                                                 now=moment)
+        except Exception:  # noqa: BLE001 -- bookkeeping must not fail a tick
+            logger.warning("S6 monitor heartbeat not recorded", exc_info=True)
         _attach_session_report(report, conn=conn, session=session, now=moment)
     return report
+
+
+def _adopt_untracked_when_flat(conn, *, now):
+    """Adoption on the otherwise-idle path, with its own broker.
+
+    `_dependencies()` builds a market-data provider this path has no use
+    for, so the flat tick pays for a broker and nothing else.
+    """
+    from brokers.kis_broker import KISBroker
+    from s6_live import fill_adoption
+
+    try:
+        return fill_adoption.adopt_untracked_fills(
+            conn, broker=KISBroker(), now=now)
+    except Exception:  # noqa: BLE001 -- an idle tick must not fail over
+        # a repair that simply could not be attempted.
+        logger.warning("S6 adoption check failed on the flat path",
+                       exc_info=True)
+        return []
 
 
 

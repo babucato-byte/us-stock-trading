@@ -202,6 +202,30 @@ def aggregate(fills: List[Dict[str, Any]], broker_order_id: str
             "ordered": ordered}
 
 
+#: How long an order that has LEFT the open-order book may report no
+#: fills before that silence is believed.
+#:
+#: KIS removes a filled order from the open-order book BEFORE it
+#: publishes the execution rows for it. For as long as that gap lasts,
+#: "gone from the book and no fill rows" describes a FILLED order and an
+#: abandoned one identically.
+#:
+#: On 2026-09-02 order 0030708837 filled 7 HBAN at 17.01. It left the
+#: book immediately; the fill became visible to reconciliation four
+#: minutes later. In between, a tick read "gone, nothing filled", called
+#: it terminal, and `sync_buy_fills` abandoned the position as
+#: BUY_NEVER_FILLED -- leaving the account holding 7 shares no position
+#: tracked, which no exit rule could ever act on.
+#:
+#: So absence is no longer self-sufficient evidence. Inside the window
+#: the answer is "not yet", the row stays SUBMITTED, and reconciliation
+#: gets its chance to settle the fill from KIS's own history. Past it,
+#: an order still absent with still no fills is believed to have died,
+#: which is what keeps a genuinely cancelled row from sitting SUBMITTED
+#: forever and holding the position slot.
+NO_FILL_CONFIRMATION_GRACE_SECONDS = 900.0
+
+
 def inquire(broker, *, broker_order_id, symbol=None, side=None,
             ordered_quantity=None, now=None, since=None,
             open_orders=None) -> FillReport:
@@ -258,10 +282,8 @@ def inquire(broker, *, broker_order_id, symbol=None, side=None,
             side=side, ordered_quantity=ordered, filled_quantity=0,
             remaining_quantity=ordered, average_fill_price=None,
             broker_timestamp=stamp, venue=resolved_venue,
-            terminal=bool(open_known and not still_open),
-            detail=("no fill rows and the order is no longer open at KIS"
-                    if open_known and not still_open else
-                    "no fill rows yet"))
+            terminal=_absence_is_final(open_known, still_open, since, moment),
+            detail=_no_fill_detail(open_known, still_open, since, moment))
 
     remaining = (ordered - cumulative) if ordered is not None else None
     filled_all = ordered is not None and cumulative >= ordered
@@ -273,8 +295,49 @@ def inquire(broker, *, broker_order_id, symbol=None, side=None,
         remaining_quantity=(max(0.0, remaining) if remaining is not None else None),
         average_fill_price=summary.get("average"),
         broker_timestamp=stamp, venue=resolved_venue,
-        terminal=bool(filled_all or (open_known and not still_open)),
+        terminal=bool(filled_all or _absence_is_final(
+            open_known, still_open, since, moment)),
         detail=f"{summary['matched_rows']} execution row(s)")
+
+
+def _absence_is_final(open_known, still_open, since, moment) -> bool:
+    """Is "gone from the book with nothing filled" believable yet?
+
+    Only when the order has been gone long enough that a fill would have
+    surfaced by now. An unreadable book (`open_known` False) is never
+    final, and neither is an order whose age cannot be established --
+    both are ignorance, and abandoning a position on ignorance is what
+    left seven HBAN shares untracked.
+    """
+    if not open_known or still_open:
+        return False
+    age = _age_seconds(since, moment)
+    if age is None:
+        logger.warning(
+            "KIS fill inquiry: the order is gone from the open-order book "
+            "with no fill rows, but its age is unknown; declining to call "
+            "that final")
+        return False
+    return age >= NO_FILL_CONFIRMATION_GRACE_SECONDS
+
+
+def _no_fill_detail(open_known, still_open, since, moment) -> str:
+    if not (open_known and not still_open):
+        return "no fill rows yet"
+    if _absence_is_final(open_known, still_open, since, moment):
+        return ("no fill rows and the order has been gone from KIS's "
+                "open-order book longer than the fill-publication window")
+    return ("the order is gone from KIS's open-order book but no fill rows "
+            "have been published yet; not final until they could have been")
+
+
+def _age_seconds(since, moment) -> Optional[float]:
+    if since is None or moment is None:
+        return None
+    try:
+        return (moment - since).total_seconds()
+    except (TypeError, AttributeError):
+        return None
 
 
 def _still_open(broker, broker_order_id, open_orders):

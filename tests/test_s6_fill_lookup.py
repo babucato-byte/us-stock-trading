@@ -123,13 +123,44 @@ class TestBuyInquiry:
         assert r.terminal is False, "still open -- not final"
         assert r.as_store_fill() is None, "no action while it may still fill"
 
-    def test_no_fill_and_gone_from_open_orders_is_terminal(self):
+    def test_no_fill_and_gone_from_open_orders_is_not_terminal_yet(self):
+        """Absence is no longer self-sufficient evidence of non-fill.
+
+        This test used to assert the opposite, and the opposite is what
+        cost a position on 2026-09-02: KIS drops a FILLED order from the
+        open-order book BEFORE it publishes the execution rows, so for
+        the length of that gap "gone and nothing filled" describes a
+        filled order and an abandoned one identically. Seven HBAN shares
+        were held while the position that should have tracked them was
+        closed BUY_NEVER_FILLED.
+        """
         broker = FakeBroker(fills=[], open_orders=[])
         r = fq.inquire(broker, broker_order_id=ORDER, ordered_quantity=1,
-                       now=T0)
+                       now=T0, since=T0 - timedelta(seconds=60))
+        assert r.status == fq.STATUS_NO_FILL
+        assert r.terminal is False
+        assert r.as_store_fill() is None, (
+            "nothing may act on it while the fill could still surface")
+
+    def test_no_fill_and_long_gone_is_terminal(self):
+        """The other half: a row that can never resolve must not hold the
+        position slot forever, so past the publication window silence is
+        finally believed."""
+        broker = FakeBroker(fills=[], open_orders=[])
+        r = fq.inquire(
+            broker, broker_order_id=ORDER, ordered_quantity=1, now=T0,
+            since=T0 - timedelta(
+                seconds=fq.NO_FILL_CONFIRMATION_GRACE_SECONDS + 60))
         assert r.status == fq.STATUS_NO_FILL
         assert r.terminal is True
         assert r.as_store_fill()["terminal"] is True
+
+    def test_an_order_of_unknown_age_is_never_terminal(self):
+        """Ignorance is not evidence; abandoning on it is the bug."""
+        broker = FakeBroker(fills=[], open_orders=[])
+        r = fq.inquire(broker, broker_order_id=ORDER, ordered_quantity=1,
+                       now=T0, since=None)
+        assert r.terminal is False
 
     def test_partial_fill_reports_cumulative_and_remaining(self):
         broker = FakeBroker(fills=[fill_row(qty="1")],

@@ -145,3 +145,25 @@ def _isolate_kis_rate_limiter(monkeypatch, tmp_path):
     yield
     kis_rate_limiter.reset_limiter()
     kis_token_cache.reset_cache()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_s6_execution_lock(monkeypatch, tmp_path):
+    """The entry cycle now takes a real flock around its submission.
+
+    Its production default is `/home/ubuntu/logs/cron/s6_exec.lock`,
+    resolved at call time. Unisolated, a test that reaches the submit
+    step would try to create `/home/ubuntu/logs/cron` on the developer's
+    machine -- failing there, and on a host WITH that path, taking the
+    lock the live exit monitor uses. Neither is acceptable from a test.
+
+    Same reasoning for the monitor heartbeat, which is a file the health
+    check writes on every evaluated tick.
+    """
+    monkeypatch.setenv("S6_EXECUTION_LOCK_FILE", str(tmp_path / "s6_exec.lock"))
+    monkeypatch.setenv("S6_MONITOR_HEARTBEAT_FILE",
+                       str(tmp_path / "s6_monitor_heartbeat.json"))
+    # Tests must never spend real seconds waiting for a lock nothing else
+    # is holding; contention itself is exercised explicitly in
+    # tests/test_execution_lock_scope.py.
+    monkeypatch.setenv("S6_EXECUTION_LOCK_TIMEOUT_SECONDS", "0")

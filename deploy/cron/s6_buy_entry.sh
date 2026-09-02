@@ -26,9 +26,28 @@
 # hold -- the idempotency ledger and the symbol lock are durable -- but
 # the correct place to not send a second order is before deciding to.
 #
-# The lock is SHARED WITH s6_exec.sh deliberately. The runtime tick syncs
-# fills and can open positions from them; an entry deciding "this symbol
-# is flat" while that is landing is the race the shared lock removes.
+# Two DIFFERENT locks, for two different jobs
+# -------------------------------------------
+# `s6_entry.lock` (here) stops two ENTRY CYCLES overlapping. That is all
+# it does. It is not a broker lock and nothing else takes it.
+#
+# `s6_exec.lock` still serialises BROKER MUTATION, and this script no
+# longer takes it: the cycle acquires it in Python, around the
+# submission alone, and revalidates under it (execution/execution_lock.py
+# and kis_live_trading._revalidate_before_submit).
+#
+# It used to take `s6_exec.lock` here, for the whole process, so the
+# runtime tick could not open a position from a fill while an entry was
+# deciding a symbol was flat. That race is still closed -- the fill sync
+# and the submission both hold `s6_exec.lock`, and the entry re-reads
+# the position store, the open-order book and orderable cash under it.
+# What is no longer serialised is the ANALYSIS, which never mutated
+# anything and was holding the lock for minutes at a time.
+#
+# On 2026-09-02 that cost a position: the one-minute exit monitor got
+# execution access 1 tick in 29, a filled BUY went unsynced, and the
+# entry timeout closed it as BUY_NEVER_FILLED while the account held
+# seven shares.
 set -u
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
@@ -72,17 +91,18 @@ echo "$(date -u +%FT%TZ) tick sha=$SCANNER_SHA root=$SCANNER_RUNTIME_ROOT" >> "$
 # entry costs an opportunity; making S1's executor wait costs the
 # management of a real open position, and on 2026-08-27 that ended with
 # its watchdog disabling entries for every strategy.
-flock -n -E 99 /home/ubuntu/logs/cron/s6_exec.lock \
+flock -n -E 99 /home/ubuntu/logs/cron/s6_entry.lock \
   env TRADING_PROJECT_ROOT="$SCANNER_RUNTIME_ROOT" \
       SCANNER_CANDIDATE_DIR="${SCANNER_CANDIDATE_DIR:-}" \
       KIS_LOCK_OWNER=S6_ENTRY \
       KIS_LOCK_ACQUIRE_TIMEOUT_SECONDS=1 \
+      S6_EXECUTION_LOCK_FILE=/home/ubuntu/logs/cron/s6_exec.lock \
   "$SCANNER_RUNTIME_ROOT/venv/bin/python" \
     "$SCANNER_RUNTIME_ROOT/scripts/run_live_buy_entry.py" --strategy s6 \
     >> "$LOG" 2>&1
 STATUS=$?
 if [ "$STATUS" -eq 99 ]; then
-    echo "$(date -u +%FT%TZ) OVERLAP_SKIPPED lock=/home/ubuntu/logs/cron/s6_exec.lock (an S6 execution cycle is already running; this tick is dropped, not queued)" >> "$LOG"
+    echo "$(date -u +%FT%TZ) OVERLAP_SKIPPED lock=/home/ubuntu/logs/cron/s6_entry.lock (the previous entry cycle is still running; this tick is dropped, not queued)" >> "$LOG"
     exit 0
 fi
 echo "$(date -u +%FT%TZ) LOCK_ACQUIRED status=$STATUS" >> "$LOG"

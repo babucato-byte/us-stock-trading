@@ -71,6 +71,8 @@ from domain.instrument import Instrument, InstrumentError, build_instrument
 from domain.order_intent import OrderIntent, OrderIntentError
 from domain.signal import Signal, SignalError, build_signal
 from execution import entry_limits, execution_engine, idempotency, order_gate
+from execution.execution_lock import ExecutionLockUnavailable
+from execution import execution_lock
 from market_data.exchange_registry import (
     ExchangeResolutionError,
     build_kis_instrument,
@@ -380,6 +382,151 @@ def _session_permitted(source, rollout) -> bool:
         if rollout.regular_session_only else True
 
 
+#: Who this cycle identifies itself as while holding the lock.
+_EXEC_LOCK_OWNER_ENTRY = "S6_ENTRY_SUBMIT"
+
+#: Reason codes for an entry dropped by the under-lock revalidation.
+#:
+#: Every one of these means the prepared entry was CORRECT when it was
+#: prepared and is not correct now. Dropping is the whole point: the
+#: analysis that produced it ran without the execution lock, so between
+#: deciding and submitting, the world was free to move.
+REVALIDATION_HALT = "REVALIDATION_HALT"
+REVALIDATION_ENTRY_OFF = "REVALIDATION_ENTRY_OFF"
+REVALIDATION_ENTRY_DISABLED_ENV = "REVALIDATION_ENTRY_DISABLED_ENV"
+REVALIDATION_EXIT_IN_FLIGHT = "REVALIDATION_EXIT_IN_FLIGHT"
+REVALIDATION_SYMBOL_HELD = "REVALIDATION_SYMBOL_HELD"
+REVALIDATION_SIGNAL_EXPIRED = "REVALIDATION_SIGNAL_EXPIRED"
+REVALIDATION_STATE_UNREADABLE = "REVALIDATION_STATE_UNREADABLE"
+
+
+def _revalidate_before_submit(*, symbol, broker, conn, instrument, order_intent,
+                              buffered_price, live_state, signal=None,
+                              now=None):
+    """Re-ask, holding the execution lock, everything that could have
+    changed while the analysis ran unlocked.
+
+    Returns `(reason_code, detail)` to DROP the prepared entry, or None
+    to proceed. On success it REFRESHES `live_state` so the gate context
+    is built from what is true now rather than from what was true when
+    the candidate was picked.
+
+    Everything here is either a local read or a broker read that the
+    submission is about to depend on anyway. What it does NOT re-do is
+    the gate: `entry_limits.collect()` and the reconciliation snapshot
+    are gathered by the context builder, which runs inside this same
+    lock, so the caps, SYMBOL_ALREADY_HELD and reconciliation are
+    already evaluated against current state and are not duplicated here.
+
+    Fails CLOSED. A read that cannot be completed drops the entry --
+    an entry is an opportunity, and the cost of missing one is a tick.
+    """
+    from live_pilot import posture as live_posture
+
+    moment = now or datetime.now(timezone.utc)
+
+    # 0. Is the signal still current?
+    #
+    #    The gate asks this too, but against the CYCLE's clock -- the
+    #    same value every symbol shares, stamped before the analysis
+    #    began. That was harmless while the analysis was inside the lock
+    #    and measured in seconds. It is not harmless now: a signal can
+    #    expire during minutes of unlocked pre-trade validation and the
+    #    gate would still be comparing it against the moment the cycle
+    #    started. Asked here against the real clock.
+    if signal is not None:
+        try:
+            expired = signal.is_expired(now=moment)
+        except Exception:  # noqa: BLE001 -- fail closed
+            return (REVALIDATION_STATE_UNREADABLE,
+                    "the signal's freshness could not be determined")
+        if expired:
+            return (REVALIDATION_SIGNAL_EXPIRED,
+                    f"the {symbol} signal expired while the entry was being "
+                    "prepared")
+
+    # 1. The two kill switches and the operator posture. All three were
+    #    checked once at the top of the cycle, minutes ago.
+    try:
+        if ops_kill_switch.is_halted():
+            return (REVALIDATION_HALT,
+                    "operations HALT was set while this entry was being prepared")
+        if not ops_kill_switch.is_entry_allowed():
+            return (REVALIDATION_ENTRY_OFF,
+                    "ENTRY_OFF was set while this entry was being prepared")
+    except Exception as exc:  # noqa: BLE001 -- unreadable switch = no order
+        return (REVALIDATION_STATE_UNREADABLE,
+                f"the kill switch could not be re-read: {type(exc).__name__}")
+
+    if live_posture.env_bool(os.environ, live_posture.FLAG_ENTRY_DISABLED, False):
+        return (REVALIDATION_ENTRY_DISABLED_ENV,
+                f"{live_posture.FLAG_ENTRY_DISABLED} was set while this entry "
+                "was being prepared")
+
+    # 2. An exit that went in flight while we were preparing. A position
+    #    already at risk outranks a new one -- the same rule the entry
+    #    applies at start-up, re-asked because start-up was minutes ago.
+    #    Also catches the symbol becoming held by anyone, including by an
+    #    earlier candidate in this very cycle.
+    try:
+        from s6_live import position_store as _s6_store
+
+        for _pid, row in _s6_store.load_live(conn):
+            if row.get("exit_submitted"):
+                return (REVALIDATION_EXIT_IN_FLIGHT,
+                        "an S6 exit reached the broker while this entry was "
+                        "being prepared")
+        existing = _s6_store.load_by_symbol(conn, symbol)
+        if existing is not None and existing.get("status") in _s6_store.LIVE_STATUSES:
+            return (REVALIDATION_SYMBOL_HELD,
+                    f"{symbol} became live in the canonical store "
+                    f"({existing.get('status')}) while this entry was being prepared")
+    except Exception as exc:  # noqa: BLE001 -- fail closed
+        return (REVALIDATION_STATE_UNREADABLE,
+                f"the S6 position store could not be re-read: {type(exc).__name__}")
+
+    # 3. A resting order for this symbol. The pre-lock read of the open
+    #    order book is now minutes old, and a duplicate BUY is the one
+    #    mistake this whole lock exists to make impossible.
+    try:
+        open_orders = broker.get_open_orders() or []
+    except Exception as exc:  # noqa: BLE001 -- fail closed
+        return (REVALIDATION_STATE_UNREADABLE,
+                f"the open order book could not be re-read: {type(exc).__name__}")
+    # REFRESHED, not decided here. The gate already refuses a symbol
+    # with a resting order, with its own reason code and its own audit
+    # event, and the execution engine's idempotency ledger refuses a
+    # repeated signal behind it. Both were reaching the RIGHT answer from
+    # a STALE reading -- the open-order book as it looked before the
+    # analysis. Handing them a current one is the fix; making the
+    # decision here as well would only shadow the more specific refusal
+    # and lose DUPLICATE_BLOCKED from the audit trail.
+    live_state["has_open_order_for_symbol"] = any(
+        (o.get("pdno") or o.get("PDNO")) == symbol
+        for o in open_orders if hasattr(o, "get")
+    )
+
+    # 4. Orderable cash. Another entry in this cycle may have spent it,
+    #    and an order the account cannot fund is a rejection at best.
+    try:
+        available_usd = broker.get_orderable_usd(instrument, buffered_price)
+    except Exception as exc:  # noqa: BLE001 -- fail closed
+        return (REVALIDATION_STATE_UNREADABLE,
+                f"orderable cash could not be re-read: {type(exc).__name__}")
+    # Rounded to cents before comparing. 7 x 17.01 is 119.07000000000001
+    # in binary floating point, so an account holding exactly 119.07 --
+    # which can afford the order -- would be refused for being a
+    # hundred-billionth of a cent short.
+    # Refreshed, not re-decided -- same reasoning as the open-order book
+    # above. The gate already refuses an order the account cannot fund,
+    # with its own CASH code; it was simply doing so against the balance
+    # as it stood before the analysis. A second cash rule here would be a
+    # new safety gate with subtly different arithmetic, which is worse
+    # than the staleness it would be trying to fix.
+    live_state["available_usd"] = available_usd
+    return None
+
+
 def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                              candidate_source=None):
     """Returns a results dict: {"submitted": [...], "blocked": [(symbol, reason)], "skipped": [...]}.
@@ -402,6 +549,16 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
     safe, and they diverge silently.
     """
     current = now or datetime.now(timezone.utc)
+    # Real time at which this cycle began, kept alongside `current`.
+    #
+    # The revalidation below needs to know how long the analysis actually
+    # took -- that is the whole window it guards. It cannot read the wall
+    # clock directly: `current` is injectable, and a caller that supplies
+    # a fixed clock would then have its signals measured against today,
+    # which makes every injected-clock cycle look expired. So elapsed
+    # time is measured in wall time and ADDED to the cycle's own clock,
+    # which is correct under both.
+    cycle_wall_start = datetime.now(timezone.utc)
     results = {"submitted": [], "blocked": [], "skipped": []}
     cycle_run_id = shadow_audit.new_run_id()
 
@@ -864,11 +1021,21 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                     logger.info("S1 execution price OK for %s: %s",
                                 symbol, execution_price_verdict.detail)
 
+                # The two values the revalidation refreshes once the
+                # execution lock is held. Read through this dict rather
+                # than captured as defaults: the builder runs INSIDE the
+                # lock, and binding them here would hand the gate the
+                # numbers from before the analysis, which is exactly the
+                # staleness moving the lock was meant to remove.
+                live_state = {
+                    "available_usd": available_usd,
+                    "has_open_order_for_symbol": has_open_order_for_symbol,
+                }
+
                 def _buy_ctx_builder(
                     reconciliation,
                     signal=signal, instrument=instrument, order_intent=order_intent,
-                    kis_price=kis_quote.price_usd, available_usd=available_usd,
-                    has_open_order_for_symbol=has_open_order_for_symbol,
+                    kis_price=kis_quote.price_usd, live_state=live_state,
                     execution_price_verdict=execution_price_verdict,
                 ):
                     # Collected inside the builder, so it is read at gate
@@ -901,7 +1068,8 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                         order_intent=order_intent, instrument=instrument, signal=signal,
                         is_regular_session=is_regular_session, kis_price_usd=kis_price,
                         max_price_deviation_percent=rollout.max_price_deviation_percent,
-                        usd_orderable_cash=available_usd, has_open_order_for_symbol=has_open_order_for_symbol,
+                        usd_orderable_cash=live_state["available_usd"],
+                        has_open_order_for_symbol=live_state["has_open_order_for_symbol"],
                         has_order_for_signal_id=False, allowed_symbols=allowed_symbols,
                         # CODEX-044: supplied BY the Execution Engine from its
                         # own live KIS reads -- this pipeline cannot assert
@@ -934,18 +1102,63 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                 submit_at = datetime.now(timezone.utc)
 
                 try:
-                    # CODEX-048: audit_run_id lets the Execution Engine
-                    # record GATE_APPROVED and EXECUTION_PLANNED BEFORE it
-                    # calls the broker. Recording them here, after this
-                    # call returns, would leave a crash during the broker
-                    # call with no audit of the approval that authorized
-                    # an order that may already have reached KIS.
-                    result = execution_engine.submit_buy_order(
-                        order_intent=order_intent, buy_gate_context_builder=_buy_ctx_builder,
-                        conn=conn, broker=broker, instrument=instrument,
-                        account_id=account_snapshot.account_id, now=current,
-                        audit_run_id=run_id,
-                    )
+                    # THE CRITICAL SECTION, and only this.
+                    #
+                    # Everything above -- candidates, precision watch,
+                    # pre-trade validation, quotes, sizing -- ran without
+                    # this lock. That is the point: holding it across the
+                    # whole cycle is what starved the one-minute exit
+                    # monitor down to 1 acquisition in 29 on 2026-09-02,
+                    # and enforced a 180-second TTL at 782 and 836
+                    # seconds. What is serialised here is the mutation,
+                    # not the thinking that led to it.
+                    #
+                    # The gate context builder runs INSIDE this block, so
+                    # `entry_limits` (the caps and SYMBOL_ALREADY_HELD)
+                    # and the reconciliation snapshot are gathered against
+                    # current state rather than re-checked afterwards.
+                    with execution_lock.hold(_EXEC_LOCK_OWNER_ENTRY):
+                        dropped = _revalidate_before_submit(
+                            symbol=symbol, broker=broker, conn=conn,
+                            instrument=instrument, order_intent=order_intent,
+                            buffered_price=buffered_price, live_state=live_state,
+                            signal=signal,
+                            now=current + (datetime.now(timezone.utc)
+                                           - cycle_wall_start))
+                        if dropped is not None:
+                            revalidation_code, revalidation_detail = dropped
+                            logger.info(
+                                "ENTRY_REVALIDATION_DROPPED %s reason=%s: %s",
+                                symbol, revalidation_code, revalidation_detail)
+                            results["blocked"].append((symbol, revalidation_detail))
+                            _persist_blocked_record(
+                                symbol=symbol,
+                                account_available_usd=live_state["available_usd"],
+                                risk_gate_result="BLOCKED",
+                                rejection_reason=revalidation_detail, now=current,
+                            )
+                            outcome["result"] = shadow_audit.RESULT_BLOCKED
+                            outcome["reason_code"] = revalidation_code
+                            outcome["detail"] = revalidation_detail
+                            _audit(run_id, shadow_audit.GATE_REJECTED,
+                                   shadow_audit.RESULT_BLOCKED, symbol=symbol,
+                                   signal_id=signal.signal_id,
+                                   internal_order_id=order_intent.internal_order_id,
+                                   reason_code=revalidation_code,
+                                   detail=revalidation_detail, now=current)
+                            continue
+                        # CODEX-048: audit_run_id lets the Execution Engine
+                        # record GATE_APPROVED and EXECUTION_PLANNED BEFORE it
+                        # calls the broker. Recording them here, after this
+                        # call returns, would leave a crash during the broker
+                        # call with no audit of the approval that authorized
+                        # an order that may already have reached KIS.
+                        result = execution_engine.submit_buy_order(
+                            order_intent=order_intent, buy_gate_context_builder=_buy_ctx_builder,
+                            conn=conn, broker=broker, instrument=instrument,
+                            account_id=account_snapshot.account_id, now=current,
+                            audit_run_id=run_id,
+                        )
                     # A REJECTED transport result is not a submission.
                     #
                     # `submit_buy_order` PERSISTS the broker's answer and
@@ -1073,6 +1286,25 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                         # Surfaced via results["blocked"] as a warning entry so
                         # it's visible, but the symbol stays in "submitted".
                         results["blocked"].append((symbol, f"WARNING: position tracking failed after successful buy: {exc}"))
+                except ExecutionLockUnavailable as exc:
+                    # Something else holds execution access -- an exit, a
+                    # runtime tick, reconciliation. All of them outrank a
+                    # new entry, so this drops the prepared order rather
+                    # than queue behind them. Nothing was sent.
+                    reason = ("execution access is held by another cycle; "
+                              "this entry was dropped before submission")
+                    logger.info("ENTRY_LOCK_UNAVAILABLE %s: %s", symbol, exc)
+                    results["blocked"].append((symbol, reason))
+                    outcome["result"] = shadow_audit.RESULT_BLOCKED
+                    outcome["reason_code"] = "EXECUTION_LOCK_UNAVAILABLE"
+                    outcome["detail"] = reason
+                    _audit(run_id, shadow_audit.GATE_REJECTED,
+                           shadow_audit.RESULT_BLOCKED, symbol=symbol,
+                           signal_id=signal.signal_id,
+                           internal_order_id=order_intent.internal_order_id,
+                           reason_code="EXECUTION_LOCK_UNAVAILABLE",
+                           detail=reason, now=current)
+                    continue
                 except ExecutionEngineError as exc:
                     results["blocked"].append((symbol, str(exc)))
                     shadow_mode.persist(_shadow_record("BLOCKED", str(exc)))

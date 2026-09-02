@@ -65,7 +65,27 @@ LOG=/home/ubuntu/releases/us-stock-trading/shared/state/s6_exit_monitor_$(date -
 # position.
 # No acquire-timeout override: an exit outranks a new entry and takes
 # the default patience. It is the entry that yields, not this.
-flock -n /home/ubuntu/logs/cron/s6_exec.lock \
+# Every scheduled tick leaves a line, whether or not it ran.
+#
+# It used to leave one only when it ran. A tick that could not take the
+# lock exited silently, so a monitor blocked for eleven consecutive
+# minutes and a monitor with nothing to do produced identical logs --
+# both empty. On 2026-09-02 that hid the starvation completely: the
+# evidence that the one-minute monitor was acquiring the lock 1 tick in
+# 29 had to be reconstructed afterwards from cron firings in syslog,
+# because the monitor's own log said nothing at all.
+echo "$(date -u +%FT%TZ) MONITOR_TICK held=$HELD" >> "$LOG"
+flock -n -E 99 /home/ubuntu/logs/cron/s6_exec.lock \
   env PYTHONPATH="$ROOT" TRADING_PROJECT_ROOT="$ROOT" \
       KIS_LOCK_OWNER=S6_EXIT \
+      S6_EXECUTION_LOCK_FILE=/home/ubuntu/logs/cron/s6_exec.lock \
   "$ROOT/venv/bin/python" "$ROOT/scripts/run_s6_runtime.py" >> "$LOG" 2>&1
+STATUS=$?
+if [ "$STATUS" -eq 99 ]; then
+    # Not a failure, and not a success either: a held position went
+    # un-evaluated this minute. Named so it can be counted.
+    echo "$(date -u +%FT%TZ) MONITOR_LOCK_SKIPPED held=$HELD lock=/home/ubuntu/logs/cron/s6_exec.lock" >> "$LOG"
+    exit 0
+fi
+echo "$(date -u +%FT%TZ) MONITOR_EVALUATED held=$HELD status=$STATUS" >> "$LOG"
+exit "$STATUS"
