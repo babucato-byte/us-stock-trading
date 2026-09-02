@@ -141,6 +141,13 @@ class TestEvaluateBuyGate:
         with pytest.raises(OrderGateBlockedError, match="expired"):
             evaluate_buy_gate(_buy_ctx(now=NOW + timedelta(minutes=10)))
 
+    def test_signal_validity_keeps_its_historical_cycle_clock_semantics(self):
+        signal = _signal(valid_for_seconds=120)
+        assert evaluate_buy_gate(_buy_ctx(signal=signal, now=NOW)) is True
+        with pytest.raises(OrderGateBlockedError, match="expired"):
+            evaluate_buy_gate(_buy_ctx(
+                signal=signal, now=NOW + timedelta(seconds=121)))
+
     def test_invalid_kis_price_blocked(self):
         with pytest.raises(OrderGateBlockedError, match="KIS price is invalid"):
             evaluate_buy_gate(_buy_ctx(kis_price_usd=-1.0))

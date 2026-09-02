@@ -130,6 +130,16 @@ class TestTheKillSwitchesAreReAsked:
 
 
 class TestAnExitOutranksTheEntry:
+    def test_an_exit_that_became_pending_drops_the_order(self, conn):
+        pid = position_store.record_submission(
+            conn, symbol="MTCH", variant="S6-R", entry_session="REGULAR",
+            client_order_id="cid-mtch", now=NOW)
+        position_store.open_from_fill(conn, pid, quantity=2,
+                                      average_fill_price=41.36, now=NOW)
+        position_store.latch_pending_exit(conn, pid, "VWAP_FAILURE", now=NOW)
+        code, _ = _revalidate(conn, _Broker())
+        assert code == klt.REVALIDATION_EXIT_IN_FLIGHT
+
     def test_an_exit_that_reached_the_broker_drops_the_order(self, conn):
         pid = position_store.record_submission(
             conn, symbol="MTCH", variant="S6-R", entry_session="REGULAR",
@@ -206,21 +216,23 @@ class TestCashIsReReadUnderTheLock:
         assert code == klt.REVALIDATION_STATE_UNREADABLE
 
 
-class TestTheCandidateMustStillBeCurrent:
-    def test_a_signal_that_expired_during_analysis_drops_the_order(self, conn):
-        code, _ = _revalidate(conn, _Broker(), signal=_Signal(expired=True))
-        assert code == klt.REVALIDATION_SIGNAL_EXPIRED
+class TestSignalFreshnessRemainsCycleScoped:
+    def test_analysis_over_120_seconds_does_not_add_a_submit_time_refusal(
+            self, conn):
+        """The historical gate owns freshness against the cycle clock.
 
-    def test_freshness_is_measured_at_submit_time_not_cycle_start(self, conn):
-        """The gate asks against the cycle's clock, which is stamped
-        before minutes of unlocked analysis. This must not."""
-        seen = {}
+        A lock refactor must not silently ask the same signal again
+        against a wall clock five minutes later and change trade selection.
+        """
+        calls = []
 
-        class _Recording(_Signal):
+        class _ExpiredAtSubmit(_Signal):
             def is_expired(self, now=None):
-                seen["now"] = now
-                return False
+                calls.append(now)
+                return True
 
-        later = NOW + timedelta(minutes=5)
-        _revalidate(conn, _Broker(), signal=_Recording(), now=later)
-        assert seen["now"] == later
+        assert klt.SIGNAL_VALID_SECONDS == 120
+        assert _revalidate(
+            conn, _Broker(), signal=_ExpiredAtSubmit(),
+            now=NOW + timedelta(minutes=5)) is None
+        assert calls == [], "submit-time revalidation must not re-ask freshness"

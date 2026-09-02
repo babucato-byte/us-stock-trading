@@ -396,7 +396,6 @@ REVALIDATION_ENTRY_OFF = "REVALIDATION_ENTRY_OFF"
 REVALIDATION_ENTRY_DISABLED_ENV = "REVALIDATION_ENTRY_DISABLED_ENV"
 REVALIDATION_EXIT_IN_FLIGHT = "REVALIDATION_EXIT_IN_FLIGHT"
 REVALIDATION_SYMBOL_HELD = "REVALIDATION_SYMBOL_HELD"
-REVALIDATION_SIGNAL_EXPIRED = "REVALIDATION_SIGNAL_EXPIRED"
 REVALIDATION_STATE_UNREADABLE = "REVALIDATION_STATE_UNREADABLE"
 
 
@@ -428,27 +427,23 @@ def _revalidate_before_submit(*, symbol, broker, conn, instrument, order_intent,
     """
     from live_pilot import posture as live_posture
 
-    moment = now or datetime.now(timezone.utc)
-
-    # 0. Is the signal still current?
+    # Signal freshness is NOT re-asked here, and that is deliberate.
     #
-    #    The gate asks this too, but against the CYCLE's clock -- the
-    #    same value every symbol shares, stamped before the analysis
-    #    began. That was harmless while the analysis was inside the lock
-    #    and measured in seconds. It is not harmless now: a signal can
-    #    expire during minutes of unlocked pre-trade validation and the
-    #    gate would still be comparing it against the moment the cycle
-    #    started. Asked here against the real clock.
-    if signal is not None:
-        try:
-            expired = signal.is_expired(now=moment)
-        except Exception:  # noqa: BLE001 -- fail closed
-            return (REVALIDATION_STATE_UNREADABLE,
-                    "the signal's freshness could not be determined")
-        if expired:
-            return (REVALIDATION_SIGNAL_EXPIRED,
-                    f"the {symbol} signal expired while the entry was being "
-                    "prepared")
+    # It was, briefly, and it stopped S6 trading. `SIGNAL_VALID_SECONDS`
+    # is 120 while an entry cycle legitimately takes two to five minutes,
+    # so measuring the signal against the real clock at submit time
+    # expired every candidate -- 2 of 2 on 2026-09-02 -- and replaced
+    # lock starvation with expiry starvation.
+    #
+    # The gate asks this against the cycle's own clock, which makes the
+    # 120s window effectively "this cycle". Whether that window SHOULD
+    # be measured across the pipeline is a real question about a risk
+    # parameter, and the answer is not this function's to give: changing
+    # when a signal counts as stale changes which trades happen, and
+    # that belongs to the strategy, not to a lock refactor.
+    #
+    # What this function may do is make the gate's inputs current. What
+    # it may not do is quietly redefine one of them.
 
     # 1. The two kill switches and the operator posture. All three were
     #    checked once at the top of the cycle, minutes ago.
@@ -477,10 +472,10 @@ def _revalidate_before_submit(*, symbol, broker, conn, instrument, order_intent,
         from s6_live import position_store as _s6_store
 
         for _pid, row in _s6_store.load_live(conn):
-            if row.get("exit_submitted"):
+            if row.get("exit_submitted") or row.get("pending_exit_reason"):
                 return (REVALIDATION_EXIT_IN_FLIGHT,
-                        "an S6 exit reached the broker while this entry was "
-                        "being prepared")
+                        "an S6 exit became pending or reached the broker while "
+                        "this entry was being prepared")
         existing = _s6_store.load_by_symbol(conn, symbol)
         if existing is not None and existing.get("status") in _s6_store.LIVE_STATUSES:
             return (REVALIDATION_SYMBOL_HELD,
@@ -554,16 +549,6 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
     safe, and they diverge silently.
     """
     current = now or datetime.now(timezone.utc)
-    # Real time at which this cycle began, kept alongside `current`.
-    #
-    # The revalidation below needs to know how long the analysis actually
-    # took -- that is the whole window it guards. It cannot read the wall
-    # clock directly: `current` is injectable, and a caller that supplies
-    # a fixed clock would then have its signals measured against today,
-    # which makes every injected-clock cycle look expired. So elapsed
-    # time is measured in wall time and ADDED to the cycle's own clock,
-    # which is correct under both.
-    cycle_wall_start = datetime.now(timezone.utc)
     results = {"submitted": [], "blocked": [], "skipped": []}
     cycle_run_id = shadow_audit.new_run_id()
 
@@ -1127,9 +1112,7 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                             symbol=symbol, broker=broker, conn=conn,
                             instrument=instrument, order_intent=order_intent,
                             buffered_price=buffered_price, live_state=live_state,
-                            signal=signal,
-                            now=current + (datetime.now(timezone.utc)
-                                           - cycle_wall_start))
+                            signal=signal, now=current)
                         if dropped is not None:
                             revalidation_code, revalidation_detail = dropped
                             logger.info(
