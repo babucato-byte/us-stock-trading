@@ -375,6 +375,33 @@ def stale_temp_min_age():
     return _float_env("KIS_RATE_LIMIT_STALE_TEMP_MIN_AGE_SECONDS", 0.0)
 
 
+#: How many callers may be queued on one category at once. Not a limit
+#: that is enforced anywhere -- it is the depth the corruption guard is
+#: willing to believe the limiter itself produced. Seven READ consumers
+#: were observed concurrently on 2026-09-01 (four scanners, two
+#: reconciliation passes, the collector); this leaves room for that and
+#: for growth, while keeping a wildly wrong timestamp detectable.
+DEFAULT_MAX_RESERVATION_DEPTH = 16
+RESERVATION_DEPTH_ENV = "KIS_RATE_LIMIT_MAX_RESERVATION_DEPTH"
+
+
+def max_reservation_depth():
+    depth = _float_env(RESERVATION_DEPTH_ENV, DEFAULT_MAX_RESERVATION_DEPTH)
+    return depth if depth >= 1 else DEFAULT_MAX_RESERVATION_DEPTH
+
+
+def _future_horizon(interval):
+    """The furthest ahead a legitimate reservation can sit.
+
+    Derived from what the limiter can actually do -- `interval` per
+    queued caller, up to the believed depth -- rather than from a
+    tolerance picked to make the error stop. Raising `max_clock_skew`
+    instead would have blunted genuine clock detection to fix a
+    concurrency bug.
+    """
+    return interval * max_reservation_depth() + max_clock_skew()
+
+
 def max_clock_skew():
     return _float_env("KIS_RATE_LIMIT_MAX_CLOCK_SKEW_SECONDS", DEFAULT_MAX_CLOCK_SKEW)
 
@@ -634,16 +661,35 @@ class KisRateLimiter:
                         f"KIS rate-limit timestamp for {category} is not a usable time",
                         detail=repr(last))
                 elapsed = now - last
-                # A recorded time may legitimately be up to one interval
-                # in the FUTURE: that is a slot another caller reserved
-                # and has not reached yet. Anything beyond that is a
-                # clock or a file an operator has to fix -- waiting it
-                # out could block for hours, and ignoring it would
-                # bypass pacing entirely.
-                if elapsed < -(max_clock_skew() + interval):
+                # A recorded time is legitimately in the FUTURE whenever
+                # callers are queued: each reservation moves `last`
+                # forward by exactly one interval, so N waiting callers
+                # put it N intervals ahead. The horizon has to allow for
+                # that depth or the limiter reports its own correct
+                # behaviour as corruption.
+                #
+                # It did. The old bound was one interval plus skew -- 8s
+                # for READ -- which tolerates two queued callers and
+                # rejects the third at 9s. On 2026-09-01 seven READ
+                # consumers ran concurrently (four scanners, two
+                # reconciliation passes, the collector) and the observed
+                # rejections were 8.1s and 8.6s: three reservations deep,
+                # every one of them legitimate. It aborted 81
+                # reconciliation passes, 24 scans and one exit-monitor
+                # tick -- and an exit that cannot read is the one failure
+                # this system cannot accept.
+                #
+                # Still bounded, and still fails closed on real
+                # corruption: a timestamp beyond the deepest queue the
+                # limiter could have produced is a clock or a file an
+                # operator has to fix, and waiting it out could block for
+                # hours.
+                if elapsed < -_future_horizon(interval):
                     raise KISRateLimitStateInvalid(
                         f"KIS rate-limit timestamp for {category} is "
-                        f"{abs(elapsed):.1f}s in the future",
+                        f"{abs(elapsed):.1f}s in the future, beyond the "
+                        f"reservation horizon of "
+                        f"{_future_horizon(interval):.1f}s",
                         detail="future_timestamp")
                 if elapsed < interval:
                     # RESERVE the slot; do not occupy it here.
