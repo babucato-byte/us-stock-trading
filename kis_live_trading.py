@@ -472,10 +472,25 @@ def _revalidate_before_submit(*, symbol, broker, conn, instrument, order_intent,
         from s6_live import position_store as _s6_store
 
         for _pid, row in _s6_store.load_live(conn):
-            if row.get("exit_submitted") or row.get("pending_exit_reason"):
+            # `exit_submitted` ONLY, and deliberately not
+            # `pending_exit_reason`.
+            #
+            # A latched exit that cannot be submitted is not competing
+            # for anything. RIG latched EXIT_PENDING on a Friday at
+            # 19:52 with its route unavailable all weekend; treating
+            # that as "an exit is in flight" deferred every entry for
+            # three days to protect a cycle that was never going to
+            # start. `scripts/run_live_buy_entry._exit_in_flight` draws
+            # the same distinction, and asks `session_capability`
+            # before letting a latched exit stand anything down.
+            #
+            # What this check is for is narrower and always true when it
+            # fires: an order is LIVE at the broker, and a new one must
+            # not race it.
+            if row.get("exit_submitted"):
                 return (REVALIDATION_EXIT_IN_FLIGHT,
-                        "an S6 exit became pending or reached the broker while "
-                        "this entry was being prepared")
+                        "an S6 exit reached the broker while this entry was "
+                        "being prepared")
         existing = _s6_store.load_by_symbol(conn, symbol)
         if existing is not None and existing.get("status") in _s6_store.LIVE_STATUSES:
             return (REVALIDATION_SYMBOL_HELD,

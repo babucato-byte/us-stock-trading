@@ -130,15 +130,18 @@ class TestTheKillSwitchesAreReAsked:
 
 
 class TestAnExitOutranksTheEntry:
-    def test_an_exit_that_became_pending_drops_the_order(self, conn):
+    def test_a_latched_pending_exit_alone_does_not_drop_the_order(self, conn):
+        """RIG, 2026: a latched EXIT_PENDING whose route was unavailable
+        returned "exit in flight" for three days and deferred every
+        entry, protecting a cycle that could never start. Only an order
+        actually at the broker stands a new entry down here."""
         pid = position_store.record_submission(
             conn, symbol="MTCH", variant="S6-R", entry_session="REGULAR",
             client_order_id="cid-mtch", now=NOW)
         position_store.open_from_fill(conn, pid, quantity=2,
                                       average_fill_price=41.36, now=NOW)
         position_store.latch_pending_exit(conn, pid, "VWAP_FAILURE", now=NOW)
-        code, _ = _revalidate(conn, _Broker())
-        assert code == klt.REVALIDATION_EXIT_IN_FLIGHT
+        assert _revalidate(conn, _Broker()) is None
 
     def test_an_exit_that_reached_the_broker_drops_the_order(self, conn):
         pid = position_store.record_submission(
