@@ -111,3 +111,82 @@ def _group(match, index) -> Optional[float]:
         return float(match.group(index))
     except (IndexError, TypeError, ValueError):
         return None
+
+
+# -- DATA_ERROR diagnostics -------------------------------------------
+#
+# `DATA_ERROR` is one bucket in the scan summary, and on 2026-09-02 it was
+# 592 of 593 symbols for six consecutive overnight scans with `rejected=0`
+# -- the strategy was never consulted at all. The aggregate could not say
+# whether that was thin overnight liquidity doing exactly what it always
+# does, or a fetch path that had stopped working, and those two call for
+# opposite responses.
+#
+# So each DATA_ERROR is also filed under one diagnostic category. This is
+# OBSERVATIONAL ONLY: nothing branches on it, no symbol's fate changes,
+# and the existing `DATA_ERROR` count is untouched.
+
+INSUFFICIENT_POST_RANGE_BARS = "INSUFFICIENT_POST_RANGE_BARS"
+MISSING_VWAP = "MISSING_VWAP"
+MISSING_EMA = "MISSING_EMA"
+STALE_DATA = "STALE_DATA"
+NO_EXECUTABLE_PRICE = "NO_EXECUTABLE_PRICE"
+KIS_FETCH_ERROR = "KIS_FETCH_ERROR"
+RATE_LIMIT = "RATE_LIMIT"
+OTHER = "OTHER"
+
+DATA_ERROR_CATEGORIES = (
+    INSUFFICIENT_POST_RANGE_BARS, MISSING_VWAP, MISSING_EMA, STALE_DATA,
+    NO_EXECUTABLE_PRICE, KIS_FETCH_ERROR, RATE_LIMIT, OTHER,
+)
+
+#: Categories where the data never arrived, as opposed to arriving and
+#: being insufficient. The distinction is the whole point: one is an
+#: infrastructure fault, the other is a quiet market.
+ACQUISITION_FAILURES = frozenset({KIS_FETCH_ERROR, RATE_LIMIT})
+
+#: Most specific first; first match wins, so exactly one category is
+#: assigned per symbol and the counts sum to the DATA_ERROR total.
+_DATA_ERROR_PATTERNS = (
+    # Acquisition. Checked before the "insufficient" families because a
+    # fetch that failed produces no bars, and "no bars" would otherwise
+    # read as thin liquidity.
+    (RATE_LIMIT, r"rate.?limit|EGW00201|too many requests|throttl"),
+    (KIS_FETCH_ERROR,
+     r"KIS|minute chart unavailable|fetch failed|no intraday bars|"
+     r"MarketDataUnavailable|returned no minute bars|HTTP \d{3}|timeout"),
+    # Arrived, but not enough to compute the strategy's inputs.
+    (INSUFFICIENT_POST_RANGE_BARS,
+     r"bars since the \d+m opening range|post.?range|opening range "
+     r"\(\d+m\)? ?not computable|no regular-session bars|"
+     r"no .* bars for this session"),
+    (MISSING_VWAP, r"VWAP not computable|no VWAP|vwap"),
+    (MISSING_EMA, r"EMA9?/?EMA21 not computable|EMA not computable|ema"),
+    (STALE_DATA, r"stale|insufficient_or_stale_data|too old|age"),
+    (NO_EXECUTABLE_PRICE,
+     r"no usable current price|no usable closes|price .* invalid|"
+     r"no executable price|no usable .* price"),
+)
+
+_DATA_ERROR_COMPILED = tuple(
+    (code, re.compile(pattern, re.IGNORECASE))
+    for code, pattern in _DATA_ERROR_PATTERNS)
+
+
+def classify_data_error(message) -> str:
+    """One diagnostic category for a `ScannerDataError`. Never raises.
+
+    An unrecognised message yields OTHER rather than a guess, and a
+    growing OTHER is the signal that this table needs a new pattern --
+    the same discipline `classify` uses for UNCLASSIFIED.
+    """
+    text = "" if message is None else str(message)
+    for code, pattern in _DATA_ERROR_COMPILED:
+        if pattern.search(text):
+            return code
+    return OTHER
+
+
+def is_acquisition_failure(category) -> bool:
+    """True when the data never arrived, false when it arrived thin."""
+    return category in ACQUISITION_FAILURES

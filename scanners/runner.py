@@ -852,6 +852,40 @@ def _log_summary(report: RunReport) -> None:
         "fetch_failures=%s duration=%.1fs",
         report.trading_day, report.universe_size, report.signal_count,
         report.stored_signals, report.fetch_failures, report.duration_seconds)
+    _log_data_error_summary(report.outcomes)
+
+
+def _log_data_error_summary(outcomes) -> None:
+    """One aggregate line per scan: why the DATA_ERRORs happened.
+
+    The count alone could not distinguish a thin overnight market from a
+    fetch path that had stopped working. On 2026-09-02 six consecutive
+    scans reported DATA_ERROR on 592 of 593 symbols with `rejected=0` --
+    the strategy was never consulted -- and the number was equally
+    consistent with either. Both had happened before, days apart, and
+    they call for opposite responses.
+
+    Aggregate, not per symbol: six hundred lines a scan is how a log
+    stops being read.
+    """
+    from scanners.base import reject_reasons
+
+    for outcome in outcomes or ():
+        reasons = getattr(outcome, "data_error_reasons", None)
+        if not reasons:
+            continue
+        total = sum(reasons.values())
+        acquisition = sum(count for reason, count in reasons.items()
+                          if reject_reasons.is_acquisition_failure(reason))
+        ordered = " ".join(
+            f"{reason}={reasons[reason]}"
+            for reason in reject_reasons.DATA_ERROR_CATEGORIES
+            if reasons.get(reason))
+        logger.info(
+            "DATA_ERROR_SUMMARY scanner=%s total=%s acquisition_failures=%s "
+            "insufficient_data=%s %s",
+            outcome.scanner_name, total, acquisition, total - acquisition,
+            ordered)
 
 
 def print_report(report: RunReport) -> None:

@@ -110,6 +110,13 @@ class ScanOutcome:
     symbols_seen: int = 0
     duration_seconds: float = 0.0
     reject_reasons: Dict[str, int] = field(default_factory=dict)
+    #: Why each DATA_ERROR happened, one category per symbol. Purely
+    #: diagnostic: `data_errors` is unchanged and nothing branches on
+    #: this. The aggregate alone could not tell thin overnight liquidity
+    #: from a fetch path that had stopped working -- on 2026-09-02 it was
+    #: 592 of 593 symbols with `rejected=0`, and either answer was
+    #: consistent with the number.
+    data_error_reasons: Dict[str, int] = field(default_factory=dict)
     error_samples: List[str] = field(default_factory=list)
     failed: bool = False
     failure_reason: Optional[str] = None
@@ -179,6 +186,7 @@ class ScanOutcome:
             "symbols_seen": self.symbols_seen,
             "rejected": self.rejected,
             "data_errors": self.data_errors,
+            "data_error_reasons": dict(self.data_error_reasons),
             "exceptions": self.exceptions,
             "consecutive_error_peak": self.consecutive_error_peak,
             "circuit_breaker_triggered": self.circuit_breaker_triggered,
@@ -540,6 +548,10 @@ class BaseScanner(ABC):
                                    reject_sink=_rejected, session=session)
         except ScannerDataError as exc:
             outcome.data_errors += 1
+            # One category per symbol, counted where the DATA_ERROR
+            # itself is counted, so the two totals cannot drift.
+            count_reject_reason(outcome.data_error_reasons,
+                                reject_reasons.classify_data_error(exc))
             count_reject_reason(outcome.reject_reasons, reject_reasons.DATA_ERROR)
             outcome.note_first_reject(data.symbol, reject_reasons.DATA_ERROR,
                                       detail=str(exc))
