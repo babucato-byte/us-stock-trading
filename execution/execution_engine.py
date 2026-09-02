@@ -58,6 +58,7 @@ from market_hours import us_trading_day
 from operations import live_notifications
 import shadow_audit
 from reconciliation import snapshot as reconciliation_snapshot
+from reconciliation import state as reconciliation_state
 from execution.secret_redaction import safe_repr
 from reconciliation.snapshot import (
     ReconciliationBlockedError,
@@ -196,13 +197,27 @@ def _reject(conn, record, *, event_type, reason):
         return record
 
 
-def _reconcile_now(*, conn, broker, order_intent, account_id, current, side_label):
+def _reconciliation_block_code(snapshot):
+    return (REASON_UNKNOWN_ORDER if snapshot.has_unknown_orders
+            else REASON_RECONCILIATION_DIRTY)
+
+
+def _reconcile_now(*, conn, broker, order_intent, account_id, current, side_label,
+                   defer_dirty_to_gate=False):
     """CODEX-044: the engine collects the REAL state itself, immediately
     before the gate, and judges it -- no caller may hand it a
     `reconciliation_ok` boolean. A failed KIS read, a stale snapshot, a
     position/open-order/fill disagreement, or ANY order still in UNKNOWN
     all raise here, i.e. before APPROVED, before SUBMITTING, and
-    therefore with exactly zero transport calls."""
+    therefore with exactly zero transport calls.
+
+    TCN-02A: for a SELL (`defer_dirty_to_gate=True`) a snapshot that is
+    dirty -- a real, recent observation that found a disagreement -- is
+    returned instead of raised, so the sell gate can weigh the
+    protective-exit evidence for the specific position. Nothing is
+    relaxed here: a failed read, a stale snapshot and a BUY all raise
+    exactly as before, and the gate blocks a dirty sell unless every
+    item of evidence holds (execution/sell_safe_evidence.py)."""
     try:
         snapshot = reconciliation_snapshot.build_snapshot(
             broker=broker, conn=conn, account_id=account_id,
@@ -218,10 +233,19 @@ def _reconcile_now(*, conn, broker, order_intent, account_id, current, side_labe
             snapshot, account_id=account_id, symbol=order_intent.symbol, now=current,
         )
     except ReconciliationBlockedError as exc:
-        code = (REASON_UNKNOWN_ORDER if snapshot.has_unknown_orders
-                else REASON_RECONCILIATION_DIRTY)
+        if defer_dirty_to_gate:
+            classification = reconciliation_state.classify_snapshot(
+                snapshot, account_id=account_id, now=current)
+            if classification.sell_needs_evidence():
+                logger.warning(
+                    "%s order for %s: reconciliation is %s (%s); deferring to the "
+                    "sell gate's protective-exit evidence",
+                    side_label, order_intent.symbol, classification.primary,
+                    "; ".join(snapshot.detail) or "no detail")
+                return snapshot
         raise ExecutionEngineError(
-            f"{side_label} order blocked by reconciliation: {exc}", reason_code=code,
+            f"{side_label} order blocked by reconciliation: {exc}",
+            reason_code=_reconciliation_block_code(snapshot),
         ) from exc
     return snapshot
 
@@ -373,10 +397,14 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
             snapshot = _reconcile_now(
                 conn=conn, broker=broker, order_intent=order_intent, account_id=account_id,
                 current=current, side_label=side_label,
+                # TCN-02A: only a SELL may carry a dirty snapshot into the
+                # gate. The buy path is byte-for-byte what it was.
+                defer_dirty_to_gate=(side_label == "sell"),
             )
         except ExecutionEngineError as exc:
             _reject(conn, record, event_type="RECONCILIATION_BLOCKED", reason=str(exc))
             raise
+        reconciliation_dirty = not snapshot.is_clean()
 
         # The context the gate actually evaluated, captured so the
         # pre-transport notification reports the SAME facts the gate
@@ -394,12 +422,39 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
                 order_intent, _build_gate_context, gate_fn, now=current,
             )
         except (order_gate.OrderGateBlockedError, UnauthorizedExecutionError) as exc:
+            if (reconciliation_dirty
+                    and getattr(exc, "code", None) == "RECONCILIATION"):
+                # TCN-02A: the dirty snapshot was deferred to the gate and
+                # the gate refused it. Reported under the SAME reason
+                # code and event the engine used before the deferral
+                # existed, so nothing downstream reads a reconciliation
+                # block as a generic gate rejection.
+                _reject(conn, record, event_type="RECONCILIATION_BLOCKED", reason=str(exc))
+                raise ExecutionEngineError(
+                    f"{side_label} order blocked by reconciliation: {exc}",
+                    reason_code=_reconciliation_block_code(snapshot),
+                ) from exc
             _reject(conn, record, event_type="GATE_REJECTED", reason=str(exc))
             code = (REASON_HALT if isinstance(exc, UnauthorizedExecutionError)
                     else f"{REASON_GATE}:{getattr(exc, 'code', 'GATE')}")
             raise ExecutionEngineError(
                 f"{side_label} order blocked by order gate: {exc}", reason_code=code,
             ) from exc
+
+        protective_exit_detail = None
+        if reconciliation_dirty:
+            # The gate let a SELL through on protective-exit evidence.
+            # Said loudly, and carried into the approval audit event: an
+            # order that proceeded under a dirty reconciliation must
+            # never look, afterwards, like one that proceeded under a
+            # clean one.
+            protective_exit_detail = (
+                f"{order_gate.PROTECTIVE_EXIT}: reconciliation "
+                f"{reconciliation_state.classify_snapshot(snapshot, account_id=account_id, now=current).primary}"
+                f" ({'; '.join(snapshot.detail) or 'no detail'}); sell of "
+                f"{order_intent.symbol} x{order_intent.quantity} approved on "
+                "protective-exit evidence")
+            logger.warning("%s", protective_exit_detail)
 
         try:
             record = order_repository.advance(
@@ -416,7 +471,7 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
         _audit_before_transport(
             audit_run_id=audit_run_id, event_type=shadow_audit.GATE_APPROVED,
             order_intent=order_intent, side_label=side_label, now=current,
-            reason_code="APPROVED",
+            reason_code="APPROVED", detail=protective_exit_detail,
         )
 
         try:

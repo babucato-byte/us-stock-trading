@@ -38,6 +38,7 @@ lifecycle.py` already uses for the Alpaca path (`reconcile_pending_
 exit`/`recover_on_restart`).
 """
 
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -50,8 +51,11 @@ from market_data.exchange_registry import build_kis_instrument
 from domain.order_intent import OrderIntent, OrderIntentError
 from execution import execution_engine, idempotency, order_gate
 from execution.execution_engine import ExecutionEngineError
+from execution.order_repository import FatalRepositoryConnectionError
 from market_data.kis_validation_provider import KISValidationProvider
 from state_store import db as state_db
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -167,7 +171,15 @@ class KISBrokerAdapter:
         )
 
     def submit_order(self, symbol, qty=1, *, side, order_type="market", time_in_force="day",
-                      client_order_id=None, live_entry_context=None, account_cash_snapshot=None):
+                      client_order_id=None, live_entry_context=None, account_cash_snapshot=None,
+                      sell_evidence=None):
+        """`sell_evidence` (TCN-02A) is the caller's
+        `execution.sell_safe_evidence.LocalPositionEvidence` for the row
+        being sold. When supplied, this adapter adds its own broker and
+        ledger reads to it and hands the sell gate a complete
+        `SellSafeEvidence`, which is what lets a protective EXIT proceed
+        under a dirty reconciliation. When absent -- every caller that
+        predates it -- the gate applies the strict policy unchanged."""
         if side != "sell":
             raise KISBrokerAdapterError(
                 f"KISBrokerAdapter.submit_order() only supports side='sell' "
@@ -267,17 +279,29 @@ class KISBrokerAdapter:
 
         conn = state_db.open_db()
 
+        evidence = self._collect_sell_evidence(
+            conn, sell_evidence, symbol=symbol, internal_order_id=internal_order_id,
+            position_qty=position_qty, has_existing_sell_order=has_existing_sell_order,
+            now=current,
+        )
+
         def _sell_ctx_builder(reconciliation):
             # CODEX-044: `reconciliation` is the snapshot the Execution
             # Engine itself built from live KIS reads immediately before
             # the gate -- this adapter never asserts reconciliation
             # status, and the sell path is held to exactly the same
             # policy as the buy path.
+            #
+            # TCN-02A: `sell_safe_evidence` is the one addition. It does
+            # not assert reconciliation status either; it supplies the
+            # per-position facts the gate weighs when the engine's own
+            # snapshot turned out dirty.
             return order_gate.SellGateContext(
                 execution_broker="kis", live_order_enabled=True, order_intent=order_intent,
                 instrument=instrument, kis_position_quantity=position_qty, position_source="kis",
                 has_existing_sell_order_for_symbol=has_existing_sell_order,
                 reconciliation=reconciliation, kis_account_no=account_id, now=current,
+                sell_safe_evidence=evidence,
             )
 
         try:
@@ -344,6 +368,61 @@ class KISBrokerAdapter:
                 "filled_avg_price": None,
             },
             dry_run=False,
+        )
+
+    @staticmethod
+    def _collect_sell_evidence(conn, local, *, symbol, internal_order_id, position_qty,
+                               has_existing_sell_order, now):
+        """TCN-02A: assemble the protective-exit evidence, or None.
+
+        None whenever the caller supplied no local evidence OR any of the
+        ledger reads below fails -- the gate then applies the strict
+        policy. Evidence is never partially assembled: a read that could
+        not be made is not "zero", it is "unknown", and unknown fails
+        closed.
+
+        `other_active_exit_intents` excludes the intent the caller has
+        just reserved for THIS attempt (keyed on this internal order id);
+        every other non-terminal intent for the position is a sell that
+        may already be working."""
+        if local is None:
+            return None
+        from execution import idempotency
+        from execution.sell_safe_evidence import SellSafeEvidence
+        from state_store import exit_intent_ledger
+
+        name = str(symbol or "").upper()
+        try:
+            unknown_for_symbol = sum(
+                1 for row in idempotency.list_unknown_orders(conn)
+                if str(row["symbol"] or "").upper() == name)
+            other_intents = 0
+            position_id = getattr(local, "position_id", None)
+            if position_id:
+                placeholders = ",".join("?" for _ in exit_intent_ledger.NON_TERMINAL_STATES)
+                rows = conn.execute(
+                    "SELECT client_order_id FROM exit_intents WHERE position_id = ? "
+                    f"AND state IN ({placeholders})",
+                    (position_id, *exit_intent_ledger.NON_TERMINAL_STATES),
+                ).fetchall()
+                other_intents = sum(
+                    1 for row in rows
+                    if (row["client_order_id"] if hasattr(row, "keys") else row[0])
+                    != internal_order_id)
+        except FatalRepositoryConnectionError:
+            raise  # CODEX-059: a poisoned connection outranks "no evidence"
+        except Exception:  # noqa: BLE001 - unreadable is not zero
+            logger.warning("sell evidence could not be collected for %s; the strict "
+                           "reconciliation policy applies", name, exc_info=True)
+            return None
+        return SellSafeEvidence(
+            local=local,
+            broker_position_read_ok=True,
+            broker_position_quantity=int(position_qty),
+            broker_open_order_for_symbol=bool(has_existing_sell_order),
+            unknown_orders_for_symbol=unknown_for_symbol,
+            other_active_exit_intents=other_intents,
+            collected_at=now,
         )
 
     def get_order_by_client_order_id(self, client_order_id):

@@ -113,6 +113,14 @@ class SellGateContext:
     reconciliation: ReconciliationSnapshot
     kis_account_no: str
     now: datetime
+    #: TCN-02A: the protective-exit evidence (execution/sell_safe_evidence.py)
+    #: the caller collected about THIS position. Optional, defaulting to
+    #: None, which means "no evidence" and therefore the strict policy:
+    #: a dirty reconciliation blocks the sell exactly as it always did.
+    #: Supplying it never relaxes anything on its own -- every item of
+    #: evidence must hold for a dirty reconciliation to be overridden,
+    #: and a stale, failed or foreign snapshot is never overridden.
+    sell_safe_evidence: Optional[object] = None
 
 
 def _is_finite_number(value):
@@ -618,11 +626,53 @@ def evaluate_sell_gate(ctx: SellGateContext) -> bool:
             f"a sell order already exists for {ctx.order_intent.symbol!r} -- duplicate liquidation blocked",
             code="DUPLICATE_SELL",
         )
-    _check_reconciliation(
-        ctx.reconciliation, account_id=ctx.kis_account_no,
-        symbol=ctx.order_intent.symbol, now=ctx.now,
-    )
+    try:
+        _check_reconciliation(
+            ctx.reconciliation, account_id=ctx.kis_account_no,
+            symbol=ctx.order_intent.symbol, now=ctx.now,
+        )
+    except OrderGateBlockedError as blocked:
+        _check_protective_exit_evidence(ctx, quantity, blocked)
     return True
+
+
+#: The gate code recorded when a sell passed on evidence rather than on
+#: a clean reconciliation. Not a block code -- the order proceeds -- but
+#: the audit trail must be able to say that it did so.
+PROTECTIVE_EXIT = "PROTECTIVE_EXIT"
+
+
+def _check_protective_exit_evidence(ctx, quantity, blocked):
+    """TCN-02A: a dirty reconciliation does not, by itself, trap an
+    existing position. It is overridden ONLY when every item of
+    protective-exit evidence holds for this specific position; see
+    execution/sell_safe_evidence.py for the list. No evidence, or any
+    missing item, re-raises the original reconciliation block with the
+    missing item named.
+
+    A stale, failed or foreign snapshot is never overridden: those are
+    not "dirty", they are "unobserved", and the evidence module refuses
+    them before it looks at anything else."""
+    evidence = getattr(ctx, "sell_safe_evidence", None)
+    if evidence is None:
+        raise blocked
+    from execution import sell_safe_evidence
+
+    verdict = sell_safe_evidence.evaluate_protective_exit(
+        snapshot=ctx.reconciliation, symbol=ctx.order_intent.symbol,
+        quantity=quantity, evidence=evidence, now=ctx.now,
+        account_id=ctx.kis_account_no,
+    )
+    if not verdict.permitted:
+        raise OrderGateBlockedError(
+            f"reconciliation is not OK and the protective-exit evidence is "
+            f"insufficient [{verdict.reason_code}]: {verdict.detail}; "
+            f"original block: {blocked}",
+            code="RECONCILIATION",
+        ) from blocked
+    # Permitted. The caller (execution_engine) records that this sell
+    # proceeded under a dirty reconciliation; the gate itself only
+    # decides.
 
 
 @dataclass(frozen=True)

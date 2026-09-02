@@ -34,11 +34,13 @@ Any one of them alone would do it. All three are kept because the cost
 of being wrong is selling a position twice with real money.
 """
 
+import inspect
 import logging
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from domain.position_evidence import LocalPositionEvidence
 from s1_live import exit_policy, position_store
 from state_store import exit_intent_ledger
 
@@ -107,6 +109,26 @@ def _broker_order_id(response):
     return None
 
 
+def _accepts_sell_evidence(broker_adapter) -> bool:
+    """Whether `broker_adapter.submit_order` can take `sell_evidence=`.
+
+    Inspected rather than attempted: a TypeError from a real submit call
+    could not be told apart from one raised inside the broker, and the
+    exception branch below would then file a never-sent order as
+    SUBMISSION_UNKNOWN."""
+    submit = getattr(broker_adapter, "submit_order", None)
+    if submit is None:
+        return False
+    try:
+        parameters = inspect.signature(submit).parameters
+    except (TypeError, ValueError):
+        return False
+    # Named explicitly, or not at all. A `**kwargs` catch-all is not an
+    # agreement to receive evidence: test doubles record every keyword
+    # they are given, and a legacy adapter would swallow it silently.
+    return "sell_evidence" in parameters
+
+
 def _submit_sell(conn, *, broker_adapter, position_id, row, reason, now=None,
                  store=None, prefix="s1exit") -> ExitOutcome:
     """Reserve the intent, place the order through the VERIFIED path, and
@@ -135,9 +157,18 @@ def _submit_sell(conn, *, broker_adapter, position_id, row, reason, now=None,
         return ExitOutcome(position_id, symbol, ACTION_BLOCKED, reason,
                            f"active exit intent already exists: {exc}")
 
+    # TCN-02A: what the position row itself says, handed to the sell
+    # gate as protective-exit evidence. Built from the row this function
+    # was given -- the same row whose quantity is being sold -- and only
+    # passed to an adapter that can receive it, so a fake or legacy
+    # adapter sees the call it always saw.
+    submit_kwargs = {"side": "sell", "client_order_id": client_order_id}
+    if _accepts_sell_evidence(broker_adapter):
+        submit_kwargs["sell_evidence"] = LocalPositionEvidence.from_row(
+            row, position_id=position_id)
+
     try:
-        response = broker_adapter.submit_order(
-            symbol, quantity, side="sell", client_order_id=client_order_id)
+        response = broker_adapter.submit_order(symbol, quantity, **submit_kwargs)
     except Exception as exc:
         # Spec §10 / §9: an ambiguous or failed submission is NEVER
         # auto-retried and NEVER clears the trigger. The intent goes to
