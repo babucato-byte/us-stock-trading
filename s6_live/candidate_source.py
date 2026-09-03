@@ -23,30 +23,32 @@ from typing import Any, Dict, FrozenSet, List, Optional
 from config import s6_sessions, scanner_live_mode
 
 
-def rf_max_bar_age() -> float:
-    """The existing 900s data-integrity bound, read from its owner."""
-    from s6_live import realtime_features as rf
-
-    return float(rf.DEFAULT_MAX_BAR_AGE_SECONDS)
-
 logger = logging.getLogger(__name__)
 
-#: How old a COMPLETED generation may be and still be served while a
-#: newer scan is running.
+#: Continuity is bounded by the SCAN'S LIFE, not by a clock.
 #:
-#: The EXISTING market-data bound, reused rather than invented:
-#: `realtime_features.DEFAULT_MAX_BAR_AGE_SECONDS` is 900s, described
-#: there as "a data-integrity bound, not a trading threshold".
+#: This briefly used `realtime_features.DEFAULT_MAX_BAR_AGE_SECONDS`
+#: (900s) as a generation TTL. That was wrong twice over.
 #:
-#: It is applied here to a DIFFERENT quantity -- how long ago the scan
-#: COMPLETED, rather than how old the newest bar in a features view is --
-#: and that difference is deliberate and reported. What decays in a
-#: candidate is not its ORB range, which is a fixed historical fact of
-#: the session, but the market evidence around it. That evidence is
-#: revalidated independently by Precision Watch against its own 900s
-#: bound, so this bound governs only how long the candidate LIST stays
-#: available, never whether any candidate is READY.
-_GENERATION_MAX_AGE_SECONDS = rf_max_bar_age()
+#: It did not work: a REGULAR scan takes ~6 minutes, so 900s covers it,
+#: but an OVERNIGHT_DAYTIME scan takes ~61 (3619s, 3660s, 3772s measured
+#: on 2026-09-02). The previous generation expired about fifteen minutes
+#: into every hour-long scan and left a ~46 minute blackout -- the very
+#: gap continuity exists to close.
+#:
+#: And it was the kind of number `scanners/publish/scan_cycle` refuses
+#: on principle: "picking 'candidates older than N minutes are stale'
+#: would be inventing a threshold nobody measured". 900s is the age of
+#: the newest BAR in a features view. It is not the age at which a
+#: completed scan's candidate LIST stops describing what the scanner
+#: found, and borrowing it for that made it look measured when it was
+#: not.
+#:
+#: The honest question is the one that module already answers exactly:
+#: is the scan that supersedes this generation still alive? That is
+#: kernel-truth -- a crashed or killed scan releases its flock and stops
+#: being alive within microseconds -- so continuity needs no timeout to
+#: end and cannot get stuck on a dead producer.
 
 SOURCE_S6 = "s6_orb_breakout"
 STRATEGY_ID = s6_sessions.STRATEGY_ID
@@ -209,7 +211,7 @@ class S6CandidateSource:
             # session and variant, while it is fresh. Anything else --
             # no record, a FAILED one, a stale one, another variant --
             # refuses exactly as before.
-            if self._previous_generation_ok():
+            if self._previous_generation_ok(state):
                 return True
             self._refusal = state.refusal()
             return False
@@ -225,13 +227,15 @@ class S6CandidateSource:
             return False
         return True
 
-    def _previous_generation_ok(self) -> bool:
+    def _previous_generation_ok(self, state=None) -> bool:
         """May the last completed generation still be served?
 
-        Freshness is the existing market-data bound
-        (`realtime_features.DEFAULT_MAX_BAR_AGE_SECONDS`, 900s), applied
-        to how long ago the generation COMPLETED. See the note in
-        `_GENERATION_MAX_AGE_SECONDS` on what that does and does not mean.
+        Bounded by the SCAN, not by a clock: the previous generation is
+        served for exactly as long as the scan that supersedes it is
+        alive and holding its cycle lock. When that process ends --
+        completing, failing, crashing or being killed -- the kernel
+        releases the lock, `state.running` goes false, and this branch
+        stops being reached at all. Nothing here can outlive its producer.
 
         Serving a previous generation does NOT make it READY. Precision
         Watch revalidates price, as-of, VWAP, EMA, volume, breakout,
@@ -241,24 +245,27 @@ class S6CandidateSource:
         """
         from scanners.publish import generations
 
+        if not (state is not None and state.running):
+            # Not a live scan. Either nothing is running -- in which case
+            # this branch should not have been reached -- or liveness
+            # could not be ESTABLISHED (fcntl unavailable, unreadable
+            # cycle file). "Cannot tell" is not "still going", so
+            # continuity does not extend over it.
+            return False
+
         record = generations.current(self._trading_day, self._session)
         if not generations.is_consumable(
                 record, variant=self._variant,
                 trading_day=self._trading_day, session=self._session):
             return False
-        age = generations.age_seconds(record)
-        if age is None or age > _GENERATION_MAX_AGE_SECONDS:
-            logger.info(
-                "S6 previous generation not served: age=%s limit=%ss",
-                "unknown" if age is None else f"{age:.0f}s",
-                _GENERATION_MAX_AGE_SECONDS)
-            return False
+
         self._continuity = dict(record)
-        self._continuity["age_seconds"] = age
+        self._continuity["age_seconds"] = generations.age_seconds(record)
         logger.info(
-            "S6 serving the previous completed generation %s while a scan "
-            "runs: %s candidate(s), %.0fs old",
-            record.get("generation_id"), record.get("candidate_count"), age)
+            "S6 serving the previous completed generation %s while scan %s "
+            "(pid %s) is still running: %s candidate(s), completed %s",
+            record.get("generation_id"), state.run_id, state.pid,
+            record.get("candidate_count"), record.get("completed_at"))
         return True
 
     def _generation_rows(self, rows):

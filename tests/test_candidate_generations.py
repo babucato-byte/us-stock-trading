@@ -114,19 +114,53 @@ class TestSameSessionContinuity:
             described = source().describe()
         assert described.get("refusal") in (None, "")
 
-    # 2. stale previous generation refused
-    def test_a_stale_previous_generation_is_refused(self, store):
-        old = (datetime.now(timezone.utc)
-               - timedelta(seconds=cs._GENERATION_MAX_AGE_SECONDS + 120))
-        store(["AAPL"], completed_at=old.isoformat())
+    # 1/2. a 61-minute OVERNIGHT_DAYTIME scan keeps continuity alive
+    def test_a_sixty_one_minute_scan_still_serves_the_previous_generation(
+            self, store):
+        """The measured DAYTIME case: 3660s. A 900s TTL expired the
+        previous generation fifteen minutes in and left a ~46 minute
+        blackout -- the gap continuity exists to close."""
+        completed = (datetime.now(timezone.utc) - timedelta(seconds=3660))
+        store(["AAPL", "MSFT"], completed_at=completed.isoformat())
+        with scan_cycle.hold(DAY, SESSION, scanner=ORB) as held:
+            assert held.acquired
+            assert sorted(source().symbols()) == ["AAPL", "MSFT"]
+
+    def test_generation_age_alone_never_ends_continuity(self, store):
+        """Eight hours old, and still served while its successor runs."""
+        completed = (datetime.now(timezone.utc) - timedelta(hours=8))
+        store(["AAPL"], completed_at=completed.isoformat())
         with scan_cycle.hold(DAY, SESSION, scanner=ORB):
-            assert source().symbols() == []
+            assert source().symbols() == ["AAPL"]
 
-    def test_the_freshness_bound_is_the_existing_market_data_one(self):
-        from s6_live import realtime_features as rf
+    def test_no_invented_generation_ttl_remains(self):
+        """`scan_cycle` refuses age limits on principle: picking
+        'candidates older than N minutes are stale' would be inventing a
+        threshold nobody measured."""
+        text = (REPO_ROOT / "s6_live/candidate_source.py").read_text()
+        assert "_GENERATION_MAX_AGE_SECONDS" not in text
+        assert not hasattr(cs, "_GENERATION_MAX_AGE_SECONDS")
 
-        assert cs._GENERATION_MAX_AGE_SECONDS == float(
-            rf.DEFAULT_MAX_BAR_AGE_SECONDS) == 900.0
+    # 4. a scan that is no longer alive does not keep candidates forever
+    def test_a_dead_scan_does_not_keep_the_previous_generation_alive(
+            self, store):
+        """The lock is the marker. When the holder ends, continuity ends
+        -- there is no timeout to wait out."""
+        store(["AAPL"], generation_id="gen-1")
+        with scan_cycle.hold(DAY, SESSION, scanner=ORB):
+            assert source().symbols() == ["AAPL"]
+        # Lock released: not a live scan any more. The generation is now
+        # simply the current one, by the ordinary path.
+        assert scan_cycle.state(DAY, SESSION, scanner=ORB).running is False
+
+    def test_continuity_requires_established_liveness(self, store,
+                                                      monkeypatch):
+        """"Cannot tell" is not "still going"."""
+        store(["AAPL"])
+        undetectable = scan_cycle.CycleState(
+            running=False, detectable=False, detail="fcntl unavailable")
+        monkeypatch.setattr(scan_cycle, "state", lambda *a, **k: undetectable)
+        assert source().symbols() == []
 
     # 4. FAILED generation never consumed
     def test_a_failed_generation_is_never_served(self, store):
@@ -243,6 +277,29 @@ class TestPublicationIsAtomic:
 
 # 11 / 12. the contract this must NOT change
 class TestWhatMustNotChange:
+    def test_market_data_freshness_is_unchanged_at_900_seconds(self):
+        """The 900s bound stays where it belongs: current market data."""
+        from s6_live import realtime_features as rf
+
+        assert rf.DEFAULT_MAX_BAR_AGE_SECONDS == 15 * 60 == 900
+
+    def test_precision_watch_still_rejects_stale_market_data(self):
+        """A served generation supplies a candidate LIST. Its market
+        evidence is judged fresh or stale on its own, at 900s."""
+        from datetime import datetime as _dt
+
+        from s6_live import realtime_features as rf
+
+        stale = rf.SessionFeatures(
+            symbol="AAPL", session=SESSION,
+            market_data_asof=_dt(2026, 9, 3, 0, 0, tzinfo=timezone.utc))
+        fresh = rf.SessionFeatures(
+            symbol="AAPL", session=SESSION,
+            market_data_asof=_dt(2026, 9, 3, 1, 55, tzinfo=timezone.utc))
+        now = _dt(2026, 9, 3, 2, 0, tzinfo=timezone.utc)
+        assert stale.is_stale(now, max_age=rf.DEFAULT_MAX_BAR_AGE_SECONDS)
+        assert not fresh.is_stale(now, max_age=rf.DEFAULT_MAX_BAR_AGE_SECONDS)
+
     def test_serving_a_generation_does_not_make_it_ready(self):
         """Precision Watch still revalidates current market data."""
         from s6_live import precision_watch as pw
