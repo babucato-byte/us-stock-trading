@@ -218,6 +218,31 @@ class EntryLimitState:
         }
 
 
+def _symbols_from_quantities(quantities):
+    """Open-position symbols from the ENGINE's own snapshot reading.
+
+    Same derivation as `_open_position_symbols`, from facts the
+    execution engine already fetched for this submission -- so the
+    caller never supplies broker truth (CODEX-044) and the position
+    book is read once per submission instead of twice.
+
+    None means "not carried"; an EMPTY tuple means "read, and the
+    account holds nothing". Collapsing those would turn a missing
+    reading into a licence to open a position, which is the one
+    direction this must never fail.
+    """
+    symbols = set()
+    for symbol, quantity in quantities:
+        if isinstance(quantity, bool) or not isinstance(quantity, (int, float)):
+            raise EntryLimitStateUnavailable(
+                f"KIS position {symbol} has a non-numeric quantity",
+                reason_code=POSITION_LIMIT_STATE_UNKNOWN,
+            )
+        if quantity > 0:
+            symbols.add(str(symbol).upper())
+    return frozenset(symbols)
+
+
 def _open_position_symbols(broker):
     try:
         positions = broker.get_positions()
@@ -435,7 +460,8 @@ def _same_day_exits_by_slot(conn, *, trading_day, now=None):
     return by_slot
 
 
-def collect(*, broker, conn, rollout, now=None, exclude_internal_order_id=None):
+def collect(*, broker, conn, rollout, now=None, exclude_internal_order_id=None,
+            kis_position_quantities=None):
     """Gather the authoritative limit state, or raise.
 
     `exclude_internal_order_id` is the attempt being evaluated right now.
@@ -463,7 +489,14 @@ def collect(*, broker, conn, rollout, now=None, exclude_internal_order_id=None):
     max_per_strategy = _optional_cap(rollout, "max_positions_per_strategy",
                                      POSITION_LIMIT_STATE_UNKNOWN)
 
-    open_symbols = _open_position_symbols(broker)
+    # The engine's own snapshot when it carries the reading, this
+    # function's own read otherwise. NOT a cache: the quantities come
+    # from the same locked submission decision, fetched moments earlier
+    # by `reconciliation.snapshot.build_snapshot`, which is where broker
+    # truth for a submission is supposed to come from.
+    open_symbols = (_open_position_symbols(broker)
+                    if kis_position_quantities is None
+                    else _symbols_from_quantities(kis_position_quantities))
     pending_symbols = _pending_entry_symbols(
         conn, exclude_internal_order_id=exclude_internal_order_id)
     held_by_slot = _held_symbols_by_slot(conn)

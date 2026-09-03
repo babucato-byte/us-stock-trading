@@ -1035,6 +1035,16 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                     limits = entry_limits.collect(
                         broker=broker, conn=conn, rollout=rollout, now=current,
                         exclude_internal_order_id=order_intent.internal_order_id,
+                        # The ENGINE's reading, not this module's. The
+                        # snapshot handed to this builder was built by
+                        # `submit_buy_order` moments ago inside the same
+                        # lock, so the position book is read once per
+                        # submission instead of twice. Passing None when
+                        # a snapshot does not carry it leaves the
+                        # original broker read in place, which is what a
+                        # hand-built snapshot in a test still gets.
+                        kis_position_quantities=getattr(
+                            reconciliation, "kis_position_quantities", None),
                     )
                     # A strategy stood down for new entries must be
                     # refused HERE, at the gate, by the same policy the
