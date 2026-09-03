@@ -167,7 +167,7 @@ unset이어야 성립)가 깨지므로, 파일별 적용이거나 opt-out 있는
 
 근거: `03de626d1` 커밋 메시지, `tests/test_scanner_runner.py::TestCliGateIsolationFromLiveScans`.
 
-### T9. `scanner_profile.sh daily`가 6시간 넘게 락을 쥔 채 실행 — `status: open` (2026-09-01)
+### T9. `scanner_profile.sh daily`가 6시간 넘게 락을 쥔 채 실행 — `status: resolved` (2026-09-03)
 
 2026-08-31 20:17:00Z에 시작된 daily profile 스캔(pid 3395053, 릴리스 `cdad78cc7`)이
 2026-09-01 03:0x 시점까지 **6시간 49분** 실행 중이었고, 그동안 shared store의
@@ -179,6 +179,47 @@ unset이어야 성립)가 깨지므로, 파일별 적용이거나 opt-out 있는
 
 관측은 read-only였고 프로세스에 손대지 않았다. 확인:
 `ps -o pid,lstart,etime -p <pid>`, `logs/cron/scanner_daily.log`.
+
+**해결 (2026-09-03, `c7684da`)** — hang이 아니라 정당한 장시간 작업이었고, 원인은
+provider 선택이 **세션**에 묶여 있었던 것이다. daily profile은 16:17 ET(AFTER_HOURS)에
+돌고 AFTER_HOURS는 KIS-authoritative라서, `DAILY_SCANNERS`가 읽지도 않는 분봉을 위해
+심볼당 한 번씩 KIS를 호출했다 — 11,047심볼 × 공유 3초 간격 = 48,798.8s(13.55h).
+이제 요청이 daily-bars-only이면 세션과 무관하게 bulk provider를 쓴다. 측정:
+13,380심볼 / **7,644.8s(2h07m)**, KIS 호출 0건, `ENTRY_DEFERRED_KIS_BUSY` 0건.
+남은 소요 시간은 T13으로 분리했다.
+
+### T13. `scanner_daily` yfinance 처리량 최적화 — `status: open` (2026-09-03)
+
+`SCANNER_DAILY_YFINANCE_THROUGHPUT_OPTIMIZATION`
+
+T9의 KIS 경합은 사라졌지만 절대 소요 시간은 여전히 길다. 2026-09-03 controlled run:
+
+    universe 13,380 · duration 7,644.8s (2h07m) · 1.75 symbols/sec · fetch_failures 532
+
+yfinance에는 batch endpoint가 없어 심볼당 왕복 1회다. 라이브 안전 기준은 이미 통과했고
+(KIS 예산 경합 0), 이 항목은 **성능 전용**이다.
+
+이번 작업에서 의도적으로 하지 않은 것: universe 축소, 동시성/async 워커 추가,
+provider 교체, 공격적 재시도, eligibility 의미 변경. 어느 것도 단독으로는 안전하지 않고,
+별도 설계와 검증이 필요하다. 최적화 전에 먼저 필요한 근거: 세션별 정상 소요 시간 분포,
+532건 fetch_failure의 분류(상장폐지 vs 일시적), 그리고 2h07m가 실제로 무엇을 막는지.
+
+### T14. S6 스캔 liveness — heartbeat 또는 max-runtime — `status: open` (2026-09-03)
+
+`S6_SCAN_LIVENESS_HEARTBEAT_OR_MAX_RUNTIME`
+
+`scanners/publish/scan_cycle`은 커널 `flock` 소유로 "스캔이 살아 있는가"를 **정확히**
+답한다 — 죽거나 kill된 프로세스는 커널이 락을 놓아주므로 상태가 끼일 수 없다. 2026-09-03에
+배포한 generation continuity(`a153ae6`)는 이 사실에 의존해서, 후속 스캔이 살아 있는 동안
+이전 COMPLETED generation을 계속 제공한다.
+
+**남은 위험**: 살아 있으면서 hang된 프로세스는 락을 무한히 쥔다. 그 경우 이전 generation이
+무기한 제공될 수 있다. 커널 락은 crash/kill은 잡지만 hang은 잡지 못한다.
+
+지금 타임아웃을 넣지 않았고 값도 고르지 않았다. `scan_cycle` 헤더가 명시하듯
+"N분보다 오래되면 stale"은 아무도 측정하지 않은 임계값을 만드는 일이다. 구현 전에 필요한
+근거: 세션별 정상 소요 시간 분포, 관측된 최장 정상 스캔, 실제 hang 사례,
+그리고 그로부터 도출된 운영상 정당한 timeout/heartbeat 정책.
 
 ### T10. Slack 채널 역할 정리 — rename 대기 — `status: blocked` (2026-09-01)
 
