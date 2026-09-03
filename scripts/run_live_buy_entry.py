@@ -57,19 +57,6 @@ EXIT_FATAL_DB = 4
 #: lost, or it is not, in which case the order should not have been sent.
 ENTRY_DEFERRED_KIS_BUSY = "ENTRY_DEFERRED_KIS_BUSY"
 
-#: An exit is in flight, so this tick does not start.
-#:
-#: The entry and the exit runtime share `s6_exec.lock`, so whichever
-#: arrives first holds it -- and an entry cycle that has taken it delays
-#: the exit behind it for as long as the cycle runs. An entry is an
-#: opportunity; an exit is a position already at risk, and a strategy
-#: whose exit condition has fired is not one that should be opening
-#: anything else first.
-#:
-#: Checked from the local position store: a SQLite read, no broker call,
-#: so asking costs nothing from the budget it is protecting.
-ENTRY_DEFERRED_EXIT_PENDING = "ENTRY_DEFERRED_EXIT_PENDING"
-
 #: S1's executor has gone quiet, so this tick stands down.
 #:
 #: On 2026-08-27 the entry consumed enough of the shared KIS budget that
@@ -129,78 +116,6 @@ def _s1_is_falling_behind(now=None):
         # decide trading either way; the watchdog remains the backstop.
         logger.warning("could not measure S1 tick age", exc_info=True)
         return False
-
-
-def _exit_in_flight(now=None):
-    """True when an exit is actually able to run and compete for the lock.
-
-    The original rule deferred entries whenever ANY position had an exit
-    submitted or pending, because entry and exit share `s6_exec.lock` and
-    an entry cycle holding it delays the exit behind it.
-
-    That reasoning holds only while the exit CAN run. RIG latched
-    EXIT_PENDING on Friday at 19:52 and its route was unavailable all
-    weekend, so this returned True continuously for three days and
-    deferred every entry -- protecting an exit cycle that was never going
-    to start. Nothing was being contended for.
-
-    So the two cases are separated:
-
-      an order already at the broker (`exit_submitted`)
-          always defers. Something is live and a second order must not
-          race it, whatever the session says.
-
-      a latched exit that cannot be submitted right now
-          does not defer. It is not competing for the lock, and blocking
-          on it stops trading for a reason that no longer exists.
-
-    Everything else -- slot caps, ownership, reconciliation, the gate --
-    is unchanged and still applies to any entry that proceeds.
-    """
-    try:
-        from s6_live import position_store
-        from state_store import db as state_db
-
-        pending = False
-        with state_db.open_db() as conn:
-            for _pid, row in position_store.load_live(conn):
-                if row.get("exit_submitted"):
-                    return True
-                if row.get("pending_exit_reason"):
-                    pending = True
-        if not pending:
-            return False
-        return _exit_can_run_now(now)
-    except Exception:  # noqa: BLE001 -- an unreadable store is not a
-        # reason to refuse the entry; the gate and the runtime have their
-        # own, stronger refusals, and failing the tick over a diagnostic
-        # would stop trading for the wrong reason.
-        logger.warning("could not check for exits in flight", exc_info=True)
-        return False
-
-
-
-def _exit_can_run_now(now=None):
-    """Can a latched exit actually be submitted at this moment?
-
-    Asked of `session_capability`, the same authority the order path
-    uses, so the entry cycle and the exit runtime cannot disagree about
-    whether a sell is possible.
-
-    Fails CLOSED: if capability cannot be determined, the answer is that
-    an exit may well be about to run, and deferring the entry is the
-    cheaper mistake.
-    """
-    try:
-        from config import session_capability
-
-        capability = session_capability.capability_at(now)
-        return bool(capability.exit_supported)
-    except Exception:  # noqa: BLE001
-        logger.warning("could not determine exit capability; deferring the "
-                       "entry as the safer direction", exc_info=True)
-        return True
-
 
 
 def _log_calendar(now, declared_session):
@@ -698,13 +613,6 @@ def main(argv=None):
             "%s: S1's executor is behind and holds the account's open "
             "position; a new entry stands down rather than compete with it",
             ENTRY_DEFERRED_S1_STALE)
-        return EXIT_OK
-
-    if _exit_in_flight():
-        logger.info(
-            "%s: an S6 exit is in flight; a position already at risk outranks "
-            "a new one, and this tick is dropped rather than queued",
-            ENTRY_DEFERRED_EXIT_PENDING)
         return EXIT_OK
 
     try:

@@ -67,7 +67,7 @@ class _Broker:
 
 @pytest.fixture
 def conn(monkeypatch, tmp_path):
-    monkeypatch.setenv("TRADING_STATE_DB", str(tmp_path / "state.db"))
+    monkeypatch.setenv("STATE_STORE_DB_FILE", str(tmp_path / "state.db"))
     monkeypatch.setenv("POSITION_STORE_FILE", str(tmp_path / "pos.json"))
     from state_store.db import open_db
 
@@ -143,15 +143,25 @@ class TestAnExitOutranksTheEntry:
         position_store.latch_pending_exit(conn, pid, "VWAP_FAILURE", now=NOW)
         assert _revalidate(conn, _Broker()) is None
 
-    def test_an_exit_that_reached_the_broker_drops_the_order(self, conn):
+    def test_another_symbols_exit_does_not_drop_the_order(self, conn):
         pid = position_store.record_submission(
             conn, symbol="MTCH", variant="S6-R", entry_session="REGULAR",
             client_order_id="cid-mtch", now=NOW)
         position_store.open_from_fill(conn, pid, quantity=2,
                                       average_fill_price=41.36, now=NOW)
         position_store.mark_exit_submitted(conn, pid, "VWAP_FAILURE", now=NOW)
-        code, _ = _revalidate(conn, _Broker())
+        assert _revalidate(conn, _Broker()) is None
+
+    def test_this_symbols_exit_drops_the_order(self, conn):
+        pid = position_store.record_submission(
+            conn, symbol="HBAN", variant="S6-R", entry_session="REGULAR",
+            client_order_id="cid-hban", now=NOW)
+        position_store.open_from_fill(conn, pid, quantity=2,
+                                      average_fill_price=17.01, now=NOW)
+        position_store.mark_exit_submitted(conn, pid, "VWAP_FAILURE", now=NOW)
+        code, detail = _revalidate(conn, _Broker())
         assert code == klt.REVALIDATION_EXIT_IN_FLIGHT
+        assert "HBAN" in detail
 
 
 class TestTheSymbolBecameHeld:

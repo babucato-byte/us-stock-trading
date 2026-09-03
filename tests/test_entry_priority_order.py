@@ -21,56 +21,23 @@ if str(REPO_ROOT) not in sys.path:
 RUNNER = (REPO_ROOT / "scripts" / "run_live_buy_entry.py").read_text(encoding="utf-8")
 
 
-class TestAnExitOutranksAnEntry:
-    def test_the_tick_defers_when_an_exit_is_in_flight(self):
-        assert "ENTRY_DEFERRED_EXIT_PENDING" in RUNNER
-        assert "_exit_in_flight()" in RUNNER
-
-    def test_the_check_runs_before_any_candidate_work(self):
-        """After the kill-switch refusal and before the cycle is
-        started, so an entry never takes the shared lock ahead of an
-        exit."""
+class TestExitPriorityIsSymbolScoped:
+    def test_no_global_exit_deferral_precedes_candidate_work(self):
         main = RUNNER[RUNNER.index("def main(argv=None):"):]
-        assert main.index("if _exit_in_flight():") < main.index(
-            "run_once(strategy=args.strategy)")
+        assert "_exit_in_flight" not in main
+        assert "ENTRY_DEFERRED_EXIT_PENDING" not in main
+        assert "run_once(strategy=args.strategy)" in main
 
-    def test_it_costs_no_broker_call_to_ask(self):
-        """A check that spent the budget it protects would be
-        self-defeating."""
-        body = RUNNER[RUNNER.index("def _exit_in_flight"):
-                      RUNNER.index("def run_once(")]
-        assert "position_store" in body
-        for forbidden in ("KISBroker", "get_positions", "get_open_orders",
-                          "get_orderable_usd"):
-            assert forbidden not in body, forbidden
-
-    def test_both_pending_and_submitted_exits_count(self):
-        """An exit decided but not yet sent is still an exit that must
-        not queue behind an entry."""
-        body = RUNNER[RUNNER.index("def _exit_in_flight"):
-                      RUNNER.index("def run_once(")]
-        assert "exit_submitted" in body
-        assert "pending_exit_reason" in body
-
-    def test_an_unreadable_store_does_not_block_entries(self):
-        """The stronger refusals live in the gate and the runtime. Losing
-        this diagnostic must not stop trading on its own."""
-        body = RUNNER[RUNNER.index("def _exit_in_flight"):
-                      RUNNER.index("def run_once(")]
-        assert "except Exception" in body
-        assert "return False" in body.split("except Exception")[1]
-
-    def test_deferring_is_not_a_failure(self):
-        block = RUNNER[RUNNER.index("if _exit_in_flight():"):]
-        assert "return EXIT_OK" in block[:600]
+    def test_submit_time_revalidation_remains_in_the_shared_cycle(self):
+        shared = (REPO_ROOT / "kis_live_trading.py").read_text(encoding="utf-8")
+        assert "with execution_lock.hold(_EXEC_LOCK_OWNER_ENTRY):" in shared
+        assert "_revalidate_before_submit(" in shared
+        assert "REVALIDATION_EXIT_IN_FLIGHT" in shared
 
 
 class TestDeferringIsNeverQueueing:
     def test_neither_defer_path_waits(self):
-        for marker in ("ENTRY_DEFERRED_EXIT_PENDING",
-                       "ENTRY_DEFERRED_KIS_BUSY"):
-            assert marker in RUNNER
-        assert "dropped rather than queued" in RUNNER
+        assert "ENTRY_DEFERRED_KIS_BUSY" in RUNNER
         assert "dropped, not queued" in RUNNER
 
     def test_the_wrapper_also_drops_an_overlapping_tick(self):
@@ -114,18 +81,18 @@ class TestTheEntryStandsDownBeforeItCanStarveS1:
         """S1 is not due to tick outside REGULAR, so overnight silence
         must not stand the entry down for a whole session."""
         body = RUNNER[RUNNER.index("def _s1_is_falling_behind"):
-                      RUNNER.index("def _exit_in_flight")]
+                      RUNNER.index("def _log_calendar")]
         assert "ticks_expected_now()" in body
         assert "return False" in body.split("ticks_expected_now()")[1][:200]
 
     def test_no_tick_yet_today_is_not_falling_behind(self):
         body = RUNNER[RUNNER.index("def _s1_is_falling_behind"):
-                      RUNNER.index("def _exit_in_flight")]
+                      RUNNER.index("def _log_calendar")]
         assert "newest is None" in body
 
     def test_it_costs_no_broker_call(self):
         body = RUNNER[RUNNER.index("def _s1_is_falling_behind"):
-                      RUNNER.index("def _exit_in_flight")]
+                      RUNNER.index("def _log_calendar")]
         for forbidden in ("KISBroker", "get_positions", "get_orderable_usd"):
             assert forbidden not in body, forbidden
 
@@ -136,6 +103,6 @@ class TestTheEntryStandsDownBeforeItCanStarveS1:
 
     def test_a_missing_measurement_does_not_decide_trading_either_way(self):
         body = RUNNER[RUNNER.index("def _s1_is_falling_behind"):
-                      RUNNER.index("def _exit_in_flight")]
+                      RUNNER.index("def _log_calendar")]
         assert "except Exception" in body
         assert "return False" in body.split("except Exception")[1]

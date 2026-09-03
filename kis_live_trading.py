@@ -463,36 +463,20 @@ def _revalidate_before_submit(*, symbol, broker, conn, instrument, order_intent,
                 f"{live_posture.FLAG_ENTRY_DISABLED} was set while this entry "
                 "was being prepared")
 
-    # 2. An exit that went in flight while we were preparing. A position
-    #    already at risk outranks a new one -- the same rule the entry
-    #    applies at start-up, re-asked because start-up was minutes ago.
-    #    Also catches the symbol becoming held by anyone, including by an
-    #    earlier candidate in this very cycle.
+    # 2. Re-read this symbol's position while holding the mutation lock.
+    #    An exit for THIS symbol blocks its re-entry, but an unrelated
+    #    position's exit does not suppress the rest of a multi-position
+    #    strategy. Also catches the symbol becoming held by anyone,
+    #    including by an earlier candidate in this very cycle.
     try:
         from s6_live import position_store as _s6_store
 
-        for _pid, row in _s6_store.load_live(conn):
-            # `exit_submitted` ONLY, and deliberately not
-            # `pending_exit_reason`.
-            #
-            # A latched exit that cannot be submitted is not competing
-            # for anything. RIG latched EXIT_PENDING on a Friday at
-            # 19:52 with its route unavailable all weekend; treating
-            # that as "an exit is in flight" deferred every entry for
-            # three days to protect a cycle that was never going to
-            # start. `scripts/run_live_buy_entry._exit_in_flight` draws
-            # the same distinction, and asks `session_capability`
-            # before letting a latched exit stand anything down.
-            #
-            # What this check is for is narrower and always true when it
-            # fires: an order is LIVE at the broker, and a new one must
-            # not race it.
-            if row.get("exit_submitted"):
-                return (REVALIDATION_EXIT_IN_FLIGHT,
-                        "an S6 exit reached the broker while this entry was "
-                        "being prepared")
         existing = _s6_store.load_by_symbol(conn, symbol)
         if existing is not None and existing.get("status") in _s6_store.LIVE_STATUSES:
+            if existing.get("exit_submitted"):
+                return (REVALIDATION_EXIT_IN_FLIGHT,
+                        f"an S6 exit for {symbol} reached the broker while this "
+                        "entry was being prepared")
             return (REVALIDATION_SYMBOL_HELD,
                     f"{symbol} became live in the canonical store "
                     f"({existing.get('status')}) while this entry was being prepared")
