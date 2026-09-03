@@ -838,6 +838,17 @@ def run_bootstrap_buy(*, broker, conn, rollout=None, now=None, env=None, source=
             has_open_order_for_symbol=False, has_order_for_signal_id=False,
             allowed_symbols=rollout.allowed_symbols,
             reconciliation=reconciliation, entry_limits=limits, now=current,
+            # The SAME capability the broker guard will re-validate, handed
+            # to the gate as well.
+            #
+            # Without it the daytime bootstrap could not run at all: the
+            # gate refuses a BUY on a route with no live response, and the
+            # daytime BUY TR can only get one from a real BUY. The
+            # capability travelled to the broker but not to the gate, so
+            # the order was refused two steps before the guard that was
+            # designed to admit it. This is the only context in the
+            # codebase that supplies this field.
+            bootstrap_capability=capability,
         )
 
     try:
