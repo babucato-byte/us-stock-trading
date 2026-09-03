@@ -253,9 +253,10 @@ class S6CandidateSource:
             # continuity does not extend over it.
             return False
 
-        record = generations.current(self._trading_day, self._session)
+        record = generations.current(self._trading_day, self._session,
+                                     strategy_id=STRATEGY_ID)
         if not generations.is_consumable(
-                record, variant=self._variant,
+                record, variant=self._variant, strategy_id=STRATEGY_ID,
                 trading_day=self._trading_day, session=self._session):
             return False
 
@@ -281,9 +282,9 @@ class S6CandidateSource:
         from scanners.publish import generations
 
         record = self._continuity or generations.current(
-            self._trading_day, self._session)
+            self._trading_day, self._session, strategy_id=STRATEGY_ID)
         if not generations.is_consumable(
-                record, variant=self._variant,
+                record, variant=self._variant, strategy_id=STRATEGY_ID,
                 trading_day=self._trading_day, session=self._session):
             # No declared generation: pre-record store, or a producer
             # that never ran. Fall back to the historical inference so a

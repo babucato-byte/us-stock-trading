@@ -171,7 +171,7 @@ class TestSameSessionContinuity:
     def test_a_failed_generation_is_not_read_as_zero(self, store):
         """It is the absence of a result, not a result."""
         store(["AAPL"], status=gen.STATUS_FAILED)
-        record = gen.current(DAY, SESSION)
+        record = gen.current(DAY, SESSION, strategy_id=cs.STRATEGY_ID)
         assert record["status"] == gen.STATUS_FAILED
         assert gen.is_consumable(record) is False
 
@@ -183,9 +183,12 @@ class TestSameSessionContinuity:
 
     def test_is_consumable_checks_day_session_and_variant(self):
         record = {"status": gen.STATUS_COMPLETED, "trading_day": DAY,
-                  "session": SESSION, "variant": VARIANT}
+                  "session": SESSION, "variant": VARIANT,
+                  "strategy_id": cs.STRATEGY_ID}
         assert gen.is_consumable(record, trading_day=DAY, session=SESSION,
-                                 variant=VARIANT) is True
+                                 variant=VARIANT,
+                                 strategy_id=cs.STRATEGY_ID) is True
+        assert gen.is_consumable(record, strategy_id="S2_VOLUME_ACCUMULATION_V1") is False
         assert gen.is_consumable(record, variant="S6-R") is False
         assert gen.is_consumable(record, session="REGULAR") is False
         assert gen.is_consumable(record, trading_day="2026-09-02") is False
@@ -228,7 +231,7 @@ class TestTheDeclaredGenerationWins:
 
     def test_the_zero_generation_is_recorded_explicitly(self, store):
         store([], generation_id="gen-21")
-        record = gen.current(DAY, SESSION)
+        record = gen.current(DAY, SESSION, strategy_id=cs.STRATEGY_ID)
         assert record["status"] == gen.STATUS_COMPLETED
         assert record["candidate_count"] == 0
 
@@ -236,7 +239,8 @@ class TestTheDeclaredGenerationWins:
     def test_a_missing_producer_is_not_a_completed_zero(self, tmp_path,
                                                         monkeypatch):
         monkeypatch.setenv(publisher.CANDIDATE_DIR_ENV, str(tmp_path / "empty"))
-        assert gen.current(DAY, SESSION) is None, (
+        assert gen.current(DAY, SESSION,
+                           strategy_id=cs.STRATEGY_ID) is None, (
             "no record at all -- the producer has not run")
         described = source().describe()
         assert described.get("refusal")
@@ -247,7 +251,7 @@ class TestPublicationIsAtomic:
     def test_a_torn_record_cannot_become_visible(self, store, tmp_path):
         """os.replace is atomic: a reader sees one record or the other."""
         store(["AAPL"], generation_id="gen-1")
-        path = gen.manifest_path(DAY, SESSION)
+        path = gen.manifest_path(DAY, SESSION, cs.STRATEGY_ID)
         first = json.loads(path.read_text())
         store(["NVDA"], generation_id="gen-2")
         second = json.loads(path.read_text())
@@ -262,7 +266,7 @@ class TestPublicationIsAtomic:
                             lambda *a, **k: (_ for _ in ()).throw(OSError("full")))
         assert gen.publish(DAY, SESSION, generation_id="gen-2",
                            variant=VARIANT, candidate_count=9) is False
-        record = gen.current(DAY, SESSION)
+        record = gen.current(DAY, SESSION, strategy_id=cs.STRATEGY_ID)
         assert record["generation_id"] == "gen-1", (
             "the previous completed generation must be untouched")
         assert source().symbols() == ["AAPL"]
@@ -321,3 +325,43 @@ class TestWhatMustNotChange:
         text = (REPO_ROOT / "scanners/publish/generations.py").read_text()
         for forbidden in ("submit_order", "KISBroker", "broker"):
             assert forbidden not in text
+
+
+class TestAnotherStrategysGenerationCannotHijackS6(object):
+    """2026-09-03. The DAILY profile publishes S2_VOLUME_ACCUMULATION_V1
+    in whatever session it happens to run in. S6 published its own
+    generations at 05:00:15 and 06:05:13; the daily run finished at
+    06:15:38 and its S2 record -- same trading day, same session,
+    `variant: null` -- replaced both, because the manifest was keyed on
+    (day, session) alone. S6 then read a record whose generation_id no S6
+    row carries and offered zero candidates.
+    """
+
+    def test_the_manifest_path_is_scoped_by_strategy(self, store):
+        s6 = gen.manifest_path(DAY, SESSION, cs.STRATEGY_ID)
+        s2 = gen.manifest_path(DAY, SESSION, "S2_VOLUME_ACCUMULATION_V1")
+        assert s6 != s2, "two strategies must not share one record"
+
+    def test_a_foreign_generation_does_not_answer_for_s6(self, store):
+        store(["AAPL"], generation_id="gen-1")
+        # The daily profile finishing in the same session, as it did.
+        gen.publish(DAY, SESSION, generation_id="20260903_DAILY_f04be8",
+                    variant=None, strategy_id="S2_VOLUME_ACCUMULATION_V1",
+                    status=gen.STATUS_COMPLETED, candidate_count=466)
+        assert source().symbols() == ["AAPL"], (
+            "S6 must still see its own generation")
+
+    def test_a_variant_less_record_never_satisfies_a_variant(self):
+        """The specific hole: `variant: null` used to skip the check."""
+        foreign = {"status": gen.STATUS_COMPLETED, "trading_day": DAY,
+                   "session": SESSION, "variant": None,
+                   "strategy_id": "S2_VOLUME_ACCUMULATION_V1"}
+        assert gen.is_consumable(foreign, variant="S6-O") is False
+
+    def test_continuity_ignores_a_foreign_generation(self, store):
+        store(["AAPL"], generation_id="gen-1")
+        gen.publish(DAY, SESSION, generation_id="20260903_DAILY_f04be8",
+                    variant=None, strategy_id="S2_VOLUME_ACCUMULATION_V1",
+                    status=gen.STATUS_COMPLETED, candidate_count=466)
+        with scan_cycle.hold(DAY, SESSION, scanner=ORB):
+            assert source().symbols() == ["AAPL"]

@@ -73,10 +73,31 @@ STATUS_FAILED = "FAILED"
 CONSUMABLE_STATUSES = frozenset({STATUS_COMPLETED})
 
 
-def manifest_path(trading_day: str, session: Optional[str] = None) -> Path:
+def _safe(value) -> str:
+    return "".join(ch if ch.isalnum() or ch in "-_" else "_"
+                   for ch in str(value)) or "unknown"
+
+
+def manifest_path(trading_day: str, session: Optional[str] = None,
+                  strategy_id: Optional[str] = None) -> Path:
+    """One record per (day, session, STRATEGY).
+
+    The strategy segment is not decoration. Several publishing scanners
+    run in the same (day, session) -- the DAILY profile publishes
+    S2_VOLUME_ACCUMULATION_V1 while S6 publishes S6_ORB_BREAKOUT_V1 --
+    and keying only on (day, session) gave them ONE record to overwrite.
+
+    Observed on 2026-09-03: S6 published its generation at 05:00:15 and
+    again at 06:05:13; the daily profile finished at 06:15:38 and its S2
+    record replaced both. S6's consumer then read a record whose
+    generation_id no S6 row carries and offered zero candidates.
+    """
     from scanners.publish.candidates import candidates_path
 
-    return Path(str(candidates_path(trading_day, session)) + GENERATION_SUFFIX)
+    base = str(candidates_path(trading_day, session))
+    if strategy_id:
+        return Path(f"{base}.{_safe(strategy_id)}{GENERATION_SUFFIX}")
+    return Path(base + GENERATION_SUFFIX)
 
 
 def publish(trading_day: str, session: Optional[str] = None, *,
@@ -108,7 +129,7 @@ def publish(trading_day: str, session: Optional[str] = None, *,
     }
     target = None
     try:
-        target = manifest_path(trading_day, session)
+        target = manifest_path(trading_day, session, strategy_id)
         target.parent.mkdir(parents=True, exist_ok=True)
         handle = tempfile.NamedTemporaryFile(
             mode="w", encoding="utf-8", dir=str(target.parent),
@@ -138,8 +159,8 @@ def publish(trading_day: str, session: Optional[str] = None, *,
         return False
 
 
-def current(trading_day: str, session: Optional[str] = None
-            ) -> Optional[Dict[str, Any]]:
+def current(trading_day: str, session: Optional[str] = None,
+            strategy_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """The current generation record, or None when there is none.
 
     None means "no generation has been declared" -- a producer that has
@@ -147,8 +168,14 @@ def current(trading_day: str, session: Optional[str] = None
     does NOT mean zero candidates.
     """
     try:
-        path = manifest_path(trading_day, session)
+        path = manifest_path(trading_day, session, strategy_id)
         if not path.exists():
+            # Deliberately NO fallback to an unscoped record. One written
+            # before records were strategy-scoped may belong to another
+            # strategy entirely, and reading it would be the very
+            # cross-strategy confusion the scoping exists to stop. None
+            # sends the consumer to its historical row inference, which
+            # is the safe direction.
             return None
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 - unreadable is not empty
@@ -175,7 +202,7 @@ def age_seconds(record: Optional[Dict[str, Any]], now=None) -> Optional[float]:
 
 
 def is_consumable(record: Optional[Dict[str, Any]], *, variant=None,
-                  trading_day=None, session=None) -> bool:
+                  trading_day=None, session=None, strategy_id=None) -> bool:
     """Is this record a completed generation for the asked-for scope?
 
     Scope is checked here as well as by the caller's file path, because a
@@ -190,7 +217,13 @@ def is_consumable(record: Optional[Dict[str, Any]], *, variant=None,
         return False
     if session is not None and str(record.get("session")) != str(session):
         return False
-    if variant is not None and record.get("variant") is not None \
-            and str(record.get("variant")) != str(variant):
+    if strategy_id is not None and \
+            str(record.get("strategy_id")) != str(strategy_id):
+        return False
+    if variant is not None and str(record.get("variant")) != str(variant):
+        # FAIL CLOSED on a missing variant. This used to skip the check
+        # when the record carried none, which let a variant-less record
+        # -- the daily profile writes `variant: null` -- satisfy an
+        # S6-O question it had nothing to do with.
         return False
     return True
