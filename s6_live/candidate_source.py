@@ -22,7 +22,31 @@ from typing import Any, Dict, FrozenSet, List, Optional
 
 from config import s6_sessions, scanner_live_mode
 
+
+def rf_max_bar_age() -> float:
+    """The existing 900s data-integrity bound, read from its owner."""
+    from s6_live import realtime_features as rf
+
+    return float(rf.DEFAULT_MAX_BAR_AGE_SECONDS)
+
 logger = logging.getLogger(__name__)
+
+#: How old a COMPLETED generation may be and still be served while a
+#: newer scan is running.
+#:
+#: The EXISTING market-data bound, reused rather than invented:
+#: `realtime_features.DEFAULT_MAX_BAR_AGE_SECONDS` is 900s, described
+#: there as "a data-integrity bound, not a trading threshold".
+#:
+#: It is applied here to a DIFFERENT quantity -- how long ago the scan
+#: COMPLETED, rather than how old the newest bar in a features view is --
+#: and that difference is deliberate and reported. What decays in a
+#: candidate is not its ORB range, which is a fixed historical fact of
+#: the session, but the market evidence around it. That evidence is
+#: revalidated independently by Precision Watch against its own 900s
+#: bound, so this bound governs only how long the candidate LIST stays
+#: available, never whether any candidate is READY.
+_GENERATION_MAX_AGE_SECONDS = rf_max_bar_age()
 
 SOURCE_S6 = "s6_orb_breakout"
 STRATEGY_ID = s6_sessions.STRATEGY_ID
@@ -95,6 +119,11 @@ class S6CandidateSource:
         self._trading_day = str(trading_day)
         self._session = session
         self._variant = s6_sessions.variant_for(session)
+        #: Set when a previous completed generation is being served
+        #: because a newer scan is still running.
+        self._continuity = None
+        #: The generation record the offered rows came from.
+        self._generation = None
         self._rollout = rollout
         self._modes = modes
         self._rows: Optional[List[dict]] = None
@@ -131,9 +160,19 @@ class S6CandidateSource:
     def _cycle_ok(self) -> bool:
         """Is the file on disk this cycle's answer, or the last one's?
 
-        S6 scans every fifteen minutes and consumes five minutes later,
-        so a scan that runs long leaves a file whose trading day, session
-        and variant are all CORRECT and whose contents are superseded.
+        S6 is SCHEDULED every fifteen minutes and consumes five minutes
+        later, so a scan that runs long leaves a file whose trading day,
+        session and variant are all CORRECT and whose contents are
+        superseded.
+
+        "Every fifteen minutes" is the schedule, not the observed
+        cadence. A REGULAR scan takes about six minutes on the bulk
+        provider; an OVERNIGHT_DAYTIME scan takes about SIXTY-ONE on the
+        per-symbol KIS path (3619s, 3660s, 3772s measured on
+        2026-09-02), so overlapping ticks are skipped by the cycle lock
+        and that session effectively re-scans hourly. That gap is why
+        the previous completed generation is now kept while a scan runs
+        -- see `_previous_generation_ok`.
         Every other refusal in this class is keyed on one of those three,
         which is why none of them catches it.
 
@@ -159,6 +198,19 @@ class S6CandidateSource:
 
         self._cycle_state = state.as_dict()
         if state.blocks_consumption:
+            # A scan is running (or its state is unknowable). Its output
+            # is NOT consumable -- that rule does not move. But refusing
+            # outright discards the answer the PREVIOUS scan already
+            # completed, and an OVERNIGHT_DAYTIME scan takes about an
+            # hour, so the consumer spent most of every hour with no
+            # candidates while a perfectly good generation sat on disk.
+            #
+            # So: keep the previous COMPLETED generation, for THIS day,
+            # session and variant, while it is fresh. Anything else --
+            # no record, a FAILED one, a stale one, another variant --
+            # refuses exactly as before.
+            if self._previous_generation_ok():
+                return True
             self._refusal = state.refusal()
             return False
 
@@ -172,6 +224,87 @@ class S6CandidateSource:
             self._refusal = detail
             return False
         return True
+
+    def _previous_generation_ok(self) -> bool:
+        """May the last completed generation still be served?
+
+        Freshness is the existing market-data bound
+        (`realtime_features.DEFAULT_MAX_BAR_AGE_SECONDS`, 900s), applied
+        to how long ago the generation COMPLETED. See the note in
+        `_GENERATION_MAX_AGE_SECONDS` on what that does and does not mean.
+
+        Serving a previous generation does NOT make it READY. Precision
+        Watch revalidates price, as-of, VWAP, EMA, volume, breakout,
+        extension and reentry against the CURRENT session on every tick,
+        exactly as it does for a fresh generation. What continuity
+        restores is the candidate LIST, never its market evidence.
+        """
+        from scanners.publish import generations
+
+        record = generations.current(self._trading_day, self._session)
+        if not generations.is_consumable(
+                record, variant=self._variant,
+                trading_day=self._trading_day, session=self._session):
+            return False
+        age = generations.age_seconds(record)
+        if age is None or age > _GENERATION_MAX_AGE_SECONDS:
+            logger.info(
+                "S6 previous generation not served: age=%s limit=%ss",
+                "unknown" if age is None else f"{age:.0f}s",
+                _GENERATION_MAX_AGE_SECONDS)
+            return False
+        self._continuity = dict(record)
+        self._continuity["age_seconds"] = age
+        logger.info(
+            "S6 serving the previous completed generation %s while a scan "
+            "runs: %s candidate(s), %.0fs old",
+            record.get("generation_id"), record.get("candidate_count"), age)
+        return True
+
+    def _generation_rows(self, rows):
+        """Rows belonging to the CURRENT declared generation.
+
+        Declared, not inferred. `_latest_generation` picks the newest
+        `generated_at` among the rows PRESENT, which cannot represent a
+        completed generation that found nothing: an empty scan writes no
+        rows, so the previous generation's stay newest and its candidates
+        stay live. The record says how many there are, so zero is finally
+        expressible.
+        """
+        from scanners.publish import generations
+
+        record = self._continuity or generations.current(
+            self._trading_day, self._session)
+        if not generations.is_consumable(
+                record, variant=self._variant,
+                trading_day=self._trading_day, session=self._session):
+            # No declared generation: pre-record store, or a producer
+            # that never ran. Fall back to the historical inference so a
+            # store written before generation records still trades.
+            return _latest_generation(rows)
+
+        self._generation = dict(record)
+        generation_id = record.get("generation_id")
+        if not generation_id:
+            return _latest_generation(rows)
+        declared = int(record.get("candidate_count") or 0)
+        mine = [r for r in rows
+                if str(r.get("scanner_run_id") or "") == str(generation_id)]
+        if declared == 0:
+            # Authoritative. The scan ran and nothing broke out; the
+            # previous generation's candidates are superseded, not
+            # inherited.
+            if mine:
+                logger.warning(
+                    "S6 generation %s declares 0 candidates but %d rows "
+                    "carry its id; trusting the declaration",
+                    generation_id, len(mine))
+            return []
+        if len(mine) != declared:
+            logger.warning(
+                "S6 generation %s declares %d candidate(s) and %d row(s) "
+                "carry its id", generation_id, declared, len(mine))
+        return mine
 
     def _load(self):
         if self._loaded:
@@ -191,6 +324,7 @@ class S6CandidateSource:
 
             rows = [r for r in publisher.read(self._trading_day, self._session)
                     if str(r.get("strategy_id")) == STRATEGY_ID]
+            rows = self._generation_rows(rows)
         except Exception:  # noqa: BLE001 - an unreadable file is empty,
             # never an exception that could abort the shared cycle and
             # take S1's entries down with it.

@@ -226,14 +226,20 @@ TR_ID_DAYTIME_CANCEL = {"live": "TTTS6038U"}
 
 #: Sessions whose order route the official specification defines.
 #:
-#: REGULAR uses the standard US order; OVERNIGHT_DAYTIME uses the
-#: daytime family above. PREMARKET and AFTER_HOURS are ABSENT on
-#: purpose: the overseas API exposes no US extended-hours order route.
-#: The complete set of US order TRs in the reference is TTTT1002U/1006U,
-#: TTTT1004U and the three daytime ones -- ORD_DVSN's LOO/LOC/MOO/MOC
-#: values are at-the-open and at-the-close types WITHIN the regular
-#: session, not extended-hours trading. A session with no specified
-#: route stays refused rather than being served a guessed one.
+#: REGULAR, PREMARKET and AFTER_HOURS share the general US order family;
+#: OVERNIGHT_DAYTIME uses the daytime family above. The complete set of
+#: US order TRs in the reference is TTTT1002U/1006U, TTTT1004U and the
+#: three daytime ones -- ORD_DVSN's LOO/LOC/MOO/MOC values are
+#: at-the-open and at-the-close types WITHIN the regular session, not
+#: extended-hours trading. A session with no specified route stays
+#: refused rather than being served a guessed one.
+#:
+#: This block used to say PREMARKET and AFTER_HOURS were "ABSENT on
+#: purpose: the overseas API exposes no US extended-hours order route",
+#: which contradicted the note immediately below it and was wrong -- see
+#: there for why the absence of a distinct TR is what sharing a route
+#: looks like. `GENERAL_SESSIONS` has included both since that was
+#: fixed; only this comment lagged.
 #: Sessions the general order family serves. The overseas order API
 #: documents US orders in the premarket and aftermarket as well as the
 #: regular session -- they share one endpoint and one TR family, because

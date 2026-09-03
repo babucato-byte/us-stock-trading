@@ -123,9 +123,22 @@ class TestAScanThatFinishedIsConsumed:
 # B. the long scan itself
 # --------------------------------------------------------------------
 class TestAScanStillRunningBlocksNewEntries:
-    def test_the_previous_cycles_candidates_are_not_reused(self, store):
-        """The whole point. Same day, same session, same variant -- and
-        superseded by an answer being computed right now."""
+    def test_undeclared_rows_are_not_reused_while_a_scan_runs(self, store):
+        """Rows with no DECLARED generation are not reused.
+
+        This used to be stated as "the previous cycle's candidates are
+        never reused", and that was the right rule while a generation was
+        something inferred from row timestamps: an inferred generation
+        cannot be shown to be complete, so it could not be trusted while
+        a newer answer was being computed.
+
+        Generations are now declared and published atomically
+        (scanners/publish/generations.py), so a COMPLETED one CAN be
+        trusted -- see tests/test_candidate_generations.py for that
+        contract. What has not changed, and is what this pins: rows that
+        no generation record vouches for stay refused, and a partial
+        in-progress answer is never consumable.
+        """
         store(["AAPL"])
         with scan_cycle.hold(DAY, SESSION, scanner=ORB) as held:
             assert held.acquired

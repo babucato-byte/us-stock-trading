@@ -1026,6 +1026,8 @@ def publish_report_candidates(report) -> int:
     # misconfigured store would otherwise produce nothing but two log
     # warnings and a return value of 0. Indistinguishable from a quiet
     # session, which is the whole failure.
+    from scanners.publish import generations
+
     directory = candidate_publisher.candidate_dir()
     logger.info("candidate hand-off directory: %s", directory)
 
@@ -1050,11 +1052,6 @@ def publish_report_candidates(report) -> int:
             status=(scan_cycle.STATUS_FAILED if failed else scan_cycle.STATUS_OK),
             started_at=started_at, completed_at=completed_at,
             duration_seconds=duration)
-        if failed:
-            logger.info("not publishing %s candidates: the scanner failed", name)
-            continue
-        if not signals:
-            continue
         variant = None
         if str(name) == "orb":
             from config import s6_sessions
@@ -1063,10 +1060,36 @@ def publish_report_candidates(report) -> int:
             # which range produced it. S6-R and S6-O are different
             # setups that happen to share a scanner.
             variant = s6_sessions.variant_for(session) or None
+
+        if failed:
+            logger.info("not publishing %s candidates: the scanner failed", name)
+            # Declared, so a failed attempt cannot read as "no scan since
+            # the last good one". FAILED is never consumable and is never
+            # read as zero candidates -- it is the absence of a result.
+            generations.publish(
+                day, session, generation_id=run_id, variant=variant,
+                strategy_id=strategy_id, status=generations.STATUS_FAILED,
+                candidate_count=0, generated_at=started_at,
+                completed_at=completed_at)
+            continue
+
         rows = candidate_publisher.publish(
             signals, strategy_id=strategy_id, trading_day=day,
             session=session, variant=variant, run_id=run_id)
         written += len(rows)
+
+        # LAST, and only now: every row is on disk, so the generation can
+        # be declared complete. Published even when there are none --
+        # zero is an answer, and a scan that reported it must supersede
+        # whatever the previous generation found. Before this, an empty
+        # scan wrote nothing at all and the previous generation's rows
+        # simply stayed newest.
+        generations.publish(
+            day, session, generation_id=run_id, variant=variant,
+            strategy_id=strategy_id, status=generations.STATUS_COMPLETED,
+            candidate_count=len(rows), generated_at=started_at,
+            completed_at=completed_at)
+
         _snapshot_safely(rows, scanner_name=name, report=report)
     return written
 
