@@ -79,11 +79,71 @@ class ActivityRecord:
     updated_at: Optional[str] = None
 
 
-def store_path(provider: str) -> Path:
+#: The ONE key the ranking lives under, whichever provider built it.
+#:
+#: It used to be keyed by `provider_name`, and the provider is chosen by
+#: SESSION -- `market_data.kis_bar_provider.provider_for_session` returns
+#: KIS inside PREMARKET / AFTER_HOURS / OVERNIGHT_DAYTIME and the bulk
+#: fallback in REGULAR. So the daily profile, which runs at 16:17 ET in
+#: AFTER_HOURS, wrote `activity/kis.json`, and the open profile, which
+#: runs at 09:52 ET in REGULAR, looked for `activity/yfinance.json` and
+#: found nothing:
+#:
+#:     2026-09-02 13:22Z premarket  provider kis       300 of 300 eligible
+#:     2026-09-02 13:52Z open       provider yfinance  FAILED_NO_UNIVERSE
+#:
+#: Same day, same release, same directory, thirty minutes apart. Nothing
+#: was stale and nothing was missing -- the ranking was filed under a
+#: name the reader never asked for.
+#:
+#: The ranking is not a provider's opinion. It is "which symbols traded
+#: the most dollars yesterday", derived from daily bars, and that is the
+#: same market fact whoever fetched it. Keying it by feed made a shared
+#: answer look like several private ones. The PROVIDER IS STILL RECORDED
+#: inside the file -- what changed is only where the file lives.
+#:
+#: Eligibility is deliberately NOT changed: whether a provider can serve
+#: a symbol at all genuinely differs between providers.
+RANKING_KEY = "daily_liquidity"
+
+
+def _safe_key(provider) -> str:
+    return "".join(ch if ch.isalnum() or ch in "-_" else "_"
+                   for ch in str(provider)) or "unknown"
+
+
+def store_path(provider: str = RANKING_KEY) -> Path:
+    """Where the ranking is written and read. One path, always."""
     directory = analytics_dir() / ACTIVITY_SUBDIR
     directory.mkdir(parents=True, exist_ok=True)
-    safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(provider))
-    return directory / f"{safe or 'unknown'}.json"
+    return directory / f"{RANKING_KEY}.json"
+
+
+def legacy_store_path(provider: str) -> Path:
+    """Where a provider-keyed ranking was written before the key was one.
+
+    Read-only compatibility. A ranking that already exists must keep
+    working across the deploy that changes the key -- the alternative is
+    an empty universe on the first run after it, which is the exact
+    failure this whole change is about.
+    """
+    return analytics_dir() / ACTIVITY_SUBDIR / f"{_safe_key(provider)}.json"
+
+
+def _readable_paths(provider) -> list:
+    """Canonical first, then any pre-existing provider-keyed file."""
+    paths = [store_path()]
+    directory = analytics_dir() / ACTIVITY_SUBDIR
+    legacy = legacy_store_path(provider)
+    if legacy not in paths:
+        paths.append(legacy)
+    try:
+        others = sorted(
+            (p for p in directory.glob("*.json") if p not in paths),
+            key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        others = []
+    return paths + others
 
 
 class ActivityStore:
@@ -96,14 +156,37 @@ class ActivityStore:
 
     @classmethod
     def load(cls, provider: str) -> "ActivityStore":
-        path = store_path(provider)
-        if not path.exists():
+        """The canonical ranking, or a pre-existing provider-keyed one.
+
+        Reading more widely than it writes is deliberate and temporary in
+        effect: the first daily run after this lands rewrites under the
+        canonical key and the fallback stops being reached. Without it,
+        the deploy itself would empty the universe for every session
+        until that run -- turning a fix for FAILED_NO_UNIVERSE into a
+        cause of it.
+        """
+        path = None
+        payload = None
+        for candidate in _readable_paths(provider):
+            if not candidate.exists():
+                continue
+            try:
+                payload = json.loads(candidate.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                logger.warning("activity cache unreadable at %s (%s); "
+                               "trying the next", candidate, exc)
+                continue
+            path = candidate
+            break
+        if payload is None:
+            # Genuinely absent. The caller reports FAILED_NO_UNIVERSE, and
+            # it must keep doing so: an empty pool is an operational fact,
+            # never a market with no active names.
             return cls(provider)
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            logger.warning("activity cache unreadable at %s (%s); starting empty", path, exc)
-            return cls(provider)
+        if path != store_path():
+            logger.info("activity ranking read from the pre-canonical key at "
+                        "%s; the next daily run writes %s",
+                        path.name, store_path().name)
         records = {}
         for symbol, row in (payload.get("symbols") or {}).items():
             try:
@@ -115,7 +198,7 @@ class ActivityStore:
     def save(self) -> Optional[Path]:
         if not self._dirty:
             return None
-        path = store_path(self.provider)
+        path = store_path()
         payload = {
             "provider": self.provider,
             "updated_at": datetime.now(timezone.utc).isoformat(),

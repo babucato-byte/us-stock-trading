@@ -71,9 +71,17 @@ class TestAnEmptyTickDoesNotRaise:
         assert "EXECUTION_DEFECT_SUSPECTED" not in source
 
     def test_the_funnel_carries_it(self):
+        """It belongs with the counts. The literal now lives in the
+        classifier the funnel calls, so assert the call site rather than
+        the string -- the property is where the decision is made, not
+        where the words are."""
         import inspect
 
-        assert "EXECUTION_DEFECT_SUSPECTED" in inspect.getsource(entry._funnel)
+        assert "_classify_no_submission" in inspect.getsource(entry._funnel)
+        assert "REAL_EXECUTION_DEFECT" in inspect.getsource(
+            entry._classify_no_submission)
+        assert entry.REAL_EXECUTION_DEFECT == "EXECUTION_DEFECT_SUSPECTED", (
+            "the name operators grep for must not change silently")
 
 
 class TestItCountsRatherThanReadingTheLastSymbol:

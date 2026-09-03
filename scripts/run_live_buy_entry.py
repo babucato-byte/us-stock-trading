@@ -371,11 +371,36 @@ def _funnel(source, results, *, since):
 
         conn = shadow_audit._open_conn()
         try:
-            executable = conn.execute(
-                "SELECT COUNT(*) FROM shadow_audit_events "
-                "WHERE event_type = ? AND created_at >= ?",
-                (shadow_audit.GATE_APPROVED, since.isoformat()),
-            ).fetchone()[0]
+            # SCOPED THREE WAYS, and every one of them was missing.
+            #
+            # The count answers "did a BUY this funnel prepared get
+            # approved and then not sent". Unscoped it answered "did
+            # ANY gate approve ANYTHING", which on 2026-09-02 at
+            # 16:34:52 counted `s6exit-HBAN-4bd8f7bb86f3` -- an exit
+            # SELL, approved by the exit runtime at 16:24:52, inside
+            # this cycle's window because the cycle had been running
+            # since 16:24:07. The funnel then reported that the gate
+            # had approved a buy it never submitted. It had not.
+            #
+            #   side='buy'   an exit approval is not a buy
+            #   symbol IN    another strategy's buy is not this funnel's
+            #   created_at   this cycle only, as before
+            #
+            # Entry cycles now run for minutes without the execution
+            # lock, so the window is wide and the odds of catching an
+            # unrelated approval in it are no longer small.
+            symbols = sorted(evaluations)
+            if symbols:
+                placeholders = ",".join("?" * len(symbols))
+                executable = conn.execute(
+                    "SELECT COUNT(*) FROM shadow_audit_events "
+                    "WHERE event_type = ? AND created_at >= ? "
+                    "AND side = 'buy' "
+                    f"AND symbol IN ({placeholders})",
+                    (shadow_audit.GATE_APPROVED, since.isoformat(), *symbols),
+                ).fetchone()[0]
+            else:
+                executable = 0
         finally:
             conn.close()
     except Exception:  # noqa: BLE001 -- reporting must never affect trading
@@ -397,10 +422,11 @@ def _funnel(source, results, *, since):
     # no candidates at all. Which is every tick when discovery is empty:
     # the check meant to catch a silent execution defect was itself
     # failing silently, once a minute.
-    if ready > 0 and executable > 0 and submitted == 0:
-        logger.error(
-            "EXECUTION_DEFECT_SUSPECTED ready=%d executable=%d submitted=0 -- "
-            "the gate approved an order that was never submitted", ready, executable)
+    if ready > 0 and submitted == 0:
+        label, level, detail = _classify_no_submission(results, executable)
+        logger.log(
+            level, "%s ready=%d executable=%d submitted=0 -- %s",
+            label, ready, executable, detail)
     for symbol, evaluation in sorted(evaluations.items()):
         if not getattr(evaluation, "ready", False):
             logger.info("FUNNEL_WATCHING %s state=%s blocking=%s", symbol,
@@ -414,6 +440,87 @@ def _funnel(source, results, *, since):
         logger.info("FUNNEL_SUBMITTED %s", symbol)
 
     _record_shadow_signals(source, results, since=since)
+
+
+#: A tick that produced no order, and what kind of nothing it was.
+#:
+#: All three were one ERROR line. That made the loudest signal in the
+#: entry path fire on days when the system was working exactly as
+#: designed -- an exit holding execution access, a candidate dropped by
+#: revalidation, an account with no cash -- and a warning that cries on
+#: ordinary Tuesdays stops being read by Thursday.
+EXPECTED_CONTENTION = "ENTRY_YIELDED_EXPECTED_CONTENTION"
+EXPECTED_DEFERRAL = "ENTRY_DEFERRED_EXPECTED"
+REAL_EXECUTION_DEFECT = "EXECUTION_DEFECT_SUSPECTED"
+
+#: The entry gave way to something that outranks it. No broker mutation
+#: happened, nothing is stuck, and the next minute re-asks.
+_CONTENTION_MARKERS = (
+    "execution access is held by another cycle",
+)
+
+#: The entry decided against itself on current evidence. Also expected,
+#: also self-recovering, but worth separating from contention: one says
+#: the system was busy, the other says the candidate stopped qualifying.
+_DEFERRAL_MARKERS = (
+    "while this entry was being prepared",   # every revalidation drop
+    "insufficient KIS orderable cash",
+    "not in live_rollout.allowed_symbols",
+    "signal", "expired",
+)
+
+#: The order REACHED the broker and the broker answered. That answer is
+#: reported by its own path (BROKER_REJECTED / BROKER_UNKNOWN) and it
+#: accounts for a gate approval that produced no submission -- so it is
+#: neither an unexplained defect nor a quiet deferral.
+_BROKER_ANSWERED_MARKERS = (
+    "KIS rejected the order",
+    "KIS did not confirm the order",
+)
+
+
+def _classify_no_submission(results, executable):
+    """Why did a tick with READY candidates send nothing?
+
+    Returns (label, log level, detail). Observability only: nothing here
+    gates, blocks, retries or cancels anything, and a misclassification
+    costs a log line, never a trade.
+
+    The question that matters is narrow: was a BUY *approved by the gate*
+    and then not sent? Everything else is the system declining to trade,
+    which it is supposed to be able to do without raising an alarm.
+    """
+    blocked = [str(reason or "") for _s, reason in (results.get("blocked") or ())]
+    answered = sum(1 for r in blocked
+                   if any(m in r for m in _BROKER_ANSWERED_MARKERS))
+
+    # An approval the broker answered is accounted for. What is left is
+    # an approval with no order and no answer anywhere -- the silent
+    # failure this check was written for.
+    unexplained = max(0, int(executable) - int(answered))
+    if unexplained > 0:
+        return (REAL_EXECUTION_DEFECT, logging.ERROR,
+                f"the gate approved {unexplained} order(s) that were never "
+                f"submitted and that the broker never answered")
+
+    if any(any(m in r for m in _CONTENTION_MARKERS) for r in blocked):
+        return (EXPECTED_CONTENTION, logging.INFO,
+                "an exit or another execution cycle held execution access; "
+                "no broker mutation occurred and the next tick re-asks")
+
+    if blocked and all(
+            any(m in r for m in _DEFERRAL_MARKERS + _BROKER_ANSWERED_MARKERS)
+            for r in blocked):
+        return (EXPECTED_DEFERRAL, logging.INFO,
+                "every ready candidate was declined on current evidence; "
+                "no broker mutation occurred and the next tick re-asks")
+
+    # Ready candidates, no approvals, and reasons this function does not
+    # recognise. Not proof of a defect -- but not something to file as
+    # expected either, so it stays visible at WARNING.
+    return (EXPECTED_DEFERRAL, logging.WARNING,
+            "no order was submitted and the reasons are not all recognised "
+            f"as expected: {sorted(set(blocked))[:5]}")
 
 
 def _record_shadow_signals(source, results, *, since):

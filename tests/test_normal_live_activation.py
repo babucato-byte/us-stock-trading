@@ -314,10 +314,18 @@ class TestTheTickIsLegibleAfterwards:
             assert stage in text, stage
 
     def test_ready_and_approved_but_unsubmitted_is_called_a_defect(self):
-        """The one combination that is not a market condition."""
+        """The one combination that is not a market condition.
+
+        Asserted on the classifier rather than on one literal condition
+        string: the check now separates an approval the broker answered
+        (a rejection, reported by its own path) from an approval that
+        vanished, and only the second is the silent failure this exists
+        to catch.
+        """
         text = self.RUNNER.read_text(encoding="utf-8")
         assert "EXECUTION_DEFECT_SUSPECTED" in text
-        assert "ready > 0 and executable > 0 and submitted == 0" in text
+        assert "_classify_no_submission" in text
+        assert "ready > 0 and submitted == 0" in text
 
     def test_executable_comes_from_the_audit_trail(self):
         """Not from a counter kept beside the submission loop: the number
@@ -326,6 +334,14 @@ class TestTheTickIsLegibleAfterwards:
         text = self.RUNNER.read_text(encoding="utf-8")
         assert "GATE_APPROVED" in text
         assert "created_at >= ?" in text
+
+    def test_the_approval_count_is_scoped_to_this_funnels_own_buys(self):
+        """2026-09-02 16:34:52: an exit SELL approved at 16:24:52 was
+        counted by a BUY cycle that had started at 16:24:07, and the
+        funnel reported a defect that had not happened."""
+        text = self.RUNNER.read_text(encoding="utf-8")
+        assert "side = 'buy'" in text, "an exit approval is not a buy"
+        assert "symbol IN" in text, "another strategy's buy is not ours"
 
     def test_a_reporting_failure_cannot_affect_the_cycle(self):
         """The report runs after the orders are already placed. It must
