@@ -244,6 +244,38 @@ REALTIME_FEED_STALE = "REALTIME_FEED_STALE"
 #: is not the test S6 thinks it is running.
 DATA_INCOMPLETE = "DATA_INCOMPLETE"
 
+#: What to ask a provider that does not declare an interval of its own.
+#: "5m" because that is what yfinance has always served here and REGULAR
+#: is decided on it; a provider that wants something else says so.
+DEFAULT_INTRADAY_INTERVAL = "5m"
+
+
+def _interval_for(provider, requested):
+    """The interval to ask this provider for.
+
+    An explicit `requested` always wins -- a caller that names an
+    interval is making a measurement decision and this must not
+    second-guess it. Otherwise the PROVIDER decides, because the provider
+    is the only party that knows what it can serve.
+
+    This function is the fix for the 2026-09-04 P0. `build` hard-coded
+    "5m", which was true of yfinance and false of the KIS provider that
+    `pretrade_validation` began injecting for PREMARKET, AFTER_HOURS and
+    OVERNIGHT_DAYTIME on 2026-09-01. The request and the source disagreed
+    for exactly the three sessions that had been swapped, every fetch
+    returned intraday=None, and all three sat at WATCHING.
+
+    Note this is NOT a session-to-interval mapping. Adding one would put
+    a second copy of the session routing next to `provider_for_session`,
+    and two mappings that must agree are how the next one of these
+    starts. The interval follows whichever provider was actually handed
+    in, so swapping a provider can never again leave the interval behind.
+    """
+    if requested is not None:
+        return requested
+    return getattr(provider, "preferred_intraday_interval",
+                   DEFAULT_INTRADAY_INTERVAL) or DEFAULT_INTRADAY_INTERVAL
+
 
 def _build_from_kis_stream(symbol, *, session, now, range_minutes):
     """Features from the collected stream, or None if there are none."""
@@ -266,13 +298,18 @@ def _build_from_kis_stream(symbol, *, session, now, range_minutes):
 
 
 def build(symbol, *, session=None, now=None, provider=None,
-          intraday_interval="5m", intraday_lookback_days=2,
+          intraday_interval=None, intraday_lookback_days=2,
           range_minutes=15) -> SessionFeatures:
     """The current intraday view, or a view that says what is missing.
 
     Never raises. A failure produces a SessionFeatures whose `error` and
     `unavailable` say so, because a caller that gets an exception has to
     invent a fallback and the fallback is always "carry on".
+
+    `intraday_interval=None` means "ask the provider" -- see
+    `_interval_for`. It is not a change of resolution for REGULAR, which
+    keeps yfinance's 5m; it is what stops the request and the source from
+    disagreeing when a provider is swapped underneath.
     """
     moment = now or datetime.now(timezone.utc)
     from scanners.base import scan_session
@@ -312,22 +349,35 @@ def build(symbol, *, session=None, now=None, provider=None,
     try:
         from scanners.base import indicators as ind
         from scanners.base import session_range as srange
-        from scanners.base.market_data_provider import default_provider
+        from scanners.base.market_data_provider import (
+            UNSUPPORTED_PROVIDER_CONTRACT, default_provider,
+        )
 
         source = provider or default_provider(cached=False)
+        interval = _interval_for(source, intraday_interval)
         data = source.get_symbol_data(
             symbol, daily_lookback_days=5,
-            intraday_interval=intraday_interval,
+            intraday_interval=interval,
             intraday_lookback_days=intraday_lookback_days,
             include_prepost=True, want_premarket=True)
         intraday = getattr(data, "intraday", None)
         if intraday is None or len(intraday) == 0:
+            # Say WHICH kind of nothing this is. A thin symbol and a
+            # provider that cannot serve the interval it was asked for
+            # both arrive here as intraday=None, and for four days the
+            # second was read as the first across three whole sessions.
+            reason = getattr(data, "intraday_unavailable_reason", None)
+            detail = (f"{reason}: provider "
+                      f"{getattr(source, 'provider_name', '?')!r} did not "
+                      f"serve {interval!r}"
+                      if reason == UNSUPPORTED_PROVIDER_CONTRACT
+                      else "no intraday bars")
             return SessionFeatures(
                 symbol=symbol, session=resolved, built_at=moment,
-                unavailable={k: "no intraday bars" for k in
+                unavailable={k: (reason or "no intraday bars") for k in
                              ("price", "vwap", "ema9", "ema21", "volume",
                               "volume_expansion")},
-                error="no intraday bars")
+                error=detail)
 
         # Scoped to the session happening NOW, not to the most recent
         # date that happens to have bars for it. Without the date,

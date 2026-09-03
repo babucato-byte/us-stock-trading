@@ -110,6 +110,43 @@ class MarketDataUnavailable(Exception):
     """
 
 
+#: Why an intraday frame is missing. Two answers that look identical at
+#: the call site and mean opposite things.
+#:
+#: A thinly-traded name with no prints is ordinary and self-correcting.
+#: A provider being asked for an interval it does not serve is a WIRING
+#: fault: it fails for every symbol, for as long as the wiring stands,
+#: and it fails BEFORE any market data is fetched -- so it cannot recover
+#: on its own and no amount of waiting will change it.
+#:
+#: They were indistinguishable until 2026-09-04. `realtime_features.build`
+#: asked for "5m" while `KISBarMarketDataProvider` serves 1m only, so
+#: every PREMARKET / AFTER_HOURS / OVERNIGHT_DAYTIME candidate got
+#: intraday=None, every gate read UNAVAILABLE, and all three sessions sat
+#: at WATCHING for four days. The refusal was logged at DEBUG, once per
+#: symbol, worded exactly like a quiet stock.
+UNSUPPORTED_PROVIDER_CONTRACT = "UNSUPPORTED_PROVIDER_CONTRACT"
+NORMAL_SYMBOL_DATA_UNAVAILABLE = "NORMAL_SYMBOL_DATA_UNAVAILABLE"
+
+
+class UnsupportedIntervalError(MarketDataUnavailable):
+    """A provider was asked for an interval it does not serve.
+
+    A subclass rather than a flag, so existing `except
+    MarketDataUnavailable` handlers keep working unchanged -- a symbol
+    is still skipped, the scan still continues, and nothing new can take
+    a cycle down. What the subclass buys is that a handler which CARES
+    can tell the two apart, and `get_symbol_data` does.
+    """
+
+    reason_code = UNSUPPORTED_PROVIDER_CONTRACT
+
+    def __init__(self, message, *, requested=None, supported=()):
+        super().__init__(message)
+        self.requested = requested
+        self.supported = tuple(supported)
+
+
 @dataclass(frozen=True)
 class PremarketSnapshot:
     """What section S4 needs before the opening bell."""
@@ -157,6 +194,12 @@ class SymbolData:
     daily_interval: str = "1d"
     intraday_interval: Optional[str] = None
     include_prepost: Optional[bool] = None
+    #: Why `intraday` is None, when it is: UNSUPPORTED_PROVIDER_CONTRACT
+    #: or NORMAL_SYMBOL_DATA_UNAVAILABLE. Carried on the bundle rather
+    #: than left in a log line, because the caller that has to explain
+    #: "no features" to an operator is several layers from the fetch and
+    #: cannot otherwise tell a quiet stock from a mis-wired provider.
+    intraday_unavailable_reason: Optional[str] = None
 
     def require_daily(self, minimum_bars: int = 1) -> pd.DataFrame:
         """The daily frame, or a refusal naming what was missing.
@@ -203,6 +246,27 @@ class BarMarketDataProvider(ABC):
     #: actually observed -- a fabricated one is worse than a null,
     #: because a null is visibly unknown and a guess is not.
     feed_name = None
+
+    #: What a caller with no opinion should ask this provider for.
+    #:
+    #: The interval belongs to the PROVIDER, not to the session and not
+    #: to the caller. `s6_live/realtime_features.py` hard-coded "5m"
+    #: because that is what yfinance served, and when the extended
+    #: sessions were switched to a KIS provider serving 1m only, the
+    #: request and the source disagreed for exactly the three sessions
+    #: that had been swapped. A second session-to-interval mapping
+    #: somewhere else is how that happens again; asking the provider
+    #: that was actually injected is how it cannot.
+    preferred_intraday_interval = "5m"
+
+    #: The intervals this provider serves, or () for "no declared
+    #: restriction". Declared once and used BY the guard that enforces
+    #: it, so the list and the refusal cannot drift apart.
+    supported_intraday_intervals: tuple = ()
+
+    def serves_intraday_interval(self, interval) -> bool:
+        return (not self.supported_intraday_intervals
+                or str(interval) in self.supported_intraday_intervals)
 
     @abstractmethod
     def get_daily_bars(self, symbol: str, lookback_days: int = 400) -> pd.DataFrame:
@@ -280,9 +344,17 @@ class BarMarketDataProvider(ABC):
         symbol whose minute bars are missing, which is routine for
         thinly-traded names. A daily failure DOES propagate, because no
         scanner here can do anything useful without it.
+
+        The demotion still happens for a provider asked for an interval
+        it does not serve -- one symbol must never take a scan down -- but
+        it is NAMED and logged at WARNING rather than DEBUG. That fault
+        is not about this symbol at all: it will repeat for every symbol
+        until someone changes the wiring, and four days of "quiet
+        extended sessions" were exactly this, worded as a thin stock.
         """
         daily = self.get_daily_bars(symbol, lookback_days=daily_lookback_days)
         intraday = None
+        unavailable_reason = None
         try:
             intraday = self.get_intraday_bars(
                 symbol,
@@ -290,7 +362,23 @@ class BarMarketDataProvider(ABC):
                 lookback_days=intraday_lookback_days,
                 include_prepost=include_prepost,
             )
+        except UnsupportedIntervalError as exc:
+            unavailable_reason = UNSUPPORTED_PROVIDER_CONTRACT
+            # WARNING, and per symbol. Deliberately not rate-limited and
+            # deliberately not raised: the cost of a repeated line is a
+            # noisy log, and the cost of a quiet one was three live
+            # sessions that could not produce a single tradeable
+            # candidate while every dashboard read "no setups".
+            logger.warning(
+                "%s: %s -- provider %r was asked for %r and serves %s; this "
+                "is a wiring fault, not a quiet symbol, and it will repeat "
+                "for every symbol until the interval matches",
+                symbol, UNSUPPORTED_PROVIDER_CONTRACT,
+                getattr(self, "provider_name", "?"),
+                getattr(exc, "requested", intraday_interval),
+                ", ".join(getattr(exc, "supported", ()) or ("?",)))
         except MarketDataUnavailable as exc:
+            unavailable_reason = NORMAL_SYMBOL_DATA_UNAVAILABLE
             logger.debug("%s: intraday unavailable (%s)", symbol, exc)
         premarket = None
         if want_premarket:
@@ -309,6 +397,7 @@ class BarMarketDataProvider(ABC):
             daily_interval="1d",
             intraday_interval=intraday_interval if intraday is not None else None,
             include_prepost=include_prepost if intraday is not None else None,
+            intraday_unavailable_reason=unavailable_reason,
         )
 
 
@@ -486,6 +575,17 @@ class CachingMarketDataProvider(BarMarketDataProvider):
         # mean production never recorded a usable provider name.
         self.provider_name = getattr(inner, "provider_name", "unknown")
         self.feed_name = getattr(inner, "feed_name", None)
+        # The interval contract passes through for the same reason the
+        # provenance does. A wrapper that answered the BASE class's "5m"
+        # while memoising a 1m-only provider would reintroduce the exact
+        # disagreement this declaration exists to remove -- and it would
+        # do it only in the cached configuration, which is the one
+        # production runs.
+        self.preferred_intraday_interval = getattr(
+            inner, "preferred_intraday_interval",
+            BarMarketDataProvider.preferred_intraday_interval)
+        self.supported_intraday_intervals = getattr(
+            inner, "supported_intraday_intervals", ())
 
     def _memo(self, key, produce):
         if key in self._cache:
