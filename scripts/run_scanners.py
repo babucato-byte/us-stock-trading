@@ -24,7 +24,55 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from scanners.runner import main  # noqa: E402
 
 
-def session_provider():
+def daily_bars_only(argv=None) -> bool:
+    """Does this invocation read ONLY daily bars?
+
+    `registry.DAILY_SCANNERS` already says these three "only need daily
+    bars… should not pay for minute data it will not read". The provider
+    was chosen by SESSION, not by that requirement, so the daily profile
+    -- which runs at 16:17 ET, inside AFTER_HOURS -- took the KIS
+    per-symbol path and paid for minute data it never read:
+
+        2026-09-02  universe=11047  provider=kis  duration=48798.8s
+
+    Thirteen and a half hours, serialised on the shared ~3s KIS read
+    interval, against a budget S6 needs live. The scanners were right
+    about what they needed; nothing was asking them.
+
+    Answered from the REQUEST rather than the clock, and deliberately
+    strict: every scanner named must be a daily-bars-only one. A mixed
+    run still takes the session provider, because one intraday scanner
+    in the set means minute bars really are needed.
+    """
+    from scanners.registry import DAILY_SCANNERS
+    from scanners.runner import PROFILES
+
+    argv = list(sys.argv[1:] if argv is None else argv)
+    profile = scanners = None
+    tokens = iter(range(len(argv)))
+    for i in tokens:
+        token = argv[i]
+        if token == "--profile":
+            profile = argv[i + 1] if i + 1 < len(argv) else None
+        elif token.startswith("--profile="):
+            profile = token.split("=", 1)[1]
+        elif token == "--scanners":
+            scanners = argv[i + 1] if i + 1 < len(argv) else None
+        elif token.startswith("--scanners="):
+            scanners = token.split("=", 1)[1]
+
+    if scanners:
+        names = [n.strip() for n in scanners.split(",") if n.strip()]
+    elif profile:
+        names = list(PROFILES.get(profile) or ())
+    else:
+        # No profile and no scanner list: the caller has not said what it
+        # wants, so nothing here narrows anything.
+        return False
+    return bool(names) and set(names) <= set(DAILY_SCANNERS)
+
+
+def session_provider(argv=None):
     """The bar provider for the session we are in, or None.
 
     Built HERE rather than inside `scanners/` on purpose. The extended
@@ -43,6 +91,12 @@ def session_provider():
     strictly worse than one running on the previous provider.
     """
     try:
+        # Asked BEFORE the session, and before a broker is constructed.
+        # A daily-bars-only scan has no use for KIS bars in ANY session,
+        # so there is nothing for the session branch to decide.
+        if daily_bars_only(argv):
+            return None
+
         from market_data.kis_bar_provider import (
             KIS_AUTHORITATIVE_SESSIONS, provider_for_session,
         )
