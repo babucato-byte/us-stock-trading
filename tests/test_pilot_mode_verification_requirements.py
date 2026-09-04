@@ -249,13 +249,29 @@ class TestClassificationMatchesTheSource:
             if not isinstance(node, ast.FunctionDef):
                 continue
             for child in ast.walk(node):
-                if isinstance(child, ast.Name) and child.id == "_sweep_exchanges":
-                    sweeping.add(node.name)
-                if (isinstance(child, ast.Attribute) and child.attr == "_sweep_exchanges"):
+                # Any sweep helper counts. `get_fills` uses the PAGED one
+                # (`_sweep_exchanges_paged`) because KIS caps a page and
+                # the first page is not the history -- but it still visits
+                # every venue, which is the property this asserts. Matching
+                # the base name keeps a read that sweeps NOTHING failing,
+                # which is the finding the test exists for.
+                name = None
+                if isinstance(child, ast.Name):
+                    name = child.id
+                elif isinstance(child, ast.Attribute):
+                    name = child.attr
+                if name and name.startswith("_sweep_exchanges"):
                     sweeping.add(node.name)
         assert {"get_account_snapshot", "get_positions", "get_open_orders",
                 "get_fills"} <= sweeping, sweeping
         assert "OVRS_EXCG_CD" in BROKER_SOURCE
+
+    def test_every_sweep_helper_visits_every_venue(self):
+        """The base name is matched above, so each helper wearing it must
+        genuinely sweep the full order code space."""
+        for helper in ("_sweep_exchanges", "_sweep_exchanges_paged"):
+            body = BROKER_SOURCE.split(f"def {helper}(")[1].split("\n    def ")[0]
+            assert "supported_kis_order_exchange_codes()" in body, helper
 
     def test_the_sweep_uses_the_order_code_space(self):
         from domain.exchange import supported_kis_order_exchange_codes
