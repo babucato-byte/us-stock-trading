@@ -30,6 +30,7 @@ KIS_LIVE_ALERT_WEBHOOK_ENV = "KIS_LIVE_SLACK_ALERT_WEBHOOK_URL"
 # KIS pair above, and with the same no-fallback rule: unset means silence,
 # never a reroute into the paper/alert streams.
 SCANNER_MONITOR_WEBHOOK_ENV = "SCANNER_MONITOR_SLACK_WEBHOOK_URL"
+SYSTEM_HEALTH_WEBHOOK_ENV = "SYSTEM_HEALTH_SLACK_WEBHOOK_URL"
 
 
 def _send(webhook_url, message):
@@ -106,6 +107,15 @@ def scanner_monitor_configured():
 def send_scanner_monitor_message(message):
     """The #stock-scanner channel. Never falls back to another webhook."""
     return _send(_env_webhook(SCANNER_MONITOR_WEBHOOK_ENV), message)
+
+
+def send_system_health_message(message):
+    """Dedicated system-health delivery; never falls back to live alerts."""
+    webhook = _env_webhook(SYSTEM_HEALTH_WEBHOOK_ENV)
+    if not webhook:
+        print(f"{SYSTEM_HEALTH_WEBHOOK_ENV} is not configured; health report not sent")
+        return False
+    return _send(webhook, message)
 
 
 def kis_live_notifications_configured():

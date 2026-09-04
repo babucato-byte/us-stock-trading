@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from market_guard import is_us_trading_day
-from slack_utils import send_slack_alert
+from slack_utils import send_system_health_message
 
 BASE_DIR = Path(__file__).resolve().parent
 KST = ZoneInfo("Asia/Seoul")
@@ -120,7 +120,8 @@ Git 상태
 """
 
     print(message)
-    send_slack_alert(message)
+    if not send_system_health_message(message):
+        print("SYSTEM_HEALTH_NOTIFICATION_UNCONFIGURED_OR_FAILED")
 
 
 if __name__ == "__main__":

@@ -126,9 +126,9 @@ def _mark_sent(key: str, trading_day: str) -> None:
 def _send(message: str) -> bool:
     """The only outbound call. Imported lazily and never allowed to raise."""
     try:
-        from slack_utils import send_slack_alert
+        from slack_utils import send_scanner_monitor_message
 
-        return bool(send_slack_alert(message))
+        return bool(send_scanner_monitor_message(message))
     except Exception:  # noqa: BLE001 - a Slack outage is not a scan failure
         logger.warning("scanner notify: Slack send failed", exc_info=True)
         return False
