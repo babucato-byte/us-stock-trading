@@ -1035,13 +1035,24 @@ class KISBroker:
         per-second rate limit (EGW00201) is retried with backoff rather
         than surfacing as a hard failure. Reads are safe to repeat --
         orders and cancels deliberately are not, and are never retried."""
+        return self._get_page(path, tr_id, params)[0]
+
+    def _get_page(self, path, tr_id, params, *, tr_cont=""):
+        """One page, as `(body, tr_cont)` from KIS's own response header.
+
+        `_get` is this with the continuation discarded, so every existing
+        caller keeps byte-identical behaviour. Only a reader that intends
+        to follow the continuation asks for the header, which is why the
+        paging contract lives here rather than in each caller.
+        """
         limiter = self._limiter or kis_rate_limiter.get_limiter()
 
         def _attempt():
             try:
                 response = self.session.request(
                     "GET", f"{self.config.base_url}{path}",
-                    headers=self._auth_headers(tr_id), params=params, timeout=10,
+                    headers=self._auth_headers(tr_id, tr_cont=tr_cont),
+                    params=params, timeout=10,
                 )
             except requests.exceptions.RequestException as exc:
                 raise KISBrokerError(
@@ -1061,7 +1072,21 @@ class KISBroker:
                 )
             if body is None:
                 raise KISBrokerError(f"KIS GET {path} response not JSON")
-            return body
+            # The continuation lives in the RESPONSE HEADER, not the body.
+            # Read case-insensitively: KIS has been observed answering
+            # `tr_cont` and requests' header mapping is case-insensitive
+            # only for real responses, not for the dicts tests supply.
+            headers = getattr(response, "headers", None) or {}
+            try:
+                continuation = headers.get("tr_cont")
+            except Exception:  # noqa: BLE001 - a header map that cannot be
+                continuation = None  # read is "no continuation", not a fault
+            if continuation is None:
+                for key, value in dict(headers).items():
+                    if str(key).lower() == "tr_cont":
+                        continuation = value
+                        break
+            return body, str(continuation or "").strip()
 
         return limiter.call_with_retry(
             _attempt, category=kis_rate_limiter.CATEGORY_READ, describe=path,
@@ -1164,6 +1189,113 @@ class KISBroker:
                 error.reason_code = getattr(exc, "reason_code", None) or "KIS_EXCHANGE_LEG_FAILED"
                 raise error from exc
             results.append((code, body))
+        return results
+
+    #: KIS's continuation vocabulary, in the RESPONSE header.
+    #:
+    #:   F / M  more pages follow
+    #:   D / E  this is the last page
+    #:
+    #: Anything else -- absent, blank, unrecognised -- is treated as "no
+    #: more pages". That is the safe direction for an unknown value: it
+    #: ends the read rather than looping on a header nobody documented.
+    _TR_CONT_MORE = ("F", "M")
+
+    #: What the REQUEST header must carry to ask for the next page.
+    _TR_CONT_NEXT = "N"
+
+    #: Upper bound on pages per exchange leg. A guard against a broker
+    #: that never stops saying "more", not a policy about history depth:
+    #: at 200 rows a page this is far more fill history than any window
+    #: this codebase derives. Hitting it RAISES rather than returning a
+    #: short list, because a silently truncated fill history is the exact
+    #: defect this method exists to remove.
+    _MAX_FILL_PAGES = 50
+
+    def _sweep_exchanges_paged(self, path, tr_id, base_params, *, describe):
+        """`_sweep_exchanges`, following KIS's continuation to the end.
+
+        The defect this closes
+        ----------------------
+        `get_fills` sent CTX_AREA_NK200="" and kept only the first page.
+        KIS caps a page, so a WIDER window returned FEWER of the rows
+        that mattered -- and the window widens exactly when an order is
+        stuck, which made the blindness self-reinforcing. On 2026-09-03
+        SLGN order 0030974162 filled 3 @ 41.61; reconciliation read
+        20260902-20260904, got 30 rows, and the fill was not among them,
+        while a narrower 20260903-20260904 read returned it. The ledger
+        stayed ACCEPTED, `fill_adoption` refused for want of a FILLED
+        order, and three real shares sat with no position row and no exit
+        rule attached to them.
+
+        One page per leg is the bug; every page per leg is the fix.
+
+        Returns the same `(code, body)` pairs `_sweep_exchanges` does --
+        one per PAGE rather than one per leg -- so the caller's existing
+        `_merge_rows` parsing and identity de-duplication are unchanged
+        and cover cross-page repeats for free.
+        """
+        results = []
+        for code in supported_kis_order_exchange_codes():
+            cursor_fk, cursor_nk = "", ""
+            tr_cont = ""
+            seen_keys = set()
+            for page in range(self._MAX_FILL_PAGES + 1):
+                # A FRESH dict per page. Mutating one across pages would
+                # hand the transport a dict that keeps changing after the
+                # call, which makes what was actually sent unprovable.
+                params = dict(base_params)
+                params["OVRS_EXCG_CD"] = code
+                params["CTX_AREA_FK200"] = cursor_fk
+                params["CTX_AREA_NK200"] = cursor_nk
+                if page == self._MAX_FILL_PAGES:
+                    raise KISBrokerError(
+                        f"{describe} for exchange {code} did not terminate "
+                        f"within {self._MAX_FILL_PAGES} pages; refusing to "
+                        "return a truncated fill history")
+                try:
+                    body, continuation = self._get_page(
+                        path, tr_id, params, tr_cont=tr_cont)
+                except (kis_rate_limiter.KISRateLimitStateInvalid,
+                        kis_rate_limiter.KISRateLimitStateUnavailable):
+                    raise
+                except Exception as exc:
+                    error = KISAccountSweepError(
+                        f"{describe} failed for exchange {code}: {exc}",
+                        exchange_code=code,
+                    )
+                    error.reason_code = (getattr(exc, "reason_code", None)
+                                         or "KIS_EXCHANGE_LEG_FAILED")
+                    raise error from exc
+                results.append((code, body))
+
+                if str(continuation).upper() not in self._TR_CONT_MORE:
+                    break
+                # KIS echoes the cursor in the BODY and expects it back in
+                # the next request's params.
+                next_fk = str(body.get("ctx_area_fk200") or "").strip()
+                next_nk = str(body.get("ctx_area_nk200") or "").strip()
+                if not next_nk:
+                    # "More follows" with no cursor to follow is not a
+                    # page we can request. Stopping is the only option;
+                    # inventing a cursor would be guessing at the wire.
+                    logger.warning(
+                        "%s for exchange %s reported more pages but returned "
+                        "no continuation cursor; stopping at page %d",
+                        describe, code, page + 1)
+                    break
+                cursor = (next_fk, next_nk)
+                if cursor in seen_keys:
+                    # A repeated cursor is a loop. Fail closed: returning
+                    # what we have would be a truncation wearing the
+                    # appearance of a complete read.
+                    raise KISBrokerError(
+                        f"{describe} for exchange {code} repeated its "
+                        "continuation cursor; refusing to loop or to return "
+                        "a partial fill history")
+                seen_keys.add(cursor)
+                cursor_fk, cursor_nk = next_fk, next_nk
+                tr_cont = self._TR_CONT_NEXT
         return results
 
     @staticmethod
@@ -1483,7 +1615,11 @@ class KISBroker:
         """`start_date`/`end_date` are KIS's own YYYYMMDD format."""
         self.config.validate_read_allowed()
         tr_id = TR_ID_CCNL[self._env_key()]
-        legs = self._sweep_exchanges(CCNL_PATH, tr_id, {
+        # PAGED. KIS caps a page, so the first page is not the history --
+        # see `_sweep_exchanges_paged`. The exchange sweep, the parameters
+        # and the parsing below are unchanged; only the number of pages
+        # read is.
+        legs = self._sweep_exchanges_paged(CCNL_PATH, tr_id, {
             "CANO": self.config.account_no, "ACNT_PRDT_CD": self.config.account_product_cd,
             "PDNO": "%", "ORD_STRT_DT": start_date, "ORD_END_DT": end_date,
             "SLL_BUY_DVSN": "00", "CCLD_NCCS_DVSN": "00",
