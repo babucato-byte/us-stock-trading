@@ -58,6 +58,13 @@ SUBMIT_PERMITTED = {
     # intent reaches them already gated.
     "brokers/kis_broker_adapter.py",
     "live_pilot/bootstrap.py",
+    # The route-verification one-shot's transport budget, the same shape
+    # as the bootstrap's above: it proxies the real broker so the engine
+    # can count one BUY, one cancel and one flatten, and it re-asserts
+    # the order shape immediately before the call. It cannot originate an
+    # order either -- `execution_engine.submit_buy_order` runs the full
+    # gate before the transport it holds is ever reached.
+    "live_pilot/route_verification_runner.py",
     # The strategy handing a sell intent to the ROUTER, not to KIS:
     # `broker_adapter.submit_order(...)` lands in kis_broker_adapter,
     # which calls `execution_engine.submit_sell_order()`. Naming it here

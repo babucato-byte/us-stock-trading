@@ -112,6 +112,17 @@ class BuyGateContext:
     #: check before the wire, and a caller that cannot mint one cannot
     #: fabricate one.
     bootstrap_capability: Optional[object] = None
+    #: The per-order `execution.route_verification.
+    #: RouteVerificationCapability` authorising ONE daytime BUY placed to
+    #: prove `TTTS6036U`, or None.
+    #:
+    #: A SECOND field rather than a shared one, for the same reason the
+    #: flags are separate: a bootstrap and a route verification are
+    #: different acts with different intents -- one means to fill, the
+    #: other means to rest and be cancelled -- and a single field would
+    #: let either authorise the other. Both are read by exactly one
+    #: check, `_check_route_evidence`, and by nothing else.
+    route_verification_capability: Optional[object] = None
 
 
 @dataclass(frozen=True)
@@ -362,6 +373,61 @@ def _bootstrap_may_prove_this_route(ctx, *, session, family):
     return True
 
 
+def _verification_may_prove_this_route(ctx, *, session, family):
+    """May THIS order be the one placed to prove the daytime BUY leg?
+
+    The sibling of `_bootstrap_may_prove_this_route`, and separate from
+    it on purpose. A bootstrap intends to fill and become a position; a
+    verification intends to rest two ticks under the market and be
+    cancelled. Sharing one predicate would let either authorise the
+    other's shape.
+
+    Every condition is about THIS order, and each is re-checked here
+    rather than trusted from mint time:
+
+      * a real RouteVerificationCapability, re-validated against the
+        order in hand -- which re-reads its own dedicated flags, so a
+        withdrawn acknowledgement withdraws the exception too
+      * the fixed verification shape: buy / 1 / limit
+      * session OVERNIGHT_DAYTIME resolving to the DAYTIME family, which
+        the capability ALSO carries and asserts, so a GENERAL-route order
+        can never reach this path
+      * the strategy is not stood down for entries
+
+    It permits one order to be sent and marks nothing verified. The wire
+    matrix is static; only a reviewed edit moves a value to
+    LIVE_RESPONSE_CONFIRMED, and only a real KIS response justifies one.
+
+    Fail-closed: anything unreadable or unexpected returns False and the
+    caller raises ROUTE_UNVERIFIED.
+    """
+    capability = getattr(ctx, "route_verification_capability", None)
+    if capability is None:
+        return False
+
+    try:
+        from brokers import kis_broker as kb
+        from execution import route_verification as verification
+
+        if str(session or "").strip().upper() != verification.VERIFICATION_SESSION:
+            return False
+        if family != kb.FAMILY_DAYTIME:
+            return False
+        if getattr(ctx, "entry_disabled", True):
+            return False
+
+        intent = getattr(ctx, "order_intent", None)
+        if (getattr(intent, "side", None) != verification.VERIFICATION_SIDE
+                or getattr(intent, "quantity", None) != verification.VERIFICATION_QUANTITY
+                or getattr(intent, "order_type", None) != verification.VERIFICATION_ORDER_TYPE):
+            return False
+
+        verification.validate(capability, intent)
+    except Exception:  # noqa: BLE001 - fail closed, as above
+        return False
+    return True
+
+
 def _check_route_evidence(ctx):
     """Refuse a BUY on a route family no live order has ever exercised.
 
@@ -412,17 +478,21 @@ def _check_route_evidence(ctx):
         family = kb.family_for_session(session)
         pending = sorted(kb.pending_items_for(
             session_capability.evidence_posture_for_family(family)) or ())
-        if _bootstrap_may_prove_this_route(ctx, session=session, family=family):
-            # Loud on purpose. This is the one path on which a real order
-            # is sent to a route nothing has exercised, and an operator
-            # reading the log afterwards must be able to see that it was
-            # a bootstrap that did it rather than an ordinary entry.
+        for permitted, label in (
+                (_bootstrap_may_prove_this_route, "BOOTSTRAP"),
+                (_verification_may_prove_this_route, "ROUTE_VERIFICATION")):
+            if not permitted(ctx, session=session, family=family):
+                continue
+            # Loud on purpose. These are the only paths on which a real
+            # order is sent to a route nothing has exercised, and an
+            # operator reading the log afterwards must be able to see
+            # WHICH one did it rather than an ordinary entry.
             logger.warning(
-                "ROUTE_EVIDENCE_BOOTSTRAP_EXCEPTION symbol=%s session=%s "
-                "family=%s qty=%s still_pending=%s -- one authorised "
-                "bootstrap BUY is permitted on this unproven route; no wire "
-                "value is marked verified by this decision",
-                getattr(intent, "symbol", None), session, family,
+                "ROUTE_EVIDENCE_%s_EXCEPTION symbol=%s session=%s "
+                "family=%s qty=%s still_pending=%s -- one authorised order "
+                "is permitted on this unproven route; no wire value is "
+                "marked verified by this decision",
+                label, getattr(intent, "symbol", None), session, family,
                 getattr(intent, "quantity", None), ",".join(pending) or "none")
             return
         raise OrderGateBlockedError(
