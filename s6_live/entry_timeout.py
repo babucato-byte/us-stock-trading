@@ -94,17 +94,64 @@ def _now(now=None):
     return now or datetime.now(timezone.utc)
 
 
-def _age_seconds(row, now) -> Optional[float]:
-    stamp = row.get("submitted_at") or row.get("created_at")
+def _parse_stamp(stamp) -> Optional[datetime]:
     if not stamp:
         return None
     try:
         made = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
-        if made.tzinfo is None:
-            made = made.replace(tzinfo=timezone.utc)
-        return (now - made).total_seconds()
     except Exception:  # noqa: BLE001 - an unreadable stamp is not a timeout
         return None
+    return made if made.tzinfo else made.replace(tzinfo=timezone.utc)
+
+
+def accepted_at(conn, internal_order_id) -> Optional[datetime]:
+    """When the BROKER accepted this order, from the durable event log.
+
+    The FIRST transition into ACCEPTED, which `execution_engine` writes
+    from the transport result -- so it is the moment KIS acknowledged the
+    order, not the moment this process began preparing it.
+    """
+    if conn is None or not internal_order_id:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT occurred_at FROM order_state_events "
+            "WHERE internal_order_id = ? AND to_state = 'ACCEPTED' "
+            "ORDER BY rowid ASC LIMIT 1", (internal_order_id,)).fetchone()
+    except Exception:  # noqa: BLE001 - an unreadable event log establishes
+        return None  # nothing, and establishing nothing is the point
+    return _parse_stamp(row["occurred_at"] if row else None)
+
+
+def _age_seconds(row, now, conn=None) -> Optional[float]:
+    """How long this order has been RESTING AT THE BROKER.
+
+    Anchored on the broker's acceptance, never on the cycle that prepared
+    the order. `submitted_at` is when the position row was written, and
+    the distance between the two is real work: the gate, the reconciliation
+    snapshot, sizing and the transport all happen in between.
+
+    SLGN on 2026-09-03 is what the difference costs. The position row was
+    stamped 19:32:08 and KIS accepted at 19:33:27 -- 79 seconds later. At
+    19:36:08 this read age=239.9s against a 180s TTL and cancelled an order
+    that had actually rested for ~163s. It had already filled. Three shares
+    were then lost to BUY_NEVER_FILLED, and 180 seconds had never meant
+    180 seconds at the broker.
+
+    Returns None when acceptance cannot be established, and the caller
+    treats None as "no TTL expiry" -- the fail-closed direction. Expiring
+    an order whose resting time is unknown is precisely the mistake above,
+    and the other cancel reasons (candidate gone, session not orderable)
+    still apply on their own evidence.
+    """
+    stamp = accepted_at(conn, row.get("client_order_id"))
+    if stamp is None:
+        logger.warning(
+            "S6 %s %s: broker acceptance time unavailable; the BUY fill TTL "
+            "is not applied to it this tick", row.get("position_id"),
+            row.get("symbol"))
+        return None
+    return (now - stamp).total_seconds()
 
 
 def _open_order_at_broker(broker, symbol):
@@ -319,7 +366,7 @@ def evaluate(conn, *, broker, account_id, source=None, now=None,
 
     for row in position_store.load_unconfirmed(conn) or ():
         position_id, symbol = row["position_id"], row["symbol"]
-        age = _age_seconds(row, current)
+        age = _age_seconds(row, current, conn)
 
         # A partially filled row is already OPEN by the time it gets
         # here; what remains is to pull the unfilled remainder so the

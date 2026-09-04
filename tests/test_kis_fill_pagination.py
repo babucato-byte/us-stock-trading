@@ -21,10 +21,10 @@ later page.
 
 Scope
 -----
-`get_fills` ONLY. `get_open_orders`, `get_positions` and
-`get_account_snapshot` have the identical single-page defect and are
-deliberately left alone in this urgent patch -- one endpoint changed
-under an unmanaged live position, with the rest tracked as follow-up.
+`get_fills` first, under an unmanaged live position. The identical defect
+in `get_open_orders`, `get_positions` and `get_account_snapshot` followed
+once SLGN was recovered, and all four now share one continuation
+primitive so the protocol is written once and cannot drift between them.
 """
 
 from datetime import datetime, timezone
@@ -224,7 +224,7 @@ class TestNoDuplicatesAndNoSilentTruncation:
     def test_an_endless_continuation_raises_at_the_page_cap(self):
         pages = _quiet("NASD", "AMEX")
         pages["NYSE"] = [(_page([_fill(f"A{i}")], fk="F", nk=f"N{i}"), "F")
-                         for i in range(KISBroker._MAX_FILL_PAGES + 2)]
+                         for i in range(KISBroker._MAX_PAGES + 2)]
         with pytest.raises(KISBrokerError, match="did not terminate"):
             _broker(_PagingSession(pages)).get_fills(
                 start_date="20260902", end_date="20260904")
@@ -293,14 +293,138 @@ class TestExistingBehaviourIsUnchanged:
         assert len(rows) == 3
 
 
-class TestScopeIsOnlyGetFills:
-    def test_the_other_account_reads_still_use_the_unpaged_sweep(self):
-        """Deliberate: one endpoint changed under an unmanaged position."""
+class TestEveryAccountReadIsPaged:
+    """The scope this file opened with was `get_fills` alone. It is now
+    every account read, and no reader may quietly go back to one page."""
+
+    import_error = None
+
+    @pytest.mark.parametrize("method", ["get_fills", "get_open_orders",
+                                        "get_positions", "get_account_snapshot"])
+    def test_the_read_uses_the_paged_sweep(self, method):
         import inspect
 
         source = inspect.getsource(KISBroker)
-        for method in ("get_open_orders", "get_positions", "get_account_snapshot"):
-            body = source.split(f"def {method}")[1].split("\n    def ")[0]
-            assert "_sweep_exchanges_paged" not in body, method
-        fills = source.split("def get_fills")[1].split("\n    def ")[0]
-        assert "_sweep_exchanges_paged" in fills
+        body = source.split(f"def {method}")[1].split("\n    def ")[0]
+        assert "_sweep_exchanges_paged" in body, method
+
+    def test_one_shared_continuation_primitive(self):
+        """Written once. Four copies of a wire protocol is four chances to
+        fix only three of them."""
+        import inspect
+
+        source = inspect.getsource(KISBroker)
+        assert source.count("CTX_AREA_NK200\"] = ") <= 1
+        assert source.count("_TR_CONT_NEXT") == 2  # the constant, and its use
+
+
+# --- the same defect on the other three account reads -------------------
+
+from brokers.kis_broker import BALANCE_PATH, NCCS_PATH  # noqa: E402
+
+
+class _PathPagingSession(_PagingSession):
+    """`_PagingSession` for any KIS account path, not just the fill one."""
+
+    def __init__(self, path, pages_by_venue):
+        super().__init__(pages_by_venue)
+        self._path = path
+
+    def request(self, method, url, **kwargs):
+        self.requests.append((method, url, kwargs))
+        if url.endswith("/oauth2/tokenP"):
+            return _Resp(TOKEN_BODY)
+        if url.endswith(self._path):
+            venue = (kwargs.get("params") or {}).get("OVRS_EXCG_CD")
+            index = self._served.get(venue, 0)
+            self._served[venue] = index + 1
+            pages = self._pages.get(venue) or [(_page([]), "")]
+            body, tr_cont = pages[index]
+            return _Resp(body, tr_cont=tr_cont)
+        raise AssertionError(f"unstubbed {method} {url}")
+
+    def path_requests(self):
+        return [kw for _m, url, kw in self.requests if url.endswith(self._path)]
+
+
+def _order_row(odno, symbol="AAPL"):
+    return {"odno": odno, "pdno": symbol, "ft_ord_qty": "1", "ft_ccld_qty": "0",
+            "nccs_qty": "1", "ft_ord_unpr3": "10.00", "sll_buy_dvsn_cd": "02",
+            "ovrs_excg_cd": "NYSE"}
+
+
+def _holding(symbol, qty="3", avg="41.61"):
+    return {"ovrs_pdno": symbol, "ovrs_cblc_qty": qty, "pchs_avg_pric": avg,
+            "frcr_evlu_pfls_amt": "0", "ovrs_excg_cd": "NYSE"}
+
+
+def _bal_page(rows, *, fk="", nk="", summary=None):
+    return {"rt_cd": "0", "output1": rows, "output": rows,
+            "output2": summary if summary is not None else {},
+            "ctx_area_fk200": fk, "ctx_area_nk200": nk}
+
+
+class TestOpenOrdersArePaged:
+    def test_an_open_order_on_page_two_is_returned(self):
+        pages = {v: [(_page([]), "")] for v in ("NASD", "AMEX")}
+        pages["NYSE"] = [(_page([_order_row("1")], fk="F", nk="N1"), "F"),
+                         (_page([_order_row("0000008640", "SLGN")]), "D")]
+        session = _PathPagingSession(NCCS_PATH, pages)
+        rows = _broker(session).get_open_orders()
+        assert {r["odno"] for r in rows} == {"1", "0000008640"}
+
+    def test_the_cursor_is_carried(self):
+        pages = {v: [(_page([]), "")] for v in ("NASD", "AMEX")}
+        pages["NYSE"] = [(_page([_order_row("1")], fk="FK", nk="NK"), "F"),
+                         (_page([_order_row("2")]), "D")]
+        session = _PathPagingSession(NCCS_PATH, pages)
+        _broker(session).get_open_orders()
+        nyse = [kw for kw in session.path_requests()
+                if kw["params"]["OVRS_EXCG_CD"] == "NYSE"]
+        assert nyse[1]["params"]["CTX_AREA_NK200"] == "NK"
+        assert nyse[1]["headers"]["tr_cont"] == "N"
+
+    def test_a_repeated_order_across_pages_appears_once(self):
+        pages = {v: [(_page([]), "")] for v in ("NASD", "AMEX")}
+        pages["NYSE"] = [(_page([_order_row("1")], fk="F", nk="N1"), "F"),
+                         (_page([_order_row("1")]), "D")]
+        rows = _broker(_PathPagingSession(NCCS_PATH, pages)).get_open_orders()
+        assert len([r for r in rows if r["odno"] == "1"]) == 1
+
+
+class TestPositionsArePaged:
+    def test_a_holding_on_page_two_is_returned(self):
+        pages = {v: [(_bal_page([]), "")] for v in ("NASD", "AMEX")}
+        pages["NYSE"] = [(_bal_page([_holding("AAPL", "1")], fk="F", nk="N1"), "F"),
+                         (_bal_page([_holding("SLGN", "3")]), "D")]
+        positions = _broker(_PathPagingSession(BALANCE_PATH, pages)).get_positions()
+        assert {p.symbol for p in positions} == {"AAPL", "SLGN"}
+        slgn = [p for p in positions if p.symbol == "SLGN"][0]
+        assert slgn.quantity == 3
+
+    def test_a_holding_repeated_across_pages_is_not_double_counted(self):
+        pages = {v: [(_bal_page([]), "")] for v in ("NASD", "AMEX")}
+        pages["NYSE"] = [(_bal_page([_holding("SLGN", "3")], fk="F", nk="N1"), "F"),
+                         (_bal_page([_holding("SLGN", "3")]), "D")]
+        positions = _broker(_PathPagingSession(BALANCE_PATH, pages)).get_positions()
+        assert len([p for p in positions if p.symbol == "SLGN"]) == 1
+
+
+class TestAccountSnapshotIsPaged:
+    def test_the_summary_still_comes_from_the_first_page(self):
+        """Cash is account-level: taking it from page 1 of venue 1 is
+        unchanged by paging."""
+        summary = {"frcr_pchs_amt1": "100", "ovrs_rlzt_pfls_amt": "0",
+                   "ovrs_tot_pfls": "0", "rlzt_erng_rt": "0",
+                   "tot_evlu_pfls_amt": "0", "tot_pftrt": "0"}
+        pages = {v: [(_bal_page([], summary=summary), "")]
+                 for v in ("NASD", "NYSE", "AMEX")}
+        pages["NYSE"] = [
+            (_bal_page([_holding("AAPL", "1")], fk="F", nk="N1", summary=summary), "F"),
+            (_bal_page([_holding("SLGN", "3")], summary={}), "D"),
+        ]
+        session = _PathPagingSession(BALANCE_PATH, pages)
+        snapshot = _broker(session).get_account_snapshot()
+        assert snapshot is not None
+        # every page of every venue was read
+        assert len(session.path_requests()) == 4

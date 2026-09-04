@@ -51,7 +51,7 @@ def broker_with(legs):
     """A KISBroker whose exchange sweep returns `legs` verbatim."""
     broker = kb.KISBroker.__new__(kb.KISBroker)
     broker.config = FakeConfig()
-    broker._sweep_exchanges = lambda *a, **k: legs
+    broker._sweep_exchanges_paged = lambda *a, **k: legs
     broker._env_key = lambda: "live"
     from datetime import datetime, timezone
     broker._now = lambda: datetime(2026, 8, 18, 17, 30, tzinfo=timezone.utc)

@@ -1205,19 +1205,24 @@ class KISBroker:
     _TR_CONT_NEXT = "N"
 
     #: Upper bound on pages per exchange leg. A guard against a broker
-    #: that never stops saying "more", not a policy about history depth:
-    #: at 200 rows a page this is far more fill history than any window
-    #: this codebase derives. Hitting it RAISES rather than returning a
-    #: short list, because a silently truncated fill history is the exact
-    #: defect this method exists to remove.
-    _MAX_FILL_PAGES = 50
+    #: that never stops saying "more", not a policy about how much history
+    #: or how many holdings may count: at 200 rows a page this is far more
+    #: than any account this system trades. Hitting it RAISES rather than
+    #: returning a short list, because a silently truncated account read is
+    #: the exact defect this method exists to remove.
+    _MAX_PAGES = 50
 
     def _sweep_exchanges_paged(self, path, tr_id, base_params, *, describe):
         """`_sweep_exchanges`, following KIS's continuation to the end.
 
+        Shared by every paged account read -- fills, open orders,
+        positions and the balance -- so the continuation protocol is
+        written once and cannot drift between them.
+
         The defect this closes
         ----------------------
-        `get_fills` sent CTX_AREA_NK200="" and kept only the first page.
+        Every account read sent CTX_AREA_NK200="" and kept only the
+        first page.
         KIS caps a page, so a WIDER window returned FEWER of the rows
         that mattered -- and the window widens exactly when an order is
         stuck, which made the blindness self-reinforcing. On 2026-09-03
@@ -1240,7 +1245,7 @@ class KISBroker:
             cursor_fk, cursor_nk = "", ""
             tr_cont = ""
             seen_keys = set()
-            for page in range(self._MAX_FILL_PAGES + 1):
+            for page in range(self._MAX_PAGES + 1):
                 # A FRESH dict per page. Mutating one across pages would
                 # hand the transport a dict that keeps changing after the
                 # call, which makes what was actually sent unprovable.
@@ -1248,10 +1253,10 @@ class KISBroker:
                 params["OVRS_EXCG_CD"] = code
                 params["CTX_AREA_FK200"] = cursor_fk
                 params["CTX_AREA_NK200"] = cursor_nk
-                if page == self._MAX_FILL_PAGES:
+                if page == self._MAX_PAGES:
                     raise KISBrokerError(
                         f"{describe} for exchange {code} did not terminate "
-                        f"within {self._MAX_FILL_PAGES} pages; refusing to "
+                        f"within {self._MAX_PAGES} pages; refusing to "
                         "return a truncated fill history")
                 try:
                     body, continuation = self._get_page(
@@ -1368,7 +1373,7 @@ class KISBroker:
     def get_account_snapshot(self, *, source_label="kis_balance") -> AccountSnapshot:
         self.config.validate_read_allowed()
         tr_id = TR_ID_BALANCE[self._env_key()]
-        legs = self._sweep_exchanges(BALANCE_PATH, tr_id, {
+        legs = self._sweep_exchanges_paged(BALANCE_PATH, tr_id, {
             "CANO": self.config.account_no, "ACNT_PRDT_CD": self.config.account_product_cd,
             "TR_CRCY_CD": "USD", "CTX_AREA_FK200": "", "CTX_AREA_NK200": "",
         }, describe="KIS balance read")
@@ -1552,7 +1557,7 @@ class KISBroker:
     def get_positions(self) -> List[Position]:
         self.config.validate_read_allowed()
         tr_id = TR_ID_BALANCE[self._env_key()]
-        legs = self._sweep_exchanges(BALANCE_PATH, tr_id, {
+        legs = self._sweep_exchanges_paged(BALANCE_PATH, tr_id, {
             "CANO": self.config.account_no, "ACNT_PRDT_CD": self.config.account_product_cd,
             "TR_CRCY_CD": "USD", "CTX_AREA_FK200": "", "CTX_AREA_NK200": "",
         }, describe="KIS position read")
@@ -1605,7 +1610,7 @@ class KISBroker:
 
     def get_open_orders(self) -> list:
         self.config.validate_read_allowed()
-        legs = self._sweep_exchanges(NCCS_PATH, TR_ID_NCCS[self._env_key()], {
+        legs = self._sweep_exchanges_paged(NCCS_PATH, TR_ID_NCCS[self._env_key()], {
             "CANO": self.config.account_no, "ACNT_PRDT_CD": self.config.account_product_cd,
             "SORT_SQN": "DS", "CTX_AREA_FK200": "", "CTX_AREA_NK200": "",
         }, describe="KIS open-order read")

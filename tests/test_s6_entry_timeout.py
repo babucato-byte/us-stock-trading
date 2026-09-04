@@ -77,8 +77,21 @@ class Source:
 
 
 def _submitted(conn, *, symbol="DT", age_seconds=0, client_order_id="kislive-DT-1",
-               quantity=1.0):
+               quantity=1.0, accepted_age_seconds=None, accepted=True):
+    """A submitted BUY.
+
+    `age_seconds` is how long ago the POSITION ROW was written (the entry
+    cycle preparing the order). `accepted_age_seconds` is how long ago the
+    BROKER accepted it, which is what the TTL is anchored on -- it
+    defaults to the same instant so a caller that does not care about the
+    distinction gets the behaviour it always had.
+
+    `accepted=False` writes no ACCEPTED event, which is the "authoritative
+    timestamp unavailable" case.
+    """
     submitted_at = NOW - timedelta(seconds=age_seconds)
+    accepted_at = NOW - timedelta(
+        seconds=age_seconds if accepted_age_seconds is None else accepted_age_seconds)
     pid = ps.record_submission(
         conn, symbol=symbol, variant="S6-R", entry_session="REGULAR",
         client_order_id=client_order_id, now=submitted_at)
@@ -90,6 +103,15 @@ def _submitted(conn, *, symbol="DT", age_seconds=0, client_order_id="kislive-DT-
         (client_order_id, "sig-1", symbol, "buy", "2026-08-26", "0030740200",
          "ACCEPTED", submitted_at.isoformat(), submitted_at.isoformat(),
          quantity, 1, ps.STRATEGY_ID))
+    if accepted:
+        # What execution_engine writes from the transport result. The TTL
+        # reads THIS, not the position row's own stamp.
+        conn.execute(
+            "INSERT INTO order_state_events (internal_order_id, from_state, "
+            "to_state, event_type, payload, version, occurred_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (client_order_id, "SUBMITTING", "ACCEPTED", "TRANSPORT_RESULT",
+             None, 4, accepted_at.isoformat()))
     conn.commit()
     return pid
 
@@ -126,14 +148,71 @@ class TestTheClockDecidesOnlyWhenItHasRunOut:
         assert out[0]["action"] == et.ACTION_CANCEL_REQUESTED
 
     def test_an_unreadable_timestamp_does_not_time_out(self, conn, monkeypatch):
-        """A stamp that cannot be parsed is not an old order."""
+        """A stamp that cannot be parsed is not an old order.
+
+        The stamp that matters is the BROKER's acceptance, so that is the
+        one corrupted here."""
         _submitted(conn, age_seconds=300)
-        conn.execute("UPDATE s6_positions SET submitted_at='not-a-time', "
-                     "created_at='not-a-time'")
+        conn.execute("UPDATE order_state_events SET occurred_at='not-a-time'")
         conn.commit()
         out = et.evaluate(conn, broker=Broker(), account_id=ACCOUNT,
                           source=Source(), now=NOW)
         assert out[0]["action"] == et.ACTION_HELD
+
+
+class TestTheTtlMeasuresRestingAtTheBroker:
+    """SLGN, 2026-09-03. The position row was stamped 19:32:08, KIS
+    accepted at 19:33:27, and at 19:36:08 the TTL read 239.9s against a
+    180s limit and cancelled an order that had rested ~163s. It had
+    already filled; three shares were lost to BUY_NEVER_FILLED.
+
+    180 seconds must mean 180 seconds AT THE BROKER."""
+
+    def test_preparation_latency_does_not_consume_the_ttl(self, conn):
+        """The SLGN shape exactly: 240s since preparation, 164s resting."""
+        _submitted(conn, age_seconds=240, accepted_age_seconds=164)
+        out = et.evaluate(conn, broker=Broker(), account_id=ACCOUNT,
+                          source=Source(), now=NOW)
+        assert out[0]["action"] == et.ACTION_HELD
+        assert out[0]["age_seconds"] == pytest.approx(164, abs=2)
+
+    def test_the_ttl_expires_on_broker_resting_time(self, conn, monkeypatch):
+        _stub_engine(monkeypatch, [])
+        _submitted(conn, age_seconds=1000, accepted_age_seconds=181)
+        out = et.evaluate(conn, broker=Broker(), account_id=ACCOUNT,
+                          source=Source(), now=NOW)
+        assert out[0]["action"] == et.ACTION_CANCEL_REQUESTED
+        assert out[0]["reason"] == et.REASON_TTL
+
+    def test_the_position_rows_own_stamp_no_longer_decides(self, conn):
+        """Prepared an hour ago, accepted a moment ago -> not expired."""
+        _submitted(conn, age_seconds=3600, accepted_age_seconds=5)
+        out = et.evaluate(conn, broker=Broker(), account_id=ACCOUNT,
+                          source=Source(), now=NOW)
+        assert out[0]["action"] == et.ACTION_HELD
+
+    def test_a_missing_acceptance_event_fails_closed(self, conn):
+        """No authoritative timestamp -> no TTL expiry. Expiring an order
+        whose resting time is unknown is the mistake itself."""
+        _submitted(conn, age_seconds=100000, accepted=False)
+        out = et.evaluate(conn, broker=Broker(), account_id=ACCOUNT,
+                          source=Source(), now=NOW)
+        assert out[0]["action"] == et.ACTION_HELD
+        assert out[0]["age_seconds"] is None
+
+    def test_the_ttl_duration_is_unchanged(self):
+        assert et.BUY_FILL_TTL_SECONDS == 180
+
+    def test_other_cancel_reasons_still_apply_without_an_anchor(
+            self, conn, monkeypatch):
+        """Failing closed on the TTL must not make an order uncancellable:
+        a candidate that is positively gone is still grounds."""
+        _stub_engine(monkeypatch, [])
+        _submitted(conn, age_seconds=10, accepted=False)
+        out = et.evaluate(conn, broker=Broker(), account_id=ACCOUNT,
+                          source=Source(symbols=[]), now=NOW)
+        assert out[0]["action"] == et.ACTION_CANCEL_REQUESTED
+        assert out[0]["reason"] == et.REASON_CANDIDATE_GONE
 
 
 class TestItRefusesToActOnIgnorance:

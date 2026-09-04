@@ -781,6 +781,30 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                         symbol=symbol, exchange=instrument.exchange, signal_price=analysis["price"],
                         score=analysis["score"], entry_reason=qualified.entry_reason,
                         valid_for_seconds=SIGNAL_VALID_SECONDS, now=current,
+                        # The SCANNER's signal id, not a fresh one per cycle.
+                        #
+                        # `execution/idempotency.py` already refuses a
+                        # second attempt on (signal_id, symbol, side,
+                        # trading_date) -- a durable UNIQUE constraint that
+                        # survives a restart. Minting `sig-<uuid4>` here
+                        # every cycle handed that guard a different key each
+                        # time, so it could never fire: one scanner
+                        # candidate could produce an unbounded series of
+                        # real BUY attempts.
+                        #
+                        # SLGN on 2026-09-03 is what that looks like. The
+                        # same published row bought twice, three minutes
+                        # apart, as sig-dd73fb3399f84167 and then
+                        # sig-e37f9c095891414f; the first was cancelled
+                        # zero-filled, the second filled 3 @ 41.61 and was
+                        # lost. A genuinely new scanner generation carries a
+                        # new source_signal_id and is still free to enter.
+                        #
+                        # Falls back to a generated id when a source does
+                        # not publish one, which is exactly today's
+                        # behaviour for those sources -- this narrows the
+                        # ones that DO, and widens nothing.
+                        signal_id=getattr(qualified, "source_signal_id", None) or None,
                     )
                 except (InstrumentError, SignalError) as exc:
                     reason = f"signal/instrument construction failed: {exc}"
