@@ -199,6 +199,35 @@ class RunReport:
     manifest_age_seconds: Optional[float] = None
     eligibility_summary: Dict[str, Any] = field(default_factory=dict)
     required_history_bars: int = 0
+    # Passive scan diagnostics.  These records are intentionally kept out of
+    # candidate rows: observability must not alter the hand-off contract.
+    symbol_timings: List[Dict[str, Any]] = field(default_factory=list)
+
+    def timing_summary(self) -> Dict[str, Any]:
+        def values(name):
+            return sorted(float(row[name]) for row in self.symbol_timings
+                          if row.get(name) is not None)
+        def percentiles(items):
+            if not items:
+                return {"p50_ms": None, "p90_ms": None, "p95_ms": None, "p99_ms": None, "max_ms": None}
+            def pick(p):
+                return items[min(len(items) - 1, int((len(items) - 1) * p))]
+            return {"p50_ms": round(pick(.50), 3), "p90_ms": round(pick(.90), 3),
+                    "p95_ms": round(pick(.95), 3),
+                    "p99_ms": round(pick(.99), 3), "max_ms": round(items[-1], 3)}
+        acquisition = values("acquisition_elapsed_ms")
+        total = values("total_symbol_elapsed_ms")
+        return {"symbol_count": len(self.symbol_timings), "request_count": len(acquisition),
+                "symbol_total": percentiles(total), "kis_acquisition": percentiles(acquisition),
+                "limiter_wait_total_ms": "NOT_SEPARABLE",
+                "network_time_total_ms": "NOT_SEPARABLE",
+                "local_processing_total_ms": round(sum(
+                    (row.get("feature_eval_elapsed_ms") or 0.0) for row in self.symbol_timings), 3)}
+
+    @property
+    def timing_enabled(self) -> bool:
+        return (str(self.provider).lower() == "kis" and
+                str(self.session).upper() in {"PREMARKET", "AFTER_HOURS", "OVERNIGHT_DAYTIME"})
 
     @property
     def signal_count(self) -> int:
@@ -298,6 +327,7 @@ class RunReport:
             "manifest_status": self.manifest_status,
             "manifest_detail": self.manifest_detail,
             "manifest_age_seconds": self.manifest_age_seconds,
+            **({"timing": self.timing_summary()} if self.timing_enabled else {}),
             "scanners": [outcome.summary() for outcome in self.outcomes],
         }
 
@@ -319,15 +349,30 @@ def _symbol_bundles(
     has seen it.
     """
     for symbol in symbols:
+        record = ({"symbol": symbol, "request_start": datetime.now(timezone.utc).isoformat(),
+                  "limiter_wait_ms": "NOT_SEPARABLE", "network_broker_elapsed_ms": "NOT_SEPARABLE",
+                  "response_parse_elapsed_ms": "NOT_SEPARABLE", "session_slice_elapsed_ms": "NOT_SEPARABLE",
+                  "orb_eval_elapsed_ms": None, "feature_eval_elapsed_ms": None,
+                  "result": "data_error"} if report.timing_enabled else None)
+        began = time.perf_counter()
         try:
-            yield provider.get_symbol_data(
+            bundle = provider.get_symbol_data(
                 symbol,
                 daily_lookback_days=daily_lookback_days,
                 intraday_interval=intraday_interval,
                 intraday_lookback_days=intraday_lookback_days,
                 want_premarket=want_intraday,
             )
+            if record is not None:
+                record["request_end"] = datetime.now(timezone.utc).isoformat()
+                record["acquisition_elapsed_ms"] = round((time.perf_counter() - began) * 1000.0, 3)
+                report.symbol_timings.append(record)
+            yield bundle
         except MarketDataUnavailable as exc:
+            if record is not None:
+                record["request_end"] = datetime.now(timezone.utc).isoformat()
+                record["acquisition_elapsed_ms"] = round((time.perf_counter() - began) * 1000.0, 3)
+                report.symbol_timings.append(record)
             report.fetch_failures += 1
             report.fetch_failed_symbols.append(symbol)
             if len(report.fetch_failure_samples) < 20:
@@ -337,6 +382,10 @@ def _symbol_bundles(
             # form buries anything real (section 22).
             logger.debug("skipping %s: %s", symbol, exc)
         except Exception as exc:  # noqa: BLE001 - a bad symbol must not end the run
+            if record is not None:
+                record["request_end"] = datetime.now(timezone.utc).isoformat()
+                record["acquisition_elapsed_ms"] = round((time.perf_counter() - began) * 1000.0, 3)
+                report.symbol_timings.append(record)
             report.fetch_failures += 1
             report.fetch_failed_symbols.append(symbol)
             if len(report.fetch_failure_samples) < 20:
@@ -611,6 +660,10 @@ def run_scanners(
         # A failure here belongs to the SYMBOL, not to any one scanner,
         # so it is recorded against all of them exactly as the per-scanner
         # path used to record it.
+        timing = (next((row for row in reversed(report.symbol_timings)
+                        if row["symbol"] == bundle.symbol and "total_symbol_elapsed_ms" not in row), None)
+                  if report.timing_enabled else None)
+        symbol_started = time.perf_counter()
         shared_features = None
         feature_error = None
         try:
@@ -619,6 +672,8 @@ def run_scanners(
             feature_error = exc
         except Exception as exc:  # noqa: BLE001 - unexpected: keep it per-scanner
             feature_error = exc
+        if timing is not None:
+            timing["feature_eval_elapsed_ms"] = round((time.perf_counter() - symbol_started) * 1000.0, 3)
 
         # Remember what this symbol turned out to be, so the next run
         # does not pay to rediscover it.
@@ -652,6 +707,7 @@ def run_scanners(
                 continue
             errors_before = outcome.exceptions
             try:
+                eval_started = time.perf_counter()
                 if feature_error is not None:
                     raise feature_error
                 # The session being scanned, passed rather than left for
@@ -663,6 +719,8 @@ def run_scanners(
                                       run_id=identifier,
                                       shared_features=shared_features,
                                       session=requested_session)
+                if timing is not None and name == "orb":
+                    timing["orb_eval_elapsed_ms"] = round((time.perf_counter() - eval_started) * 1000.0, 3)
             except ScannerDataError as exc:
                 # The shared pass could not build features for this
                 # symbol. Counted and logged exactly as the per-scanner
@@ -701,6 +759,11 @@ def run_scanners(
                                  name, outcome.circuit_breaker_reason)
             else:
                 consecutive_errors[name] = 0
+        if timing is not None:
+            timing["result"] = ("data_error" if feature_error is not None else
+                                ("candidate" if any(s.symbol == bundle.symbol for o in outcomes.values()
+                                                    for s in o.signals) else "rejected"))
+            timing["total_symbol_elapsed_ms"] = round((time.perf_counter() - symbol_started) * 1000.0 + timing.get("acquisition_elapsed_ms", 0.0), 3)
 
     report.outcomes = [outcomes[scanner.scanner_name] for scanner in built]
 
@@ -839,6 +902,15 @@ def _publish_safely(report: RunReport) -> None:
 def _record_manifest(report: RunReport, trading_day: str) -> None:
     try:
         result_store.write_run_manifest(report.to_manifest(), trading_day=trading_day)
+        # Bounded: one diagnostic file per immutable run id, at most one row
+        # per scanned symbol; no request payloads, headers, or credentials.
+        if report.timing_enabled:
+            directory = result_store.analytics_dir() / "timing"
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / f"{trading_day}_{report.run_id}.jsonl"
+            with path.open("w", encoding="utf-8") as handle:
+                for row in report.symbol_timings:
+                    handle.write(json.dumps(row, sort_keys=True) + "\n")
     except Exception:  # noqa: BLE001 - the manifest is an audit aid, not the data
         logger.exception("could not write the run manifest for %s", trading_day)
 
