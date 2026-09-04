@@ -234,15 +234,37 @@ class TestOnlyTheBootstrapMintsCapabilities:
                           "BootstrapCapability("):
             assert forbidden not in source, f"{relative} constructs a capability"
 
-    def test_exactly_one_module_mints_them(self):
+    def test_exactly_one_module_mints_each_kind(self):
+        """One minter per capability KIND.
+
+        There are two kinds now -- the bootstrap's, which proves the
+        pipeline, and the route verification's, which proves a wire
+        value. Each is minted in exactly one place, and neither module
+        mints the other's: that pairing is the property, and a bare count
+        of `.mint(` call sites would stop expressing it the moment a
+        second kind existed.
+        """
+        expected = {
+            "live_pilot/bootstrap.py": "execution/bootstrap_capability.py",
+            "live_pilot/route_verification_runner.py":
+                "execution/route_verification.py",
+        }
         minters = []
         for path in REPO_ROOT.rglob("*.py"):
             rel = path.relative_to(REPO_ROOT).as_posix()
-            if rel.startswith(("tests/", "venv/")) or rel == "execution/bootstrap_capability.py":
+            if rel.startswith(("tests/", "venv/")) or rel in expected.values():
                 continue
             if ".mint(" in path.read_text(encoding="utf-8"):
                 minters.append(rel)
-        assert minters == ["live_pilot/bootstrap.py"], minters
+        assert sorted(minters) == sorted(expected), minters
+
+        # Neither minter may construct the other's capability.
+        bootstrap_src = (REPO_ROOT / "live_pilot/bootstrap.py").read_text()
+        verification_src = (
+            REPO_ROOT / "live_pilot/route_verification_runner.py").read_text()
+        assert "RouteVerificationCapability(" not in bootstrap_src
+        assert "BootstrapCapability(" not in verification_src
+        assert "route_verification" not in bootstrap_src
 
     def test_the_engine_defaults_the_capability_to_none(self):
         import inspect
