@@ -1,16 +1,29 @@
 {
   "scanner_name": "orb",
   "version": "orb_v1.0",
-  "description": "S6 -- Opening Range Breakout. orb_minutes selects ORB5/ORB15/ORB30 (spec S6); 15 is the v1.0 default. Frozen for month 1 (spec section 11).",
+  "description": "S6 -- Opening Range Breakout. orb_minutes selects ORB5/ORB15/ORB30 (spec S6); 15 is the v1.0 default. Frozen for month 1 (spec section 11). Entry-timing gates (entry_window_minutes, max_breakout_age_minutes, recent_volume_window_minutes + recent_volume_expansion_min, max_minutes_since_session_high) ship null = OFF: the measurements are recorded on every candidate so the windows can be chosen from data, not guessed.",
   "params": {
     "orb_minutes": 15,
-    "supported_orb_minutes": [5, 15, 30],
+    "supported_orb_minutes": [
+      5,
+      15,
+      30
+    ],
     "require_close_breakout": true,
     "require_price_above_vwap": true,
     "require_ema9_above_ema21": true,
     "volume_expansion_min": 1.2,
     "retest_tolerance_pct": 0.3,
     "min_post_range_bars": 3,
+    "recent_volume_observation_minutes": [
+      15,
+      30
+    ],
+    "entry_window_minutes": null,
+    "max_breakout_age_minutes": null,
+    "recent_volume_window_minutes": null,
+    "recent_volume_expansion_min": null,
+    "max_minutes_since_session_high": null,
     "regular_session_only": true,
     "max_extension_above_or_high_pct": 6.0,
     "score_volume_expansion_strong": 3.0,

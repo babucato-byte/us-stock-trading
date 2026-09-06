@@ -68,6 +68,7 @@ from domain.cash_sizing import (
     whole_shares_affordable,
 )
 from domain.instrument import Instrument, InstrumentError, build_instrument
+from execution import signal_validity
 from domain.order_intent import OrderIntent, OrderIntentError
 from domain.signal import Signal, SignalError, build_signal
 from execution import entry_limits, execution_engine, idempotency, order_gate
@@ -397,11 +398,15 @@ REVALIDATION_ENTRY_DISABLED_ENV = "REVALIDATION_ENTRY_DISABLED_ENV"
 REVALIDATION_EXIT_IN_FLIGHT = "REVALIDATION_EXIT_IN_FLIGHT"
 REVALIDATION_SYMBOL_HELD = "REVALIDATION_SYMBOL_HELD"
 REVALIDATION_STATE_UNREADABLE = "REVALIDATION_STATE_UNREADABLE"
+#: The Signal's own budget ran out before the order could be sent. Only
+#: a source that STATES its budget is measured here -- see
+#: execution/signal_validity.py; the default policy is never asked.
+REVALIDATION_SIGNAL_EXPIRED = "REVALIDATION_SIGNAL_EXPIRED"
 
 
 def _revalidate_before_submit(*, symbol, broker, conn, instrument, order_intent,
                               buffered_price, live_state, signal=None,
-                              now=None):
+                              now=None, validity=None, submit_clock=None):
     """Re-ask, holding the execution lock, everything that could have
     changed while the analysis ran unlocked.
 
@@ -427,23 +432,36 @@ def _revalidate_before_submit(*, symbol, broker, conn, instrument, order_intent,
     """
     from live_pilot import posture as live_posture
 
-    # Signal freshness is NOT re-asked here, and that is deliberate.
+    # 0. Signal freshness -- asked ONLY of a source that stated its own
+    #    budget, and measured against the wall clock from the moment the
+    #    candidate was accepted.
     #
-    # It was, briefly, and it stopped S6 trading. `SIGNAL_VALID_SECONDS`
-    # is 120 while an entry cycle legitimately takes two to five minutes,
-    # so measuring the signal against the real clock at submit time
-    # expired every candidate -- 2 of 2 on 2026-09-02 -- and replaced
-    # lock starvation with expiry starvation.
+    #    It was asked of everyone once, from the cycle's START, and it
+    #    stopped S6 trading: the precision watch runs before any
+    #    candidate is accepted and took most of the 120 s, so 2 of 2
+    #    candidates on 2026-09-02 arrived here already expired. Then it
+    #    was asked of no one, and the budget stopped meaning anything.
     #
-    # The gate asks this against the cycle's own clock, which makes the
-    # 120s window effectively "this cycle". Whether that window SHOULD
-    # be measured across the pipeline is a real question about a risk
-    # parameter, and the answer is not this function's to give: changing
-    # when a signal counts as stale changes which trades happen, and
-    # that belongs to the strategy, not to a lock refactor.
-    #
-    # What this function may do is make the gate's inputs current. What
-    # it may not do is quietly redefine one of them.
+    #    The strategy now answers the question this function once could
+    #    not: the SOURCE says how long its pipeline may take
+    #    (`signal_valid_seconds`), the Signal is anchored at acceptance,
+    #    and this is where the budget is finally measured. A source that
+    #    states no budget -- the legacy watchlist, S1, S2 -- is not
+    #    measured here at all, exactly as before: their gate still asks
+    #    against the cycle clock. See execution/signal_validity.py.
+    if validity is not None and signal is not None:
+        moment = validity.submit_moment(now, clock=submit_clock)
+        if moment is not None and signal.is_expired(now=moment):
+            created = getattr(signal, "created_at", None)
+            age = ((moment - created).total_seconds()
+                   if isinstance(created, datetime) else None)
+            return (REVALIDATION_SIGNAL_EXPIRED,
+                    f"signal {getattr(signal, 'signal_id', None)!r} exceeded "
+                    f"its {validity.valid_for_seconds:.0f}s pipeline budget "
+                    f"({validity.policy_source}): accepted "
+                    f"{created.isoformat() if isinstance(created, datetime) else created}, "
+                    f"now {moment.isoformat()}"
+                    + (f", age {age:.1f}s" if age is not None else ""))
 
     # 1. The two kill switches and the operator posture. All three were
     #    checked once at the top of the cycle, minutes ago.
@@ -666,6 +684,26 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
     # one `klt.pso` -- and therefore every existing monkeypatch -- uses.
     source = candidate_source or s1_candidate_source.resolve(
         rollout, trading_day=us_trading_day(current), watchlist_module=pso)
+    # The source's signal validity, resolved ONCE and before any
+    # candidate is read. A source that states a budget opts into the
+    # measured submit-time check; one that does not keeps the default
+    # exactly as before. A source that cannot answer stops the cycle
+    # here -- see execution/signal_validity.py.
+    try:
+        validity = signal_validity.resolve(
+            source, default_seconds=SIGNAL_VALID_SECONDS)
+    except signal_validity.SignalValidityError as exc:
+        reason = (f"signal validity could not be resolved for candidate "
+                  f"source {getattr(source, 'name', None)!r}, refusing to "
+                  f"run: {exc}")
+        _persist_blocked_record(
+            symbol=_CYCLE_LEVEL_SYMBOL, risk_gate_result="BLOCKED", rejection_reason=reason, now=current,
+        )
+        _audit_cycle_block(cycle_run_id, shadow_audit.CONFIG_BLOCKED,
+                           signal_validity.REASON_UNRESOLVED, reason, now=current)
+        raise KISLiveTradingError(reason) from exc
+    logger.info("signal validity: %s", validity.as_dict())
+
     # One evaluation of the allow-list per cycle. Re-reading it per symbol
     # would let the set change underneath a cycle that had already made
     # decisions against the earlier value.
@@ -762,6 +800,18 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                     outcome["result"] = shadow_audit.RESULT_INFO
                     outcome["reason_code"] = qualified.reason_code or "NOT_QUALIFIED"
                     continue
+                # A measured source must say when it observed the market.
+                # The pipeline clock below starts at acceptance and is
+                # never a stand-in for that; a candidate that cannot say
+                # is not accepted. The default policy asks nothing here.
+                stamp_refusal = signal_validity.source_timestamp_refusal(
+                    validity, getattr(qualified, "source_signal_timestamp", None))
+                if stamp_refusal:
+                    results["skipped"].append((symbol, stamp_refusal))
+                    outcome["result"] = shadow_audit.RESULT_INFO
+                    outcome["reason_code"] = signal_validity.REASON_SOURCE_TIMESTAMP_UNUSABLE
+                    outcome["detail"] = stamp_refusal
+                    continue
                 analysis = {"price": qualified.price, "score": qualified.score}
 
                 _audit(run_id, shadow_audit.SIGNAL_RECEIVED, shadow_audit.RESULT_INFO, symbol=symbol,
@@ -780,7 +830,13 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                         config_version="live_rollout_v1", code_commit=deployed_commit,
                         symbol=symbol, exchange=instrument.exchange, signal_price=analysis["price"],
                         score=analysis["score"], entry_reason=qualified.entry_reason,
-                        valid_for_seconds=SIGNAL_VALID_SECONDS, now=current,
+                        # The SOURCE's budget, anchored where the source's
+                        # policy says: at acceptance for a measured source,
+                        # at the cycle clock for the default. Built once;
+                        # the same object reaches the revalidation and the
+                        # gate, and nothing re-stamps it on the way.
+                        valid_for_seconds=validity.valid_for_seconds,
+                        now=validity.anchor(current),
                         # The SCANNER's signal id, not a fresh one per cycle.
                         #
                         # `execution/idempotency.py` already refuses a
@@ -1145,7 +1201,7 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                             symbol=symbol, broker=broker, conn=conn,
                             instrument=instrument, order_intent=order_intent,
                             buffered_price=buffered_price, live_state=live_state,
-                            signal=signal, now=current)
+                            signal=signal, now=current, validity=validity)
                         if dropped is not None:
                             revalidation_code, revalidation_detail = dropped
                             logger.info(

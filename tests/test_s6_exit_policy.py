@@ -130,13 +130,28 @@ class TestVolumeDecayNeverExitsAlone:
                                                volume_expansion=2.0))
         assert decision.action == ex.HOLD
 
-    def test_decay_with_price_weakness_exits(self):
+    def test_decay_with_price_weakness_exits_when_enforced(self, monkeypatch):
+        """Peak 103 over a range high of 99.5; 101 has given back 2.0 of
+        the 3.5 gained. The give-back half is provisional and ships
+        unenforced, so the SELL is only reachable with the switch on."""
+        monkeypatch.setattr(policy, "ENFORCE_PEAK_GIVEBACK_EXIT", True)
         state = held(peak_volume_expansion=4.0, peak_price=103.0)
         decision = ex.decide(state, current_price=101.0,
                              features=Features(price=101.0, vwap=100.0,
                                                volume_expansion=2.0))
         assert decision.reason == ex.REASON_VOLUME_DECAY_PRICE_WEAKNESS
         assert decision.detail["weakness"] == "GAVE_BACK_PEAK"
+
+    def test_the_same_case_is_held_and_recorded_while_unenforced(self):
+        assert policy.ENFORCE_PEAK_GIVEBACK_EXIT is False
+        state = held(peak_volume_expansion=4.0, peak_price=103.0)
+        decision = ex.decide(state, current_price=101.0,
+                             features=Features(price=101.0, vwap=100.0,
+                                               volume_expansion=2.0))
+        assert decision.action == ex.HOLD
+        assert decision.detail["would_sell_reason"] == \
+            ex.REASON_VOLUME_DECAY_PRICE_WEAKNESS
+        assert decision.detail["peak_exit_enforced"] is False
 
     def test_a_position_never_elevated_cannot_decay(self):
         state = held(peak_volume_expansion=1.0, peak_price=103.0)

@@ -170,6 +170,11 @@ def build(row: Dict[str, Any], *, trading_day=None, session=None,
         "ema21": _num(row.get("ema21")),
         "ema_spread_pct": _num(row.get("ema_spread_pct")),
 
+        # When the breakout was judged relative to when it happened.
+        # Carried verbatim from the published row so the entry-window
+        # and recent-volume distributions can be read from snapshots.
+        "entry_timing": dict(row.get("entry_timing") or {}),
+
         "generated_at": generated_at,
         # Absent at publication: nothing has consumed the row yet. Filled
         # in by the final-check report, which is the thing that consumes

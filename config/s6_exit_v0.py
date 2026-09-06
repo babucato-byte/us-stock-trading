@@ -58,6 +58,8 @@ REEVALUATION_QUESTIONS = (
     "is range_low too far, giving back more than the strategy earns",
     "is range_low too near, stopping out of ordinary noise",
     "does a cap tighter than range_low improve the MFE/MAE ratio",
+    "is half the gain above the range the right give-back, and thirty "
+    "minutes the right staleness, for the compound decay exit",
 )
 
 # --- structural exits -----------------------------------------------------
@@ -79,6 +81,44 @@ EXIT_ON_EMA_STRUCTURE_FAILURE = True
 #: weakness it is the compound exit.
 EXIT_ON_VOLUME_DECAY_WITH_WEAKNESS = True
 VOLUME_DECAY_FRACTION = 0.5
+
+#: What "price weakness" means for that compound exit.
+#:
+#: It used to mean `price < peak_price`, and because the peak ratchets up
+#: on every tick that was true on the first tick a position did not
+#: print a new high -- so any winning breakout whose opening burst of
+#: volume had halved (most of them) sold on its first ordinary pullback.
+#:
+#: Weakness now needs the position to have GIVEN BACK a fraction of the
+#: gain the breakout made above the range high -- (peak - price) /
+#: (peak - range_high) -- and for the peak to be STALE: no new high for
+#: PEAK_STALE_MINUTES. A small pullback inside an advance surrenders a
+#: small fraction; a dip minutes after a fresh high is a shake, not a
+#: stall. The fraction is expressed in the setup's own geometry, like
+#: the structural stop and VOLUME_DECAY_FRACTION, so it is not a
+#: percentage of price and is not the same distance for every position.
+#:
+#: PROVISIONAL. Neither number is measured: 0.5 mirrors the decay
+#: fraction's form, and thirty minutes is two executor ticks. The exit
+#: diagnostics record the give-back fraction, the drawdown and the peak
+#: age on every tick so the distribution can be read from real positions
+#: before either value is treated as settled. See REEVALUATION_QUESTIONS.
+PEAK_GIVEBACK_FRACTION = 0.5
+PEAK_STALE_MINUTES = 30
+PEAK_GIVEBACK_IS_MEASURED = False
+
+#: Whether the give-back half of the compound exit may SELL.
+#:
+#: OFF until the two numbers above have been measured. While OFF the
+#: rule is evaluated on every tick exactly as designed, and a tick on
+#: which it would have sold is recorded -- `peak_exit_candidate` and
+#: `would_sell_reason` in the exit diagnostics, with the raw peak,
+#: give-back and age figures beside them -- but the decision is HOLD
+#: unless a higher-priority structural exit independently sells. The
+#: VWAP_BELOW half of the same rule is unaffected: it carries no new
+#: threshold. Flipping this to True is the act of adopting the numbers,
+#: and should follow the measurement, not precede it.
+ENFORCE_PEAK_GIVEBACK_EXIT = False
 
 # --- validation-phase constraints ----------------------------------------
 

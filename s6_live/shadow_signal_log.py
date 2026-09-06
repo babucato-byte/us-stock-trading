@@ -122,7 +122,7 @@ def build_record(*, symbol, session, outcome, strategy_id,
     row.update(_feature_fields(features))
     if candidate:
         for key in ("rank", "score", "variant", "generated_at",
-                    "scanner_run_id"):
+                    "scanner_run_id", "entry_timing"):
             if key in candidate:
                 row[f"candidate_{key}"] = candidate.get(key)
     return row

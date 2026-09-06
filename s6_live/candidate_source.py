@@ -53,6 +53,42 @@ logger = logging.getLogger(__name__)
 SOURCE_S6 = "s6_orb_breakout"
 STRATEGY_ID = s6_sessions.STRATEGY_ID
 
+#: S6's PIPELINE budget: how long a candidate this source has offered,
+#: and the cycle has accepted, may take to reach the broker. Read by the
+#: shared buy cycle through `signal_valid_seconds()` -- the one hook
+#: `execution/signal_validity.py` asks a source for.
+#:
+#: This is not the strategy's freshness. How old the breakout may be is
+#: the precision watch's and the scan cycle's question (`_cycle_ok`,
+#: the market-data as-of bound, the generation record) and none of that
+#: moves here. This covers only what happens AFTER qualification, per
+#: candidate, on the way to submit:
+#:
+#:     KIS quote, account snapshot, orderable cash, open orders,
+#:     positions, execution-price check           ~6 reads
+#:     execution lock                              <= 2 s (acquire timeout;
+#:                                                 SKIPPED, never queued)
+#:     revalidation: open orders, orderable cash   2 reads
+#:     engine: reconciliation snapshot             ~2 reads
+#:     the order itself                            1 write
+#:
+#: Reads are paced at DEFAULT_READ_MIN_INTERVAL = 3.0 s by the shared
+#: rate limiter, so eleven of them cannot take less than ~33 s and,
+#: with ordinary latency, take ~45 s. A rate-limit backoff is 3 s
+#: doubling to a 15 s cap, so two of them add up to 30 s. That bounds
+#: the legitimate path at roughly 80 s. 180 s is that with a factor of
+#: two, and still well inside the five-minute consume cadence and the
+#: fifteen-minute scan, so a Signal cannot outlive the generation it was
+#: built from. The precision watch, which dominated the 2-5 minute cycle
+#: measured on 2026-09-02, runs BEFORE qualification and is not in this
+#: budget -- which is why the 120 s default, started at the cycle's
+#: beginning, expired 2 of 2 that day.
+#:
+#: Not 30 or 60 minutes. The ORB thesis may well stay valid that long,
+#: but that is the strategy-age question above, and a pipeline budget
+#: that long would let a candidate sit through a superseding scan.
+SIGNAL_VALID_SECONDS = 180.0
+
 #: The scan ran and no symbol broke out. Wait.
 NO_CANDIDATE = "scan ran; no symbol met the S6 breakout conditions"
 #: No scan ran at all. Waiting will not help.
@@ -408,6 +444,12 @@ class S6CandidateSource:
 
         return qualification.qualify_s6(
             symbol, candidate_row=self.candidate_row(symbol))
+
+    def signal_valid_seconds(self) -> float:
+        """S6's pipeline budget for one accepted candidate. See the
+        constant. Implementing this opts the source into the measured
+        submit-time check in `execution/signal_validity.py`."""
+        return SIGNAL_VALID_SECONDS
 
     def freshness(self) -> Dict[str, Any]:
         """When the rows were made and when they were used.

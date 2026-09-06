@@ -163,6 +163,9 @@ def follow(candidate: Dict[str, Any], bars: Sequence[Dict[str, Any]], *,
     for field in ("score_breakout_quality", "score_volume_expansion",
                   "score_entry_proximity", "score_vwap", "score_retest"):
         row[field] = candidate.get(field)
+    # The timing the scanner recorded at judgement, unchanged: this is
+    # the axis the entry-window question is answered on.
+    row["entry_timing"] = candidate.get("entry_timing")
 
     # -- forward prices and returns ------------------------------------
     for minutes in HORIZONS:

@@ -124,14 +124,17 @@ def open_from_fill(conn, position_id, *, quantity, average_fill_price,
             SET status = ?, quantity = ?, entry_price = ?, entry_time = ?,
                 venue = COALESCE(?, venue),
                 entry_order_id = COALESCE(?, entry_order_id),
-                peak_price = ?, trough_price = ?, updated_at = ?
+                peak_price = ?, peak_price_at = ?, trough_price = ?,
+                updated_at = ?
             WHERE position_id = ? AND status = ?""",
         # The entry IS the first peak AND the first trough. Leaving either
         # NULL would let the first observation set it unopposed, so a
         # position that only ever went up would report having gone
         # against us, and one that only fell would report no give-back.
-        (OPEN, qty, price, stamp, venue, entry_order_id, price, price, stamp,
-         position_id, SUBMITTED)).rowcount
+        # The peak is dated from the same moment: its age is what tells
+        # a fresh high's shake from a stale high's stall.
+        (OPEN, qty, price, stamp, venue, entry_order_id, price, stamp, price,
+         stamp, position_id, SUBMITTED)).rowcount
     conn.commit()
     if changed:
         logger.info("S6 position opened: %s qty=%d @ %.4f", position_id,
@@ -297,6 +300,11 @@ def observe(conn, position_id, *, price=None, volume_expansion=None,
         if peak is None or new_price > peak:
             updates.append("peak_price = ?")
             params.append(new_price)
+            # Dated only when it MOVES: a lower reading leaves the peak
+            # and its date alone, so the date says when the last new
+            # high was, not when the position was last looked at.
+            updates.append("peak_price_at = ?")
+            params.append(stamp)
         trough = _finite(row.get("trough_price"))
         if trough is None or new_price < trough:
             updates.append("trough_price = ?")
@@ -447,6 +455,7 @@ def to_state(row: Dict[str, Any]):
         peak_volume_expansion=_finite(row.get("peak_volume_expansion")),
         peak_price=_finite(row.get("peak_price")),
         exit_submitted=bool(row.get("exit_submitted")),
+        peak_price_at=row.get("peak_price_at"),
     )
 
 

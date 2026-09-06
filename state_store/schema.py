@@ -1239,6 +1239,23 @@ MIGRATION_24_STATEMENTS = [
     NOTIFICATION_LEDGER_EVENT_INDEX,
 ]
 
+# Migration 25: WHEN the S6 peak was set.
+#
+# `peak_price` ratchets up on every tick, so "price below the peak" is
+# true on the first tick a position does not print a new high. The
+# compound decay exit needs to know whether the peak is fresh (a dip
+# minutes after a new high is a shake) or stale (no new high for half an
+# hour is a stall), and that is a fact the ratchet discarded. Written by
+# `open_from_fill` (the entry is the first peak) and by `observe` when
+# the peak rises; NULL on rows opened before this column existed, which
+# the policy reads as "age unknown" rather than as fresh or stale.
+S6_POSITIONS_PEAK_PRICE_AT = (
+    "ALTER TABLE s6_positions ADD COLUMN peak_price_at TEXT")
+
+MIGRATION_25_STATEMENTS = [
+    S6_POSITIONS_PEAK_PRICE_AT,
+]
+
 
 # Every table this schema version creates -- used by export.py's
 # export_all() and by tests asserting the full table set exists.

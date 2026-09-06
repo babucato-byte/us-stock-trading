@@ -20,6 +20,7 @@ from state_store.schema import (
     MIGRATION_19_STATEMENTS, MIGRATION_20_STATEMENTS,
     MIGRATION_21_STATEMENTS, MIGRATION_22_STATEMENTS,
     MIGRATION_23_STATEMENTS, MIGRATION_24_STATEMENTS,
+    MIGRATION_25_STATEMENTS,
 )
 
 MIGRATIONS = [
@@ -80,6 +81,10 @@ MIGRATIONS = [
     (24, "NOTIFICATIONS: a durable ledger so a per-minute engine does not "
          "send the same true statement sixty times an hour",
      MIGRATION_24_STATEMENTS),
+    (25, "S6 PEAK TIMING: s6_positions.peak_price_at -- the ratchet kept "
+         "the peak and discarded when it was set, so one tick below it "
+         "read as weakness",
+     MIGRATION_25_STATEMENTS),
 ]
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1][0]

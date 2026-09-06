@@ -67,7 +67,22 @@ from scanners.base.models import ScannerSignal
 logger = logging.getLogger(__name__)
 
 #: Intraday horizons, in minutes (section 12).
-INTRADAY_HORIZONS = (("return_30m", 30), ("return_1h", 60), ("return_2h", 120))
+#:
+#: 15m was added for the S6 entry-timing study: the question "does a
+#: candidate judged 60 minutes into the session behave differently from
+#: one judged at 30" turns on the first quarter hour as much as on the
+#: first two, and a fast-turnover strategy's shortest horizon was
+#: missing. Additive, like the daily horizons: rows written before it
+#: have no `return_15m`, and `common.numbers()` excludes nulls.
+INTRADAY_HORIZONS = (("return_15m", 15), ("return_30m", 30),
+                     ("return_1h", 60), ("return_2h", 120))
+
+#: Intraday excursion windows: MFE and MAE inside the first N minutes
+#: after the signal, from the signal day's own minute bars. The daily
+#: `mfe_{n}d` windows fold the signal-day tail in with the following
+#: sessions, which cannot answer how a breakout behaved in its first
+#: hour. Observation fields only; nothing gates on them.
+INTRADAY_EXCURSIONS = (("15m", 15), ("30m", 30), ("1h", 60))
 
 #: Multi-day horizons, in trading sessions (sections 12 and 13).
 #:
@@ -247,6 +262,9 @@ def compute_performance(
     }
     for name, _ in INTRADAY_HORIZONS:
         record[name] = None
+    for label, _ in INTRADAY_EXCURSIONS:
+        record[f"mfe_{label}"] = None
+        record[f"mae_{label}"] = None
     record["return_close"] = None
     for days in DAY_HORIZONS:
         record[f"return_{days}d"] = None
@@ -282,6 +300,24 @@ def compute_performance(
                 # Elapsed, and the bar is not in the frame: the session
                 # ended before the horizon did.
                 status[name] = COMPLETE if value is not None else EXPIRED
+        for label, minutes in INTRADAY_EXCURSIONS:
+            # Only once the window has fully elapsed within the frame:
+            # a partial window's extreme is not that window's, and a
+            # null is excluded from averages where a small number would
+            # be counted.
+            window = tail[tail.index <= local + timedelta(minutes=minutes)]
+            elapsed = _bar_at_or_after(
+                tail, local + timedelta(minutes=minutes)) is not None
+            if not elapsed or len(window) == 0:
+                continue
+            highs = ind.high_series(window).dropna()
+            lows = ind.low_series(window).dropna()
+            if len(highs):
+                record[f"mfe_{label}"] = max(
+                    0.0, _percent(price, ind.to_float(highs.max())) or 0.0)
+            if len(lows):
+                record[f"mae_{label}"] = min(
+                    0.0, _percent(price, ind.to_float(lows.min())) or 0.0)
     else:
         # No minute bars at all for the signal day. Whether that is
         # recoverable depends entirely on age, and the two cases call

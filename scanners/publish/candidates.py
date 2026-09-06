@@ -119,6 +119,15 @@ class PublishedCandidate:
     ema21: Optional[float] = None
     volume_expansion: Optional[float] = None
     extension_pct: Optional[float] = None
+    #: WHEN the breakout was judged relative to when it happened --
+    #: `session_elapsed_minutes`, `breakout_age_minutes`,
+    #: `minutes_since_session_high`, `drawdown_from_session_high_pct`
+    #: and one `recent_volume_expansion_<W>m` per observation window.
+    #: Observation only: no consumer gates on it. It exists so the S6
+    #: entry-window and recent-volume distributions can be measured on
+    #: real candidates before any window is fixed. None for strategies
+    #: that do not produce it.
+    entry_timing: Optional[Dict[str, Any]] = None
 
     #: Everything needed to reproduce the judgement later.
     provenance: Dict[str, Any] = field(default_factory=dict)
@@ -283,6 +292,29 @@ def _number(value):
     return number
 
 
+#: The scanner's fixed-name timing measurements; the per-window volume
+#: ratios are recognised by prefix. Kept as names rather than imported
+#: from the scanner so the hand-off does not depend on a scanner module.
+ENTRY_TIMING_KEYS = (
+    "session_elapsed_minutes", "breakout_at", "breakout_age_minutes",
+    "bars_since_breakout", "session_high", "session_high_at",
+    "minutes_since_session_high", "drawdown_from_session_high_pct",
+)
+RECENT_VOLUME_PREFIX = "recent_volume_expansion_"
+
+
+def _entry_timing(metrics: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The timing measurements a signal carried, or None if it had none."""
+    timing: Dict[str, Any] = {}
+    for key in ENTRY_TIMING_KEYS:
+        if key in metrics:
+            timing[key] = metrics.get(key)
+    for key, value in metrics.items():
+        if isinstance(key, str) and key.startswith(RECENT_VOLUME_PREFIX):
+            timing[key] = value
+    return timing or None
+
+
 def build_rows(signals: Iterable[Any], *, strategy_id: str, trading_day: str,
                session: Optional[str], run_id: Optional[str] = None,
                generated_at: Optional[str] = None,
@@ -339,6 +371,7 @@ def build_rows(signals: Iterable[Any], *, strategy_id: str, trading_day: str,
             ema21=_number(metrics.get("session_ema21")),
             volume_expansion=_number(metrics.get("volume_expansion")),
             extension_pct=_number(metrics.get("extension_above_or_high_pct")),
+            entry_timing=_entry_timing(metrics),
             provenance={
                 "schema": SCHEMA_VERSION,
                 "scanner_name": getattr(signal, "scanner_name", None),

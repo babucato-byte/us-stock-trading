@@ -89,9 +89,10 @@ def _predicate(reason, state, features, price, session, now) -> Optional[dict]:
     if reason == exit_policy.REASON_EMA_STRUCTURE_FAILURE:
         return exit_policy.ema_structure_failed(features)
     if reason == exit_policy.REASON_VOLUME_DECAY_PRICE_WEAKNESS:
-        decayed = exit_policy.volume_decayed(state, features)
-        weak = exit_policy.price_weak(state, features) if decayed else None
-        return {**decayed, **weak} if (decayed and weak) else None
+        # What the rule may DO, so a condition marked TRUE is one that
+        # sells. A give-back that fired but is not enforced is FALSE
+        # here and TRUE under `peak.peak_exit_candidate` below.
+        return exit_policy.compound_decay_exit(state, features, now)["sell"]
     if reason == exit_policy.REASON_SESSION_EXIT:
         return exit_policy.session_ending(session, now)
     return None
@@ -136,9 +137,20 @@ def _evaluate(state, *, features, price, session, now, decision):
         "range_high": getattr(state, "range_high", None),
         "range_low": getattr(state, "range_low", None),
         "peak_price": getattr(state, "peak_price", None),
+        # Every tick, HOLD included: the give-back fraction and the peak's
+        # age are what the compound exit's provisional thresholds will be
+        # calibrated from.
+        "peak": exit_policy.peak_exit_assessment(state, features, now,
+                                                 price=price),
         "conditions": conditions,
         "fired": detail,
     }
+    # The headline for the shadow rule: set when the give-back exit
+    # fired as designed and was not enforced. Never set when it sold.
+    record["would_sell_reason"] = (
+        record["peak"]["would_sell_reason"]
+        if record["peak"].get("peak_exit_candidate")
+        and not record["peak"].get("peak_exit_enforced") else None)
     if features is not None:
         if isinstance(features, rf.SessionFeatures):
             record["features"] = features.as_record(now)

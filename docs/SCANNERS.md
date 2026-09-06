@@ -471,6 +471,10 @@ manifest 가 기록된 뒤에 호출되며, 예외를 스스로 삼킵니다. Sl
 | `breakout_confirmed` | range high 위에서 **종가 마감**한 봉이 있는가 | 1m |
 | `breakout_touched` | range high를 **고가로 뚫은** 봉이 있는가 (wick) | 1m |
 | `retest_confirmed` | 돌파 → 이후 봉이 range high 근처(±0.3%)까지 되돌림 → 그 뒤 봉이 다시 위로 마감. **순서대로** | 1m |
+| `session_elapsed_minutes` | 세션 첫 봉 라벨 → 최신 봉 라벨. **entry window** 측정축 (30/45/60/90분 분포용). 봉 라벨 기준이라 최신 봉 자체의 폭은 제외 | 1m |
+| `breakout_age_minutes` | 첫 돌파 봉(종가 확정 봉, 없으면 wick 봉) 라벨 → 최신 봉 라벨. `breakout_at` 도 함께 기록 | 1m |
+| `minutes_since_session_high` | range 이후 **고가(High)** 를 마지막으로 찍은 봉 → 최신 봉. `session_high`, `drawdown_from_session_high_pct` 도 함께 기록 | 1m |
+| `recent_volume_expansion_<W>m` | 최근 W분 봉 평균 거래량 / opening range 평균 거래량. W는 `recent_volume_observation_minutes`(기본 15, 30). 세션 초반엔 range 봉과 겹침 | 1m |
 | `premarket_gain_pct` | S4는 기존 score_scanner 계산 그대로: `(최신 장중가 / 직전 일봉 종가 - 1) × 100` | 1m + 1d |
 
 **봉 라벨 규칙**: 1분봉은 **시작 시각**으로 라벨됩니다. `09:30` 봉은
@@ -483,6 +487,16 @@ manifest 가 기록된 뒤에 호출되며, 예외를 스스로 삼킵니다. Sl
 말하기 **전**의 움직임이 포함되어 있기 때문입니다.
 
 ---
+
+**S6 entry-timing 게이트 (기본 OFF)**: `scanners/orb/config.json`의
+`entry_window_minutes`, `max_breakout_age_minutes`,
+`recent_volume_window_minutes` + `recent_volume_expansion_min`,
+`max_minutes_since_session_high` 는 모두 `null` 로 출고됩니다. 위 네 측정값은
+게이트와 무관하게 **항상** 기록되어 published row 의 `entry_timing` 과
+COMMON_STOCK snapshot 으로 흘러갑니다. 실제 후보 분포를 먼저 읽고 나서 값을
+정합니다 -- 지금 값을 고르면 그 추측 아래에서 한 달치 데이터가 쌓입니다.
+게이트는 기존 거절 사유(돌파/확장/VWAP/EMA/거래량) **뒤에** 평가되므로 켜더라도
+기존 거절 통계의 라벨을 바꾸지 않습니다.
 
 ## 5. 지금 하지 않는 것
 

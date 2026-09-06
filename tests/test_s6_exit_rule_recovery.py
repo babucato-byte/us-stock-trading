@@ -76,16 +76,26 @@ class TestTheRulesCanNowFire:
             session="REGULAR", now=NOW)
         assert d.sells and d.reason == exit_policy.REASON_EMA_STRUCTURE_FAILURE
 
-    def test_VOLUME_DECAY_PRICE_WEAKNESS_fires_on_decay_plus_weakness(self):
-        """peak expansion 1.657 -> target 1 + 0.657*0.5 = 1.3286."""
+    def test_VOLUME_DECAY_PRICE_WEAKNESS_fires_on_decay_plus_weakness(
+            self, monkeypatch):
+        """peak expansion 1.657 -> target 1 + 0.657*0.5 = 1.3286.
+
+        The give-back half is provisional and unenforced by default;
+        this test is about the rule being ABLE to fire now that its
+        inputs arrive, so it is run with enforcement on.
+        """
+        monkeypatch.setattr(policy, "ENFORCE_PEAK_GIVEBACK_EXIT", True)
         target = 1.0 + (1.657214579511058 - 1.0) * (1.0 - policy.VOLUME_DECAY_FRACTION)
         assert target == pytest.approx(1.3286, abs=1e-3)
         d = exit_policy.decide(
-            _state(), current_price=52.0,
+            _state(), current_price=51.5,
             # Above VWAP and EMA-healthy so the earlier rules abstain and
-            # this one is genuinely what fires; price below peak is the
-            # weakness half.
-            features=_features(price=52.0, vwap=51.0, ema9=52.5, ema21=52.0,
+            # this one is genuinely what fires. The weakness half is a
+            # meaningful give-back, not merely "below the peak": peak
+            # 53.0 over a range high of 50.747 gained 2.253, and 51.5 has
+            # surrendered 1.5 of it (0.67, past PEAK_GIVEBACK_FRACTION).
+            # The peak is undated here, so the fraction alone decides.
+            features=_features(price=51.5, vwap=51.0, ema9=52.5, ema21=52.0,
                                volume_expansion=1.2),
             session="REGULAR", now=NOW)
         assert d.sells
@@ -122,9 +132,19 @@ class TestProfitNeverBlocksAnExit:
               volume_expansion=1.1),
          exit_policy.REASON_VOLUME_DECAY_PRICE_WEAKNESS),
     ])
-    def test_a_position_up_14_percent_still_exits(self, features, expected):
-        """Entry 52.75, price 60.00 -> +13.7%. The rule still fires."""
-        state = _state(peak_price=61.0)
+    def test_a_position_up_14_percent_still_exits(self, features, expected,
+                                                  monkeypatch):
+        """Entry 52.75, price 60.00 -> +13.7%. The rule still fires.
+
+        The peak sits at 70.0 so the compound case is a real give-back
+        (10 of the 19.25 gained above the range, past the fraction) and
+        not merely a tick below the peak; the VWAP and EMA cases do not
+        read the peak at all. The give-back half ships unenforced, so
+        the compound case is run with the switch on -- the point here is
+        that profit does not block it, not that it is enforced.
+        """
+        monkeypatch.setattr(policy, "ENFORCE_PEAK_GIVEBACK_EXIT", True)
+        state = _state(peak_price=70.0)
         d = exit_policy.decide(state, current_price=60.0,
                                features=_features(**features),
                                session="REGULAR", now=NOW)
