@@ -130,6 +130,66 @@ def _now(now=None):
     return now or datetime.now(timezone.utc)
 
 
+#: The two price reads that establish the venue is trading are this
+#: far apart. Short enough to sit inside the one-shot, long enough for
+#: a liquid name to print.
+ACTIVITY_READ_GAP_SECONDS = 15.0
+#: A collected trade this recent counts as evidence on its own.
+REALTIME_EVIDENCE_MAX_AGE_SECONDS = 600.0
+ACTIVITY_FIELDS = ("last", "today_volume", "high", "low")
+
+
+def market_activity(broker, instrument, *, symbol, first, now, sleeper=None,
+                    store_loader=None) -> Dict[str, Any]:
+    """Proof the venue is trading NOW, or a refusal.
+
+    A window on the clock is not a market. On 2026-09-08 (Labor Day
+    evening) the daytime window was open by the schedule while every
+    quote sat at Friday's figures; an order priced from that would have
+    rested into a closed venue. So before anything is minted the runner
+    needs one of:
+
+        a collected KIS trade for the symbol in the last ten minutes, or
+        a second price read, taken a pause later, that differs from the
+        first in last / today's volume / high / low.
+
+    Neither is inferred from the schedule. Returns what it saw, and
+    raises RouteVerificationBlocked(STALE_QUOTE) when nothing moved.
+    """
+    import time as _time
+
+    evidence = []
+    detail: Dict[str, Any] = {"first": {k: first.get(k) for k in ACTIVITY_FIELDS}}
+    store = None
+    try:
+        store = store_loader() if store_loader is not None else None
+    except Exception:  # noqa: BLE001 - no store is no evidence, not an error
+        store = None
+    if store is not None:
+        accumulator = store.accumulator(symbol, capability_mod.VERIFICATION_SESSION)
+        last_trade = getattr(accumulator, "last_trade_at", None) if accumulator else None
+        if last_trade is not None:
+            age = (now - last_trade).total_seconds()
+            detail["realtime_last_trade_age_seconds"] = age
+            if 0 <= age <= REALTIME_EVIDENCE_MAX_AGE_SECONDS:
+                evidence.append("REALTIME_TRADE")
+    (sleeper or _time.sleep)(ACTIVITY_READ_GAP_SECONDS)
+    second = price_facts(broker, instrument)
+    detail["second"] = {k: second.get(k) for k in ACTIVITY_FIELDS}
+    for key in ACTIVITY_FIELDS:
+        if first.get(key) is not None and second.get(key) is not None \
+                and first.get(key) != second.get(key):
+            evidence.append(f"{key.upper()}_CHANGED")
+    detail["evidence"] = evidence
+    if not evidence:
+        raise RouteVerificationBlocked(
+            f"no market activity for {symbol}: two price reads "
+            f"{ACTIVITY_READ_GAP_SECONDS:.0f}s apart are identical and no "
+            "collected trade is recent; the venue is not trading",
+            reason_codes=("STALE_QUOTE",))
+    return detail
+
+
 def price_facts(broker, instrument) -> Dict[str, Any]:
     """One KIS price-detail read, whole. Raises if it cannot be had."""
     try:
@@ -377,7 +437,8 @@ def flatten(*, broker, conn, guard, symbol, instrument, quantity, account_id,
 
 
 def run_route_verification(*, broker, conn, allowed_symbols, account_id,
-                           now=None, env=None, env_path=None) -> Dict[str, Any]:
+                           now=None, env=None, env_path=None, sleeper=None,
+                           store_loader=None) -> Dict[str, Any]:
     """The whole one-shot, from precondition to disarm.
 
     Order of operations is the safety property. Every precondition is
@@ -446,6 +507,11 @@ def run_route_verification(*, broker, conn, allowed_symbols, account_id,
     report["limit_price"] = limit_price
     report["price_facts"] = {k: detail.get(k) for k in
                              ("last", "low", "tick_size", "orderable_text")}
+    # -- 4b. the venue must be TRADING, not merely scheduled. Raises
+    # STALE_QUOTE with zero transport calls when nothing has moved.
+    report["market_activity"] = market_activity(
+        broker, instrument, symbol=symbol, first=detail, now=current,
+        sleeper=sleeper, store_loader=store_loader)
 
     # -- 5/6. capability, then intent. Minted only once every fact above
     # has held.

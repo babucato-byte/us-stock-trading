@@ -92,10 +92,14 @@ def main(argv=None):
     exit_code = 0
 
     try:
+        from market_data.kis_bar_provider import _collected_store
+
         report = runner.run_route_verification(
             broker=broker, conn=conn,
             allowed_symbols=rollout.allowed_symbols or (),
-            account_id=account_id, now=datetime.now(timezone.utc))
+            account_id=account_id, now=datetime.now(timezone.utc),
+            store_loader=lambda: _collected_store(
+                runner.capability_mod.VERIFICATION_SESSION))
         _print("Result", report)
         print(f"\nRESULT: {report.get('conclusion')}")
     except runner.RouteVerificationBlocked as exc:

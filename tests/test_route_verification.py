@@ -429,7 +429,12 @@ class _OrchestratorBroker:
     def get_price_detail(self, instrument):
         if isinstance(self._detail, Exception):
             raise self._detail
-        return self._detail
+        # A venue that trades: every read reports one more share of
+        # today's volume, so the activity guard sees a moving market.
+        self.price_reads = getattr(self, "price_reads", 0) + 1
+        detail = dict(self._detail)
+        detail["today_volume"] = float(detail.get("today_volume") or 0) + self.price_reads
+        return detail
 
     def get_open_orders(self):
         return [{"pdno": s, "odno": "0000009001"} for s in self._open]
@@ -456,7 +461,79 @@ def _run(monkeypatch, conn, broker, *, symbols=(SYMBOL,), session=DAYTIME):
     monkeypatch.setattr(scap, "route_session", lambda **k: session)
     return runner.run_route_verification(
         broker=broker, conn=conn, allowed_symbols=symbols,
-        account_id="12345678", now=NOW, env=dict(os.environ))
+        account_id="12345678", now=NOW, env=dict(os.environ),
+        sleeper=lambda seconds: None)
+
+
+class _StaleBroker(_OrchestratorBroker):
+    """Friday's figures on a closed venue: every read is identical."""
+
+    def get_price_detail(self, instrument):
+        if isinstance(self._detail, Exception):
+            raise self._detail
+        return dict(self._detail)
+
+
+class TestTheVenueMustBeTrading:
+    def test_identical_reads_and_no_trades_block_before_any_transport(
+            self, armed, conn, monkeypatch):
+        broker = _StaleBroker()
+        with pytest.raises(runner.RouteVerificationBlocked) as caught:
+            _run(monkeypatch, conn, broker)
+        assert "STALE_QUOTE" in caught.value.reason_codes
+        assert broker.submitted == []
+
+    def test_a_changed_volume_is_evidence(self, armed, conn, monkeypatch):
+        _stub_engine(monkeypatch)
+        broker = _OrchestratorBroker(open_orders=[SYMBOL], positions=[])
+        report = _run(monkeypatch, conn, broker)
+        assert "TODAY_VOLUME_CHANGED" in report["market_activity"]["evidence"]
+
+    def test_a_recent_collected_trade_is_evidence_on_its_own(
+            self, armed, conn, monkeypatch):
+        _stub_engine(monkeypatch)
+        broker = _StaleBroker(open_orders=[SYMBOL], positions=[])
+
+        class _Acc:
+            last_trade_at = NOW
+
+        class _Store:
+            def accumulator(self, symbol, session):
+                return _Acc() if symbol == SYMBOL else None
+
+        from config import session_capability as scap
+        monkeypatch.setattr(scap, "route_session", lambda **k: DAYTIME)
+        report = runner.run_route_verification(
+            broker=broker, conn=conn, allowed_symbols=(SYMBOL,),
+            account_id="12345678", now=NOW, env=dict(os.environ),
+            sleeper=lambda seconds: None, store_loader=lambda: _Store())
+        assert report["market_activity"]["evidence"] == ["REALTIME_TRADE"]
+
+    def test_an_old_collected_trade_is_not_evidence(self, armed, conn, monkeypatch):
+        from datetime import timedelta
+
+        broker = _StaleBroker()
+
+        class _Acc:
+            last_trade_at = NOW - timedelta(hours=3)
+
+        class _Store:
+            def accumulator(self, symbol, session):
+                return _Acc()
+
+        from config import session_capability as scap
+        monkeypatch.setattr(scap, "route_session", lambda **k: DAYTIME)
+        with pytest.raises(runner.RouteVerificationBlocked) as caught:
+            runner.run_route_verification(
+                broker=broker, conn=conn, allowed_symbols=(SYMBOL,),
+                account_id="12345678", now=NOW, env=dict(os.environ),
+                sleeper=lambda seconds: None, store_loader=lambda: _Store())
+        assert "STALE_QUOTE" in caught.value.reason_codes
+
+    def test_the_guard_reads_twice_with_a_real_pause_by_default(self):
+        assert runner.ACTIVITY_READ_GAP_SECONDS >= 10
+        source = (REPO_ROOT / "live_pilot" / "route_verification_runner.py").read_text()
+        assert "(sleeper or _time.sleep)(ACTIVITY_READ_GAP_SECONDS)" in source
 
 
 class TestOrchestrationPreconditions:

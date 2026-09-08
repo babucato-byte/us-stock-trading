@@ -60,11 +60,53 @@ class KISBarMarketDataProvider(BarMarketDataProvider):
     preferred_intraday_interval = "1m"
 
     def __init__(self, *, broker=None, fallback=None, exchange_for=None,
-                 trading_day=None):
+                 trading_day=None, session=None, store_loader=None):
         self._broker = broker
         self._fallback = fallback
         self._exchange_for = exchange_for
         self._trading_day = trading_day
+        #: Realtime-first. When a collected KIS trade store holds bars
+        #: for this session and symbol, they are served WITHOUT a chart
+        #: read: no API call, no 3-second pacing, and the same trades the
+        #: entry path's features are built from. The chart is the
+        #: fallback for symbols the collector is not subscribed to.
+        self._session = session
+        self._store_loader = store_loader
+        self._store = None
+        self._store_loaded = False
+        self.realtime_hits = 0
+        self.chart_reads = 0
+
+    def _realtime_store(self):
+        if self._store_loaded:
+            return self._store
+        self._store_loaded = True
+        if self._store_loader is None or not self._session:
+            return None
+        try:
+            self._store = self._store_loader()
+        except Exception:  # noqa: BLE001 - a missing store is "no store"
+            logger.warning("realtime bar store unavailable for %s; the chart "
+                           "is the only source this scan", self._session,
+                           exc_info=True)
+            self._store = None
+        return self._store
+
+    def _realtime_frame(self, symbol):
+        store = self._realtime_store()
+        if store is None:
+            return None
+        try:
+            bars = store.bars(symbol, self._session)
+        except Exception:  # noqa: BLE001
+            return None
+        if not bars:
+            return None
+        return pd.DataFrame([{
+            "Open": b.open, "High": b.high, "Low": b.low,
+            "Close": b.close, "Volume": b.volume,
+        } for b in bars], index=pd.DatetimeIndex(
+            [b.minute for b in bars], name="Datetime"))
 
     # -- daily -----------------------------------------------------------
 
@@ -106,9 +148,14 @@ class KISBarMarketDataProvider(BarMarketDataProvider):
                 requested=interval,
                 supported=self.supported_intraday_intervals)
 
+        realtime = self._realtime_frame(symbol)
+        if realtime is not None:
+            self.realtime_hits += 1
+            return realtime
         broker = self._broker
         if broker is None:
             raise MarketDataUnavailable(f"{symbol}: no KIS broker configured")
+        self.chart_reads += 1
 
         exchange = self._exchange(symbol)
         if not exchange:
@@ -161,11 +208,18 @@ KIS_AUTHORITATIVE_SESSIONS = frozenset({
 def provider_for_session(session, *, broker=None, fallback=None,
                          trading_day=None) -> BarMarketDataProvider:
     """The right provider for `session`, falling back when KIS cannot be
-    reached at all."""
+    reached at all.
+
+    For a KIS-authoritative session the provider is REALTIME-FIRST: bars
+    the collector has already accumulated for this session are served
+    without a chart read, and the per-symbol chart is asked only for
+    symbols the collector holds nothing for.
+    """
     from scanners.base.market_data_provider import default_provider
 
     base = fallback if fallback is not None else default_provider()
-    if str(session or "").upper() not in KIS_AUTHORITATIVE_SESSIONS:
+    name = str(session or "").upper()
+    if name not in KIS_AUTHORITATIVE_SESSIONS:
         return base
     if broker is None:
         logger.warning(
@@ -173,5 +227,20 @@ def provider_for_session(session, *, broker=None, fallback=None,
             "back to %s, whose extended-hours data is why this exists",
             session, getattr(base, "provider_name", "?"))
         return base
-    return KISBarMarketDataProvider(broker=broker, fallback=base,
-                                    trading_day=trading_day)
+    return KISBarMarketDataProvider(
+        broker=broker, fallback=base, trading_day=trading_day, session=name,
+        store_loader=lambda: _collected_store(name))
+
+
+def _collected_store(session):
+    """The collector's store for this session, keyed the way the
+    collector keys it (the operational trading day), or None."""
+    from datetime import datetime, timezone
+
+    from config.operational_calendar import operational_trading_day
+    from market_hours import us_trading_day
+    from s6_live import kis_bar_features
+
+    now = datetime.now(timezone.utc)
+    day = operational_trading_day(now) or us_trading_day(now)
+    return kis_bar_features.load_store(session, day)
