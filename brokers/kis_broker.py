@@ -684,7 +684,13 @@ LIVE_RESPONSE_PENDING_ITEMS = tuple(
 
 
 def matrix_entries_for(posture):
-    """Every wire value the given posture actually depends on."""
+    """Every wire value the given posture actually depends on.
+
+    A pure projection of the STATIC matrix. Live evidence the daytime
+    one-shot recorded is applied by `brokers.route_evidence.
+    pending_items_after_live_evidence`, which the route gate asks; this
+    function and `pending_items_for` never read a file.
+    """
     return tuple(entry for entry in VERIFICATION_MATRIX
                  if posture in entry.required_for)
 

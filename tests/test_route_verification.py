@@ -513,14 +513,20 @@ class TestDisarmIsAtomicAndScoped:
             f"{runner.ALLOWLIST_KEY}=AAPL\nLIVE_ROLLOUT_ENABLED=true\n")
         return env
 
-    def test_it_turns_both_flags_off_and_clears_the_allow_list(self, tmp_path):
+    def test_it_turns_both_flags_off_and_removes_the_allow_list(self, tmp_path):
+        """REMOVED, not blanked. An empty LIVE_ROLLOUT_ALLOWED_SYMBOLS is
+        read by the rollout config as "deny every symbol", so a blanked
+        key left behind by a route test would have stopped every live
+        entry after it."""
         env = self._env_file(tmp_path)
         runner.disarm(env, now=NOW)
         text = env.read_text()
         assert f"{rv.FLAG_ENABLED}=false" in text
         assert f"{rv.FLAG_ACK}=false" in text
-        assert f"{runner.ALLOWLIST_KEY}=\n" in text or \
-            text.rstrip().endswith(f"{runner.ALLOWLIST_KEY}=")
+        assert runner.ALLOWLIST_KEY not in text
+        from config.live_rollout_config import LiveRolloutConfig
+        mapping = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+        assert LiveRolloutConfig.from_env(mapping).allowed_symbols is None
 
     def test_it_leaves_unrelated_flags_alone(self, tmp_path):
         env = self._env_file(tmp_path)

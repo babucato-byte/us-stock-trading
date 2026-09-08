@@ -352,12 +352,15 @@ def route_awaiting_live_evidence(session_or_family) -> bool:
     they were written apart only one of them was taught that ARMED is not
     a reason to refuse a bootstrap.
     """
-    from brokers import kis_broker as kb
+    from brokers import route_evidence
 
     name = str(session_or_family or "").strip().upper()
     family = name if name in (FAMILY_GENERAL, FAMILY_DAYTIME) else (
         FAMILY_DAYTIME if name == "OVERNIGHT_DAYTIME" else FAMILY_GENERAL)
-    return bool(list(kb.pending_items_for(evidence_posture_for_family(family))))
+    # The static matrix, minus what the daytime one-shot has recorded
+    # from a real KIS acceptance. See brokers/route_evidence.py.
+    return bool(list(route_evidence.pending_items_after_live_evidence(
+        evidence_posture_for_family(family))))
 
 
 def bootstrap_permitted_on_armed(*, now=None) -> bool:

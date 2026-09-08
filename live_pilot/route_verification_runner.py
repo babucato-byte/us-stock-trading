@@ -202,8 +202,14 @@ ALLOWLIST_KEY = "LIVE_ROLLOUT_ALLOWED_SYMBOLS"
 _DISARMED = {
     capability_mod.FLAG_ENABLED: "false",
     capability_mod.FLAG_ACK: "false",
-    ALLOWLIST_KEY: "",
 }
+#: Removed on disarm, never blanked. `LiveRolloutConfig._env_symbol_set`
+#: reads an EMPTY allow-list as "deny every symbol", so writing
+#: `LIVE_ROLLOUT_ALLOWED_SYMBOLS=` into the shared env after a
+#: verification would have stopped every live entry until someone
+#: noticed. Absent is the normal live posture: the scanner and the gates
+#: decide what may be bought.
+_REMOVED_ON_DISARM = (ALLOWLIST_KEY,)
 
 
 def disarm(env_path, *, now=None) -> Dict[str, Any]:
@@ -242,6 +248,8 @@ def disarm(env_path, *, now=None) -> Dict[str, Any]:
         if key in _DISARMED:
             lines.append(f"{key}={_DISARMED[key]}")
             seen.add(key)
+        elif key in _REMOVED_ON_DISARM:
+            continue
         else:
             lines.append(line)
     for key, value in _DISARMED.items():
@@ -261,11 +269,11 @@ def disarm(env_path, *, now=None) -> Dict[str, Any]:
     shutil.copymode(target, handle.name)
     os.replace(handle.name, target)
 
-    logger.warning("ROUTE_VERIFICATION_DISARMED %s=false %s=false %s cleared",
+    logger.warning("ROUTE_VERIFICATION_DISARMED %s=false %s=false %s removed",
                    capability_mod.FLAG_ENABLED, capability_mod.FLAG_ACK,
                    ALLOWLIST_KEY)
     return {"disarmed": True, "backup": str(backup) if backup else None,
-            "keys": sorted(_DISARMED)}
+            "keys": sorted(_DISARMED), "removed": list(_REMOVED_ON_DISARM)}
 
 
 # ---------------------------------------------------------------------
@@ -498,6 +506,10 @@ def run_route_verification(*, broker, conn, allowed_symbols, account_id,
     report["transport"]["buy"] = guard.submit_calls
     report["broker_order_id"] = getattr(execution_result, "broker_order_id", None)
     report["submit_status"] = getattr(execution_result, "status", None)
+    # The response is real and it is an acceptance: that, and only
+    # that, is evidence for the daytime BUY wire values. A rejection is
+    # refused by the store and leaves the route pending.
+    report["evidence"] = {"buy": _record_buy_evidence(execution_result, intent)}
 
     # -- 8. what actually happened, asked of KIS.
     shim = _Shim(symbol=symbol, instrument=instrument, guard=guard,
@@ -528,6 +540,8 @@ def run_route_verification(*, broker, conn, allowed_symbols, account_id,
                       "detail": f"{type(exc).__name__}: {exc}"}
         report["cancel"] = cancel
         report["transport"]["cancel"] = guard.cancel_calls
+        report.setdefault("evidence", {})["cancel"] = _record_cancel_evidence(
+            cancel, intent, report.get("broker_order_id"))
 
     # -- 9B/9C. anything actually held is sold back immediately.
     if held > 0:
@@ -585,6 +599,69 @@ def run_route_verification(*, broker, conn, allowed_symbols, account_id,
                            if report.get("cancel", {}).get("cancelled")
                            else "NO_FILL_NOT_CANCELLED")
     return report
+
+
+def _record_buy_evidence(execution_result, intent) -> Dict[str, Any]:
+    """Persist the BUY acceptance as evidence for TTTS6036U and the path.
+
+    Never raises: evidence is a consequence of the order, and an order
+    that reached the broker must not be reported as failed because a
+    bookkeeping file could not be written. Refusals and errors are
+    returned so the report says what was and was not recorded.
+    """
+    from brokers import kis_broker as kb
+    from brokers import route_evidence
+
+    status = getattr(execution_result, "status", None)
+    odno = getattr(execution_result, "broker_order_id", None)
+    out: Dict[str, Any] = {"status": status, "broker_order_id": odno,
+                           "recorded": []}
+    if str(status or "").upper() != "ACCEPTED" or not odno:
+        out["detail"] = "not an acceptance; nothing recorded"
+        return out
+    tr_id = kb.TR_ID_DAYTIME_ORDER_US[("live", "buy")]
+    for name, value in (("daytime_order_tr_id_live_buy", tr_id),
+                        ("daytime_order_path", kb.DAYTIME_ORDER_PATH)):
+        try:
+            route_evidence.record(
+                name, wire_value=value, broker_order_id=odno, rt_cd="0",
+                status="ACCEPTED", run_id=getattr(intent, "internal_order_id", None),
+                internal_order_id=getattr(intent, "internal_order_id", None))
+            out["recorded"].append(name)
+        except Exception as exc:  # noqa: BLE001
+            out.setdefault("errors", []).append(f"{name}: {type(exc).__name__}: {exc}")
+            logger.error("route evidence NOT recorded for %s: %s", name, exc)
+    return out
+
+
+def _record_cancel_evidence(cancel, intent, original_order_id) -> Dict[str, Any]:
+    """Persist a confirmed cancel as evidence for TTTS6038U and its path.
+
+    Only a cancel the engine reports as done (`cancelled` True) with the
+    original order number counts. An ambiguous or refused cancel leaves
+    both cancel legs pending, which is the honest state.
+    """
+    from brokers import kis_broker as kb
+    from brokers import route_evidence
+
+    out: Dict[str, Any] = {"cancelled": bool((cancel or {}).get("cancelled")),
+                           "recorded": []}
+    if not out["cancelled"] or not original_order_id:
+        out["detail"] = "cancel not confirmed; nothing recorded"
+        return out
+    for name, value in (("daytime_cancel_tr_id_live", kb.TR_ID_DAYTIME_CANCEL["live"]),
+                        ("daytime_cancel_path", kb.DAYTIME_CANCEL_PATH)):
+        try:
+            route_evidence.record(
+                name, wire_value=value, broker_order_id=original_order_id,
+                rt_cd="0", status="CANCELLED",
+                run_id=getattr(intent, "internal_order_id", None),
+                internal_order_id=getattr(intent, "internal_order_id", None))
+            out["recorded"].append(name)
+        except Exception as exc:  # noqa: BLE001
+            out.setdefault("errors", []).append(f"{name}: {type(exc).__name__}: {exc}")
+            logger.error("route evidence NOT recorded for %s: %s", name, exc)
+    return out
 
 
 def _verification_signal(intent, now):
