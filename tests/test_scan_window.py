@@ -36,6 +36,7 @@ ET = ZoneInfo("America/New_York")
 MON = (2026, 8, 24)
 SAT = (2026, 8, 22)
 SUN = (2026, 8, 23)
+FRI = (2026, 8, 21)
 
 
 def at(day, hour, minute=0):
@@ -79,11 +80,48 @@ class TestAWeekendClosesEverySession:
         assert window.reason == scan_window.WEEKEND
         assert window.not_applicable is True
 
-    @pytest.mark.parametrize("hour", [1, 10, 22])
+    @pytest.mark.parametrize("hour", [1, 10, 15])
     def test_sunday_is_refused_too(self, hour):
         window = scan_window.evaluate(at(SUN, hour))
         assert window.scan_allowed is False
         assert window.reason == scan_window.WEEKEND
+
+    def test_sunday_evening_is_mondays_daytime_session_and_scans(self):
+        """10:00-13:00 KST on a Monday is Sunday 21:00-24:00 ET. KIS dates
+        that daytime session to Monday, and so must the scan guard: it
+        skipped every Monday morning daytime scan as WEEKEND on
+        2026-08-31 and 2026-09-07."""
+        window = scan_window.evaluate(at(SUN, 22))
+        assert window.session == "OVERNIGHT_DAYTIME"
+        assert window.calendar_trading_day is True
+        assert window.scan_allowed is True
+        assert window.reason == scan_window.VALID_TRADING_DAY
+
+    def test_friday_evening_belongs_to_saturday_and_is_refused(self):
+        window = scan_window.evaluate(at(FRI, 22))
+        assert window.session == "OVERNIGHT_DAYTIME"
+        assert window.scan_allowed is False
+        assert window.reason == scan_window.WEEKEND
+
+    def test_a_holiday_evening_is_the_next_days_session(self, monkeypatch):
+        """Labor Day 2026-09-07 evening ET is Tuesday's daytime session;
+        the calendar is asked about Tuesday, which trades."""
+        import market_guard
+
+        asked = []
+
+        def fake(now=None):
+            asked.append(now)
+            return now.date().isoformat() != "2026-09-07"
+        monkeypatch.setattr(market_guard, "is_us_trading_day", fake)
+        from datetime import datetime as _dt
+        from market_hours import EASTERN as _ET
+        window = scan_window.evaluate(_dt(2026, 9, 7, 22, 0, tzinfo=_ET))
+        assert window.session == "OVERNIGHT_DAYTIME"
+        assert window.scan_allowed is True
+        assert asked and asked[0].date().isoformat() == "2026-09-08"
+        regular = scan_window.evaluate(_dt(2026, 9, 7, 10, 0, tzinfo=_ET))
+        assert regular.reason == scan_window.US_MARKET_HOLIDAY
 
     def test_a_saturday_session_that_opened_on_a_trading_day_is_still_refused(
             self):

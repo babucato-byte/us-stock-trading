@@ -42,7 +42,7 @@ this module.
 
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, time
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -94,6 +94,33 @@ def _is_weekend(moment: datetime) -> bool:
     return moment.weekday() >= 5
 
 
+def calendar_moment_for(eastern: datetime, session) -> datetime:
+    """The instant whose CALENDAR DATE decides whether this scan may run.
+
+    Every session except the daytime one is dated to the Eastern day it
+    sits in. The daytime session is KIS's 미국주간거래, which runs
+    through the Eastern evening BEFORE the trading day it belongs to:
+    10:00 KST on a Monday is Sunday 21:00 ET, and it is Monday's session.
+    Judging that evening by Sunday's date skipped every Monday
+    10:00-13:00 KST daytime scan as WEEKEND (2026-08-31, 2026-09-07) and
+    every holiday-evening scan as US_MARKET_HOLIDAY -- while the order
+    path, which dates the window through `kis_market_schedule.
+    trading_day_for`, called the same instants CAPABLE. One convention,
+    the schedule's, now decides both.
+    """
+    from scanners.base import scan_session
+
+    if session != scan_session.OVERNIGHT_DAYTIME:
+        return eastern
+    from config import kis_market_schedule as sched
+
+    day_iso = sched.trading_day_for(eastern, sched.WINDOW_DAYTIME)
+    if not day_iso:
+        return eastern
+    return datetime.combine(date.fromisoformat(day_iso), time(12, 0),
+                            tzinfo=eastern.tzinfo)
+
+
 def evaluate(moment: Optional[datetime] = None, *, scans=None) -> ScanWindow:
     """Whether a scan may run at `moment`. Never raises.
 
@@ -124,14 +151,17 @@ def evaluate(moment: Optional[datetime] = None, *, scans=None) -> ScanWindow:
     except Exception:  # noqa: BLE001 - a display value must not decide
         market_state = None
 
-    if _is_weekend(eastern):
+    # The daytime session is judged by the trading day it belongs to,
+    # not by the Eastern evening it starts in -- see calendar_moment_for.
+    calendar_moment = calendar_moment_for(eastern, session)
+    if _is_weekend(calendar_moment):
         return ScanWindow(eastern, session, session_date, False, False,
                           WEEKEND, market_state)
 
     try:
         from market_guard import is_us_trading_day
 
-        trading_day = bool(is_us_trading_day(eastern))
+        trading_day = bool(is_us_trading_day(calendar_moment))
     except Exception as exc:  # noqa: BLE001
         logger.warning("US trading calendar unavailable; refusing to scan",
                        exc_info=True)

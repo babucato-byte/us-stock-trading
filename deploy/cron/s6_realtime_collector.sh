@@ -40,8 +40,28 @@ mkdir -p "$(dirname "$LOG")" /home/ubuntu/logs/cron
 # Already up? Then there is nothing to do. The runner's own lock is the
 # real guarantee; this just avoids the log noise of a start that will
 # immediately refuse.
+# Self-healing, bounded. A collector that is running but wedged --
+# heartbeat stale, socket DISCONNECTED/FAILED past its grace, or
+# subscriptions incomplete -- is terminated so the start below replaces
+# it. market_data/collector_health.py decides, and allows at most one
+# forced restart per 15 minutes (marker beside the status file), so a
+# venue that is simply quiet (CONNECTED_NO_TRADES) is never restarted
+# and a feed that is genuinely down is not restarted every five minutes.
+STATUS_FILE="${SCANNER_DATA_ROOT}/realtime_bars/collector_status.json"
+MARKER_FILE="${SCANNER_DATA_ROOT}/realtime_bars/collector_restart.marker"
 if pgrep -f "run_realtime_bar_collector.py" > /dev/null 2>&1; then
-    exit 0
+    HEALTH=$("$SCANNER_RUNTIME_ROOT/venv/bin/python" -m market_data.collector_health \
+        --status "$STATUS_FILE" --marker "$MARKER_FILE" --process-running yes 2>>"$LOG")
+    HEALTH_RC=$?
+    if [ "$HEALTH_RC" = "2" ]; then
+        echo "$(date -u +%FT%TZ) COLLECTOR_RESTART reason=$HEALTH sha=$SCANNER_SHA" >> "$LOG"
+        pkill -TERM -f "run_realtime_bar_collector.py" 2>/dev/null
+        sleep 5
+        pkill -KILL -f "run_realtime_bar_collector.py" 2>/dev/null
+    else
+        [ "$HEALTH_RC" = "0" ] || echo "$(date -u +%FT%TZ) COLLECTOR_UNHEALTHY_NO_RESTART reason=$HEALTH" >> "$LOG"
+        exit 0
+    fi
 fi
 
 echo "$(date -u +%FT%TZ) starting collector sha=$SCANNER_SHA" >> "$LOG"

@@ -1203,13 +1203,19 @@ def main(argv=None, *, provider=None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
     if not args.ignore_market_calendar:
-        # Same gate the existing scanner entry points use, so a holiday
-        # cannot quietly produce a day of signals that never traded and
-        # contaminate the month-1 dataset (section 28's market-holiday
-        # case).
+        # Session-aware: a daytime scan is judged by the trading day the
+        # daytime session belongs to (see scan_window.calendar_moment_for),
+        # every other session by the Eastern date as before.
         from market_guard import is_us_trading_day
-
-        if not is_us_trading_day():
+        _session_name = str(args.session or "").upper()
+        if _session_name == "OVERNIGHT_DAYTIME":
+            from market_hours import EASTERN as _EASTERN
+            from scanners.base import scan_window as _scan_window
+            _market_open = is_us_trading_day(
+                _scan_window.calendar_moment_for(datetime.now(_EASTERN), _session_name))
+        else:
+            _market_open = is_us_trading_day()
+        if not _market_open:
             # Recorded, not just printed. Section 14: a closed market is
             # neither a success with zero candidates nor a failure, and
             # month 1 needs to be able to tell "we did not scan" from
