@@ -193,6 +193,7 @@ SOURCE_FACTORIES = {
     "s1": lambda rollout, now, broker=None: None,  # None -> cycle default
     "s6": lambda rollout, now, broker=None: _s6_source(rollout, now,
                                                        broker=broker),
+    "s6_buy_worker": lambda rollout, now, broker=None: _s6_buy_worker_source(rollout, now),
 }
 
 
@@ -278,6 +279,85 @@ def _s6_source(rollout, now, *, broker=None):
         provider=ptv.provider_for(session, broker=broker,
                                   trading_day=trading_day),
         budget_seconds=ptv.budget_seconds())
+
+
+def _s6_buy_worker_source(rollout, now):
+    """The execution worker's source: claimed BUY_INTENT rows, not a
+    fresh fast-watch evaluation. See s6_live/buy_intent_source.py."""
+    from market_hours import us_trading_day
+    from scanners.base import scan_session
+    from s6_live.buy_intent_source import IntentQueueSource
+
+    session = scan_session.session_at()
+    return IntentQueueSource(
+        trading_day=us_trading_day(now), session=session,
+        rollout=rollout, now=now)
+
+
+def _s6_write_intents(source, *, now):
+    """S6's entire responsibility on the fast-watch tick: decide READY,
+    hand it off, return. Does not qualify, does not call KIS beyond what
+    fast-watch evaluation itself already does, does not submit.
+
+    Returns (ready_symbols, written_count) for the caller's own logging;
+    never raises -- an admission fault is logged by
+    `s6_live.buy_intent.write_ready` and must not turn a fast-watch tick
+    into a failed cron run.
+    """
+    from s6_live import buy_intent
+
+    ready_symbols = source.symbols()
+    rows = [source.candidate_row(s) for s in ready_symbols]
+    rows = [r for r in rows if r]
+    written = buy_intent.write_ready(
+        source._trading_day, source._session, rows, now=now)
+    logger.info("S6_BUY_INTENT_WRITTEN ready=%d written=%d symbols=%s",
+               len(ready_symbols), written,
+               ",".join(ready_symbols) or "-")
+    return ready_symbols, written
+
+
+def _execution_funnel(source, claimed, results, *, since):
+    """The execution worker's own funnel (§18/§20): READY -> BUY_INTENT
+    (already true by the time this runs -- `claimed` IS that hand-off) ->
+    execution started -> qualification -> cash/risk -> submitted/
+    accepted/blocked, with READY->intent->execution latency per symbol.
+
+    Deliberately separate from `_funnel()`: that one is built around a
+    fresh WATCHING/READY evaluation (`source.evaluations`), which this
+    source never produces -- these candidates were already judged READY
+    by an earlier fast-watch tick.
+    """
+    from datetime import datetime
+
+    blocked = dict(results.get("blocked") or ())
+    skipped = dict(results.get("skipped") or ())
+    submitted = set(results.get("submitted") or ())
+    logger.info(
+        "FUNNEL_EXECUTION claimed=%d submitted=%d blocked=%d skipped=%d",
+        len(claimed), len(submitted), len(blocked), len(skipped))
+    for symbol in sorted(claimed):
+        meta = source.intent_metadata(symbol) if hasattr(source, "intent_metadata") else {}
+        first_ready_at = meta.get("first_ready_at")
+        latency_ms = None
+        if first_ready_at:
+            try:
+                ready_at = datetime.fromisoformat(str(first_ready_at))
+                latency_ms = round(
+                    (since - ready_at).total_seconds() * 1000, 1)
+            except Exception:  # noqa: BLE001 -- reporting only
+                latency_ms = None
+        if symbol in submitted:
+            outcome = "SUBMITTED"
+        elif symbol in blocked:
+            outcome = f"BLOCKED reason={blocked[symbol]}"
+        elif symbol in skipped:
+            outcome = f"SKIPPED reason={skipped[symbol]}"
+        else:
+            outcome = "UNKNOWN"
+        logger.info(
+            "FUNNEL_EXECUTION_SYMBOL %s first_ready_at=%s ready_to_execution_ms=%s outcome=%s",
+            symbol, first_ready_at, latency_ms, outcome)
 
 
 def _funnel(source, results, *, since):
@@ -875,6 +955,19 @@ def run_once(broker=None, *, strategy="s1"):
     entry limits, kill switch, reconciliation, the Execution Engine --
     is shared and exists exactly once, which is what keeps a second
     strategy from getting a second, less-exercised execution path.
+
+    `strategy="s6"` is the one exception, and it never reaches that
+    shared cycle at all: it is fast-watch's own tick, and its entire
+    job is deciding READY and writing a BUY_INTENT (see
+    `_s6_write_intents`) -- not qualifying, not calling KIS beyond what
+    fast-watch evaluation itself already does, not submitting. Measured
+    2026-09-09: the shared cycle's qualify->KIS->submit sequence costs
+    ~44-45s PER READY CANDIDATE, which is why it used to blow through
+    the 60s cron interval and OVERLAP_SKIP the next tick. `strategy=
+    "s6_buy_worker"` is the other half: a separate process, its own cron/lock,
+    that claims the queue `_s6_write_intents` filled and calls the
+    SAME unchanged shared cycle those candidates would have gone
+    through inline before.
     """
     from datetime import datetime, timezone
 
@@ -900,10 +993,23 @@ def run_once(broker=None, *, strategy="s1"):
         os.environ.get("TRADING_PROJECT_ROOT", "<unset>"))
     _log_calendar(now, session)
 
+    if strategy == "s6":
+        ready_symbols, _written = _s6_write_intents(source, now=now)
+        try:
+            _funnel(source, {"submitted": [], "blocked": [], "skipped": []}, since=now)
+        except Exception:  # noqa: BLE001 -- a reporting fault must not
+            # change what the tick already did, nor mask its result.
+            logger.warning("funnel report failed", exc_info=True)
+        return {"submitted": [], "blocked": [], "skipped": [],
+               "ready_written": ready_symbols}
+
     results = klt.run_live_buy_entry_cycle(
         broker=resolved_broker, candidate_source=source)
     try:
-        _funnel(source, results, since=now)
+        if strategy == "s6_buy_worker":
+            _execution_funnel(source, source.claimed_symbols(), results, since=now)
+        else:
+            _funnel(source, results, since=now)
     except Exception:  # noqa: BLE001 -- a reporting fault must not
         # change what the cycle already did, nor mask its result.
         logger.warning("funnel report failed", exc_info=True)
@@ -926,7 +1032,14 @@ def main(argv=None):
         logger.error("refusing to run the live buy-entry cycle: %s", reason)
         return EXIT_REFUSED
 
-    if _s1_is_falling_behind():
+    # Fast-watch's own tick (strategy="s6") no longer makes the heavy,
+    # KIS-budget-competing calls this stand-down exists to protect S1
+    # from -- those moved to the execution worker (strategy="s6_buy_worker")
+    # when READY was decoupled from submission (2026-09-10). Standing
+    # fast-watch down here would only cost READY-detection cadence for
+    # no protective effect, so only the strategies that still reach the
+    # shared qualify->KIS->submit cycle check it.
+    if args.strategy != "s6" and _s1_is_falling_behind():
         logger.info(
             "%s: S1's executor is behind and holds the account's open "
             "position; a new entry stands down rather than compete with it",

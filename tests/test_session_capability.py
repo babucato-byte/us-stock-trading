@@ -700,7 +700,12 @@ class TestTheLiveEntryRunnerCanReachS6:
         return LiveRolloutConfig.from_env()
 
     def test_both_strategies_are_offered(self):
-        assert sorted(self._runner().SOURCE_FACTORIES) == ["s1", "s6"]
+        # "s6_buy_worker" is the decoupled execution worker (2026-09-10):
+        # it claims what "s6" (fast-watch) already decided was READY and
+        # runs the same shared cycle, on its own cadence -- not a third
+        # strategy's candidates, so it does not change what this test's
+        # name asserts about S1 and S6 both being reachable.
+        assert sorted(self._runner().SOURCE_FACTORIES) == ["s1", "s6", "s6_buy_worker"]
 
     def test_the_default_is_still_s1(self):
         """Turning S6 on by default would change which strategy the live

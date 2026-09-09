@@ -285,3 +285,27 @@ class TestPerCandidateAnswers:
         assert msft == 0.0
         assert whole_shares_affordable(aapl, 5.82) == 5
         assert whole_shares_affordable(msft, 400.0) == 0
+
+
+# ---------------------------------------------------------------------
+# 5. §8/§19 balance feedback on the INSUFFICIENT_CASH block.
+# ---------------------------------------------------------------------
+class TestInsufficientCashReasonReportsBalance:
+    def test_reports_available_required_and_shortfall(self):
+        from kis_live_trading import _insufficient_cash_reason
+
+        reason = _insufficient_cash_reason(16.00, 356.8301)
+        assert "available=16.00" in reason
+        assert "required=356.83" in reason
+        assert "shortfall=340.83" in reason
+        # the substring every existing classifier matches on must survive
+        assert "insufficient KIS orderable cash for even 1 share" in reason
+
+    def test_shortfall_never_negative(self):
+        from kis_live_trading import _insufficient_cash_reason
+
+        # Not reachable through the real gate (which only calls this when
+        # quantity < 1), but the arithmetic itself must never claim a
+        # negative shortfall for an operator skimming the log.
+        reason = _insufficient_cash_reason(1000.0, 5.0)
+        assert "shortfall=0.00" in reason

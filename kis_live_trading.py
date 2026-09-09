@@ -165,6 +165,21 @@ def _persist_blocked_record(*, symbol, side="buy", strategy_id="PAPER_STRATEGY_O
     ))
 
 
+def _insufficient_cash_reason(available_usd, buffered_price) -> str:
+    """§8/§19 balance feedback: an operator reading this reason should
+    not have to do the arithmetic themselves to see how far off it
+    was. required_cash is the cost of the smallest possible order --
+    one share at the price this candidate would actually be bought
+    at; shortfall is what would still be missing even at that
+    minimum."""
+    required_cash = float(buffered_price)
+    shortfall = max(0.0, required_cash - float(available_usd))
+    return (
+        "insufficient KIS orderable cash for even 1 share "
+        f"available={float(available_usd):.2f} required={required_cash:.2f} "
+        f"shortfall={shortfall:.2f}")
+
+
 def _audit(run_id, event_type, result, *, symbol=None, signal_id=None, internal_order_id=None,
             reason_code=None, detail=None, now):
     """CODEX-048: one durable audit row per evaluation step, in SQLite,
@@ -971,7 +986,7 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                     if rollout.max_quantity_per_order is not None else "none",
                     quantity)
                 if quantity < 1:
-                    reason = "insufficient KIS orderable cash for even 1 share"
+                    reason = _insufficient_cash_reason(available_usd, buffered_price)
                     results["blocked"].append((symbol, reason))
                     _persist_blocked_record(
                         symbol=symbol, signal_price=signal.signal_price, kis_price=kis_quote.price_usd,
