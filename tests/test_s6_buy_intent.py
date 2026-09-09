@@ -112,6 +112,28 @@ class TestIntentQueueSource:
         assert source.symbols() == ["UNH"]
         assert buy_intent.read_ready(DAY, SESSION, env=env) == {}
 
+    def test_allowed_symbols_claims_first_when_called_before_symbols(self, tmp_path):
+        """Production evidence 2026-09-09: kis_live_trading.run_live_buy_
+        entry_cycle calls source.allowed_symbols() BEFORE source.symbols()
+        (kis_live_trading.py:740 then :743). An earlier version of
+        IntentQueueSource populated its claim only inside .symbols(), so
+        .allowed_symbols() always saw an empty claim -- every real,
+        already-queued candidate (IOT, OWL, UMC, VIST that morning) was
+        refused as "not in live_rollout.allowed_symbols" with NO operator
+        restriction actually configured. allowed_symbols() must claim the
+        queue itself when asked first."""
+        env = _env(tmp_path)
+        buy_intent.write_ready(DAY, SESSION, [_row("UNH"), _row("HUM")], now=NOW, env=env)
+        rollout = SimpleNamespace(allowed_symbols=frozenset())  # no operator restriction
+        source = IntentQueueSource(trading_day=DAY, session=SESSION,
+                                   rollout=rollout, now=NOW, env=env)
+        # allowed_symbols() first, exactly as run_live_buy_entry_cycle does.
+        allowed = source.allowed_symbols()
+        assert allowed == frozenset({"UNH", "HUM"})
+        # symbols() afterward must still see the SAME claim, not re-claim
+        # (the queue is already empty at this point).
+        assert sorted(source.symbols()) == ["HUM", "UNH"]
+
     def test_allowed_symbols_respects_operator_allow_list(self, tmp_path):
         env = _env(tmp_path)
         buy_intent.write_ready(DAY, SESSION, [_row("UNH"), _row("HUM")], now=NOW, env=env)

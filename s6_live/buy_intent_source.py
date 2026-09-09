@@ -32,6 +32,7 @@ class IntentQueueSource:
         self._env = env
         self._claimed: Dict[str, Dict[str, Any]] = {}
         self._rows: Dict[str, dict] = {}
+        self._claimed_once = False
         # No fresh WATCHING/READY evaluation happens here -- these
         # candidates were already judged READY by a fast-watch tick.
         # Kept empty (not omitted) because callers -- `_funnel`,
@@ -45,23 +46,37 @@ class IntentQueueSource:
         operator = getattr(self._rollout, "allowed_symbols", None) or frozenset()
         return available & frozenset(str(s).upper() for s in operator) if operator else available
 
+    def _ensure_claimed(self) -> None:
+        """Claim the queue exactly once per instance, whichever method
+        is asked first. `run_live_buy_entry_cycle` calls
+        `.allowed_symbols()` BEFORE `.symbols()` -- an earlier version
+        of this class populated `self._claimed` only inside `.symbols()`,
+        so `.allowed_symbols()` always saw an empty claim and every
+        candidate was refused as "not in live_rollout.allowed_symbols"
+        regardless of the operator's actual configuration. A production
+        worker tick on 2026-09-09 reproduced exactly that: real,
+        already-claimed candidates (IOT, OWL, UMC, VIST) all refused
+        this way, with no operator restriction actually in effect.
+        A boolean flag, not `if not self._claimed`, because an
+        genuinely empty queue must not look unclaimed and trigger a
+        second, redundant claim attempt.
+        """
+        if self._claimed_once:
+            return
+        self._claimed_once = True
+        self._claimed = buy_intent.claim_ready(
+            self._trading_day, self._session, env=self._env)
+        for symbol, entry in self._claimed.items():
+            candidate = dict((entry or {}).get("candidate") or {})
+            candidate.setdefault("symbol", symbol)
+            self._rows[symbol] = candidate
+
     def allowed_symbols(self) -> FrozenSet[str]:
+        self._ensure_claimed()
         return self._operator_allowed(self._claimed)
 
     def symbols(self) -> List[str]:
-        """Claim the queue exactly once per instance. A second call
-        returns the same claimed set rather than re-draining an
-        already-emptied store -- `run_live_buy_entry_cycle` calls
-        `.symbols()` once per cycle, but nothing prevents a caller
-        from asking twice, and a second real claim would silently
-        return nothing."""
-        if not self._claimed:
-            self._claimed = buy_intent.claim_ready(
-                self._trading_day, self._session, env=self._env)
-            for symbol, entry in self._claimed.items():
-                candidate = dict((entry or {}).get("candidate") or {})
-                candidate.setdefault("symbol", symbol)
-                self._rows[symbol] = candidate
+        self._ensure_claimed()
         return sorted(self._rows)
 
     def candidate_row(self, symbol) -> Optional[dict]:
