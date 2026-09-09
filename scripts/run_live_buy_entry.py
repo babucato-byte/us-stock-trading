@@ -634,6 +634,22 @@ def _announce_quality_blocks(source, *, since) -> None:
 _TICK_HARD_BUDGET_SECONDS = 50.0
 
 
+def _shadow_budget_remaining(since, *, now=None):
+    """Seconds left for optional shadow work in this entry tick."""
+    from datetime import datetime, timezone
+
+    elapsed = ((now or datetime.now(timezone.utc)) - since).total_seconds()
+    return _TICK_HARD_BUDGET_SECONDS - elapsed
+
+
+def _shadow_deferred_budget(*, processed, total, since):
+    """Make an audit deferral visible without changing trading state."""
+    elapsed = _TICK_HARD_BUDGET_SECONDS - _shadow_budget_remaining(since)
+    logger.info("SHADOW_DEFERRED_BUDGET elapsed=%.1fs limit=%.0fs processed=%d deferred=%d",
+                elapsed, _TICK_HARD_BUDGET_SECONDS, processed,
+                max(0, total - processed))
+
+
 def _record_shadow_signals(source, results, *, since):
     """Persist what happened to every candidate this tick.
 
@@ -645,6 +661,15 @@ def _record_shadow_signals(source, results, *, since):
     """
     from datetime import datetime, timezone
 
+    # This is research/audit work after the order path.  It never earns an
+    # extra second of the entry lock: return before imports or persistence
+    # when the tick has reached its deadline.
+    evaluations = getattr(source, "evaluations", None) or {}
+    total = len(evaluations)
+    if _shadow_budget_remaining(since) <= 0:
+        _shadow_deferred_budget(processed=0, total=total, since=since)
+        return
+
     try:
         from config import s6_sessions
         from market_hours import us_trading_day
@@ -653,14 +678,17 @@ def _record_shadow_signals(source, results, *, since):
         session = getattr(source, "_session", None) or getattr(
             source, "session", None)
         day = us_trading_day(since)
-        evaluations = getattr(source, "evaluations", None) or {}
         blocked = {str(sym): reason
                    for sym, reason in (results.get("blocked") or ())}
         skipped = {str(sym): reason
                    for sym, reason in (results.get("skipped") or ())}
         submitted = {str(s) for s in (results.get("submitted") or ())}
 
+        processed = 0
         for symbol, evaluation in sorted(evaluations.items()):
+            if _shadow_budget_remaining(since) <= 0:
+                _shadow_deferred_budget(processed=processed, total=total, since=since)
+                return
             ready = bool(getattr(evaluation, "ready", False))
             if symbol in submitted:
                 outcome, first = ssl.OUTCOME_SUBMITTED, None
@@ -695,6 +723,12 @@ def _record_shadow_signals(source, results, *, since):
                               if k in ("entry_quality_gate", "age_seconds",
                                        "extension_pct", "volume_expansion")})
             ssl.append(record, trading_day=day)
+            processed += 1
+            # append can block on filesystem pressure; do not start the
+            # next symbol after it consumes the remaining entry deadline.
+            if _shadow_budget_remaining(since) <= 0:
+                _shadow_deferred_budget(processed=processed, total=total, since=since)
+                return
     except Exception:  # noqa: BLE001 -- an observation that fails must
         # not alter a cycle that has already finished trading.
         logger.warning("could not record shadow signals", exc_info=True)

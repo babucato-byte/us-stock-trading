@@ -70,6 +70,7 @@ class TestOneObservationCannotKillTheOther:
         called = {}
         monkeypatch.setattr(entry, "_record_closed_bar_shadow",
                             lambda *a, **k: called.setdefault("yes", True))
+        monkeypatch.setattr(entry, "_shadow_budget_remaining", lambda *a, **k: 1)
 
         class _Src:
             evaluations = {}
@@ -109,6 +110,7 @@ class TestItWritesWhenGivenSomewhereToWrite:
         from datetime import datetime, timezone
 
         monkeypatch.setenv("SHADOW_SIGNAL_DIR", str(tmp_path))
+        monkeypatch.setattr(entry, "_shadow_budget_remaining", lambda *a, **k: 1)
 
         class _Eval:
             ready = False

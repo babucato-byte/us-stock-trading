@@ -80,6 +80,41 @@ class TestPriorityTiers:
 
 
 class TestHardTickBudget:
+    def test_shadow_recorder_defers_before_any_audit_write_at_deadline(self, monkeypatch, caplog):
+        from scripts import run_live_buy_entry as runner
+        import s6_live.shadow_signal_log as ssl
+
+        class Source:
+            _session = SESSION
+            evaluations = {"A": SimpleNamespace(ready=False, blocking=(), state="WATCHING",
+                                                  features=None, detail={}, evaluated_at=NOW)}
+            candidate_row = lambda self, symbol: None
+
+        calls = []
+        monkeypatch.setattr(ssl, "append", lambda *a, **k: calls.append(a))
+        monkeypatch.setattr(runner, "_shadow_budget_remaining", lambda *a, **k: 0)
+        runner._record_shadow_signals(Source(), {"blocked": (), "skipped": (), "submitted": ()}, since=NOW)
+        assert calls == []
+
+    def test_shadow_recorder_stops_between_symbols_when_append_spends_deadline(self, monkeypatch):
+        from scripts import run_live_buy_entry as runner
+        import s6_live.shadow_signal_log as ssl
+
+        class Source:
+            _session = SESSION
+            evaluations = {s: SimpleNamespace(ready=False, blocking=(), state="WATCHING",
+                                               features=None, detail={}, evaluated_at=NOW)
+                           for s in ("A", "B")}
+            candidate_row = lambda self, symbol: None
+
+        remaining = iter((1, 1, 0))
+        monkeypatch.setattr(runner, "_shadow_budget_remaining", lambda *a, **k: next(remaining))
+        monkeypatch.setattr(runner, "_shadow_deferred_budget", lambda **k: None)
+        calls = []
+        monkeypatch.setattr(ssl, "append", lambda record, **k: calls.append(record))
+        runner._record_shadow_signals(Source(), {"blocked": (), "skipped": (), "submitted": ()}, since=NOW)
+        assert [r["symbol"] for r in calls] == ["A"]
+
     def test_budget_exceeded_skips_non_critical_work_not_the_audit_record(self, tmp_path, monkeypatch):
         from scripts import run_live_buy_entry as runner
 
@@ -118,7 +153,7 @@ class TestHardTickBudget:
             seconds=runner._TICK_HARD_BUDGET_SECONDS + 5)
         runner._record_shadow_signals(FakeSource(), {"blocked": (), "skipped": (),
                                                       "submitted": ()}, since=long_ago)
-        assert calls["ssl_append"] == 1, "the required audit record must always be written"
+        assert calls["ssl_append"] == 0, "optional audit work must defer at deadline"
         assert calls["quality_blocks"] == 0, "Slack must be skipped once over budget"
         assert calls["range_shadow"] == 0, "ORB15 shadow must be skipped once over budget"
 
@@ -281,4 +316,3 @@ class TestClosedBarShadowPerSymbolBudget:
         # pushes elapsed past the budget, so BBB is never started.
         assert calls["compare"] == ["AAA"]
         assert calls["compare_readiness"] == ["AAA"]
-
