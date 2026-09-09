@@ -24,7 +24,7 @@ others: the other sessions carry it as a REFERENCE to be measured
 against 5 and 30, not as a decided value.
 """
 
-from typing import Dict, FrozenSet
+from typing import Dict, FrozenSet, Optional
 
 STRATEGY_ID = "S6_ORB_BREAKOUT_V1"
 SCANNER_NAME = "orb"
@@ -108,6 +108,53 @@ SHADOW_RANGE_MINUTES = (5, 15, 30)
 def variant_for(session) -> str:
     """The variant that owns this session, or "" if S6 does not scan it."""
     return VARIANT_BY_SESSION.get(str(session or "").strip().upper(), "")
+
+
+#: The shadow comparison range for sessions whose live range differs
+#: from it. ORB15 is the measured v1.0 reference, so when PREMARKET runs
+#: ORB5 live, ORB15 keeps evaluating the same market beside it.
+SHADOW_ORB_MINUTES = 15
+SHADOW_SCANNER_VARIANT = f"S6_ORB{SHADOW_ORB_MINUTES}_SHADOW"
+
+
+def orb_minutes_for(session, config=None) -> int:
+    """The LIVE opening-range length for one session.
+
+    Read from the scanner's own config so the scanner, the precision
+    watch and the position row agree: `orb_minutes_by_session` overrides
+    the global `orb_minutes` for the sessions it names. Validated against
+    `supported_orb_minutes` exactly as the scanner validates the global;
+    an unsupported value raises rather than falling back, because a
+    month of rows labelled ORB5 collected under whatever a typo produced
+    is worse than a loud failure.
+    """
+    cfg = config
+    if cfg is None:
+        from scanners.base import config as scanner_config
+
+        cfg = scanner_config.load_config("orb", scanner_name="orb")
+    minutes = cfg.require_int("orb_minutes")
+    overrides = cfg.get("orb_minutes_by_session") or {}
+    key = str(session or "").strip().upper()
+    if isinstance(overrides, dict) and key in overrides and overrides[key] is not None:
+        minutes = int(overrides[key])
+    supported = cfg.get("supported_orb_minutes") or []
+    if supported and minutes not in [int(v) for v in supported]:
+        raise ValueError(f"orb_minutes={minutes} for {key or 'default'} is not one "
+                         f"of the supported values {supported}")
+    return minutes
+
+
+def scanner_variant_for(session, config=None) -> str:
+    """The live scanner variant label: S6_ORB5, S6_ORB15, ..."""
+    return f"S6_ORB{orb_minutes_for(session, config=config)}"
+
+
+def shadow_orb_minutes_for(session, config=None) -> Optional[int]:
+    """The shadow range for this session, or None when the live range IS
+    the reference (nothing to compare)."""
+    live = orb_minutes_for(session, config=config)
+    return SHADOW_ORB_MINUTES if live != SHADOW_ORB_MINUTES else None
 
 
 def scans(session) -> bool:

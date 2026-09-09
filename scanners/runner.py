@@ -715,10 +715,31 @@ def run_scanners(
                 # `context.get("session") or "REGULAR"` to REGULAR on
                 # every run and judged the regular session no matter
                 # which one was requested.
-                scanner.evaluate_into(outcome, bundle, trading_day=day, timestamp=stamp,
-                                      run_id=identifier,
-                                      shared_features=shared_features,
-                                      session=requested_session)
+                signal = scanner.evaluate_into(
+                    outcome, bundle, trading_day=day, timestamp=stamp,
+                    run_id=identifier, shared_features=shared_features,
+                    session=requested_session)
+                if name == "orb" and signal is not None:
+                    # Observability only: keep the common signal timestamp
+                    # shared by all scanners, while preserving when this
+                    # symbol's ORB evaluation actually finished.
+                    signal.metrics["symbol_evaluated_at"] = datetime.now(
+                        timezone.utc).isoformat()
+                    # FULL_SCAN_PUBLICATION_BLOCK fix: admit this PASS into
+                    # S6's WATCHING-tier active-watch store the instant it
+                    # is found, not after the whole (often ~50-minute)
+                    # universe finishes. This does NOT write to the
+                    # candidate manifest this module's own docstring says
+                    # it never touches, and it does not order, size, gate
+                    # on risk, or call a broker -- s6_live/active_watch.py
+                    # explicitly "never decides a symbol is buyable". The
+                    # existing 1-minute fast-watch tick is the only thing
+                    # that reads this store, through the exact same
+                    # precision/risk/sizing/account/kill-switch gates a
+                    # fully-published candidate already goes through.
+                    _admit_s6_pass_provisionally(
+                        signal, trading_day=day, session=requested_session,
+                        scan_id=identifier, full_scan_started_at=report.started_at)
                 if timing is not None and name == "orb":
                     timing["orb_eval_elapsed_ms"] = round((time.perf_counter() - eval_started) * 1000.0, 3)
             except ScannerDataError as exc:
@@ -1147,7 +1168,8 @@ def publish_report_candidates(report) -> int:
 
         rows = candidate_publisher.publish(
             signals, strategy_id=strategy_id, trading_day=day,
-            session=session, variant=variant, run_id=run_id)
+            session=session, variant=variant, run_id=run_id,
+            full_scan_started_at=started_at)
         written += len(rows)
 
         # LAST, and only now: every row is on disk, so the generation can
@@ -1186,6 +1208,55 @@ def _snapshot_safely(rows, *, scanner_name, report) -> None:
     except Exception:  # noqa: BLE001 - see publish() on why a scan must
         # survive a failed write.
         logger.warning("could not record an S6 candidate snapshot",
+                       exc_info=True)
+
+
+def _admit_s6_pass_provisionally(signal, *, trading_day, session, scan_id,
+                                  full_scan_started_at) -> None:
+    """FULL_SCAN_PUBLICATION_BLOCK fix: hand a fresh S6 PASS to active-watch
+    the moment it is found, instead of only after the whole run finishes
+    and publishes its manifest.
+
+    Scope is deliberately narrow: this writes ONLY to s6_live/active_watch.py's
+    own provisional store (a small side file next to the main active-watch
+    state), which the existing `refresh_from_existing_sources()` already
+    reads as one more source on every 1-minute tick -- so admission here
+    means WATCHING-tier eligibility, evaluated by the SAME fast-watch/
+    precision-watch/risk/sizing/account/kill-switch/session-capability
+    gates every other candidate already goes through. It does not publish
+    to the candidate manifest, submit an order, or call a broker.
+
+    Never raises: an admission failure must not slow down or fail the
+    scan that found the symbol (record_provisional_pass() itself is
+    already fire-and-forget; this wrapper also guards the session-scope
+    lookup and the import, so a misconfigured environment degrades to
+    "no incremental admission this run", not a scan failure)."""
+    try:
+        from config import s6_sessions
+        if str(session).upper() not in s6_sessions.SCAN_SESSIONS:
+            return
+        from s6_live import active_watch
+        session_date = active_watch.session_scope(session)
+        if session_date is None:
+            return
+        admitted = active_watch.record_provisional_pass(session_date, session, {
+            "symbol": signal.symbol,
+            "trading_day": trading_day,
+            "scan_id": scan_id,
+            "scanner_variant": s6_sessions.VARIANT_BY_SESSION.get(str(session).upper()),
+            "full_scan_started_at": full_scan_started_at,
+            "symbol_evaluated_at": signal.metrics.get("symbol_evaluated_at"),
+            "candidate_discovered_at": signal.timestamp,
+        })
+        if admitted is False:
+            # Do not fail the broad scan, but make the lost fast-path handoff
+            # explicit in the scanner log/health pipeline.
+            logger.error("S6 provisional PASS was not persisted: symbol=%s scan=%s",
+                         signal.symbol, scan_id)
+    except Exception:  # noqa: BLE001 - observability/hand-off write only;
+        # see _snapshot_safely() immediately above for why this pattern
+        # never lets a side write cost the scan itself.
+        logger.warning("could not admit an S6 PASS to active-watch provisionally",
                        exc_info=True)
 
 

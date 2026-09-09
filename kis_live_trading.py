@@ -318,6 +318,21 @@ def is_strategy_source(source) -> bool:
     return getattr(source, "name", None) in STRATEGY_SOURCES
 
 
+def _s6_watch(source, symbol):
+    """The precision-watch evaluation this order was authorised on, or None.
+
+    Read from the wrapped source's `evaluations` after the decision was
+    made; diagnostic lineage only. Best-effort for the same reason as
+    `_s6_candidate_row`: a missing evaluation must not fail an order
+    that has already reached the broker.
+    """
+    try:
+        evaluations = getattr(source, "evaluations", None) or {}
+        return evaluations.get(str(symbol).upper()) or evaluations.get(symbol)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _s6_candidate_row(source, symbol):
     """The published row this order was built from, or None.
 
@@ -1298,6 +1313,8 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                                     session=order_intent.session,
                                     client_order_id=order_intent.internal_order_id,
                                     candidate_row=_s6_candidate_row(source, symbol),
+                                    watch=_s6_watch(source, symbol),
+                                    broker_submit_at=submit_at,
                                     now=current)
                             except Exception:  # noqa: BLE001
                                 logger.exception(
@@ -1350,6 +1367,8 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                                 session=order_intent.session,
                                 client_order_id=order_intent.internal_order_id,
                                 candidate_row=_s6_candidate_row(source, symbol),
+                                watch=_s6_watch(source, symbol),
+                                broker_submit_at=submit_at,
                                 now=current)
                         else:
                             kis_position_manager.create_kis_position_after_buy(
@@ -1422,6 +1441,8 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                                 session=order_intent.session,
                                 client_order_id=order_intent.internal_order_id,
                                 candidate_row=_s6_candidate_row(source, symbol),
+                                watch=_s6_watch(source, symbol),
+                                broker_submit_at=submit_at,
                                 now=current)
                         except Exception:  # noqa: BLE001
                             logger.exception(

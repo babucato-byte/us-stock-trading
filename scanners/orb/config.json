@@ -1,14 +1,35 @@
 {
   "scanner_name": "orb",
   "version": "orb_v1.0",
-  "description": "S6 -- Opening Range Breakout. orb_minutes selects ORB5/ORB15/ORB30 (spec S6); 15 is the v1.0 default. Frozen for month 1 (spec section 11). Entry-timing gates (entry_window_minutes, max_breakout_age_minutes, recent_volume_window_minutes + recent_volume_expansion_min, max_minutes_since_session_high) ship null = OFF: the measurements are recorded on every candidate so the windows can be chosen from data, not guessed.",
+  "description": "S6 -- Opening Range Breakout. orb_minutes selects ORB5/ORB15/ORB30 (spec S6); 15 is the v1.0 default and orb_minutes_by_session runs every live S6 session on ORB5 with ORB15 as the shadow reference. Frozen for month 1 (spec section 11). Entry-timing gates (entry_window_minutes, max_breakout_age_minutes, recent_volume_window_minutes + recent_volume_expansion_min, max_minutes_since_session_high) ship null = OFF: the measurements are recorded on every candidate so the windows can be chosen from data, not guessed.",
   "params": {
     "orb_minutes": 15,
+    "orb_minutes_by_session": {
+      "OVERNIGHT_DAYTIME": 5,
+      "PREMARKET": 5,
+      "REGULAR": 5,
+      "AFTER_HOURS": 5
+    },
     "supported_orb_minutes": [
       5,
       15,
       30
     ],
+    "entry_quality": {
+      "PREMARKET": {
+        "max_breakout_age_minutes": null,
+        "max_minutes_since_session_high": null,
+        "min_rvol_5m": null,
+        "min_rvol_tb_5m": null,
+        "min_volume_ratio_5m_15m": null,
+        "min_volume_ratio_5m_30m": null,
+        "min_return_5m_pct": null,
+        "min_return_10m_pct": null,
+        "min_dollar_volume_5m": null,
+        "max_spread_bps": null
+      },
+      "default": {}
+    },
     "require_close_breakout": true,
     "require_price_above_vwap": true,
     "require_ema9_above_ema21": true,

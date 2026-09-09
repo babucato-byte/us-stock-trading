@@ -99,15 +99,23 @@ class OpeningRangeBreakoutScanner(BaseScanner):
     #: MINUTE bar, not the newest daily bar the feature pass also read.
     source_timeframe = "1m"
 
-    def orb_minutes(self) -> int:
-        """The configured window, validated against the supported set.
+    def orb_minutes(self, session=None) -> int:
+        """The configured window for a session, validated against the
+        supported set.
 
-        Rejecting an unsupported value outright rather than falling back
-        to 15 matters for section 11: a silently-corrected typo would
-        mean a month of data labelled ORB15 that was collected under
-        whatever the operator thought they had set.
+        `orb_minutes_by_session` overrides the global `orb_minutes` for
+        the sessions it names (PREMARKET runs ORB5 live; REGULAR keeps
+        the measured ORB15). Rejecting an unsupported value outright
+        rather than falling back to 15 matters for section 11: a
+        silently-corrected typo would mean a month of data labelled
+        ORB15 that was collected under whatever the operator thought
+        they had set.
         """
         minutes = self.config.require_int("orb_minutes")
+        overrides = self.config.get("orb_minutes_by_session") or {}
+        key = str(session or "").strip().upper()
+        if isinstance(overrides, dict) and key and overrides.get(key) is not None:
+            minutes = int(overrides[key])
         supported = self.config.get("supported_orb_minutes") or []
         if supported and minutes not in [int(value) for value in supported]:
             raise ScannerConfigError(
@@ -118,14 +126,17 @@ class OpeningRangeBreakoutScanner(BaseScanner):
               context: Dict[str, Any]) -> List[str]:
         config = self.config
         reasons: List[str] = []
-        minutes = self.orb_minutes()
 
         # Which session's range this run is judging. REGULAR is the
-        # default and takes the ORIGINAL path byte for byte -- S6-R is
-        # the measured v1.0 behaviour and is not being changed. The other
+        # default and takes the ORIGINAL code path byte for byte; the other
         # sessions route through the session-aware engine, which is the
         # only thing that knows a 20:00->04:00 window wraps midnight.
+        # The LENGTH of the range is a separate question and is answered by
+        # `orb_minutes(session)`: since the all-session move every live
+        # session names 5, so REGULAR runs the v1.0 path over an ORB5
+        # window rather than the v1.0 fifteen minutes.
         requested = str(context.get("session") or "REGULAR").strip().upper()
+        minutes = self.orb_minutes(requested)
 
         if requested == "REGULAR":
             session = sess.slice_session(
@@ -151,7 +162,8 @@ class OpeningRangeBreakoutScanner(BaseScanner):
             # PTC candidate on 2026-08-27 whose data was from
             # 2026-08-26 19:30 ET.
             session_date = srange.current_session_date(requested)
-            session = srange.slice_session_bars(data.intraday, requested,
+            closed = srange.closed_bars(data.intraday)
+            session = srange.slice_session_bars(closed, requested,
                                                 session_date=session_date)
             if session is None or len(session) == 0:
                 # NO_CURRENT_SESSION_DATA, not "no setups". The previous
@@ -160,9 +172,10 @@ class OpeningRangeBreakoutScanner(BaseScanner):
                     f"{data.symbol}: NO_CURRENT_SESSION_DATA -- no "
                     f"{requested} bars for {session_date}")
 
-            window = srange.opening_range(data.intraday, requested,
+            window = srange.opening_range(closed, requested,
                                           minutes=minutes,
-                                          session_date=session_date)
+                                          session_date=session_date,
+                                          require_official_origin=True)
             if not window.complete:
                 # Not a rejection. A session whose range has not formed
                 # yet has nothing to say; calling it a market judgement
@@ -294,6 +307,7 @@ class OpeningRangeBreakoutScanner(BaseScanner):
 
         context.update({
             "orb_minutes": minutes,
+            "scanner_variant": f"S6_ORB{minutes}",
             "opening_range_high": range_high,
             "opening_range_low": range_low,
             "opening_range_mid": range_mid,
@@ -362,7 +376,7 @@ class OpeningRangeBreakoutScanner(BaseScanner):
     def extra_metrics(self, features: SymbolFeatures, data: SymbolData,
                       context: Dict[str, Any]) -> Dict[str, Any]:
         metrics = {key: context.get(key) for key in (
-            "orb_minutes", "opening_range_high", "opening_range_low",
+            "orb_minutes", "scanner_variant", "opening_range_high", "opening_range_low",
             "opening_range_mid", "opening_range_bars", "post_range_bars",
             "breakout_touched", "breakout_confirmed", "retest_confirmed",
             "extension_above_or_high_pct", "vwap_distance", "session_ema9",

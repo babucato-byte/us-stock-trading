@@ -44,8 +44,8 @@ class TestBothTimestampsAlwaysAppear:
         message = ln._format(ln.FILL_COMPLETED, fill_notice.build(
             symbol="DT", quantity=1, fill_price=52.75,
             candidate_generated_at="A", market_data_asof="B"))
-        assert "candidate_generated_at: A" in message
-        assert "market_data_asof: B" in message
+        assert "후보 생성시각: A" in message
+        assert "시세 기준시각: B" in message
 
 
 class TestEachGateIsItsOwnLine:
@@ -63,7 +63,7 @@ class TestEachGateIsItsOwnLine:
         message = ln._format(ln.FILL_COMPLETED, fill_notice.build(
             symbol="DT", quantity=1, fill_price=52.75,
             conditions={"VOLUME_DATA_VALID": "UNAVAILABLE"}))
-        assert "gate_volume_data_valid: UNAVAILABLE" in message
+        assert "게이트 VOLUME_DATA_VALID: UNAVAILABLE" in message
 
 
 class TestItReportsTheDecisionThatWasMade:
@@ -92,7 +92,7 @@ class TestItReportsTheDecisionThatWasMade:
 class TestARealOrderIsNeverFiledAsATest:
     def test_live_carries_the_kis_live_prefix(self):
         headline = ln._format(ln.FILL_COMPLETED, {"symbol": "DT"}).splitlines()[0]
-        assert headline.startswith(ln.KIS_LIVE_PREFIX)
+        assert headline.startswith("[매수 체결]")
         assert "[TEST]" not in headline
         assert "[VALIDATION]" not in headline
 

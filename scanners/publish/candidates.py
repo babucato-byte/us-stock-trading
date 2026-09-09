@@ -111,6 +111,10 @@ class PublishedCandidate:
     #: shared hand-off exists to avoid.
     variant: Optional[str] = None
     session_date: Optional[str] = None
+    #: Which opening-range length produced this row (S6_ORB5 / S6_ORB15).
+    #: Distinct from `variant`, which names the SESSION (S6-P) and is what
+    #: the candidate source filters on.
+    scanner_variant: Optional[str] = None
     range_minutes: Optional[int] = None
     range_high: Optional[float] = None
     range_low: Optional[float] = None
@@ -318,6 +322,7 @@ def _entry_timing(metrics: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 def build_rows(signals: Iterable[Any], *, strategy_id: str, trading_day: str,
                session: Optional[str], run_id: Optional[str] = None,
                generated_at: Optional[str] = None,
+               full_scan_started_at: Optional[str] = None,
                variant: Optional[str] = None,
                session_date: Optional[str] = None
                ) -> List[PublishedCandidate]:
@@ -328,6 +333,7 @@ def build_rows(signals: Iterable[Any], *, strategy_id: str, trading_day: str,
     file never sees two different "rank 1"s for one run.
     """
     stamp = generated_at or datetime.now(timezone.utc).isoformat()
+    published_at = datetime.now(timezone.utc).isoformat()
     ordered = sorted(
         list(signals or []),
         key=lambda sig: (-(_number(getattr(sig, "scanner_score", None)) or 0.0),
@@ -362,6 +368,9 @@ def build_rows(signals: Iterable[Any], *, strategy_id: str, trading_day: str,
                          or metrics.get("vwap")),
             variant=variant,
             session_date=session_date,
+            scanner_variant=(metrics.get("scanner_variant")
+                             or (f"S6_ORB{int(metrics['orb_minutes'])}"
+                                 if metrics.get("orb_minutes") is not None else None)),
             range_minutes=(int(metrics["orb_minutes"])
                            if metrics.get("orb_minutes") is not None else None),
             range_high=_number(metrics.get("opening_range_high")),
@@ -384,6 +393,12 @@ def build_rows(signals: Iterable[Any], *, strategy_id: str, trading_day: str,
                 "feature_timestamp": getattr(signal, "feature_timestamp", None),
                 "source_timeframe": getattr(signal, "source_timeframe", None),
                 "signal_timestamp": getattr(signal, "timestamp", None),
+                "full_scan_started_at": full_scan_started_at or stamp,
+                "symbol_evaluated_at": (metrics.get("symbol_evaluated_at") or
+                                        getattr(signal, "timestamp", None)),
+                "candidate_discovered_at": (metrics.get("symbol_evaluated_at") or
+                                            getattr(signal, "timestamp", None)),
+                "candidate_published_at": published_at,
                 "reasons": list(getattr(signal, "reasons", None) or []),
                 # Stated on every row so a consumer never has to look
                 # elsewhere to learn that publication is not selection.
@@ -397,6 +412,7 @@ def build_rows(signals: Iterable[Any], *, strategy_id: str, trading_day: str,
 def publish(signals: Iterable[Any], *, strategy_id: str, trading_day: str,
             session: Optional[str], run_id: Optional[str] = None,
             generated_at: Optional[str] = None, variant: Optional[str] = None,
+            full_scan_started_at: Optional[str] = None,
             session_date: Optional[str] = None) -> List[PublishedCandidate]:
     """Write the rows and return them. Never raises.
 
@@ -407,6 +423,7 @@ def publish(signals: Iterable[Any], *, strategy_id: str, trading_day: str,
     """
     rows = build_rows(signals, strategy_id=strategy_id, trading_day=trading_day,
                       session=session, run_id=run_id, generated_at=generated_at,
+                      full_scan_started_at=full_scan_started_at,
                       variant=variant, session_date=session_date)
     if not rows:
         return rows

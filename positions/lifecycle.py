@@ -833,6 +833,10 @@ def _notify_sell_filled(record, *, delta, price, realized_before):
         realized_pnl=realized, realized_pnl_pct=realized_pct,
         position_after=record.get("remaining_qty"))
     fields["average_buy_price"] = entry_price if entry_price is not None else "UNAVAILABLE"
+    if record.get("exit_reason"):
+        fields["reason"] = record.get("exit_reason")
+    if record.get("strategy_id"):
+        fields["strategy_id"] = record.get("strategy_id")
     live_notifications.notify(live_notifications.SELL_FILLED, fields)
 
 

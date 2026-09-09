@@ -326,13 +326,21 @@ def cancel_unfilled(conn, *, broker, row, reason, account_id, now=None) -> Dict[
             has_cancel_already_in_flight=False,
         )
 
+    # The engine announces the cancel; the context tells that one message
+    # WHY (the TTL, a vanished candidate, a closed session). Presentation
+    # only: nothing inside the block reads it.
+    from operations import live_notifications
+
     try:
-        execution_engine.submit_cancel(
-            order_intent=intent, broker_order_id=broker_order_id,
-            cancel_gate_context_builder=_cancel_ctx_builder, conn=conn,
-            broker=broker, instrument=instrument,
-            audit_run_id=shadow_audit.new_run_id(), now=current,
-        )
+        with live_notifications.cancel_context(
+                reason=reason, strategy_id=row.get("strategy_id"),
+                session=row.get("entry_session")):
+            execution_engine.submit_cancel(
+                order_intent=intent, broker_order_id=broker_order_id,
+                cancel_gate_context_builder=_cancel_ctx_builder, conn=conn,
+                broker=broker, instrument=instrument,
+                audit_run_id=shadow_audit.new_run_id(), now=current,
+            )
     except Exception as exc:  # noqa: BLE001
         # Never re-sent from here. The engine has already written the
         # durable state; reconciliation decides what the broker holds.

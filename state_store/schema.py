@@ -1256,6 +1256,40 @@ MIGRATION_25_STATEMENTS = [
     S6_POSITIONS_PEAK_PRICE_AT,
 ]
 
+# Migration 26: WHICH range the entry broke out of, and the momentum
+# freshness measured at the exact decision instant.
+#
+# PREMARKET runs ORB5 live from 2026-09 while ORB15 keeps evaluating in
+# shadow; `scanner_variant` (S6_ORB5 / S6_ORB15) names the range the
+# row was traded on, separately from `variant` (S6-P), which names the
+# session. `entry_quality_json` is the immutable snapshot the precision
+# watch decided on -- breakout age, session-high age, recent volume,
+# momentum, extension, provenance -- so a post-mortem reads what the
+# strategy SAW rather than a candidate row re-read later. NULL on rows
+# opened before this column existed.
+S6_POSITIONS_SCANNER_VARIANT = (
+    "ALTER TABLE s6_positions ADD COLUMN scanner_variant TEXT")
+S6_POSITIONS_ENTRY_QUALITY_JSON = (
+    "ALTER TABLE s6_positions ADD COLUMN entry_quality_json TEXT")
+
+MIGRATION_26_STATEMENTS = [
+    S6_POSITIONS_SCANNER_VARIANT,
+    S6_POSITIONS_ENTRY_QUALITY_JSON,
+]
+
+# Migration 27: the complete S6 discovery-to-fill clock.  Nullable columns
+# preserve every existing row and make unavailable historical stages honest.
+_S6_LINEAGE_TIMESTAMPS = (
+    "full_scan_started_at", "symbol_evaluated_at", "candidate_discovered_at",
+    "watchlist_added_at", "fast_watch_evaluated_at", "candidate_published_at",
+    "source_consumed_at", "precision_watch_started_at", "broker_submit_at",
+    "fill_at",
+)
+MIGRATION_27_STATEMENTS = [
+    f"ALTER TABLE order_lineage ADD COLUMN {name} TEXT"
+    for name in _S6_LINEAGE_TIMESTAMPS
+]
+
 
 # Every table this schema version creates -- used by export.py's
 # export_all() and by tests asserting the full table set exists.

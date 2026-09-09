@@ -126,13 +126,14 @@ class TestMessageContent:
 
     def test_the_message_states_the_order_path_is_unaffected(self):
         message = notify.format_run_alert(FakeReport(run_context.FAILED_PROVIDER))
-        assert "Candidate Decision: disabled" in message
+        assert "주문 경로 영향 없음" in message
+        assert message.startswith("⚠️ [시스템 상태]")
 
     def test_a_tripped_breaker_is_named(self):
         message = notify.format_run_alert(
             FakeReport(run_context.PARTIAL, breaker=True,
                        outcomes=[FakeOutcome("orb", breaker=True)]))
-        assert "circuit breaker" in message.lower()
+        assert "서킷 브레이커: 작동" in message
 
     def test_cli_exit_two_explains_itself(self):
         message = notify.format_cli_alert("run_scanner_report.py weekly", 2,
@@ -214,7 +215,7 @@ class TestCliFailures:
         recorder = Recorder()
         assert notify.notify_cli_failure(f"cmd{code}", code, trading_day="2026-08-17",
                                          sender=recorder) is True
-        assert f"exit {code}" in recorder.messages[0]
+        assert f"SCANNER_CLI_EXIT_{code}" in recorder.messages[0]
 
 
 class TestRunnerIntegration:
@@ -357,7 +358,10 @@ class TestWeeklySlackFormat:
             run_health={"runs": 12, "failed": ["2026-08-12 open: FAILED_PROVIDER"],
                         "partial": [], "circuit_breaker_runs": 1,
                         "skipped_market_closed": 0, "statuses": {}})
-        assert "실행 12회" in text
+        # The run count is a labelled Korean field now, and only
+        # anomalies are listed beside it.
+        assert "스캐너 실행: 12회" in text
+        assert "실행 이상: 실패 1" in text
         assert "FAILED_PROVIDER" in text
 
     def test_an_empty_week_says_so(self):

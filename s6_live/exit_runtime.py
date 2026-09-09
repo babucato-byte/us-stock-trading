@@ -30,6 +30,7 @@ to escape. Entry fail-closed and exit continuity are different rules.
 """
 
 import logging
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from s1_live.exit_runtime import ExitOutcome, _submit_sell
@@ -187,7 +188,89 @@ def sync_buy_fills(conn, *, fills_for, now=None) -> List[Dict[str, Any]]:
         applied.append({"position_id": pid, "symbol": symbol,
                         "status": "OPENED" if changed else "NO_CHANGE",
                         "filled_quantity": quantity})
+        if changed:
+            try:
+                fill_at = (fill.get("broker_fill_time") or
+                           fill.get("filled_at") or now or
+                           datetime.now(timezone.utc))
+                if hasattr(fill_at, "isoformat"):
+                    fill_at = fill_at.isoformat()
+                conn.execute(
+                    "UPDATE order_lineage SET fill_at = COALESCE(fill_at, ?), "
+                    "broker_fill_time = COALESCE(broker_fill_time, ?) "
+                    "WHERE position_id = ?",
+                    (fill_at, fill_at, pid))
+                conn.commit()
+            except Exception:  # noqa: BLE001 - fill is already durable
+                logger.warning("S6 fill lineage not completed for %s", symbol,
+                               exc_info=True)
+            # The one human-facing BUY message, after the durable write.
+            # Side effect only; the notifier never raises and its result
+            # is not read. Keyed on the position so a second tick that
+            # sees the same fill cannot announce it twice.
+            _announce_buy_fill(conn, row, pid, symbol, quantity, fill)
     return applied
+
+
+def _announce_buy_fill(conn, row, pid, symbol, quantity, fill) -> None:
+    try:
+        from operations import live_notifications as ln
+
+        fields = ln.fill_completed_fields(
+            symbol=symbol, filled_qty=quantity,
+            fill_price=fill.get("average_fill_price"),
+            position_qty=quantity, average_cost=fill.get("average_fill_price"),
+            strategy_id=row.get("strategy_id"),
+            session=row.get("entry_session"),
+            broker_order_id=fill.get("order_id"))
+        fields.update(_fill_quality_context(row))
+        ln.notify(ln.FILL_COMPLETED, fields,
+                  dedupe_conn=conn, dedupe_subject=pid, dedupe_version="OPENED")
+    except Exception:  # noqa: BLE001 - a message must never touch the book
+        logger.warning("S6 BUY fill notice for %s not sent", symbol, exc_info=True)
+
+
+def _fill_quality_context(row) -> Dict[str, Any]:
+    """The compact ORB / freshness context for the one fill message:
+    the range length and, when the decision snapshot exists, the breakout
+    age and whether recent volume was holding. Presentation only."""
+    import json
+
+    out: Dict[str, Any] = {}
+    try:
+        if row.get("range_minutes") is not None:
+            out["orb_minutes"] = int(row["range_minutes"])
+        raw = row.get("entry_quality_json")
+        if raw:
+            snapshot = json.loads(raw) if isinstance(raw, str) else dict(raw)
+            if snapshot.get("breakout_age_minutes") is not None:
+                out["breakout_age_minutes"] = snapshot["breakout_age_minutes"]
+            decay = snapshot.get("volume_decay")
+            if decay is not None:
+                out["recent_volume_state"] = "감소" if decay else "유지"
+    except Exception:  # noqa: BLE001 - context is optional
+        pass
+    return out
+
+
+def _announce_sell_fill(conn, row, pid, symbol, sold, fill, *, session,
+                        remaining) -> None:
+    try:
+        from operations import live_notifications as ln
+
+        ln.notify(
+            ln.SELL_FILLED,
+            ln.sell_filled_fields(
+                symbol=symbol, qty=sold, fill_price=fill.get("average_fill_price"),
+                realized_pnl=None, realized_pnl_pct=None,
+                position_after=remaining, reason=row.get("exit_reason"),
+                strategy_id=row.get("strategy_id"),
+                session=_session_name(session) or row.get("exit_session"),
+                average_buy_price=row.get("entry_price")),
+            dedupe_conn=conn, dedupe_subject=pid,
+            dedupe_version=f"SOLD:{sold}:{remaining}")
+    except Exception:  # noqa: BLE001 - a message must never touch the book
+        logger.warning("S6 SELL fill notice for %s not sent", symbol, exc_info=True)
 
 
 def _session_name(session):
@@ -314,6 +397,8 @@ def sync_sell_fills(conn, *, fills_for, session=None, now=None) -> List[Dict[str
             results.append({"position_id": pid, "symbol": symbol,
                             "status": "CLOSED", "sold": sold,
                             "exit_price": fill.get("average_fill_price")})
+            _announce_sell_fill(conn, row, pid, symbol, sold, fill,
+                                session=session, remaining=0)
         else:
             remaining = held - sold
             conn.execute(
@@ -325,6 +410,8 @@ def sync_sell_fills(conn, *, fills_for, session=None, now=None) -> List[Dict[str
             results.append({"position_id": pid, "symbol": symbol,
                             "status": "PARTIALLY_SOLD", "sold": sold,
                             "remaining": remaining})
+            _announce_sell_fill(conn, row, pid, symbol, sold, fill,
+                                session=session, remaining=remaining)
     return results
 
 

@@ -214,12 +214,36 @@ def _s6_source(rollout, now, *, broker=None):
     age limit here would be a second staleness policy.
     """
     from market_hours import us_trading_day
+    from config import s6_sessions
     from s6_live.candidate_source import S6CandidateSource
     from scanners.base import scan_session
 
+    session = scan_session.session_at()
+    trading_day = us_trading_day(now)
+
+    # The fast second stage uses the existing one-minute BUY tick as its
+    # single owner, in EVERY S6 session.  It evaluates only the persisted
+    # <=41 active symbols for the current session and then enters the same
+    # shared order path below; there is no session-specific runtime and no
+    # second execution path.  A session S6 does not scan keeps the
+    # published full-scan source byte for byte.
+    if session in s6_sessions.SCAN_SESSIONS:
+        from s6_live.fast_watch import ActiveWatchSource
+        from s6_live import pretrade_validation as ptv
+        from state_store import db as state_db
+
+        return ActiveWatchSource(
+            trading_day=trading_day, session=session, rollout=rollout,
+            now=now, conn=state_db.open_db(),
+            # Stream members are local reads. A newly discovered outsider
+            # uses the bounded REST fallback only until it joins a stream.
+            provider=ptv.provider_for(session, broker=broker,
+                                      trading_day=trading_day),
+            budget_seconds=ptv.budget_seconds())
+
     source = S6CandidateSource(
-        trading_day=us_trading_day(now),
-        session=scan_session.session_at(),
+        trading_day=trading_day,
+        session=session,
         rollout=rollout,
     )
     # An hourly candidate is a reason to WATCH, not a reason to buy.
@@ -248,12 +272,11 @@ def _s6_source(rollout, now, *, broker=None):
     # delivery mechanism; it does not select stocks.
     from s6_live import pretrade_validation as ptv
 
-    session = scan_session.session_at()
     return WatchedCandidateSource(
         source, conn=state_db.open_db(),
         session=session, now=now,
         provider=ptv.provider_for(session, broker=broker,
-                                  trading_day=us_trading_day(now)),
+                                  trading_day=trading_day),
         budget_seconds=ptv.budget_seconds())
 
 
@@ -351,10 +374,49 @@ def _funnel(source, results, *, since):
         logger.info("FUNNEL_SKIPPED %s reason=%s", symbol, reason)
     for symbol, reason in (results.get("blocked") or ()):
         logger.info("FUNNEL_BLOCKED %s reason=%s", symbol, reason)
+    _announce_blocks(results.get("blocked") or ())
     for symbol in (results.get("submitted") or ()):
         logger.info("FUNNEL_SUBMITTED %s", symbol)
 
     _record_shadow_signals(source, results, since=since)
+    _announce_fast_watch_health(source)
+
+
+def _announce_fast_watch_health(source) -> None:
+    """Route only S6 runtime faults to system-health, after trading ends."""
+    # Identity, not session: only the active-watch source reports this.
+    if getattr(source, "name", None) is None or not hasattr(source, "describe") \
+            or getattr(source, "_scope", "missing") == "missing":
+        return
+    try:
+        info = source.describe()
+        faults = []
+        status = info.get("watchlist_status")
+        if status != "ACTIVE":
+            faults.append(("ACTIVE_WATCH_FAILURE", f"watchlist_status={status}"))
+        collector = info.get("collector_state")
+        if collector in ("COLLECTOR_STALE", "DISCONNECTED", "FAILED",
+                         "SUBSCRIPTION_PARTIAL", "UNKNOWN"):
+            faults.append(("ACTIVE_WATCH_STALE", f"collector_state={collector}"))
+        origin_missing = []
+        for symbol, evaluation in (getattr(source, "evaluations", None) or {}).items():
+            reason = str(getattr(evaluation, "reason", "") or "")
+            error = str(getattr(getattr(evaluation, "features", None), "error", "") or "")
+            if "OFFICIAL_ORIGIN_NOT_COVERED" in reason + error:
+                origin_missing.append(symbol)
+        if origin_missing:
+            faults.append(("DATA_ORIGIN_UNAVAILABLE",
+                           f"count={len(origin_missing)} symbols={','.join(origin_missing[:8])}"))
+        if not faults:
+            return
+        script_dir = str(Path(__file__).resolve().parent)
+        if script_dir not in sys.path:
+            sys.path.insert(0, script_dir)
+        import notify_system_health
+        for code, detail in faults:
+            notify_system_health.main([code, detail])
+    except Exception:  # noqa: BLE001 -- health reporting cannot affect orders
+        logger.warning("fast-watch health report failed", exc_info=True)
 
 
 #: A tick that produced no order, and what kind of nothing it was.
@@ -438,6 +500,108 @@ def _classify_no_submission(results, executable):
             f"as expected: {sorted(set(blocked))[:5]}")
 
 
+def _announce_blocks(blocked) -> None:
+    """One 매수 차단 message per (symbol, reason code, trading day).
+
+    Presentation only. The block itself was decided and logged above;
+    this reads `results["blocked"]` and never writes anything the entry
+    path reads. Transient codes (the execution lock, an already-held
+    symbol) and outcomes the engine already announced (a broker rejection
+    or an UNKNOWN response) are filtered inside `notify()`. A tracking
+    failure after a successful buy is not a block at all and goes to the
+    alert channel instead.
+    """
+    if not blocked:
+        return
+    try:
+        from operations import live_notifications as ln
+        from operations import slack_presentation as sp
+        from state_store import db as state_db
+    except Exception:  # noqa: BLE001
+        logger.warning("block notifications unavailable", exc_info=True)
+        return
+    conn = None
+    try:
+        conn = state_db.open_db()
+    except Exception:  # noqa: BLE001 - dedupe is best-effort
+        conn = None
+    try:
+        for symbol, reason in blocked:
+            code = sp.block_code_for(reason)
+            if code == "POSITION_TRACKING_FAILED":
+                ln.notify(ln.DB_FAILURE, {"symbol": symbol, "reason": code,
+                                          "detail": str(reason)[:200]},
+                          dedupe_conn=conn, dedupe_subject=symbol,
+                          dedupe_version=code)
+                continue
+            ln.notify(ln.ORDER_BLOCKED,
+                      ln.order_blocked_fields(symbol=symbol, reason_code=code,
+                                              detail=str(reason)[:200],
+                                              strategy_id="S6_ORB_BREAKOUT_V1"),
+                      dedupe_conn=conn)
+    except Exception:  # noqa: BLE001 - reporting must never affect trading
+        logger.warning("block notifications failed", exc_info=True)
+    finally:
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _announce_quality_blocks(source, *, since) -> None:
+    """One 매수 차단 message per (symbol, S6 reason code, day) for the
+    candidates the entry-quality gate stopped this tick.
+
+    Presentation only. The watch already decided and logged; this reads
+    `source.evaluations` and never writes anything the entry path reads.
+    Deduplicated through the notification ledger; a Slack failure cannot
+    reach trading (notify() never raises).
+    """
+    evaluations = getattr(source, "evaluations", None) or {}
+    hits = []
+    for symbol, evaluation in sorted(evaluations.items()):
+        blocking = list(getattr(evaluation, "blocking", ()) or ())
+        detail = dict(getattr(evaluation, "detail", {}) or {})
+        code = detail.get("entry_quality_reason")
+        if not code or not blocking or blocking[0] != "ENTRY_QUALITY":
+            continue
+        hits.append((symbol, code, detail, evaluation))
+    if not hits:
+        return
+    from operations import live_notifications as ln
+    from state_store import db as state_db
+
+    conn = None
+    try:
+        conn = state_db.open_db()
+    except Exception:  # noqa: BLE001
+        conn = None
+    try:
+        for symbol, code, detail, evaluation in hits:
+            fields = ln.order_blocked_fields(
+                symbol=symbol, reason_code=code,
+                strategy_id="S6_ORB_BREAKOUT_V1",
+                session=getattr(evaluation, "session", None))
+            compact = dict(detail.get("entry_quality") or {})
+            fields["orb_minutes"] = detail.get("range_minutes")
+            for key in ("breakout_age_minutes", "minutes_since_session_high",
+                        "rvol_5m", "rvol_15m"):
+                if compact.get(key) is not None:
+                    fields[key] = compact[key]
+            try:
+                ln.notify(ln.ORDER_BLOCKED, fields, dedupe_conn=conn)
+            except Exception:  # noqa: BLE001 -- notify() never raises; belt and braces
+                logger.warning("entry-quality block notice for %s failed", symbol,
+                               exc_info=True)
+    finally:
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _record_shadow_signals(source, results, *, since):
     """Persist what happened to every candidate this tick.
 
@@ -476,19 +640,43 @@ def _record_shadow_signals(source, results, *, since):
                 blocking = list(getattr(evaluation, "blocking", ()) or ())
                 first = blocking[0] if blocking else None
 
+            feats = getattr(evaluation, "features", None)
+            detail = dict(getattr(evaluation, "detail", {}) or {})
             record = ssl.build_record(
                 symbol=symbol, session=session, outcome=outcome,
                 strategy_id=s6_sessions.STRATEGY_ID,
-                features=getattr(evaluation, "features", None),
+                features=feats,
                 candidate=(source.candidate_row(symbol)
                            if hasattr(source, "candidate_row") else None),
                 first_blocked_by=first,
                 watch_blocking=getattr(evaluation, "blocking", ()),
-                now=since)
+                now=since,
+                scanner_variant=detail.get("scanner_variant"),
+                range_minutes=detail.get("range_minutes"),
+                evaluated_at=getattr(evaluation, "evaluated_at", None),
+                entry_quality=getattr(feats, "entry_quality", None),
+                entry_quality_reason=detail.get("entry_quality_reason"),
+                watch_state=getattr(evaluation, "state", None),
+                watch_detail={k: v for k, v in detail.items()
+                              if k in ("entry_quality_gate", "age_seconds",
+                                       "extension_pct", "volume_expansion")})
             ssl.append(record, trading_day=day)
     except Exception:  # noqa: BLE001 -- an observation that fails must
         # not alter a cycle that has already finished trading.
         logger.warning("could not record shadow signals", exc_info=True)
+
+    try:
+        _announce_quality_blocks(source, since=since)
+    except Exception:  # noqa: BLE001 -- presentation only
+        logger.warning("could not announce entry-quality blocks", exc_info=True)
+
+    try:
+        from market_hours import us_trading_day
+        from s6_live import range_shadow
+
+        range_shadow.record_cycle(source, trading_day=us_trading_day(since), now=since)
+    except Exception:  # noqa: BLE001 -- research, and the cycle is over
+        logger.warning("could not record the ORB15 range shadow", exc_info=True)
 
     # In its OWN try. It used to sit inside the block above, after the
     # shadow-signal import -- so when that import was wrong, this never

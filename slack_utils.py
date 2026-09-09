@@ -31,6 +31,20 @@ KIS_LIVE_ALERT_WEBHOOK_ENV = "KIS_LIVE_SLACK_ALERT_WEBHOOK_URL"
 # never a reroute into the paper/alert streams.
 SCANNER_MONITOR_WEBHOOK_ENV = "SCANNER_MONITOR_SLACK_WEBHOOK_URL"
 SYSTEM_HEALTH_WEBHOOK_ENV = "SYSTEM_HEALTH_SLACK_WEBHOOK_URL"
+# The daily trading report channel (sotck-trading-report). Same rule:
+# unset means the report is printed and not sent, never rerouted.
+TRADING_REPORT_WEBHOOK_ENV = "TRADING_REPORT_SLACK_WEBHOOK_URL"
+
+#: Channel role -> environment variable. The roles are defined in
+#: operations.slack_presentation; this is the only place a role becomes
+#: a webhook, so "which channel does X go to" has one answer.
+ROLE_WEBHOOK_ENV = {
+    "LIVE_TRADING": KIS_LIVE_WEBHOOK_ENV,
+    "LIVE_ALERTS": KIS_LIVE_ALERT_WEBHOOK_ENV,
+    "SCANNER": SCANNER_MONITOR_WEBHOOK_ENV,
+    "SYSTEM_HEALTH": SYSTEM_HEALTH_WEBHOOK_ENV,
+    "TRADING_REPORT": TRADING_REPORT_WEBHOOK_ENV,
+}
 
 
 def _send(webhook_url, message):
@@ -114,6 +128,29 @@ def send_system_health_message(message):
     webhook = _env_webhook(SYSTEM_HEALTH_WEBHOOK_ENV)
     if not webhook:
         print(f"{SYSTEM_HEALTH_WEBHOOK_ENV} is not configured; health report not sent")
+        return False
+    return _send(webhook, message)
+
+
+def send_trading_report_message(message):
+    """The daily trading report channel; never falls back to another webhook."""
+    webhook = _env_webhook(TRADING_REPORT_WEBHOOK_ENV)
+    if not webhook:
+        print(f"{TRADING_REPORT_WEBHOOK_ENV} is not configured; trading report not sent")
+        return False
+    return _send(webhook, message)
+
+
+def send_for_role(role, message):
+    """Send on a channel ROLE (operations.slack_presentation.*). Unknown
+    roles and unset webhooks return False; nothing is rerouted."""
+    env_name = ROLE_WEBHOOK_ENV.get(str(role))
+    if not env_name:
+        print(f"unknown Slack channel role {role!r}; message not sent")
+        return False
+    webhook = _env_webhook(env_name)
+    if not webhook:
+        print(f"{env_name} is not configured; message for {role} not sent")
         return False
     return _send(webhook, message)
 

@@ -386,10 +386,16 @@ class TestOpeningRangeBreakout:
             scanner.orb_minutes()
 
     def test_a_different_window_changes_the_measured_range(self):
+        # The per-session override is what the live scanner reads, so a
+        # test that means to change the window must change THAT: since the
+        # all-session ORB5 move every live session names its own length and
+        # the global `orb_minutes` no longer reaches them.
         five = build_scanner("orb")
         five.config.params["orb_minutes"] = 5
+        five.config.params["orb_minutes_by_session"] = {}
         thirty = build_scanner("orb")
         thirty.config.params["orb_minutes"] = 30
+        thirty.config.params["orb_minutes_by_session"] = {}
 
         bundle = fx.orb_bundle()
         _, five_context = check(five, bundle)
@@ -404,6 +410,8 @@ class TestOpeningRangeBreakout:
         yet", not as "no setups today"."""
         from scanners.base.models import ScannerDataError
 
+        scanner = build_scanner("orb")
+        scanner.config.params["orb_minutes_by_session"] = {}
         bundle = fx.orb_bundle(range_bars=15, post_bars=1)
         with pytest.raises(ScannerDataError, match="bars since"):
-            check(self.scanner, bundle)
+            check(scanner, bundle)

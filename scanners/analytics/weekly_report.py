@@ -224,6 +224,20 @@ def _days_in_range(start_day: str, end_day: str) -> List[str]:
     return out
 
 
+#: The return field a hit rate is measured on, as an operator reads it.
+HORIZON_LABELS = {
+    "return_1d": "신호 발생 후 1일 수익률",
+    "return_3d": "신호 발생 후 3일 수익률",
+    "return_5d": "신호 발생 후 5일 수익률",
+    "return_30m": "신호 발생 후 30분 수익률",
+}
+
+
+def _horizon_label(value) -> str:
+    text = str(value or "").strip()
+    return HORIZON_LABELS.get(text, text or "-")
+
+
 def format_slack(report: Dict[str, Any], *, run_health: Optional[Dict[str, Any]] = None) -> str:
     """The weekly summary as a Slack message.
 
@@ -243,17 +257,23 @@ def format_slack(report: Dict[str, Any], *, run_health: Optional[Dict[str, Any]]
     an additional rendering, not a replacement.
     """
     start, end = report.get("start_day"), report.get("end_day")
+    # Operator-facing text is Korean, including the measurement basis:
+    # "hit horizon: return_1d" and "Month 1" were the two fragments that
+    # left this report reading half-English in production.
+    horizon = _horizon_label(report.get("hit_horizon"))
     lines = [
-        "*📡 Scanner 주간 요약* (Month 1 · 관측 전용)",
+        "[S1~S5 스캐너 주간 리포트]",
+        "",
         f"기간: {start} ~ {end}",
-        f"신호 총계: {report.get('total_signals', 0)}   "
-        f"신호 발생 거래일: {len(report.get('trading_days') or [])}   "
-        f"hit horizon: {report.get('hit_horizon')}",
+        f"관측 단계: {report.get('observation_month', 1)}개월차",
+        "",
+        f"전체 신호: {report.get('total_signals', 0)}건",
+        f"신호 발생 거래일: {len(report.get('trading_days') or [])}일",
     ]
 
     health = run_health or {}
     if health:
-        bits = [f"실행 {health.get('runs', 0)}회"]
+        bits = []
         if health.get("failed"):
             bits.append(f"실패 {len(health['failed'])}")
         if health.get("partial"):
@@ -262,14 +282,17 @@ def format_slack(report: Dict[str, Any], *, run_health: Optional[Dict[str, Any]]
             bits.append(f"circuit breaker {health['circuit_breaker_runs']}")
         if health.get("skipped_market_closed"):
             bits.append(f"휴장 {health['skipped_market_closed']}")
-        lines.append("실행 상태: " + " · ".join(bits))
+        lines.append(f"스캐너 실행: {health.get('runs', 0)}회")
+        if bits:
+            # Only anomalies. "0 failures" is not news; a failure is.
+            lines.append("실행 이상: " + " · ".join(bits))
         for entry in (health.get("failed") or [])[:5]:
             lines.append(f"  ⚠️ {entry}")
 
     scanners = report.get("scanners") or []
     if not scanners:
         lines.append("")
-        lines.append("이번 주 기록된 신호가 없습니다.")
+        lines.append("이번 주에는 기록된 후보 신호가 없습니다.")
     else:
         lines.append("")
         lines.append("```")
@@ -295,7 +318,8 @@ def format_slack(report: Dict[str, Any], *, run_health: Optional[Dict[str, Any]]
         lines.append(f"⚠️ {format_split_warning(finding)}")
 
     lines.append("")
-    lines.append("종목명 미포함 · 주문 경로 영향 없음 · Candidate Decision: disabled")
+    lines.append(f"성과 측정 기준: {horizon}")
+    lines.append("종목명 미포함 · 주문 연동: 사용 안 함")
     return "\n".join(lines)
 
 

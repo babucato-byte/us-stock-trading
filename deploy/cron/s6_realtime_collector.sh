@@ -55,11 +55,19 @@ if pgrep -f "run_realtime_bar_collector.py" > /dev/null 2>&1; then
     HEALTH_RC=$?
     if [ "$HEALTH_RC" = "2" ]; then
         echo "$(date -u +%FT%TZ) COLLECTOR_RESTART reason=$HEALTH sha=$SCANNER_SHA" >> "$LOG"
+        # Infrastructure event -> stock-system-health. Best-effort; a
+        # Slack failure must not stop the restart.
+        "$SCANNER_RUNTIME_ROOT/venv/bin/python" -m scripts.notify_system_health \
+            COLLECTOR_RESTART "$HEALTH" >> "$LOG" 2>&1 || true
         pkill -TERM -f "run_realtime_bar_collector.py" 2>/dev/null
         sleep 5
         pkill -KILL -f "run_realtime_bar_collector.py" 2>/dev/null
     else
-        [ "$HEALTH_RC" = "0" ] || echo "$(date -u +%FT%TZ) COLLECTOR_UNHEALTHY_NO_RESTART reason=$HEALTH" >> "$LOG"
+        if [ "$HEALTH_RC" != "0" ]; then
+            echo "$(date -u +%FT%TZ) COLLECTOR_UNHEALTHY_NO_RESTART reason=$HEALTH" >> "$LOG"
+            "$SCANNER_RUNTIME_ROOT/venv/bin/python" -m scripts.notify_system_health \
+                COLLECTOR_UNHEALTHY_NO_RESTART "$HEALTH" >> "$LOG" 2>&1 || true
+        fi
         exit 0
     fi
 fi

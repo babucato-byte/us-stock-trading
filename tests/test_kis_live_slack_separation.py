@@ -55,8 +55,15 @@ def kis_configured(monkeypatch):
 class TestKISLiveRouting:
     def test_a_routine_event_goes_to_the_kis_live_general_webhook(
             self, captured, kis_configured):
-        live_notifications.notify(live_notifications.ORDER_SUBMITTED, {"symbol": "AAPL"})
+        live_notifications.notify(live_notifications.FILL_COMPLETED,
+                                  {"symbol": "AAPL", "filled_qty": 1, "fill_price": 10.0})
         assert [url for url, _ in captured] == [KIS_GENERAL]
+
+    def test_an_internal_event_sends_nothing_anywhere(self, captured, kis_configured):
+        """Submitted / accepted / prepared are audit rows, not messages."""
+        for event in sorted(live_notifications.INTERNAL_EVENTS):
+            assert live_notifications.notify(event, {"symbol": "AAPL"}) is False
+        assert captured == []
 
     def test_an_urgent_event_goes_to_the_kis_live_alert_webhook(
             self, captured, kis_configured):
@@ -64,7 +71,8 @@ class TestKISLiveRouting:
         assert [url for url, _ in captured] == [KIS_ALERT]
 
     def test_the_two_streams_stay_separate(self, captured, kis_configured):
-        live_notifications.notify(live_notifications.ORDER_SUBMITTED, {"symbol": "AAPL"})
+        live_notifications.notify(live_notifications.SELL_FILLED,
+                                  {"symbol": "AAPL", "qty": 1, "fill_price": 10.0})
         live_notifications.notify(live_notifications.HALT_ACTIVATED, {"reason": "x"})
         assert [url for url, _ in captured] == [KIS_GENERAL, KIS_ALERT]
 
@@ -137,13 +145,18 @@ class TestAlpacaRoutingIsUntouched:
         slack_utils.send_slack_alert("paper alert")
         assert captured == [(ALPACA_ALERT, "paper alert")]
 
-    def test_operations_alerts_still_delegates_to_the_alpaca_alert_channel(
-            self, captured, monkeypatch):
+    def test_operations_alerts_go_to_the_live_alert_channel_not_alpaca(
+            self, captured, monkeypatch, kis_configured):
+        """Every caller of operations.alerts reports a fault on the real
+        account; it belongs on stock-live-alerts, never in the paper
+        stream, and it carries a Korean headline."""
         from operations import alerts
 
         monkeypatch.setattr(slack_utils, "SLACK_ALERT_WEBHOOK_URL", ALPACA_ALERT)
-        alerts.send_alert("something")
-        assert [url for url, _ in captured] == [ALPACA_ALERT]
+        alerts.send_alert("*KIS token cache rejected*\n- reason: clock")
+        assert [url for url, _ in captured] == [KIS_ALERT]
+        assert captured[0][1].startswith("🚨 [KIS 토큰 캐시 거부]")
+        assert "- reason: clock" in captured[0][1]
 
     def test_configuring_kis_live_changes_nothing_for_alpaca(
             self, captured, monkeypatch, kis_configured):
@@ -152,28 +165,34 @@ class TestAlpacaRoutingIsUntouched:
         assert [url for url, _ in captured] == [ALPACA_GENERAL]
 
 
-class TestEveryMessageIsPrefixed:
-    def test_routine_messages_carry_the_kis_live_prefix(self):
-        message = live_notifications._format(
-            live_notifications.ORDER_SUBMITTED, {"symbol": "AAPL"})
-        assert message.startswith("[KIS LIVE] ")
-        assert "[CRITICAL]" not in message
+class TestEveryMessageIsTitled:
+    """The English [KIS LIVE] prefix is gone: the channels are role-specific
+    and the Korean title says what happened. Urgent messages carry the
+    🚨 marker so they cannot be mistaken for routine traffic."""
 
-    def test_urgent_messages_carry_the_critical_prefix(self):
+    def test_routine_messages_carry_a_korean_title(self):
+        message = live_notifications._format(
+            live_notifications.FILL_COMPLETED, {"symbol": "AAPL"})
+        assert message.startswith("[매수 체결]")
+        assert "🚨" not in message
+
+    def test_urgent_messages_carry_the_siren(self):
         message = live_notifications._format(
             live_notifications.ORDER_UNKNOWN, {"symbol": "AAPL"})
-        assert message.startswith("[KIS LIVE][CRITICAL] ")
+        assert message.startswith("🚨 [주문 결과 확인 불가]")
 
-    @pytest.mark.parametrize("event", sorted(live_notifications.EVENTS))
-    def test_no_event_is_unprefixed(self, event):
-        assert live_notifications._format(event, {}).startswith("[KIS LIVE]")
+    @pytest.mark.parametrize("event", sorted(live_notifications.EVENTS
+                                             - live_notifications.INTERNAL_EVENTS))
+    def test_no_presented_event_is_untitled(self, event):
+        first = live_notifications._format(event, {}).splitlines()[0]
+        assert first.startswith("[") or first.startswith("🚨 ["), first
 
     def test_the_test_marker_still_comes_first(self):
         """An operator scanning for real traffic must see [TEST] before
         anything else."""
         message = live_notifications._format(
             live_notifications.HALT_ACTIVATED, {}, test=True)
-        assert message.startswith("[TEST][KIS LIVE][CRITICAL]")
+        assert message.startswith("[TEST] 🚨 [")
 
     def test_the_unknown_contract_lines_survive_the_prefix_change(self):
         message = live_notifications._format(
@@ -189,7 +208,7 @@ class TestNoSecretIsPrinted:
             assert url not in message
 
     def test_redaction_still_applies_to_payload_values(self, captured, kis_configured):
-        live_notifications.notify(live_notifications.ORDER_SUBMITTED, {
+        live_notifications.notify(live_notifications.KIS_API_FAILURE, {
             "symbol": "AAPL", "app_key": "PSxxxxxxxxxxxxxxxxxx",
             "authorization": "Bearer abcdef123456",
         })

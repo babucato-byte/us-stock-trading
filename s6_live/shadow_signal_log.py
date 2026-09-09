@@ -96,7 +96,10 @@ def _feature_fields(features) -> Dict[str, Any]:
 def build_record(*, symbol, session, outcome, strategy_id,
                  strategy_version=None, features=None, candidate=None,
                  gate_results=None, first_blocked_by=None, watch_blocking=None,
-                 target_qty=None, orderable_usd=None, now=None) -> Dict[str, Any]:
+                 target_qty=None, orderable_usd=None, now=None,
+                 scanner_variant=None, range_minutes=None, evaluated_at=None,
+                 entry_quality=None, entry_quality_reason=None,
+                 watch_state=None, watch_detail=None) -> Dict[str, Any]:
     """One candidate's signal, flattened for storage.
 
     `first_blocked_by` is stored separately from the full gate map on
@@ -118,6 +121,18 @@ def build_record(*, symbol, session, outcome, strategy_id,
         "gate_results": dict(gate_results or {}),
         "target_qty": target_qty,
         "orderable_usd": orderable_usd,
+        # The decision-time identity and snapshot. `evaluated_at` is the
+        # instant the watch judged; `logged_at` above is when this row
+        # was written, and the two are deliberately both kept.
+        "scanner_variant": scanner_variant,
+        "range_minutes": range_minutes,
+        "evaluated_at": (evaluated_at.isoformat()
+                         if isinstance(evaluated_at, datetime) else evaluated_at),
+        "watch_state": watch_state,
+        "entry_quality_reason": entry_quality_reason,
+        "entry_quality": (entry_quality.as_record()
+                          if hasattr(entry_quality, "as_record") else entry_quality),
+        "watch_detail": dict(watch_detail or {}),
     }
     row.update(_feature_fields(features))
     if candidate:

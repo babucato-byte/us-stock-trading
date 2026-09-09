@@ -363,11 +363,16 @@ class TestTheStrategyIsUnchanged:
         assert (window.range_end - window.range_start).total_seconds() == 14 * 60
 
     def test_the_condition_set_is_unchanged(self):
+        """The v1.0 conditions, in order, plus the 2026-09 ENTRY_QUALITY
+        gate appended LAST -- it is PASS whenever its per-session
+        thresholds are null, so the original set decides exactly as
+        before until a threshold is deliberately configured."""
         assert pw.CONDITION_ORDER == (
             pw.C_MARKET_DATA_ASOF, pw.C_MARKET_DATA_FRESH, pw.C_PRICE,
             pw.C_VWAP_AVAILABLE, pw.C_EMA_AVAILABLE, pw.C_PRICE_ABOVE_VWAP,
             pw.C_EMA_STRUCTURE, pw.C_BREAKOUT, pw.C_VOLUME_VALID,
-            pw.C_VOLUME_EXPANSION, pw.C_EXTENSION, pw.C_REENTRY)
+            pw.C_VOLUME_EXPANSION, pw.C_EXTENSION, pw.C_REENTRY,
+            pw.C_ENTRY_QUALITY)
 
     def test_the_kis_authoritative_session_set_is_unchanged(self):
         assert ptv.provider_for("REGULAR", broker=object(),

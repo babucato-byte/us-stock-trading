@@ -116,7 +116,12 @@ class TestOpeningRangeWindow:
         """"No verdict yet" must not read as "no setups today" -- one is
         a schedule fact, the other is a market observation."""
         scanner = build_scanner("orb")
-        bundle = fx.orb_bundle(range_bars=15, post_bars=1)
+        # "Too early" is relative to the range this scanner actually runs,
+        # which every live session now sets for itself. Sizing the fixture
+        # from the resolved length keeps the test about the schedule fact
+        # instead of about a hard-coded fifteen minutes.
+        minutes = scanner.orb_minutes("REGULAR")
+        bundle = fx.orb_bundle(range_bars=minutes, post_bars=1)
         with pytest.raises(ScannerDataError, match="bars since"):
             scanner.check(scanner.build_features(bundle), bundle, {})
 

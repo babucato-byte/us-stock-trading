@@ -80,12 +80,10 @@ ALL_SESSION_SCANNERS = frozenset({"accumulation"})
 #: rather than as live.
 MODE_DISCOVERY_ONLY = "DISCOVERY_ONLY"
 
-TAG_LIVE_BUY = "LIVE BUY"
-TAG_LIVE_FILL = "LIVE FILL"
-TAG_LIVE_SELL = "LIVE SELL"
-TAG_RISK = "RISK"
-TAG_WATCHDOG = "WATCHDOG"
-TAG_RECONCILIATION = "RECONCILIATION"
+#: Analytics only. The execution tags (LIVE BUY / LIVE FILL / LIVE SELL /
+#: RISK / WATCHDOG / RECONCILIATION) were removed with the senders that
+#: used them: this channel carries scanner analytics, and trading events
+#: belong to stock-live-trading and stock-live-alerts.
 TAG_DAILY_SUMMARY = "DAILY SUMMARY"
 
 #: How many ranked candidates a scan message lists. The rest are counted,
@@ -410,89 +408,19 @@ def notify_scan(*, scanner_name, session, trading_day, scanned, candidates,
         return False
 
 
-# --- live order lifecycle -------------------------------------------------
-
-def format_buy(*, strategy, symbol, session, qty, limit_price, order_id,
-               status="ACCEPTED", rank=None) -> str:
-    lines = [f"[{labels.tag(TAG_LIVE_BUY)} · {_strategy_number(strategy)}]", "",
-             f"전략: {labels.strategy(strategy)}",
-             f"{labels.field('Symbol')}: {symbol}"]
-    if rank is not None:
-        lines.append(f"{labels.field('Rank')}: {rank}")
-    lines += [
-        f"{labels.field('Session')}: {labels.session(session)}",
-        f"{labels.field('Quantity')}: {qty}주",
-        f"주문가: {_fmt(limit_price, 4)}",
-        f"{labels.field('Order ID')}: {order_id}",
-        f"{labels.field('Status')}: {labels.status(status)}",
-    ]
-    return "\n".join(lines)
-
-
-def format_fill(*, strategy, symbol, qty, average_fill_price, position_id,
-                side=None, position_state=None) -> str:
-    """A fill, tagged by the ACTUAL side.
-
-    Not by the event name: one fill event carries both directions, and
-    labelling a sell "매수 체결" would make the channel lie about a real
-    order. An unknown side degrades to the neutral "체결".
-    """
-    lines = [f"[{labels.fill_tag(side)} · {_strategy_number(strategy)}]", "",
-             f"전략: {labels.strategy(strategy)}",
-             f"{labels.field('Symbol')}: {symbol}",
-             f"{labels.field('Quantity')}: {qty}주",
-             f"{labels.field('Avg Fill')}: {_fmt(average_fill_price, 4)}"]
-    if position_state:
-        lines.append(f"{labels.field('Position')}: {position_state}")
-    lines.append(f"포지션 ID: {position_id}")
-    return "\n".join(lines)
-
-
-def format_sell(*, strategy, symbol, reason, qty, average_entry, average_sell,
-                realized_pnl=None, holding_time=None) -> str:
-    lines = [f"[{labels.tag(TAG_LIVE_SELL)} · {_strategy_number(strategy)}]", "",
-             f"전략: {labels.strategy(strategy)}",
-             f"{labels.field('Symbol')}: {symbol}",
-             f"매도 사유: {labels.exit_reason(reason)}",
-             f"{labels.field('Quantity')}: {qty}주",
-             f"평균 매수가: {_fmt(average_entry, 4)}",
-             f"평균 매도가: {_fmt(average_sell, 4)}"]
-    # PnL is printed only when it is known. A fee-inclusive realised
-    # number is not available until settlement, and printing a
-    # gross figure labelled "Realized PnL" would be a claim the ledger
-    # cannot support.
-    lines.append(f"{labels.field('Realized PnL')}: "
-                 f"{_fmt(realized_pnl) if realized_pnl is not None else labels.status('PENDING_SETTLEMENT')}")
-    if holding_time:
-        lines.append(f"{labels.field('Holding Time')}: {holding_time}")
-    return "\n".join(lines)
-
-
-def notify_buy(**kwargs) -> bool:
-    env = kwargs.pop("env", None)
-    try:
-        return _send(format_buy(**kwargs), env=env)
-    except Exception:  # noqa: BLE001
-        logger.warning("scanner monitor: buy message failed", exc_info=True)
-        return False
-
-
-def notify_fill(**kwargs) -> bool:
-    env = kwargs.pop("env", None)
-    try:
-        return _send(format_fill(**kwargs), env=env)
-    except Exception:  # noqa: BLE001
-        logger.warning("scanner monitor: fill message failed", exc_info=True)
-        return False
-
-
-def notify_sell(**kwargs) -> bool:
-    env = kwargs.pop("env", None)
-    try:
-        return _send(format_sell(**kwargs), env=env)
-    except Exception:  # noqa: BLE001
-        logger.warning("scanner monitor: sell message failed", exc_info=True)
-        return False
+# --- live order lifecycle: NOT THIS CHANNEL'S JOB -------------------------
+#
+# `format_buy` / `format_fill` / `format_sell` and their `notify_*` senders
+# used to render a real BUY/SELL lifecycle into the scanner channel, which
+# is how production came to show "[실거래 매수] ORDER_SUBMITTED" and
+# "[실거래 매도] ORDER_ACCEPTED" beside scan analytics. They are removed
+# rather than left unused: a live-order formatter sitting in the scanner
+# module is an invitation to call it again.
+#
+# Execution logging is untouched. The order lifecycle is recorded in
+# order_state_events and shadow_audit_events exactly as before, and the
+# operator-facing half now belongs to operations.live_notifications, which
+# routes to stock-live-trading and sends ONE final message per lifecycle.
 
 
 # --- operational tags -----------------------------------------------------

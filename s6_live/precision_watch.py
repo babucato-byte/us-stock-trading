@@ -93,11 +93,15 @@ C_VOLUME_VALID = "VOLUME_DATA_VALID"
 C_VOLUME_EXPANSION = "VOLUME_EXPANSION"
 C_EXTENSION = "EXTENSION_WITHIN_LIMIT"
 C_REENTRY = "SAME_DAY_REENTRY"
+#: Is the momentum still fresh, or is this a late chase? Judged by
+#: s6_live.entry_quality against the session's configured thresholds;
+#: every threshold ships null (off) until the historical review sets it.
+C_ENTRY_QUALITY = "ENTRY_QUALITY"
 
 CONDITION_ORDER = (
     C_MARKET_DATA_ASOF, C_MARKET_DATA_FRESH, C_PRICE, C_VWAP_AVAILABLE, C_EMA_AVAILABLE,
     C_PRICE_ABOVE_VWAP, C_EMA_STRUCTURE, C_BREAKOUT, C_VOLUME_VALID,
-    C_VOLUME_EXPANSION, C_EXTENSION, C_REENTRY,
+    C_VOLUME_EXPANSION, C_EXTENSION, C_REENTRY, C_ENTRY_QUALITY,
 )
 
 
@@ -149,7 +153,7 @@ def _orb_config():
 
 def evaluate(symbol, *, session=None, now=None, features=None, conn=None,
              config=None, max_age_seconds=None, provider=None,
-             candidate=None) -> WatchEvaluation:
+             candidate=None, require_scanner_thesis=False) -> WatchEvaluation:
     """Re-ask S6's entry conditions against the market as it is now.
 
     `features` may be supplied by a caller that already built the view
@@ -165,7 +169,8 @@ def evaluate(symbol, *, session=None, now=None, features=None, conn=None,
         return _evaluate(symbol, session=session, now=moment,
                          features=features, conn=conn, config=config,
                          max_age_seconds=max_age_seconds, provider=provider,
-                         candidate=candidate)
+                         candidate=candidate,
+                         require_scanner_thesis=require_scanner_thesis)
     except Exception as exc:  # noqa: BLE001
         logger.warning("S6 precision watch failed for %s", symbol,
                        exc_info=True)
@@ -176,11 +181,29 @@ def evaluate(symbol, *, session=None, now=None, features=None, conn=None,
 
 
 def _evaluate(symbol, *, session, now, features, conn, config,
-              max_age_seconds, provider, candidate):
+              max_age_seconds, provider, candidate,
+              require_scanner_thesis=False):
     cfg = config or _orb_config()
-    feats = features if features is not None else rf.build(
-        symbol, session=session, now=now, provider=provider,
-        range_minutes=cfg.require_int("orb_minutes"))
+    from config import s6_sessions as _s6
+
+    # The LIVE range for this session (PREMARKET: ORB5; REGULAR: the
+    # measured ORB15), read from the scanner's own config so the scanner,
+    # this watch and the position row agree.
+    live_minutes = _s6.orb_minutes_for(session, config=cfg)
+    if features is not None:
+        feats = features
+    else:
+        try:
+            feats = rf.build(
+                symbol, session=session, now=now, provider=provider,
+                range_minutes=live_minutes, closed_bar_only=True)
+        except TypeError as exc:
+            # Compatibility for injected/test builders written before the
+            # explicit policy argument existed. Production's build accepts it.
+            if "closed_bar_only" not in str(exc):
+                raise
+            feats = rf.build(symbol, session=session, now=now,
+                             provider=provider, range_minutes=live_minutes)
 
     max_age = (max_age_seconds if max_age_seconds is not None
                else rf.DEFAULT_MAX_BAR_AGE_SECONDS)
@@ -258,6 +281,15 @@ def _evaluate(symbol, *, session, now, features, conn, config,
             PASS if feats.volume_expansion >= minimum else FAIL)
         detail["volume_expansion"] = feats.volume_expansion
 
+    if require_scanner_thesis:
+        scanner_expansion = getattr(feats, "scanner_volume_expansion", None)
+        scanner_verdict = (
+            UNAVAILABLE if scanner_expansion is None else
+            PASS if scanner_expansion >= minimum else FAIL)
+        if scanner_verdict != PASS:
+            conditions[C_VOLUME_EXPANSION] = scanner_verdict
+        detail["scanner_volume_expansion"] = scanner_expansion
+
     # -- 6. extension, measured from the price we would actually pay.
     #
     # The scanner checks this at scan time. DT was 1.76% extended when
@@ -287,10 +319,32 @@ def _evaluate(symbol, *, session, now, features, conn, config,
             conditions[C_REENTRY] = UNAVAILABLE
             detail["same_day_reentry_error"] = str(exc)
 
+    # -- 8. is the momentum still fresh? Configured per session; every
+    # threshold is null until the historical review sets it, in which
+    # case this is PASS and changes nothing. A configured threshold whose
+    # measurement is missing refuses (UNAVAILABLE) rather than passing.
+    from s6_live import entry_quality as eq
+
+    thresholds = eq.thresholds_for(cfg, feats.session or session)
+    quality = getattr(feats, "entry_quality", None)
+    verdict, quality_code, quality_detail = eq.assess(quality, thresholds)
+    conditions[C_ENTRY_QUALITY] = verdict
+    detail["range_minutes"] = getattr(feats, "range_minutes", None) or live_minutes
+    detail["scanner_variant"] = f"S6_ORB{detail['range_minutes']}"
+    if quality_code:
+        detail["entry_quality_reason"] = quality_code
+    if quality_detail:
+        detail["entry_quality_gate"] = quality_detail
+    if quality is not None and hasattr(quality, "compact"):
+        detail["entry_quality"] = quality.compact()
+    quality_terminal = bool(quality_code and quality_code in eq.TERMINAL_CODES
+                            and verdict == FAIL)
+
     if candidate:
         detail["candidate"] = {
             k: candidate.get(k) for k in
-            ("rank", "score", "generated_at", "generation_id", "candidate_id")
+            ("rank", "score", "generated_at", "generation_id", "candidate_id",
+             "scanner_variant")
             if k in candidate}
 
     failing = [name for name in CONDITION_ORDER
@@ -301,10 +355,13 @@ def _evaluate(symbol, *, session, now, features, conn, config,
         # A candidate that merely is not ready yet is still WATCHING; one
         # whose strategy thesis has actually broken is INVALIDATED. The
         # difference decides whether it can come back this generation.
+        # A stale breakout only gets older, so it is terminal too.
         broken = {C_PRICE_ABOVE_VWAP, C_EMA_STRUCTURE, C_BREAKOUT,
                   C_EXTENSION, C_REENTRY}
         hard = [name for name in failing
                 if name in broken and conditions[name] == FAIL]
+        if quality_terminal:
+            hard.append(C_ENTRY_QUALITY)
         state = INVALIDATED if hard else WATCHING
         reason = ",".join(hard or failing)
 

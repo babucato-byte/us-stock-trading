@@ -126,9 +126,12 @@ def _mark_sent(key: str, trading_day: str) -> None:
 def _send(message: str) -> bool:
     """The only outbound call. Imported lazily and never allowed to raise."""
     try:
-        from slack_utils import send_scanner_monitor_message
+        # A scanner failure is an infrastructure fact, not a market one:
+        # it goes to stock-system-health. stock-sanner carries only the
+        # daily S1-S5 summary.
+        from slack_utils import send_system_health_message
 
-        return bool(send_scanner_monitor_message(message))
+        return bool(send_system_health_message(message))
     except Exception:  # noqa: BLE001 - a Slack outage is not a scan failure
         logger.warning("scanner notify: Slack send failed", exc_info=True)
         return False
@@ -159,38 +162,42 @@ def format_run_alert(report) -> str:
     """Counts, statuses and reason codes. No symbol, no score."""
     profile = getattr(report, "profile", None) or "(explicit scanner list)"
     lines = [
-        f"*Scanner 실행 실패* — {report.status}",
-        f"profile: {profile}",
-        f"trading day: {getattr(report, 'trading_day', '?')}",
-        f"run id: {getattr(report, 'run_id', '?')}",
-        f"provider: {getattr(report, 'provider', '?')}",
-        f"universe: {getattr(report, 'universe_size', '?')} symbols",
-        f"provider errors: {getattr(report, 'fetch_failures', '?')}",
+        "⚠️ [시스템 상태] 스캐너 실행 실패",
+        "",
+        f"원인 코드: {report.status}",
+        f"프로파일: {profile}",
+        f"거래일: {getattr(report, 'trading_day', '?')}",
+        f"실행 ID: {getattr(report, 'run_id', '?')}",
+        f"데이터 공급자: {getattr(report, 'provider', '?')}",
+        f"유니버스: {getattr(report, 'universe_size', '?')}종목",
+        f"공급자 오류: {getattr(report, 'fetch_failures', '?')}",
     ]
     if getattr(report, "circuit_breaker_triggered", False):
         peak = getattr(report, "consecutive_error_peak", "?")
-        lines.append(f"circuit breaker: TRIGGERED (연속 실패 최대 {peak})")
+        lines.append(f"서킷 브레이커: 작동 (연속 실패 최대 {peak})")
     failed = _failed_scanner_names(report)
     if failed:
-        lines.append(f"failed scanners: {', '.join(failed)}")
+        lines.append(f"실패 스캐너: {', '.join(failed)}")
     if getattr(report, "skipped_reason", None):
-        lines.append(f"skipped reason: {report.skipped_reason}")
-    lines.append("주문 경로 영향 없음 · Candidate Decision: disabled")
+        lines.append(f"미실행 사유: {report.skipped_reason}")
+    lines.append("주문 경로 영향 없음")
     return "\n".join(lines)
 
 
 def format_cli_alert(command: str, exit_code: int, trading_day: str,
                      detail: Optional[str] = None) -> str:
     lines = [
-        f"*Scanner CLI 실패* — exit {exit_code}",
-        f"command: {command}",
-        f"trading day: {trading_day}",
+        "⚠️ [시스템 상태] 스캐너 명령 실패",
+        "",
+        f"원인 코드: SCANNER_CLI_EXIT_{exit_code}",
+        f"명령: {command}",
+        f"거래일: {trading_day}",
     ]
     if exit_code == 2:
         lines.append("exit 2 = 잘못된 호출(날짜 형식/인자). cron 정의를 확인.")
     if detail:
-        lines.append(f"detail: {detail}")
-    lines.append("주문 경로 영향 없음 · Candidate Decision: disabled")
+        lines.append(f"내용: {detail}")
+    lines.append("주문 경로 영향 없음")
     return "\n".join(lines)
 
 

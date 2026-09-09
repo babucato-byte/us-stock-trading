@@ -1,15 +1,29 @@
-"""Thin facade over the existing slack_utils.py (spec §5: reuse existing
-alert channel). The only addition is a KIS-specific message-formatting
-helper so callers never hand-format a KIS order/reconciliation alert
-inline -- keeps the actual wording centralized and testable.
-"""
+"""Operator alerts for faults in the KIS live path.
 
+`send_alert` used to delegate to `slack_utils.send_slack_alert`, the
+Alpaca paper alert webhook. Every caller of this function reports a real
+fault on the real account -- a cancel whose final state could not be
+persisted, a fatal connection fault, a fail-stop, a rejected token cache
+-- and those belong on stock-live-alerts with the other conditions a
+person must act on, not in the paper stream.
+
+The message body is left as the caller wrote it: the `- key: value`
+lines are the identifiers an operator greps for. A Korean headline is
+put in front of it by `slack_presentation.legacy_alert`.
+
+The three `format_*` helpers are kept for their callers and tests.
+"""
 import slack_utils
+from operations import slack_presentation
 
 
 def send_alert(message: str) -> bool:
-    """Delegates entirely to the existing slack_utils.send_slack_alert()."""
-    return slack_utils.send_slack_alert(message)
+    """A fault alert on the live-alerts channel. Never raises."""
+    try:
+        text = slack_presentation.legacy_alert(message)
+    except Exception:  # noqa: BLE001 - a headline must never cost the alert
+        text = message
+    return slack_utils.send_kis_live_alert(text)
 
 
 def format_order_blocked_message(*, symbol: str, side: str, reason: str) -> str:

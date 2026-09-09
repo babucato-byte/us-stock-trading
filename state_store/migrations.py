@@ -20,7 +20,8 @@ from state_store.schema import (
     MIGRATION_19_STATEMENTS, MIGRATION_20_STATEMENTS,
     MIGRATION_21_STATEMENTS, MIGRATION_22_STATEMENTS,
     MIGRATION_23_STATEMENTS, MIGRATION_24_STATEMENTS,
-    MIGRATION_25_STATEMENTS,
+    MIGRATION_25_STATEMENTS, MIGRATION_26_STATEMENTS,
+    MIGRATION_27_STATEMENTS,
 )
 
 MIGRATIONS = [
@@ -85,6 +86,11 @@ MIGRATIONS = [
          "the peak and discarded when it was set, so one tick below it "
          "read as weakness",
      MIGRATION_25_STATEMENTS),
+    (26, "S6 ENTRY QUALITY: s6_positions.scanner_variant (S6_ORB5/S6_ORB15) "
+         "and entry_quality_json, the decision-instant freshness snapshot",
+     MIGRATION_26_STATEMENTS),
+    (27, "S6 ACTIVE WATCH: durable full-scan through fill latency timestamps",
+     MIGRATION_27_STATEMENTS),
 ]
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1][0]

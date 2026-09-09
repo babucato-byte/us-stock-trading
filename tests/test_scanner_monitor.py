@@ -45,13 +45,7 @@ class TestUnconfiguredIsSilentNotBroken:
         assert monitor.notify_scan(scanner_name="x", session="REGULAR",
                                    trading_day="d", scanned=1, candidates=0,
                                    status="SUCCESS") is False
-        assert monitor.notify_buy(strategy="S2", symbol="ABC", session="REGULAR",
-                                  qty=1, limit_price=10.0, order_id="1") is False
-        assert monitor.notify_fill(strategy="S2", symbol="ABC", qty=1,
-                                   average_fill_price=10.0, position_id="p") is False
-        assert monitor.notify_sell(strategy="S2", symbol="ABC", reason="VWAP",
-                                   qty=1, average_entry=10.0, average_sell=11.0) is False
-        assert monitor.notify_tagged(monitor.TAG_RISK, "body") is False
+        assert monitor.notify_tagged(monitor.TAG_DAILY_SUMMARY, "body") is False
         assert monitor.notify_daily_summary(trading_day="d", rows=[]) is False
 
     def test_a_non_2xx_response_is_reported_as_not_sent(self, monkeypatch):
@@ -126,36 +120,27 @@ class TestScanMessages:
         assert monitor.scanner_tag("something_new") == "SOMETHING_NEW"
 
 
-class TestOrderMessages:
-    def test_a_buy_reports_accepted_not_filled(self):
-        text = monitor.format_buy(strategy="S2", symbol="ABC", session="REGULAR",
-                                  qty=1, limit_price=12.34, order_id="0030469882",
-                                  rank=2)
-        assert "[실거래 매수 · S2]" in text
-        assert "상태: 주문 접수" in text
-        assert "주문번호: 0030469882" in text
-        assert "평균 체결가" not in text, "a buy message must not imply a fill"
+class TestOrderMessagesAreGone:
+    """This channel carries scanner analytics, not a live order lifecycle.
 
-    def test_a_fill_carries_the_actual_average(self):
-        text = monitor.format_fill(strategy="S1", symbol="TX", qty=1,
-                                   average_fill_price=53.68, position_id="s1pos_x")
-        assert "[체결 · S1]" in text
-        assert "53.6800" in text
-        assert "s1pos_x" in text
+    Production showed "[실거래 매수] ORDER_SUBMITTED" and "[실거래 매도]
+    ORDER_ACCEPTED" in stock-scanner because the formatters below lived
+    here. They are removed, not merely uncalled: a live-order formatter
+    in the scanner module invites the next caller. Execution logging is
+    unaffected -- order_state_events still records every transition, and
+    operations.live_notifications owns the operator-facing half.
+    """
 
-    def test_a_sell_without_settled_pnl_says_so(self):
-        """Printing a gross number labelled Realized PnL would be a claim
-        the ledger cannot support until settlement."""
-        text = monitor.format_sell(strategy="S2", symbol="ABC", reason="VWAP_FAIL",
-                                   qty=1, average_entry=10.0, average_sell=10.5)
-        assert "실현손익: 정산 대기" in text
+    def test_the_live_order_formatters_no_longer_exist(self):
+        for gone in ("format_buy", "format_fill", "format_sell",
+                     "notify_buy", "notify_fill", "notify_sell"):
+            assert not hasattr(monitor, gone), gone
 
-    def test_a_sell_with_pnl_prints_it(self):
-        text = monitor.format_sell(strategy="S2", symbol="ABC", reason="VWAP_FAIL",
-                                   qty=1, average_entry=10.0, average_sell=10.5,
-                                   realized_pnl=0.5, holding_time="2h 15m")
-        assert "실현손익: 0.50" in text
-        assert "보유시간: 2h 15m" in text
+    def test_the_execution_tags_no_longer_exist(self):
+        for gone in ("TAG_LIVE_BUY", "TAG_LIVE_FILL", "TAG_LIVE_SELL",
+                     "TAG_RISK", "TAG_WATCHDOG", "TAG_RECONCILIATION"):
+            assert not hasattr(monitor, gone), gone
+        assert monitor.TAG_DAILY_SUMMARY == "DAILY SUMMARY"
 
 
 class TestDailySummaryRefusesToInventAWinner:
@@ -413,13 +398,14 @@ KIS_LIVE_PRESENT = _kis_live_present()
 
 @pytest.mark.skipif(not KIS_LIVE_PRESENT,
                     reason="KIS live lifecycle is not part of the scanner runtime")
-class TestOperationalEventsReachTheSameChannel:
-    """§6: the live lifecycle is mirrored into #stock-scanner.
+class TestTheLiveLifecycleIsNoLongerMirroredHere:
+    """2026-09: stock-sanner carries ONLY the daily S1-S5 summary.
 
-    Mirrored, not rerouted. The KIS live channels are where a real order
-    is announced and they keep receiving exactly what they received
-    before; the monitor gets a copy so one channel answers "what did the
-    system do today" without an operator reading three.
+    The live lifecycle used to be copied into this channel under
+    [LIVE BUY]/[LIVE FILL]/[RISK] tags, which doubled every order message
+    and buried the scanner results. The copy is gone: fills, cancels and
+    faults are presented once, on stock-live-trading / stock-live-alerts,
+    by operations.live_notifications.
     """
 
     def capture(self, monkeypatch):
@@ -427,60 +413,43 @@ class TestOperationalEventsReachTheSameChannel:
         monkeypatch.setattr(monitor, "_send", lambda msg, env=None: seen.append(msg) or True)
         return seen
 
-    @pytest.mark.parametrize("event,tag", [
-        ("FILL_COMPLETED", "LIVE FILL"),
-        ("PARTIAL_FILL", "LIVE FILL"),
-        ("SELL_FILLED", "LIVE SELL"),
-        ("SELL_SUBMITTED", "LIVE SELL"),
-        ("EXIT_TRIGGERED", "LIVE SELL"),
-        ("RECONCILIATION_MISMATCH", "RECONCILIATION"),
-        ("POSITION_MISMATCH", "RECONCILIATION"),
-        ("ORDER_REJECTED", "RISK"),
-        ("ORDER_UNKNOWN", "RISK"),
-        ("KILL_SWITCH_ACTIVATED", "RISK"),
-        ("HALT_ACTIVATED", "RISK"),
-        ("KIS_API_FAILURE", "RISK"),
-        ("DAILY_SUMMARY", "DAILY SUMMARY"),
-    ])
-    def test_each_event_carries_its_tag(self, event, tag):
-        assert _ln().monitor_tag_for(event) == tag
+    def test_live_notifications_no_longer_know_the_monitor(self):
+        ln = _ln()
+        assert not hasattr(ln, "_mirror_to_monitor")
+        assert not hasattr(ln, "monitor_tag_for")
+        source = (REPO_ROOT / "operations" / "live_notifications.py").read_text()
+        assert "scanners.notify" not in source
 
-    def test_a_submit_is_tagged_by_side_not_by_event_name(self):
-        """ORDER_SUBMITTED carries both directions. Filing a sell under
-        [LIVE BUY] would make the channel lie about a real order."""
-        assert _ln().monitor_tag_for("ORDER_SUBMITTED", {"side": "buy"}) == "LIVE BUY"
-        assert _ln().monitor_tag_for("ORDER_SUBMITTED", {"side": "sell"}) == "LIVE SELL"
-        assert _ln().monitor_tag_for("ORDER_ACCEPTED", {"side": "SELL"}) == "LIVE SELL"
-
-    def test_routine_intermediate_events_are_not_mirrored(self):
-        """§11: summary over commentary. These stay on the KIS channel."""
-        for event in ("MARKET_START", "BUY_CANDIDATE_SELECTED",
-                      "LIVE_ORDER_PREPARED", "ORDER_PENDING",
-                      "CANCEL_REQUESTED", "CANCEL_COMPLETED"):
-            assert _ln().monitor_tag_for(event) is None, event
-
-    def test_an_unknown_event_mirrors_nowhere(self):
-        assert _ln().monitor_tag_for("SOMETHING_NEW") is None
-
-    def test_the_mirror_cannot_break_the_kis_notification(self, monkeypatch):
-        """The order path must survive a monitor that throws."""
-        def boom(*a, **k):
-            raise RuntimeError("monitor down")
-
-        monkeypatch.setattr(monitor, "notify_tagged", boom)
-        delivered = []
-        assert _ln().notify("FILL_COMPLETED", {"symbol": "TX"},
-                         send_fn=lambda m: delivered.append(m) or True,
-                         track_health=False) is True
-        assert delivered, "the KIS message still went out"
-
-    def test_the_mirror_is_sent_even_when_the_kis_send_fails(self, monkeypatch):
-        """If the primary webhook is down the monitor line is the only
-        record there is -- gating it on the primary would lose it."""
+    @pytest.mark.parametrize("event", ["FILL_COMPLETED", "SELL_FILLED", "ORDER_UNKNOWN",
+                                       "KILL_SWITCH_ACTIVATED", "CANCEL_COMPLETED"])
+    def test_a_live_event_sends_nothing_to_the_scanner_channel(self, monkeypatch, event):
         seen = self.capture(monkeypatch)
-        assert _ln().notify("FILL_COMPLETED", {"symbol": "TX"},
-                         send_fn=lambda m: False, track_health=False) is False
-        assert any("체결" in m and "TX" in m for m in seen)
+        delivered = []
+        _ln().notify(event, {"symbol": "TX"},
+                     send_fn=lambda m: delivered.append(m) or True, track_health=False)
+        assert delivered, "the live channel still gets the message"
+        assert seen == [], "the scanner channel gets no copy"
+
+    def test_the_watchdog_alerts_only_when_it_actually_escalated(self, monkeypatch):
+        """"already ENTRY_DISABLED" and "disabled entries just now" are
+        different facts. Only the second is an alert; it goes to
+        stock-live-alerts, not to this channel."""
+        import scripts.run_s1_position_watchdog as wd
+
+        ln = _ln()
+        sent = []
+        monkeypatch.setattr(ln, "notify",
+                            lambda event, fields=None, **k: sent.append((event, fields)) or True)
+        seen = self.capture(monkeypatch)
+        wd.notify_monitor({"status": "STALE", "detail": "d", "symbol": "TX",
+                           "silent_minutes": 51}, escalated=True)
+        wd.notify_monitor({"status": "STALE", "detail": "d", "symbol": "TX",
+                           "silent_minutes": 51}, escalated=False)
+        assert [e for e, _ in sent] == [ln.WATCHDOG_ESCALATED]
+        # The bare state word travels; slack_presentation renders it as
+        # "안전 중지 상태: 신규 진입 차단" from the one shared mapping.
+        assert sent[0][1]["kill_switch"] == "ENTRY_DISABLED"
+        assert seen == []
 
     def test_the_watchdog_announces_only_the_stale_case(self):
         source = (REPO_ROOT / "scripts" / "run_s1_position_watchdog.py").read_text()
@@ -488,27 +457,8 @@ class TestOperationalEventsReachTheSameChannel:
         # definition too, and the definition is above this line by
         # construction, so the loose form would pass for the wrong reason.
         healthy_return = source.index('if result["status"] != STATUS_STALE')
-        assert source.index("notify_monitor(result, escalated=escalated)") > healthy_return
-
-    def test_the_watchdog_states_whether_it_actually_escalated(self):
-        """"already ENTRY_DISABLED" and "disabled entries just now" are
-        different facts; one message for both hides a repeating fault."""
-        import scripts.run_s1_position_watchdog as wd
-
-        sent = []
-        original = monitor.notify_tagged
-        try:
-            monitor.notify_tagged = lambda tag, body, **k: sent.append((tag, body)) or True
-            wd.notify_monitor({"status": "STALE", "detail": "d", "symbol": "TX",
-                               "silent_minutes": 51}, escalated=True)
-            wd.notify_monitor({"status": "STALE", "detail": "d", "symbol": "TX",
-                               "silent_minutes": 51}, escalated=False)
-        finally:
-            monitor.notify_tagged = original
-        assert sent[0][0] == monitor.TAG_WATCHDOG
-        assert "지금 차단됨" in sent[0][1]
-        assert "변경 없음" in sent[1][1]
-        assert "매도 경로는 계속 유지됩니다." in sent[0][1]
+        call = source.index("notify_monitor(result, escalated=escalated)")
+        assert call > healthy_return
 
 
 class TestTheWebhookIsFoundUnderCron:
@@ -629,11 +579,11 @@ class TestOwnershipIsEnforcedNotAssumed:
     def test_order_events_are_not_gated_by_scanner_ownership(self, monkeypatch):
         """Gating both halves on one flag would silence the trading
         runtime for the messages it is the only one able to send."""
-        sent = self.capture(monkeypatch)
         monkeypatch.setenv(monitor.TRADING_RUNTIME_MARKER, "bee3ee88f53f")
-        _ln().notify("FILL_COMPLETED", {"symbol": "TX"},
-                     send_fn=lambda m: True, track_health=False)
-        assert any("체결" in m for m in sent), \
+        delivered = []
+        _ln().notify("FILL_COMPLETED", {"symbol": "TX", "filled_qty": 1, "fill_price": 2.0},
+                     send_fn=lambda m: delivered.append(m) or True, track_health=False)
+        assert any("[매수 체결]" in m for m in delivered), \
             "the release must still announce its own fills"
 
 
@@ -888,38 +838,18 @@ class TestKoreanDisplayLayer:
         assert "후보 수: 0" not in text
         assert "조건을 충족한 종목이 없습니다" not in text
 
-    def test_a_buy_message_is_korean(self):
-        text = monitor.format_buy(
-            strategy="S2_VOLUME_ACCUMULATION_V1", symbol="ABC",
-            session="REGULAR", qty=1, limit_price=12.34, order_id="003")
-        assert "[실거래 매수 · S2]" in text
-        assert "전략: 거래량 누적" in text
-        assert "수량: 1주" in text
-        assert "상태: 주문 접수" in text
+    def test_the_korean_order_messages_moved_to_the_trading_channel(self):
+        """Their Korean rendering now lives in operations.slack_presentation
+        and is sent to stock-live-trading, once per lifecycle."""
+        from operations import slack_presentation as sp
 
-    @pytest.mark.parametrize("side,expected", [
-        ("buy", "[매수 체결 · S2]"), ("sell", "[매도 체결 · S2]"),
-        ("BUY", "[매수 체결 · S2]"), (None, "[체결 · S2]")])
-    def test_a_fill_is_tagged_by_the_actual_side(self, side, expected):
-        """One fill event carries both directions; labelling a sell
-        매수 체결 would make the channel lie about a real order."""
-        text = monitor.format_fill(
-            strategy="accumulation", symbol="ABC", qty=1,
-            average_fill_price=12.35, position_id="p", side=side)
-        assert expected in text
-
-    def test_a_sell_message_is_korean_with_the_reason_code(self):
-        text = monitor.format_sell(
-            strategy="accumulation", symbol="ABC",
-            reason="VOLUME_DECAY_PRICE_WEAKNESS", qty=1,
-            average_entry=12.35, average_sell=12.80, holding_time="2시간")
-        assert "[실거래 매도 · S2]" in text
-        assert "매도 사유: 거래량 감소 + 가격 약화 (VOLUME_DECAY_PRICE_WEAKNESS)" in text
-        assert "실현손익: 정산 대기" in text
+        assert sp.buy_filled({"symbol": "ABC", "quantity": 1,
+                              "average_fill_price": 12.34}).startswith("[매수 체결]")
+        assert sp.sell_filled({"symbol": "ABC", "quantity": 1,
+                               "average_fill_price": 12.80}).startswith("[매도 체결]")
 
     @pytest.mark.parametrize("tag,korean", [
-        ("RISK", "위험 관리"), ("WATCHDOG", "시스템 감시"),
-        ("RECONCILIATION", "계좌 대조"), ("DAILY SUMMARY", "일일 스캐너 요약")])
+        ("DAILY SUMMARY", "일일 스캐너 요약")])
     def test_operational_tags_are_korean(self, tag, korean, monkeypatch):
         sent = []
         monkeypatch.setattr(monitor, "_send",

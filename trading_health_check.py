@@ -482,48 +482,66 @@ def _find(report, name) -> Dict[str, Any]:
     return {"verdict": "n/a", "detail": ""}
 
 
+#: Verdict codes stay as they are (OK/WARN/FAIL are what the logs say);
+#: the word beside them is what the operator reads.
+VERDICT_WORDS = {OK: "정상", WARN: "주의", FAIL: "실패", "n/a": "미측정"}
+
+#: Check name -> Korean label for the status lines.
+CHECK_LABELS = (("kis_token", "KIS 토큰"), ("kis_account", "KIS 계좌"),
+                ("reconciliation", "계좌 대조"),
+                ("collector:connected", "Collector 연결"),
+                ("collector:subscriptions", "Collector 구독"),
+                ("collector:process", "Collector 프로세스"),
+                ("kill_switch", "킬 스위치"), ("entry_runner", "진입 러너"),
+                ("cron", "예약 작업"), ("recent_errors", "최근 오류"))
+
+
+def _verdict(item) -> str:
+    verdict = item.get("verdict", "n/a")
+    return f"{VERDICT_WORDS.get(verdict, verdict)} ({verdict})"
+
+
 def format_message(report: Dict[str, Any]) -> str:
-    lines = ["📊 미국주식 자동매매 상태", "", f"점검시각: {report['now_kst']}",
-             f"미국 증시 개장일: {'예' if report['market_day'] else '아니오' if report['market_day'] is not None else '불명'}", ""]
+    market_day = report["market_day"]
+    lines = ["📊 [시스템 상태 점검] 미국주식 자동매매", "", f"점검시각: {report['now_kst']}",
+             f"미국 증시 개장일: {'예' if market_day else '아니오' if market_day is not None else '불명'}", ""]
     mode = _find(report, "trading_mode")
-    lines += ["Trading:", f"  {mode['detail'].split(' (')[0]}", ""]
+    lines += ["거래 모드:", f"  {mode['detail'].split(' (')[0]}", ""]
     rel = _find(report, "release")
-    lines += ["Release:", f"  {rel['verdict']} {rel['detail']}", ""]
-    lines.append("DAYTIME:")
-    for leg in ("buy", "sell", "cancel"):
+    lines += ["배포 버전:", f"  {_verdict(rel)} {rel['detail']}", ""]
+    lines.append("데이장 주문 경로:")
+    for leg, word in (("buy", "매수"), ("sell", "매도"), ("cancel", "취소")):
         item = _find(report, f"daytime:{leg}")
-        lines.append(f"  {leg.upper()} {item['detail']}")
+        lines.append(f"  {word}: {item['detail']}")
     lines.append("")
-    lines.append("Scanner:")
+    lines.append("스캐너:")
     for check in report["checks"]:
         if check["name"].startswith("scanner"):
-            lines.append(f"  {check['verdict']} {check['name'].split(':', 1)[-1]}: {check['detail']}")
+            lines.append(f"  {_verdict(check)} {check['name'].split(':', 1)[-1]}: {check['detail']}")
     lines.append("")
-    for label, name in (("KIS token", "kis_token"), ("KIS account", "kis_account"),
-                        ("Reconciliation", "reconciliation"),
-                        ("Collector", "collector:connected"),
-                        ("Collector process", "collector:process"),
-                        ("Kill switch", "kill_switch"), ("Entry runner", "entry_runner"),
-                        ("Cron", "cron"), ("Errors", "recent_errors")):
+    for name, label in CHECK_LABELS:
         item = _find(report, name)
-        lines.append(f"{label}: {item['verdict']} {item['detail']}")
+        if item.get("verdict") == "n/a":
+            continue
+        lines.append(f"{label}: {_verdict(item)} {item['detail']}")
     lines.append("")
     perf = report.get("performance") or {}
-    lines.append("📈 LIVE 실거래 성과 (TRADING_STATE.db, S6)")
+    lines.append("📈 실거래 성과 (S6, 위치: TRADING_STATE.db)")
     if perf.get("available"):
         lines += [f"  청산 거래: {perf['closed_trades']}건 (승 {perf['wins']} / 패 {perf['losses']})",
                   f"  실현 손익: {perf['realized_pnl_usd']:.2f} USD",
-                  f"  보유 포지션: {perf['open_positions']}",
-                  f"  미체결 취소(BUY_NEVER_FILLED): {perf['buy_never_filled']}",
-                  f"  청산가 미확인: {perf['unconfirmed_exits']}"]
+                  f"  보유 포지션: {perf['open_positions']}개",
+                  f"  미체결 취소 (BUY_NEVER_FILLED): {perf['buy_never_filled']}건",
+                  f"  청산가 미확인: {perf['unconfirmed_exits']}건"]
     else:
         lines.append(f"  성과 조회 불가: {perf.get('detail')}")
     lines.append("")
-    lines.append(f"Overall: {report['overall']}")
+    overall = report["overall"]
+    lines.append(f"종합: {'정상' if overall == 'NORMAL' else '확인 필요'} ({overall})")
     if report["failed"]:
-        lines.append("  FAILED: " + ", ".join(report["failed"]))
+        lines.append("  실패 항목: " + ", ".join(report["failed"]))
     if report["warned"]:
-        lines.append("  WARN: " + ", ".join(report["warned"]))
+        lines.append("  주의 항목: " + ", ".join(report["warned"]))
     return "\n".join(lines)
 
 

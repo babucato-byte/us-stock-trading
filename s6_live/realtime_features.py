@@ -95,6 +95,7 @@ class SessionFeatures:
     volume: Optional[float] = None
     volume_status: str = VOLUME_DATA_UNAVAILABLE
     volume_expansion: Optional[float] = None
+    scanner_volume_expansion: Optional[float] = None
     range_high: Optional[float] = None
     range_low: Optional[float] = None
     extension_pct: Optional[float] = None
@@ -123,6 +124,13 @@ class SessionFeatures:
     #: Names of the inputs that could not be computed, and why.
     unavailable: Dict[str, str] = field(default_factory=dict)
     error: Optional[str] = None
+    #: The range length these features were built for, and the momentum
+    #: freshness measurements taken from the same bars at the same
+    #: instant (s6_live.entry_quality.EntryQuality). None without bars.
+    range_minutes: Optional[int] = None
+    range_origin_timestamp: Optional[datetime] = None
+    closed_bar_only: bool = False
+    entry_quality: Optional[Any] = None
 
     @property
     def volume_available(self) -> bool:
@@ -158,6 +166,7 @@ class SessionFeatures:
             "volume": self.volume,
             "volume_status": self.volume_status,
             "volume_expansion": self.volume_expansion,
+            "scanner_volume_expansion": self.scanner_volume_expansion,
             "range_high": self.range_high,
             "range_low": self.range_low,
             "extension_pct": self.extension_pct,
@@ -169,7 +178,52 @@ class SessionFeatures:
             "gap_detected": self.gap_detected,
             "unavailable": dict(self.unavailable),
             "error": self.error,
+            "range_minutes": self.range_minutes,
+            "range_origin_timestamp": (self.range_origin_timestamp.isoformat()
+                                       if self.range_origin_timestamp else None),
+            "closed_bar_only": self.closed_bar_only,
+            "entry_quality": (self.entry_quality.as_record()
+                              if self.entry_quality is not None
+                              and hasattr(self.entry_quality, "as_record") else None),
         }
+
+
+def _entry_quality_from_frame(bars, *, symbol, session, range_minutes, now,
+                              provider=None, vwap=None, ema9=None, ema21=None,
+                              range_origin_timestamp=None,
+                              closed_bar_only=False):
+    """The freshness snapshot from the SAME session bars the features
+    came from. Never raises: a snapshot that fails is None, and the
+    watch treats a configured quality threshold without a snapshot as
+    UNAVAILABLE rather than as passed."""
+    try:
+        from s6_live import entry_quality as eq
+        from scanners.base import session_range as srange
+
+        simple = eq.bars_from_frame(bars)
+        if not simple:
+            return None
+        baseline = None
+        try:
+            from config import s6_sessions
+            from scanners.base import scan_session
+
+            resolved = scan_session.normalize(session)
+            if resolved in KIS_AUTHORITATIVE_SESSIONS:
+                baseline = eq.time_bucket_baseline
+        except Exception:  # noqa: BLE001
+            baseline = None
+        return eq.compute(
+            simple, symbol=symbol, session=session, orb_minutes=range_minutes,
+            now=now, provider=provider, vwap=vwap, ema9=ema9, ema21=ema21,
+            scanner_variant=f"S6_ORB{int(range_minutes)}",
+            range_origin_timestamp=range_origin_timestamp,
+            require_official_origin=(srange.window_for(session) is not None),
+            closed_bar_only=closed_bar_only,
+            baseline=baseline)
+    except Exception:  # noqa: BLE001
+        logger.debug("entry quality unavailable for %s", symbol, exc_info=True)
+        return None
 
 
 def _finite(value) -> Optional[float]:
@@ -250,6 +304,18 @@ DATA_INCOMPLETE = "DATA_INCOMPLETE"
 DEFAULT_INTRADAY_INTERVAL = "5m"
 
 
+def _interval_seconds(interval) -> Optional[float]:
+    """Seconds in a provider interval string such as "1m" / "5m" / "1h"."""
+    text = str(interval or "").strip().lower()
+    units = {"m": 60.0, "h": 3600.0, "d": 86400.0}
+    if len(text) < 2 or text[-1] not in units:
+        return None
+    try:
+        return float(text[:-1]) * units[text[-1]]
+    except ValueError:
+        return None
+
+
 def _interval_for(provider, requested):
     """The interval to ask this provider for.
 
@@ -277,18 +343,24 @@ def _interval_for(provider, requested):
                    DEFAULT_INTRADAY_INTERVAL) or DEFAULT_INTRADAY_INTERVAL
 
 
-def _build_from_kis_stream(symbol, *, session, now, range_minutes):
+def _build_from_kis_stream(symbol, *, session, now, range_minutes,
+                           closed_bar_only=False):
     """Features from the collected stream, or None if there are none."""
     try:
         from market_hours import us_trading_day
         from s6_live import kis_bar_features
+        from scanners.base import session_range as srange
 
-        store = kis_bar_features.load_store(session, us_trading_day(now))
+        # The store is scoped to the session that is happening, which for a
+        # window that wraps midnight is not today's trading day.
+        session_date = srange.current_session_date(session, now)
+        store = kis_bar_features.load_store(
+            session, us_trading_day(now), session_date=session_date)
         if store is None:
             return None
         return kis_bar_features.build_from_bars(
             symbol, store=store, session=session, now=now,
-            range_minutes=range_minutes)
+            range_minutes=range_minutes, closed_bar_only=closed_bar_only)
     except Exception:  # noqa: BLE001 - a broken read is "no stream", and
         # the caller then refuses rather than reaching for the provider
         # whose zero volume is the reason this exists.
@@ -299,7 +371,7 @@ def _build_from_kis_stream(symbol, *, session, now, range_minutes):
 
 def build(symbol, *, session=None, now=None, provider=None,
           intraday_interval=None, intraday_lookback_days=2,
-          range_minutes=15) -> SessionFeatures:
+          range_minutes=15, closed_bar_only=False) -> SessionFeatures:
     """The current intraday view, or a view that says what is missing.
 
     Never raises. A failure produces a SessionFeatures whose `error` and
@@ -332,7 +404,8 @@ def build(symbol, *, session=None, now=None, provider=None,
     # trade and a much better one than a wrong trade.
     if resolved in KIS_AUTHORITATIVE_SESSIONS and provider is None:
         streamed = _build_from_kis_stream(symbol, session=resolved, now=moment,
-                                          range_minutes=range_minutes)
+                                          range_minutes=range_minutes,
+                                          closed_bar_only=closed_bar_only)
         if streamed is not None:
             return streamed
         return SessionFeatures(
@@ -388,6 +461,12 @@ def build(symbol, *, session=None, now=None, provider=None,
         session_date = srange.current_session_date(resolved, moment)
         bars = srange.slice_session_bars(intraday, resolved,
                                          session_date=session_date)
+        if closed_bar_only:
+            # The width is the resolution we ASKED this provider for, not
+            # the gap between the rows it returned: premarket frames skip
+            # minutes that did not trade.
+            bars = srange.closed_bars(bars, now=moment,
+                                      interval_seconds=_interval_seconds(interval))
         if bars is None or len(bars) == 0:
             # The current session has published nothing. Distinct from
             # "the feed is broken", and distinct again from "yesterday
@@ -426,9 +505,13 @@ def build(symbol, *, session=None, now=None, provider=None,
         # quantity the ORB scanner computes, recomputed each tick rather
         # than frozen at entry.
         range_high = range_low = expansion = None
+        window = None
         try:
-            window = srange.opening_range(intraday, resolved,
-                                          minutes=range_minutes)
+            window = srange.opening_range(
+                bars, resolved, minutes=range_minutes,
+                session_date=session_date,
+                require_official_origin=(srange.window_for(resolved) is not None
+                                         and closed_bar_only))
             if window is not None:
                 # SessionRange names them range_high/range_low, and
                 # `complete` is its own check that a high WITHOUT a low
@@ -459,15 +542,26 @@ def build(symbol, *, session=None, now=None, provider=None,
         if price is not None and range_high:
             extension = (price / range_high - 1.0) * 100.0
 
+        quality = _entry_quality_from_frame(
+            bars, symbol=symbol, session=resolved, range_minutes=range_minutes,
+            now=moment, provider=getattr(source, "provider_name", None),
+            vwap=vwap, ema9=ema9, ema21=ema21,
+            range_origin_timestamp=getattr(window, "official_origin", None),
+            closed_bar_only=closed_bar_only)
         return SessionFeatures(
             symbol=symbol, session=resolved,
             market_data_asof=_as_utc(bars.index[-1]), built_at=moment,
             price=price, vwap=vwap, ema9=ema9, ema21=ema21,
             volume=volume, volume_status=volume_status,
             volume_expansion=expansion,
+            scanner_volume_expansion=expansion,
             range_high=range_high, range_low=range_low,
             extension_pct=extension, bar_count=len(bars),
-            unavailable=missing)
+            unavailable=missing, range_minutes=int(range_minutes),
+            range_origin_timestamp=_as_utc(
+                getattr(window, "official_origin", None)),
+            closed_bar_only=closed_bar_only,
+            entry_quality=quality)
     except Exception as exc:  # noqa: BLE001 - a view that failed says so
         logger.warning("S6 realtime features failed for %s", symbol,
                        exc_info=True)

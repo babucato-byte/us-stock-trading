@@ -72,7 +72,7 @@ def parse_args(argv=None):
                         help="print the report without saving it")
     parser.add_argument("--slack", action="store_true",
                         help="weekly only: also post a symbol-free summary to "
-                             "the existing report webhook (SLACK_WEBHOOK_URL)")
+                             "the scanner channel (SCANNER_MONITOR_SLACK_WEBHOOK_URL)")
     return parser.parse_args(argv)
 
 
@@ -82,8 +82,14 @@ def _post_weekly_to_slack(report, start: str, end: str) -> None:
     try:
         from scanners.notify import slack as notify
 
+        # A scanner OBSERVATION report belongs to the scanner channel.
+        # It used to go to the generic report webhook, where it sat beside
+        # actual trading P&L and read as a trading result.
+        import slack_utils
+
         health = weekly_report.collect_run_health(start, end)
-        sent = notify.send_report(weekly_report.format_slack(report, run_health=health))
+        sent = notify.send_report(weekly_report.format_slack(report, run_health=health),
+                                  sender=slack_utils.send_scanner_monitor_message)
         print(f"slack: {'sent' if sent else 'not sent'}")
     except Exception:  # noqa: BLE001
         logging.getLogger(__name__).warning("weekly Slack post failed", exc_info=True)

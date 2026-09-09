@@ -1248,10 +1248,15 @@ def _cancel_inner(*, order_intent, broker_order_id, cancel_gate_context_builder,
                 str(normalized), reason_code=REASON_STATE_PERSISTENCE,
             ) from (unknown_error or exc)
 
+        # Notification payload only: side and quantity let the one cancel
+        # message name the direction and size. Nothing here is read back.
         live_notifications.notify(
             live_notifications.CANCEL_COMPLETED,
             {"symbol": order_intent.symbol, "broker_order_id": broker_order_id,
-             "state": execution_record.status},
+             "state": execution_record.status,
+             "side": order_intent.side, "quantity": order_intent.quantity,
+             "strategy_id": order_intent.strategy_id,
+             "session": getattr(order_intent, "session", None)},
         )
         return ExecutionResult(
             internal_order_id=order_intent.internal_order_id, status=execution_record.status,

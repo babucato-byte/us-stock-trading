@@ -126,6 +126,7 @@ class Bar:
     trade_count: int
     first_trade_at: datetime
     last_trade_at: datetime
+    price_volume: float = 0.0
     source: str = SOURCE
     #: KIS's own cumulative counters at the first and last trade of this
     #: bar. Kept for the cross-check, never used as the volume.
@@ -150,6 +151,7 @@ class Bar:
             "minute": self.minute.isoformat(),
             "open": self.open, "high": self.high, "low": self.low,
             "close": self.close, "volume": self.volume,
+            "price_volume": self.price_volume,
             "trade_count": self.trade_count,
             "first_trade_at": self.first_trade_at.isoformat(),
             "last_trade_at": self.last_trade_at.isoformat(),
@@ -221,6 +223,7 @@ class SessionAccumulator:
                 open=price, high=price, low=price, close=price,
                 volume=size, trade_count=1,
                 first_trade_at=at, last_trade_at=at,
+                price_volume=price * size,
                 cumulative_first=cumulative, cumulative_last=cumulative,
                 amount_first=amount, amount_last=amount)
         else:
@@ -228,6 +231,7 @@ class SessionAccumulator:
             bar.low = min(bar.low, price)
             bar.close = price
             bar.volume += size
+            bar.price_volume += price * size
             bar.trade_count += 1
             bar.last_trade_at = max(bar.last_trade_at, at)
             if cumulative is not None:
@@ -325,6 +329,9 @@ class RealtimeBarStore:
         self._accumulators: Dict[tuple, SessionAccumulator] = {}
         self._stale_after = float(stale_after_seconds)
         self.connected_at: Optional[datetime] = None
+        # Earliest point this session's snapshot can prove it was observing.
+        # Unlike connected_at this survives hourly collector restarts.
+        self.coverage_started_at: Optional[datetime] = None
         self.disconnected_at: Optional[datetime] = None
         self.gaps: List[dict] = []
         self.layout_mismatches = 0
@@ -421,6 +428,8 @@ class RealtimeBarStore:
 
     def mark_connected(self, *, now=None):
         current = now or datetime.now(timezone.utc)
+        if self.coverage_started_at is None:
+            self.coverage_started_at = current
         if self.disconnected_at is not None:
             # The gap is RECORDED, never backfilled. Inventing empty bars
             # to make the series look continuous would turn missing data
@@ -444,6 +453,8 @@ class RealtimeBarStore:
         """Enough to rebuild the current session after a restart."""
         return {
             "version": 1,
+            "coverage_started_at": (self.coverage_started_at.isoformat()
+                                    if self.coverage_started_at else None),
             "accumulators": [
                 {
                     "symbol": a.symbol, "session": a.session,
@@ -482,6 +493,7 @@ class RealtimeBarStore:
         store = cls(stale_after_seconds=stale_after_seconds)
         if not isinstance(payload, dict) or payload.get("version") != 1:
             return store
+        store.coverage_started_at = _parse_iso(payload.get("coverage_started_at"))
         for entry in payload.get("accumulators") or ():
             accumulator = SessionAccumulator(
                 symbol=entry["symbol"], session=entry["session"],
@@ -503,6 +515,8 @@ class RealtimeBarStore:
                     volume=raw["volume"], trade_count=raw["trade_count"],
                     first_trade_at=_parse_iso(raw["first_trade_at"]),
                     last_trade_at=_parse_iso(raw["last_trade_at"]),
+                    price_volume=float(raw.get("price_volume") or
+                                       (float(raw["close"]) * float(raw["volume"]))),
                     cumulative_first=raw.get("cumulative_first"),
                     cumulative_last=raw.get("cumulative_last"),
                     amount_first=raw.get("amount_first"),

@@ -66,6 +66,42 @@ _FIELD_MAP = {
 }
 
 
+def _decision_snapshot(candidate_row, watch) -> Dict[str, Any]:
+    """`scanner_variant` and the immutable entry-quality snapshot.
+
+    The watch evaluation the order was authorised on is the source when
+    it is available -- its features carry the range the watch actually
+    judged (`range_minutes`) and the freshness measurements taken at
+    that instant. The candidate row's `scanner_variant` is the fallback.
+    Never raises; a missing snapshot is NULL, never a re-derived one.
+    """
+    import json
+
+    out: Dict[str, Any] = {}
+    try:
+        detail = dict(getattr(watch, "detail", {}) or {}) if watch is not None else {}
+        feats = getattr(watch, "features", None) if watch is not None else None
+        variant = (detail.get("scanner_variant")
+                   or (candidate_row or {}).get("scanner_variant"))
+        if variant:
+            out["scanner_variant"] = str(variant)
+        watched_range = getattr(feats, "range_minutes", None)
+        if watched_range is not None:
+            out["range_minutes"] = int(watched_range)
+        quality = getattr(feats, "entry_quality", None)
+        if quality is not None and hasattr(quality, "as_record"):
+            snapshot = quality.as_record()
+            snapshot["watch_state"] = getattr(watch, "state", None)
+            snapshot["watch_evaluated_at"] = (
+                watch.evaluated_at.isoformat()
+                if getattr(watch, "evaluated_at", None) else None)
+            snapshot["entry_quality_reason"] = detail.get("entry_quality_reason")
+            out["entry_quality_json"] = json.dumps(snapshot, default=str)
+    except Exception:  # noqa: BLE001 - paperwork must not fail an order
+        logger.warning("S6 decision snapshot not captured", exc_info=True)
+    return out
+
+
 def is_s6(strategy_id) -> bool:
     """Does this strategy id belong to S6, under any of its spellings?"""
     from config import strategy_registry
@@ -75,7 +111,7 @@ def is_s6(strategy_id) -> bool:
 
 def record_entry_submission(conn, *, symbol, session, client_order_id,
                             candidate_row: Optional[Dict[str, Any]] = None,
-                            watch=None, now=None) -> str:
+                            watch=None, broker_submit_at=None, now=None) -> str:
     """Record a SENT S6 BUY and return its position id.
 
     The ORB measurements come from the candidate the order was built
@@ -88,6 +124,7 @@ def record_entry_submission(conn, *, symbol, session, client_order_id,
     for source_key, store_key in _FIELD_MAP.items():
         if candidate_row is not None and source_key in candidate_row:
             fields[store_key] = candidate_row.get(source_key)
+    fields.update(_decision_snapshot(candidate_row, watch))
 
     variant = s6_sessions.variant_for(session)
     position_id = position_store.record_submission(
@@ -100,12 +137,13 @@ def record_entry_submission(conn, *, symbol, session, client_order_id,
         position_id, symbol, session, variant, client_order_id)
     _record_lineage(conn, symbol=symbol, session=session,
                     client_order_id=client_order_id, position_id=position_id,
-                    candidate_row=candidate_row, watch=watch, now=now)
+                    candidate_row=candidate_row, watch=watch, now=now,
+                    broker_submit_at=broker_submit_at)
     return position_id
 
 
 def _record_lineage(conn, *, symbol, session, client_order_id, position_id,
-                    candidate_row, watch, now):
+                    candidate_row, watch, now, broker_submit_at=None):
     """Why this symbol was bought, in one row.
 
     Reconstructing the DT entry took four sources and the fact that
@@ -126,7 +164,14 @@ def _record_lineage(conn, *, symbol, session, client_order_id, position_id,
         lineage.record(conn, symbol=symbol,
                        strategy_id=position_store.STRATEGY_ID,
                        internal_order_id=client_order_id,
-                       position_id=position_id, now=now, **fields)
+                       position_id=position_id, now=now,
+                       execution_gate_at=(broker_submit_at.isoformat()
+                                          if hasattr(broker_submit_at, "isoformat")
+                                          else broker_submit_at),
+                       broker_submit_at=(broker_submit_at.isoformat()
+                                         if hasattr(broker_submit_at, "isoformat")
+                                         else broker_submit_at),
+                       **fields)
     except Exception:  # noqa: BLE001
         logger.warning("S6 order lineage not recorded for %s", symbol,
                        exc_info=True)

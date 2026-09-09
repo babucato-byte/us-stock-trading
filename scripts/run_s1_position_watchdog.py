@@ -224,18 +224,25 @@ def notify_monitor(result, *, escalated: bool) -> bool:
     would hide a watchdog firing repeatedly.
     """
     try:
-        from scanners.notify import monitor
+        from operations import live_notifications as ln
 
-        body = "\n".join([
-            f"상태: {result.get('status')}",
-            f"내용: {result.get('detail', '-')}",
-            f"종목: {result.get('symbol', '-')}",
-            f"무응답 시간: {result.get('silent_minutes', '-')}분",
-            f"킬 스위치: "
-            f"{'ENTRY_DISABLED (지금 차단됨)' if escalated else '변경 없음'}",
-            "매도 경로는 계속 유지됩니다.",
-        ])
-        return monitor.notify_tagged(monitor.TAG_WATCHDOG, body)
+        fields = {
+            "status": result.get("status"),
+            "detail": result.get("detail", "-"),
+            "symbol": result.get("symbol", "-"),
+            "silent_minutes": result.get("silent_minutes", "-"),
+            # The bare state word. Translating it here would put a second,
+            # divergent Korean vocabulary beside slack_presentation's.
+            "kill_switch": "ENTRY_DISABLED" if escalated else "변경 없음",
+            "sell_path": "유지",
+        }
+        if not escalated:
+            # Stale but nothing changed for the operator: a log line, not
+            # an alert. The escalation is the news; its absence is not.
+            logger.warning("watchdog stale without escalation: %s", fields)
+            return False
+        # stock-live-alerts: the kill switch just blocked new entries.
+        return ln.notify(ln.WATCHDOG_ESCALATED, fields, track_health=False)
     except Exception:  # noqa: BLE001 - the watchdog's job is the kill switch
         logger.warning("watchdog could not send its monitor message", exc_info=True)
         return False

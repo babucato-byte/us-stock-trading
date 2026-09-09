@@ -46,33 +46,51 @@ def record(conn, *, symbol, strategy_id, internal_order_id=None,
            gate_results=None, order_price=None, quantity=None,
            scanner_id=None, watch_started_at=None, ready_at=None,
            execution_gate_at=None, broker_fill_time=None,
-           candidate_state=None, now=None) -> Optional[str]:
+           candidate_state=None, full_scan_started_at=None,
+           symbol_evaluated_at=None, candidate_discovered_at=None,
+           watchlist_added_at=None, fast_watch_evaluated_at=None,
+           candidate_published_at=None, source_consumed_at=None,
+           precision_watch_started_at=None, broker_submit_at=None,
+           fill_at=None, now=None) -> Optional[str]:
     """Record one order's provenance. Never raises."""
     current = now or datetime.now(timezone.utc)
     try:
         from market_hours import us_trading_day
 
         lineage_id = f"lin_{uuid.uuid4().hex[:16]}"
+        values = {
+            "lineage_id": lineage_id, "internal_order_id": internal_order_id,
+            "broker_order_id": broker_order_id, "position_id": position_id,
+            "strategy_id": strategy_id, "strategy_version": strategy_version,
+            "scan_id": scan_id, "generation_id": generation_id,
+            "candidate_id": candidate_id, "symbol": str(symbol or "").upper(),
+            "session": session, "trading_day": trading_day or us_trading_day(current),
+            "rank": rank, "score": score,
+            "candidate_generated_at": candidate_generated_at,
+            "market_data_asof": market_data_asof,
+            "ready_evaluated_at": ready_evaluated_at,
+            "watch_state": watch_state, "watch_conditions": _json(watch_conditions),
+            "gate_results": _json(gate_results), "order_price": order_price,
+            "quantity": quantity, "created_at": current.isoformat(),
+            "scanner_id": scanner_id, "watch_started_at": watch_started_at,
+            "ready_at": ready_at, "execution_gate_at": execution_gate_at,
+            "broker_fill_time": broker_fill_time,
+            "candidate_state": candidate_state,
+            "full_scan_started_at": full_scan_started_at,
+            "symbol_evaluated_at": symbol_evaluated_at,
+            "candidate_discovered_at": candidate_discovered_at,
+            "watchlist_added_at": watchlist_added_at,
+            "fast_watch_evaluated_at": fast_watch_evaluated_at,
+            "candidate_published_at": candidate_published_at,
+            "source_consumed_at": source_consumed_at,
+            "precision_watch_started_at": precision_watch_started_at,
+            "broker_submit_at": broker_submit_at, "fill_at": fill_at,
+        }
+        columns = list(values)
         conn.execute(
-            "INSERT INTO order_lineage ("
-            "lineage_id, internal_order_id, broker_order_id, position_id, "
-            "strategy_id, strategy_version, scan_id, generation_id, "
-            "candidate_id, symbol, session, trading_day, rank, score, "
-            "candidate_generated_at, market_data_asof, ready_evaluated_at, "
-            "watch_state, watch_conditions, gate_results, order_price, "
-            "quantity, created_at, scanner_id, watch_started_at, ready_at, "
-            "execution_gate_at, broker_fill_time, candidate_state) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
-            "        ?,?,?,?,?,?)",
-            (lineage_id, internal_order_id, broker_order_id, position_id,
-             strategy_id, strategy_version, scan_id, generation_id,
-             candidate_id, str(symbol or "").upper(), session,
-             trading_day or us_trading_day(current), rank, score,
-             candidate_generated_at, market_data_asof, ready_evaluated_at,
-             watch_state, _json(watch_conditions), _json(gate_results),
-             order_price, quantity, current.isoformat(),
-             scanner_id, watch_started_at, ready_at, execution_gate_at,
-             broker_fill_time, candidate_state))
+            "INSERT INTO order_lineage (%s) VALUES (%s)" % (
+                ", ".join(columns), ", ".join("?" for _ in columns)),
+            tuple(values[name] for name in columns))
         conn.commit()
         return lineage_id
     except Exception:  # noqa: BLE001 - a trade must not depend on its
@@ -90,6 +108,7 @@ def from_watch(evaluation, *, candidate=None) -> Dict[str, Any]:
     """
     features = getattr(evaluation, "features", None)
     row = dict(candidate or {})
+    provenance = dict(row.get("provenance") or {})
     return {
         "session": getattr(evaluation, "session", None),
         "rank": row.get("rank"),
@@ -113,6 +132,14 @@ def from_watch(evaluation, *, candidate=None) -> Dict[str, Any]:
                      if getattr(evaluation, "state", None) == READY_TO_BUY
                      and getattr(evaluation, "evaluated_at", None) else None),
         "candidate_state": getattr(evaluation, "state", None),
+        "full_scan_started_at": provenance.get("full_scan_started_at"),
+        "symbol_evaluated_at": provenance.get("symbol_evaluated_at"),
+        "candidate_discovered_at": provenance.get("candidate_discovered_at"),
+        "watchlist_added_at": provenance.get("watchlist_added_at"),
+        "fast_watch_evaluated_at": provenance.get("fast_watch_evaluated_at"),
+        "candidate_published_at": provenance.get("candidate_published_at"),
+        "source_consumed_at": provenance.get("source_consumed_at"),
+        "precision_watch_started_at": provenance.get("precision_watch_started_at"),
     }
 
 

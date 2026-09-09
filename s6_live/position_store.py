@@ -65,7 +65,8 @@ def record_submission(conn, *, symbol, variant=None, entry_session=None,
                       range_high=None, range_low=None, entry_vwap=None,
                       entry_ema9=None, entry_ema21=None,
                       entry_volume_expansion=None, now=None,
-                      position_id=None) -> str:
+                      position_id=None, scanner_variant=None,
+                      entry_quality_json=None) -> str:
     """Record that a BUY was SENT. Not that it filled.
 
     Written before the broker answers, so an ambiguous submission leaves
@@ -80,8 +81,9 @@ def record_submission(conn, *, symbol, variant=None, entry_session=None,
                 client_order_id, range_minutes, range_high, range_low,
                 entry_vwap, entry_ema9, entry_ema21, entry_volume_expansion,
                 peak_volume_expansion, status, exit_submitted,
-                submitted_at, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)""",
+                submitted_at, created_at, updated_at,
+                scanner_variant, entry_quality_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)""",
         (identifier, STRATEGY_ID, variant, str(symbol).upper(), entry_session,
          client_order_id, range_minutes, _finite(range_high),
          _finite(range_low), _finite(entry_vwap), _finite(entry_ema9),
@@ -89,7 +91,8 @@ def record_submission(conn, *, symbol, variant=None, entry_session=None,
          # The entry expansion IS the first peak; leaving it NULL would
          # let a later, lower reading set the peak and call the position
          # undecayed forever.
-         _finite(entry_volume_expansion), SUBMITTED, stamp, stamp, stamp))
+         _finite(entry_volume_expansion), SUBMITTED, stamp, stamp, stamp,
+         scanner_variant, entry_quality_json))
     conn.commit()
     logger.info("S6 submission recorded: %s %s", identifier, symbol)
     return identifier

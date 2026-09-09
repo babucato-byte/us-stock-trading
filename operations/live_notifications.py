@@ -4,63 +4,47 @@ Why this exists
 ---------------
 An audit of the KIS live path found it Slack-silent: `kis_live_trading`,
 `kis_position_manager`, `brokers/kis_broker*` and `live_pilot/armed` sent
-nothing at all. `operations/alerts.py` already had UNKNOWN and
-reconciliation formatters, and no KIS caller invoked them. A first real
-order would have submitted, filled, partially filled, gone UNKNOWN or
-been cancelled without a single message.
+nothing at all. This module became the one place lifecycle events are
+worded and sent. It still is -- but the WORDING now lives in
+`operations.slack_presentation` (Korean, display only) and this module
+owns the POLICY: which event reaches a person, on which channel, and
+which stays a log line.
 
-This module is the one place those events are worded and sent.
+The policy (2026-09)
+--------------------
+A normal BUY produced four or five Slack messages -- PREPARED, SUBMITTED,
+ACCEPTED, then nothing about the fill because the S6 fill sync had no
+hook -- and a normal SELL the same again. Nine lifecycles on 2026-09-08
+produced about fifty messages and not one of them said "filled". So:
 
-Channel
--------
-KIS live traffic has its own two webhooks and shares nothing with Alpaca:
+    INTERNAL_EVENTS   logged, never presented. Submitted / accepted /
+                      prepared / pending / cancel-requested / exit-
+                      triggered / partial fill. The durable audit trail
+                      (order_state_events, shadow_audit_events) already
+                      records every one of them; Slack does not need to.
 
-    KIS_LIVE_SLACK_WEBHOOK_URL         routine lifecycle
-    KIS_LIVE_SLACK_ALERT_WEBHOOK_URL   urgent (see URGENT_EVENTS)
+    LIVE_TRADING      one final message per lifecycle: 매수 체결, 매도 체결,
+                      주문 취소, 주문 실패, 주문 차단, plus session readiness.
 
-There is no fallback to `SLACK_WEBHOOK_URL` / `SLACK_ALERT_WEBHOOK_URL`.
-Those carry Alpaca paper fills and scanner output; a real-money order in
-that stream is an order nobody notices, and a fallback would let an
-unconfigured deployment place one while looking correctly notified.
-Unset webhooks are a readiness blocker instead
-(KIS_LIVE_NOTIFICATION_NOT_CONFIGURED), and every message is prefixed
-`[KIS LIVE]` -- `[KIS LIVE][CRITICAL]` when urgent -- so the distinction
-survives even if the channels are later merged by someone else.
+    LIVE_ALERTS       conditions a person must act on: UNKNOWN, cancel
+                      failure, mismatches, kill switch, HALT, watchdog.
 
-`notification_health.send_with_health_tracking` remains the existing
-delivery-failure bookkeeping.
+    TRADING_REPORT    the daily summary only.
 
-The rule that matters
----------------------
-**A notification can never change what the trading system does.** Not by
-raising, not by returning False, not by being slow. `notify()` catches
-everything -- including bugs in this module's own formatting -- and
-returns a bool that callers are expected to ignore. The specific hazard
-being closed: a Slack failure must not cause a transport call to be
-retried, because the order may already be live at the broker.
-
-That is why `notify()` is called for its side effect only and never
-appears in a condition, a retry loop, or an `except` that would alter
-control flow. tests/test_live_notifications.py pins that.
-
-Ordering
---------
-`LIVE_ORDER_PREPARED` is emitted immediately before the broker call and
-every post-transport event after it, so the message sequence is a
-truthful record of when the wire was touched. If the process dies between
-PREPARED and SUBMITTED, the absence of SUBMITTED is itself the signal
-that an order may be in flight -- which is exactly what the durable
-UNKNOWN state says too.
+`notify()` is still called for its side effect only. It never raises,
+never blocks, and its return value must never steer trading. That rule
+is unchanged and tests/test_slack_failure_isolation.py pins it.
 
 Secrets
 -------
-Every payload value goes through `execution.secret_redaction.redact_value`,
+Every payload value goes through `execution.secret_redaction.redact_value`
 and account numbers through `mask_account_number`. Raw KIS responses,
-tokens, app keys and Authorization headers are never passed in; the
-redactor is the backstop, not the plan.
+tokens, app keys and Authorization headers are never passed in.
 """
 
+import contextvars
 import logging
+from datetime import datetime, timezone
 
 from execution.secret_redaction import mask_account_number, redact_value
 
@@ -68,6 +52,7 @@ logger = logging.getLogger(__name__)
 
 # -- session / candidate -------------------------------------------------
 MARKET_START = "MARKET_START"
+SESSION_BLOCKED = "SESSION_BLOCKED"
 BUY_CANDIDATE_SELECTED = "BUY_CANDIDATE_SELECTED"
 
 # -- order transport -----------------------------------------------------
@@ -77,6 +62,7 @@ ORDER_ACCEPTED = "ORDER_ACCEPTED"
 ORDER_PENDING = "ORDER_PENDING"
 ORDER_REJECTED = "ORDER_REJECTED"
 ORDER_UNKNOWN = "ORDER_UNKNOWN"
+ORDER_BLOCKED = "ORDER_BLOCKED"
 
 # -- fills ---------------------------------------------------------------
 PARTIAL_FILL = "PARTIAL_FILL"
@@ -99,28 +85,46 @@ KIS_API_FAILURE = "KIS_API_FAILURE"
 DB_FAILURE = "DB_FAILURE"
 HALT_ACTIVATED = "HALT_ACTIVATED"
 KILL_SWITCH_ACTIVATED = "KILL_SWITCH_ACTIVATED"
+WATCHDOG_ESCALATED = "WATCHDOG_ESCALATED"
 
 # -- end of day ----------------------------------------------------------
 DAILY_SUMMARY = "DAILY_SUMMARY"
 
 EVENTS = frozenset({
-    MARKET_START, BUY_CANDIDATE_SELECTED,
+    MARKET_START, SESSION_BLOCKED, BUY_CANDIDATE_SELECTED,
     LIVE_ORDER_PREPARED, ORDER_SUBMITTED, ORDER_ACCEPTED, ORDER_PENDING,
-    ORDER_REJECTED, ORDER_UNKNOWN,
+    ORDER_REJECTED, ORDER_UNKNOWN, ORDER_BLOCKED,
     PARTIAL_FILL, FILL_COMPLETED,
     EXIT_TRIGGERED, SELL_SUBMITTED, SELL_FILLED,
     CANCEL_REQUESTED, CANCEL_COMPLETED, CANCEL_FAILED,
     RECONCILIATION_MISMATCH, POSITION_MISMATCH, KIS_API_FAILURE, DB_FAILURE,
-    HALT_ACTIVATED, KILL_SWITCH_ACTIVATED,
+    HALT_ACTIVATED, KILL_SWITCH_ACTIVATED, WATCHDOG_ESCALATED,
     DAILY_SUMMARY,
 })
 
-# Events an operator must not be able to miss in a busy channel.
+#: Events an operator must not be able to miss. They go to the alert
+#: channel and carry the 🚨 marker.
 URGENT_EVENTS = frozenset({
-    ORDER_UNKNOWN, ORDER_REJECTED, CANCEL_FAILED, RECONCILIATION_MISMATCH,
+    ORDER_UNKNOWN, CANCEL_FAILED, RECONCILIATION_MISMATCH,
     POSITION_MISMATCH, KIS_API_FAILURE, DB_FAILURE, HALT_ACTIVATED,
-    KILL_SWITCH_ACTIVATED,
+    KILL_SWITCH_ACTIVATED, WATCHDOG_ESCALATED,
 })
+
+#: Intermediate states of a lifecycle that already has a final message.
+#: Logged at INFO, never sent. The durable audit trail keeps them.
+INTERNAL_EVENTS = frozenset({
+    BUY_CANDIDATE_SELECTED, LIVE_ORDER_PREPARED, ORDER_SUBMITTED,
+    ORDER_ACCEPTED, ORDER_PENDING, SELL_SUBMITTED, EXIT_TRIGGERED,
+    CANCEL_REQUESTED, PARTIAL_FILL,
+})
+
+#: The final, human-facing lifecycle messages.
+LIVE_TRADING_EVENTS = frozenset({
+    MARKET_START, SESSION_BLOCKED, FILL_COMPLETED, SELL_FILLED,
+    CANCEL_COMPLETED, ORDER_REJECTED, ORDER_BLOCKED,
+})
+
+REPORT_EVENTS = frozenset({DAILY_SUMMARY})
 
 # The two lines ORDER_UNKNOWN must always carry. An UNKNOWN order may be
 # live at the broker; the one thing that must never be inferred from the
@@ -131,164 +135,228 @@ UNKNOWN_RECONCILIATION_LINE = "RECONCILIATION_REQUIRED=true"
 _TEST_PREFIX = "[TEST]"
 
 # A validation order is REAL money placed to prove a route works, not a
-# simulation. It must not be filed under [TEST] -- an operator who reads
-# "TEST" and looks away has been told the wrong thing about an order that
-# can lose money -- and it must not read as ordinary strategy traffic
-# either, because nobody's strategy chose it.
+# simulation. It must not be filed under [TEST] and must not read as
+# ordinary strategy traffic either, because nobody's strategy chose it.
 _VALIDATION_PREFIX = "[VALIDATION]"
 
-# Every message this module produces is real money on a real account, and
-# it shares an operator's screen with Alpaca paper traffic. The prefix is
-# how that distinction survives a glance at a phone notification.
+#: Kept for callers and tests that import them. Messages no longer carry
+#: the English prefix: the channels are role-specific, and the Korean
+#: title says what happened.
 KIS_LIVE_PREFIX = "[KIS LIVE]"
 KIS_LIVE_CRITICAL_PREFIX = "[KIS LIVE][CRITICAL]"
 
+#: How many times the same symbol may be rejected by the broker in one
+#: process before the rejection is ALSO escalated to the alert channel.
+REPEATED_REJECTION_THRESHOLD = 2
+_rejections_seen = {}
 
-#: Which lifecycle events are ALSO mirrored into #stock-scanner, and
-#: under which tag. The KIS live channels keep receiving everything they
-#: received before -- this is a copy, never a reroute.
-#:
-#: The map is deliberately partial. MARKET_START, BUY_CANDIDATE_SELECTED,
-#: LIVE_ORDER_PREPARED, ORDER_PENDING and the CANCEL_* pair stay off the
-#: monitor: it is the channel an operator reads to see what the system
-#: did, and a per-symbol running commentary of every intermediate state
-#: is what makes such a channel stop being read. An unmapped event
-#: mirrors nowhere rather than defaulting into a catch-all tag.
-#:
-#: A submit is tagged by SIDE, not by event name: ORDER_SUBMITTED carries
-#: both entries and exits, and filing a sell under [LIVE BUY] would make
-#: the channel lie about the direction of a real order.
-_MONITOR_TAGS = {
-    ORDER_SUBMITTED: None,   # resolved from the side field
-    ORDER_ACCEPTED: None,
-    PARTIAL_FILL: "LIVE FILL",
-    FILL_COMPLETED: "LIVE FILL",
-    EXIT_TRIGGERED: "LIVE SELL",
-    SELL_SUBMITTED: "LIVE SELL",
-    SELL_FILLED: "LIVE SELL",
-    RECONCILIATION_MISMATCH: "RECONCILIATION",
-    POSITION_MISMATCH: "RECONCILIATION",
-    ORDER_REJECTED: "RISK",
-    ORDER_UNKNOWN: "RISK",
-    CANCEL_FAILED: "RISK",
-    KIS_API_FAILURE: "RISK",
-    DB_FAILURE: "RISK",
-    HALT_ACTIVATED: "RISK",
-    KILL_SWITCH_ACTIVATED: "RISK",
-    DAILY_SUMMARY: "DAILY SUMMARY",
-}
+#: Extra facts a caller higher in the stack knows about a cancel that the
+#: engine, which emits CANCEL_COMPLETED, does not: the reason and any
+#: filled quantity. Set with `cancel_context()`; read only by `notify()`.
+_cancel_context = contextvars.ContextVar("live_notifications_cancel_context",
+                                         default=None)
 
 
-def monitor_tag_for(event, fields=None):
-    """The #stock-scanner tag for a lifecycle event, or None to skip."""
-    if event not in _MONITOR_TAGS:
+class cancel_context:
+    """`with cancel_context(reason="BUY_FILL_TTL_EXPIRED", filled_quantity=0):`
+    around a cancel so the one cancel message can say why."""
+
+    def __init__(self, **facts):
+        self._facts = {k: v for k, v in facts.items() if v is not None}
+        self._token = None
+
+    def __enter__(self):
+        self._token = _cancel_context.set(dict(self._facts))
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            _cancel_context.reset(self._token)
+        except Exception:  # noqa: BLE001 - never let bookkeeping raise
+            _cancel_context.set(None)
+        return False
+
+
+def channel_for(event):
+    """The channel ROLE an event is presented on, or None for internal."""
+    from operations import slack_presentation as sp
+
+    if event in INTERNAL_EVENTS:
         return None
-    tag = _MONITOR_TAGS[event]
-    if tag is not None:
-        return tag
-    side = str((fields or {}).get("side") or "").strip().lower()
-    return "LIVE SELL" if side == "sell" else "LIVE BUY"
+    if event in URGENT_EVENTS:
+        return sp.LIVE_ALERTS
+    if event in REPORT_EVENTS:
+        return sp.TRADING_REPORT
+    if event in LIVE_TRADING_EVENTS:
+        return sp.LIVE_TRADING
+    return None
 
 
-def _mirror_to_monitor(event, fields):
-    """Copy a lifecycle event into the unified monitor channel.
-
-    Structurally incapable of affecting the order path: it is called after
-    the KIS delivery has already happened, its result is discarded, and it
-    catches everything. It also stays outside `notification_health` -- the
-    monitor is a second channel, and a monitor outage must not count
-    against the counter that escalates the kill switch.
-    """
-    try:
-        tag = monitor_tag_for(event, fields)
-        if not tag:
-            return
-        from scanners.notify import monitor
-
-        # A fill is tagged by its ACTUAL side, so 매수 체결 and 매도 체결
-        # are never confused -- one fill event carries both directions.
-        if tag == "LIVE FILL":
-            from scanners.notify import labels
-
-            tag = {"매수 체결": "BUY FILL", "매도 체결": "SELL FILL"}.get(
-                labels.fill_tag((fields or {}).get("side")), tag)
-        body = "\n".join([f"Event: {event}"]
-                         + [f"{key}: {value}" for key, value in (fields or {}).items()])
-        monitor.notify_tagged(tag, body)
-    except Exception:  # noqa: BLE001 - a monitor must never reach the order path
-        logger.warning("live notification could not be mirrored to the monitor",
-                       exc_info=True)
+def is_internal(event) -> bool:
+    return event in INTERNAL_EVENTS
 
 
 def _format(event, fields, *, test=False, validation=False):
-    """`[KIS LIVE] [EVENT]` headline plus one `- key: value` line per field.
+    """The complete Korean message for one event."""
+    from operations import slack_presentation as sp
 
-    Field ORDER is the caller's; dicts preserve insertion order, and the
-    payload contracts put the operationally important values first.
-    """
     if validation:
-        prefix = _VALIDATION_PREFIX
+        prefix = _VALIDATION_PREFIX + " "
     elif test:
-        prefix = _TEST_PREFIX
+        prefix = _TEST_PREFIX + " "
     else:
         prefix = ""
-    is_urgent = event in URGENT_EVENTS
-    tag = KIS_LIVE_CRITICAL_PREFIX if is_urgent else KIS_LIVE_PREFIX
-    urgent = ":rotating_light: " if is_urgent else ""
-    lines = [f"{prefix}{tag} {urgent}*[{event}]*"]
+    fields = dict(fields or {})
+
+    if event == FILL_COMPLETED:
+        body = (sp.sell_filled(fields) if str(fields.get("side") or "").lower() == "sell"
+                else sp.buy_filled(fields))
+    elif event == SELL_FILLED:
+        body = sp.sell_filled(fields)
+    elif event == CANCEL_COMPLETED:
+        body = sp.order_cancelled(fields)
+    elif event == ORDER_REJECTED:
+        body = sp.order_failed(fields)
+    elif event == ORDER_BLOCKED:
+        body = sp.order_blocked(fields)
+    elif event in (MARKET_START, SESSION_BLOCKED):
+        body = sp.session_ready(fields)
+    elif event == DAILY_SUMMARY:
+        body = fields.get("text") or _generic("일일 거래 요약", fields)
+    elif event in URGENT_EVENTS:
+        body = sp.critical(event, fields)
+        if event == ORDER_UNKNOWN:
+            body += f"\n{UNKNOWN_RETRY_LINE}\n{UNKNOWN_RECONCILIATION_LINE}"
+    else:
+        body = _generic(event, fields)
+    return prefix + body
+
+
+def _generic(title, fields):
+    lines = [f"[{title}]"]
     for key, value in (fields or {}).items():
         lines.append(f"- {key}: {value}")
-    if event == ORDER_UNKNOWN:
-        # Appended here rather than trusted to each caller: a caller that
-        # forgot them would produce a message that reads like an ordinary
-        # failure an operator might retry.
-        lines.append(f"- {UNKNOWN_RETRY_LINE}")
-        lines.append(f"- {UNKNOWN_RECONCILIATION_LINE}")
     return "\n".join(lines)
 
 
 def _sender_for(event):
-    """Urgent events go to the KIS live ALERT webhook, routine lifecycle
-    events to the KIS live general one.
+    """The slack_utils sender for an event's channel role.
 
-    Both are KIS-live-only channels (`KIS_LIVE_SLACK_ALERT_WEBHOOK_URL` /
-    `KIS_LIVE_SLACK_WEBHOOK_URL`) and neither falls back to the Alpaca
-    pair. Two independent reasons:
-
-    * Volume. The Alpaca webhooks carry paper fills and scanner output.
-      An UNKNOWN on a real order has to be the loudest thing in its
-      channel, not the fortieth message that minute.
-    * Honesty. A fallback would let an unconfigured deployment place a
-      real order and appear to have notified. Instead the missing
-      webhook is a readiness blocker
-      (KIS_LIVE_NOTIFICATION_NOT_CONFIGURED) and, if reached anyway,
-      `slack_utils` refuses to send rather than picking another channel.
-
-    The urgent/routine split matters for the same reason it always did:
-    an alert channel filled with PREPARED/SUBMITTED/ACCEPTED for every
-    routine order is an alert channel nobody reads.
+    Never an Alpaca/paper webhook: those carry paper fills and scanner
+    chatter, and a real-money message there is a message nobody sees.
+    An unconfigured role webhook makes slack_utils refuse to send rather
+    than pick another channel.
     """
     import slack_utils
+    from operations import slack_presentation as sp
 
-    if event in URGENT_EVENTS:
+    role = channel_for(event)
+    if role == sp.LIVE_ALERTS:
         return slack_utils.send_kis_live_alert
-
+    if role == sp.TRADING_REPORT:
+        return slack_utils.send_trading_report_message
     return slack_utils.send_kis_live_message
 
 
+def _dedupe_claim(conn, *, event, fields, subject, state_version):
+    """One message per (event, symbol, subject, version) via the durable
+    notification ledger. Returns (claimed, key). Errs toward sending: a
+    ledger that cannot be read must not silence a fill."""
+    if conn is None:
+        return True, None
+    try:
+        from operations import notification_ledger as ledger
+
+        symbol = (fields or {}).get("symbol")
+        key = ledger.key_for(event, symbol=symbol, subject_id=subject,
+                             state_version=state_version)
+        claimed = bool(ledger.claim(conn, key, event_type=event, symbol=symbol,
+                                    subject_id=subject, state_version=state_version,
+                                    channel=channel_for(event)))
+        return claimed, key
+    except Exception:  # noqa: BLE001
+        logger.warning("notification ledger unavailable; sending anyway", exc_info=True)
+        return True, None
+
+
+def _release_claim(conn, key) -> None:
+    """A claim is a promise to deliver. If Slack refused, give the claim
+    back so the next tick can say it -- otherwise one webhook hiccup
+    would swallow a fill message permanently."""
+    if conn is None or key is None:
+        return
+    try:
+        from operations import notification_ledger as ledger
+
+        ledger.release(conn, key)
+    except Exception:  # noqa: BLE001
+        logger.warning("could not release notification claim %s", key, exc_info=True)
+
+
+def _escalate_repeated_rejection(fields, *, send_fn=None):
+    """A second broker rejection of the same symbol in one process is a
+    pattern, not an incident; it is also told to the alert channel."""
+    from operations import slack_presentation as sp
+
+    symbol = str((fields or {}).get("symbol") or "?")
+    seen = _rejections_seen.get(symbol, 0) + 1
+    _rejections_seen[symbol] = seen
+    if seen < REPEATED_REJECTION_THRESHOLD:
+        return
+    try:
+        import slack_utils
+
+        payload = dict(fields or {})
+        payload["repeat_count"] = seen
+        message = sp.critical("ORDER_REJECTED_REPEATED", payload)
+        (send_fn or slack_utils.send_kis_live_alert)(message)
+    except Exception:  # noqa: BLE001
+        logger.warning("could not escalate a repeated rejection", exc_info=True)
+
+
 def notify(event, fields=None, *, test=False, validation=False,
-           send_fn=None, track_health=True):
+           send_fn=None, track_health=True, dedupe_conn=None,
+           dedupe_subject=None, dedupe_version=None):
     """Send one lifecycle event. Never raises. Return value is delivery
     status only and must not influence trading.
 
-    A caller that branches on this return value is a bug -- an order's
-    fate cannot depend on whether Slack answered.
+    Internal events return False without sending: they are logged so the
+    process log still shows the sequence. `dedupe_conn` (a state-store
+    connection) claims the message in the notification ledger first, so a
+    fill observed by two ticks is announced once.
     """
     try:
         if event not in EVENTS:
             logger.error("unknown live notification event %r; not sent", event)
             return False
         safe = redact_value(dict(fields or {}))
+        if event == CANCEL_COMPLETED:
+            context = _cancel_context.get()
+            if context:
+                for key, value in context.items():
+                    safe.setdefault(key, value)
+        if event in INTERNAL_EVENTS:
+            logger.info("live event %s (internal, not presented): %s", event,
+                        {k: safe[k] for k in ("symbol", "side", "state", "broker_order_id")
+                         if k in safe})
+            return False
+        if event == ORDER_BLOCKED:
+            from operations import slack_presentation as sp
+
+            code = safe.get("reason_code") or sp.block_code_for(safe.get("reason"))
+            safe.setdefault("reason_code", code)
+            if code in sp.SILENT_BLOCK_CODES:
+                logger.info("live event ORDER_BLOCKED %s %s (silent code)",
+                            safe.get("symbol"), code)
+                return False
+            if dedupe_version is None:
+                dedupe_version = f"{code}:{datetime.now(timezone.utc).date().isoformat()}"
+        claimed, claim_key = _dedupe_claim(dedupe_conn, event=event, fields=safe,
+                                           subject=dedupe_subject,
+                                           state_version=dedupe_version)
+        if not claimed:
+            logger.info("live event %s for %s already announced", event, safe.get("symbol"))
+            return False
         message = _format(event, safe, test=test, validation=validation)
     except Exception:  # noqa: BLE001 -- a formatting bug must not reach trading
         logger.exception("could not format live notification %s", event)
@@ -296,33 +364,31 @@ def notify(event, fields=None, *, test=False, validation=False,
 
     sender = send_fn or _sender_for(event)
 
-    # The monitor copy is sent regardless of how the KIS delivery goes.
-    # It is a second, independent channel: if the KIS webhook is down, the
-    # monitor line is the only record an operator gets, so gating it on
-    # the primary send would lose exactly the message that mattered most.
-    _mirror_to_monitor(event, safe)
+    if event == ORDER_REJECTED:
+        _escalate_repeated_rejection(safe, send_fn=None if send_fn is None else send_fn)
 
+    delivered = False
     if not track_health:
         # Deliberately outside notification_health. The one caller that
         # needs this is the kill-switch escalation: notification_health
         # counts consecutive Slack failures and escalates the kill switch
         # when they cross a threshold, so a message ANNOUNCING that
         # escalation, sent through the same tracker, feeds the counter
-        # that produced it. A failing Slack would then keep re-escalating
-        # itself. Delivery is still best-effort and still never raises.
+        # that produced it. Delivery is still best-effort and never raises.
         try:
-            return bool(sender(message))
+            delivered = bool(sender(message))
         except Exception:  # noqa: BLE001
             logger.exception("live notification %s could not be delivered", event)
-            return False
+    else:
+        from notification_health import send_with_health_tracking
 
-    from notification_health import send_with_health_tracking
-
-    try:
-        return bool(send_with_health_tracking(sender, message))
-    except Exception:  # noqa: BLE001 -- belt and braces; the helper already swallows
-        logger.exception("live notification %s could not be delivered", event)
-        return False
+        try:
+            delivered = bool(send_with_health_tracking(sender, message))
+        except Exception:  # noqa: BLE001 -- belt and braces; the helper already swallows
+            logger.exception("live notification %s could not be delivered", event)
+    if not delivered:
+        _release_claim(dedupe_conn, claim_key)
+    return delivered
 
 
 def account_field(account_no):
@@ -385,14 +451,22 @@ def partial_fill_fields(*, symbol, filled_qty, remaining_qty, average_fill_price
     }
 
 
-def fill_completed_fields(*, symbol, filled_qty, fill_price, position_qty, average_cost):
-    return {
+def fill_completed_fields(*, symbol, filled_qty, fill_price, position_qty, average_cost,
+                          strategy_id=None, session=None, broker_order_id=None):
+    fields = {
         "symbol": symbol,
         "filled_qty": filled_qty,
         "fill_price": fill_price,
         "position_qty": position_qty,
         "average_cost": average_cost,
     }
+    if strategy_id is not None:
+        fields["strategy_id"] = strategy_id
+    if session is not None:
+        fields["session"] = session
+    if broker_order_id:
+        fields["broker_order_id"] = broker_order_id
+    return fields
 
 
 def exit_triggered_fields(*, symbol, reason, position_qty, current_price, average_cost):
@@ -406,7 +480,8 @@ def exit_triggered_fields(*, symbol, reason, position_qty, current_price, averag
 
 
 def sell_filled_fields(*, symbol, qty, fill_price, realized_pnl, realized_pnl_pct,
-                       position_after=None):
+                       position_after=None, reason=None, strategy_id=None,
+                       session=None, average_buy_price=None):
     fields = {
         "symbol": symbol,
         "qty": qty,
@@ -416,6 +491,26 @@ def sell_filled_fields(*, symbol, qty, fill_price, realized_pnl, realized_pnl_pc
     }
     if position_after is not None:
         fields["position_after"] = position_after
+    if reason is not None:
+        fields["reason"] = reason
+    if strategy_id is not None:
+        fields["strategy_id"] = strategy_id
+    if session is not None:
+        fields["session"] = session
+    if average_buy_price is not None:
+        fields["average_buy_price"] = average_buy_price
+    return fields
+
+
+def order_blocked_fields(*, symbol, reason_code, detail=None, side="buy",
+                         strategy_id=None, session=None):
+    fields = {"symbol": symbol, "side": side, "reason_code": reason_code}
+    if detail is not None:
+        fields["detail"] = detail
+    if strategy_id is not None:
+        fields["strategy_id"] = strategy_id
+    if session is not None:
+        fields["session"] = session
     return fields
 
 
@@ -436,8 +531,8 @@ def unknown_order_fields(*, symbol, side, quantity=None, limit_price=None,
 
 
 def daily_summary_fields(*, entries, exits, fills, realized_pnl, positions,
-                         blocked_candidates, errors, unknown_count):
-    return {
+                         blocked_candidates, errors, unknown_count, text=None):
+    fields = {
         "entries": entries,
         "exits": exits,
         "fills": fills,
@@ -447,3 +542,6 @@ def daily_summary_fields(*, entries, exits, fills, realized_pnl, positions,
         "errors": errors,
         "unknown_count": unknown_count,
     }
+    if text:
+        fields["text"] = text
+    return fields

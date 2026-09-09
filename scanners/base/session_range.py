@@ -37,6 +37,7 @@ from typing import Optional
 import pandas as pd
 
 from market_hours import (
+    EASTERN,
     MARKET_AFTERMARKET_END,
     MARKET_PREMARKET_START,
     MARKET_REGULAR_END,
@@ -68,6 +69,9 @@ class SessionRange:
     range_low: Optional[float] = None
     bars: int = 0
     minutes: int = 0
+    official_origin: Optional[datetime] = None
+    origin_covered: Optional[bool] = None
+    origin_status: Optional[str] = None
 
     @property
     def complete(self) -> bool:
@@ -112,6 +116,10 @@ class SessionRange:
             "range_low": self.range_low,
             "range_bars": self.bars,
             "range_minutes": self.minutes,
+            "official_origin": (self.official_origin.isoformat()
+                                if self.official_origin else None),
+            "origin_covered": self.origin_covered,
+            "origin_status": self.origin_status,
         }
 
 
@@ -167,6 +175,14 @@ def current_session_date(session, now=None) -> Optional[date]:
     return session_start_date(moment.astimezone(EASTERN), session)
 
 
+def official_origin(session, session_date) -> Optional[datetime]:
+    """The session's nominal start as an Eastern-aware timestamp."""
+    window = window_for(session)
+    if window is None or session_date is None:
+        return None
+    return datetime.combine(session_date, window[0], tzinfo=EASTERN)
+
+
 def slice_session_bars(df, session, *, session_date: Optional[date] = None):
     """Every bar belonging to one session, oldest first.
 
@@ -212,31 +228,89 @@ def slice_session_bars(df, session, *, session_date: Optional[date] = None):
     return frame[keep]
 
 
+def closed_bars(df, *, now=None, interval_seconds=None):
+    """Only bars whose interval has ended at the decision instant.
+
+    Provider indexes are bar-open timestamps.  For S6's one-minute input,
+    the row stamped with the current minute is still accumulating and is
+    excluded. Fixture-shaped frames are returned unchanged.
+
+    `interval_seconds` is the bar WIDTH.  A caller that knows it (it asked
+    the provider for that resolution) should say so: the fallback infers a
+    width from the median gap between rows, and premarket frames are
+    sparse -- only minutes that traded appear -- so on real data that
+    median runs to several minutes and discards bars that closed long ago.
+    Inference stays the default so existing callers are unchanged.
+    """
+    if df is None or len(df) == 0 or not has_datetime_index(df):
+        return df
+    from datetime import timezone
+
+    moment = now or datetime.now(timezone.utc)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    frame = to_eastern(df)
+    if interval_seconds is not None and float(interval_seconds) > 0:
+        interval_seconds = float(interval_seconds)
+    else:
+        deltas = [(b - a).total_seconds() for a, b in zip(frame.index, frame.index[1:])
+                  if (b - a).total_seconds() > 0]
+        interval_seconds = sorted(deltas)[len(deltas) // 2] if deltas else 60.0
+    decision = moment.astimezone(EASTERN)
+    return frame[[stamp + timedelta(seconds=interval_seconds) <= decision
+                  for stamp in frame.index]]
+
+
 def opening_range(df, session, *, minutes: int,
-                  session_date: Optional[date] = None) -> SessionRange:
+                  session_date: Optional[date] = None,
+                  require_official_origin: bool = False,
+                  coverage_started_at: Optional[datetime] = None) -> SessionRange:
     """The first `minutes` of one session, as a range.
 
-    Measured from the FIRST BAR'S timestamp rather than from the
-    session's nominal open: a session whose data begins late still gets a
-    range of the requested width, instead of one truncated by however
-    long the feed took to start.
+    By default this preserves the historical first-bar policy.  Live S6
+    passes ``require_official_origin=True``: its range is then the fixed
+    session-open window, and missing origin coverage returns an incomplete
+    range instead of silently shifting the ORB later.
     """
     session_name = str(session or "").strip().upper()
     bars = slice_session_bars(df, session_name, session_date=session_date)
+    target_date = session_date
+    if target_date is None and bars is not None and len(bars) and has_datetime_index(bars):
+        target_date = session_start_date(bars.index[0], session_name)
+    origin = official_origin(session_name, target_date)
     if bars is None or len(bars) == 0:
-        return SessionRange(session=session_name, minutes=int(minutes))
+        return SessionRange(session=session_name, minutes=int(minutes),
+                            official_origin=origin, origin_covered=False,
+                            origin_status="NO_SESSION_BARS")
 
     if not has_datetime_index(bars):
         window = bars
         first = last = None
     else:
         first = bars.index[0]
-        cutoff = first + timedelta(minutes=int(minutes))
-        window = bars[[stamp < cutoff for stamp in bars.index]]
+        covered = bool(origin is not None and first <= origin)
+        if coverage_started_at is not None and origin is not None:
+            coverage = coverage_started_at
+            if coverage.tzinfo is None:
+                coverage = coverage.replace(tzinfo=origin.tzinfo)
+            else:
+                coverage = coverage.astimezone(origin.tzinfo)
+            covered = covered or coverage <= origin
+        if require_official_origin and not covered:
+            return SessionRange(
+                session=session_name, minutes=int(minutes),
+                official_origin=origin, origin_covered=False,
+                origin_status="OFFICIAL_ORIGIN_NOT_COVERED")
+        start = origin if require_official_origin and origin is not None else first
+        cutoff = start + timedelta(minutes=int(minutes))
+        window = bars[[start <= stamp < cutoff for stamp in bars.index]]
         last = window.index[-1] if len(window) else None
 
     if len(window) == 0:
-        return SessionRange(session=session_name, minutes=int(minutes))
+        return SessionRange(session=session_name, minutes=int(minutes),
+                            official_origin=origin,
+                            origin_covered=(covered if has_datetime_index(bars) else None),
+                            origin_status="NO_BARS_IN_OFFICIAL_RANGE")
 
     highs = window["High"] if "High" in window else window.get("high")
     lows = window["Low"] if "Low" in window else window.get("low")
@@ -248,7 +322,10 @@ def opening_range(df, session, *, minutes: int,
         range_start=first.to_pydatetime() if first is not None else None,
         range_end=last.to_pydatetime() if last is not None else None,
         range_high=high, range_low=low, bars=len(window),
-        minutes=int(minutes))
+        minutes=int(minutes), official_origin=origin,
+        origin_covered=(covered if has_datetime_index(bars) else None),
+        origin_status=("OFFICIAL_ORIGIN_COVERED" if require_official_origin
+                       and covered else "FIRST_BAR_ANCHORED"))
 
 
 def shadow_ranges(df, session, *, windows, session_date: Optional[date] = None):

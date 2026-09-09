@@ -359,7 +359,7 @@ class TestRedaction:
     def test_sensitive_keys_are_masked(self):
         captured = []
         live_notifications.notify(
-            live_notifications.ORDER_SUBMITTED,
+            live_notifications.KIS_API_FAILURE,
             {"symbol": "AAPL", "app_key": "AK-real", "access_token": "tok-real",
              "authorization": "Bearer tok"},
             send_fn=lambda m: captured.append(m) or True)
@@ -399,9 +399,16 @@ class TestRouting:
     def test_routine_events_go_to_the_kis_live_general_webhook(self):
         import slack_utils
 
-        for event in (live_notifications.ORDER_SUBMITTED, live_notifications.FILL_COMPLETED,
-                      live_notifications.MARKET_START, live_notifications.DAILY_SUMMARY):
+        for event in (live_notifications.FILL_COMPLETED, live_notifications.SELL_FILLED,
+                      live_notifications.CANCEL_COMPLETED, live_notifications.ORDER_BLOCKED,
+                      live_notifications.MARKET_START):
             assert live_notifications._sender_for(event) is slack_utils.send_kis_live_message
+
+    def test_the_daily_summary_goes_to_the_trading_report_webhook(self):
+        import slack_utils
+
+        assert (live_notifications._sender_for(live_notifications.DAILY_SUMMARY)
+                is slack_utils.send_trading_report_message)
 
     def test_no_event_can_reach_an_alpaca_webhook(self):
         """The decisive property: exhaustive over EVERY event, because a
@@ -473,8 +480,16 @@ class TestPayloadContracts:
 
     def test_every_declared_event_is_formattable(self):
         for event in sorted(live_notifications.EVENTS):
+            expected = event not in live_notifications.INTERNAL_EVENTS
             assert live_notifications.notify(
-                event, {"probe": "value"}, send_fn=lambda _m: True) is True
+                event, {"probe": "value"}, send_fn=lambda _m: True) is expected
+
+    def test_internal_events_never_reach_the_sender(self):
+        sent = []
+        for event in sorted(live_notifications.INTERNAL_EVENTS):
+            live_notifications.notify(event, {"symbol": "AAPL"},
+                                      send_fn=lambda m: sent.append(m) or True)
+        assert sent == []
 
     def test_the_test_prefix_is_applied(self):
         captured = []
@@ -617,7 +632,7 @@ class TestTheKillSwitchNotificationCannotFeedItself:
 
         before = nh.get_record()["consecutive_failures"]
         live_notifications.notify(
-            live_notifications.ORDER_SUBMITTED, {"symbol": "AAPL"}, send_fn=_down)
+            live_notifications.FILL_COMPLETED, {"symbol": "AAPL"}, send_fn=_down)
         assert nh.get_record()["consecutive_failures"] == before + 1
 
     def test_an_untracked_send_still_never_raises(self):

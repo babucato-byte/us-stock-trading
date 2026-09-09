@@ -99,8 +99,8 @@ class TestAHealthyWorldIsNormal:
         text = hc.format_message(report(world))
         assert "페이퍼" not in text
         assert "Git 변경 파일" not in text
-        assert "Overall: NORMAL" in text
-        assert "DAYTIME:" in text and "BUY " in text
+        assert "종합: 정상 (NORMAL)" in text
+        assert "데이장 주문 경로:" in text and "매수: " in text
         source = (REPO_ROOT / "trading_health_check.py").read_text()
         assert "performance_trades.csv" not in source
         assert "페이퍼" not in source.split('"""', 2)[2]   # allowed only in the docstring history
@@ -133,7 +133,7 @@ class TestEveryAuditedFalsePositiveIsCaught:
     def test_4_kis_token_missing_is_a_warning_not_normal(self, world):
         rep = report(world, env={"KIS_TOKEN_CACHE_FILE": "/nonexistent"})
         assert "kis_token" in rep["warned"]
-        assert "WARN: " in hc.format_message(rep)
+        assert "주의 항목: " in hc.format_message(rep)
 
     def test_5_reconciliation_not_clean(self, world):
         (world["state"] / "RECONCILIATION.json").write_text(json.dumps({
@@ -209,7 +209,7 @@ class TestLivePerformanceComesFromTheStateDb:
         assert perf["realized_pnl_usd"] == pytest.approx(1.0)
         assert perf["open_positions"] == 0 and perf["buy_never_filled"] == 1
         text = hc.format_message(report(world))
-        assert "LIVE 실거래 성과" in text and "청산 거래: 2건" in text
+        assert "실거래 성과" in text and "청산 거래: 2건" in text
 
     def test_a_missing_db_says_so_rather_than_zero(self, world):
         perf = hc.live_performance("/nonexistent/TRADING_STATE.db")
