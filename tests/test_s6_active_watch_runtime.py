@@ -452,18 +452,45 @@ class TestSessionScopedWatchlist:
         assert datetime.fromisoformat(state["expires_at"]) == datetime(
             2026, 9, 9, 8, 0, tzinfo=timezone.utc)
 
-    def test_the_cap_is_the_measured_provider_limit_in_every_session(self, tmp_path):
+    def test_the_physical_cap_is_the_measured_provider_limit_in_every_session(self, tmp_path):
+        """MAX_SUBSCRIPTIONS is a read-only reference to the physical
+        WebSocket ceiling -- unchanged, and no longer what merge()'s own
+        cap defaults to."""
         from market_data import kis_hdfscnt0
         from s6_live import active_watch
 
-        assert active_watch.MAX_SYMBOLS == kis_hdfscnt0.MAX_SUBSCRIPTIONS == 41
+        assert active_watch.MAX_SUBSCRIPTIONS == kis_hdfscnt0.MAX_SUBSCRIPTIONS == 41
+        assert active_watch.MAX_LOGICAL_WATCH_SYMBOLS > active_watch.MAX_SUBSCRIPTIONS
+
+    def test_the_logical_cap_is_decoupled_from_the_physical_one(self, tmp_path):
+        """The defect this task exists to fix: merge() used to clamp ANY
+        requested capacity down to the 41-symbol WebSocket ceiling, so a
+        caller asking for more logical room than that could never get
+        it. 60 additions with a requested cap of 99 (both above the
+        physical 41) must ALL be admitted in every session."""
+        from s6_live import active_watch
+
         for session in SESSIONS:
             state = active_watch.merge(
                 "2026-09-09", [{"symbol": f"S{i}", "source": "T"} for i in range(60)],
                 session=session, max_symbols=99, now=SESSION_CASES[session][1],
                 env=_env(tmp_path))
-            assert len(state["entries"]) == 41, session
-            assert state["dropped"] == 19, session
+            assert len(state["entries"]) == 60, session
+            assert state["dropped"] == 0, session
+
+    def test_the_logical_cap_itself_still_bounds_admission(self, tmp_path):
+        """Decoupled does not mean unlimited: a request above
+        MAX_LOGICAL_WATCH_SYMBOLS is still clamped to it."""
+        from s6_live import active_watch
+
+        state = active_watch.merge(
+            "2026-09-09",
+            [{"symbol": f"S{i}", "source": "T"}
+             for i in range(active_watch.MAX_LOGICAL_WATCH_SYMBOLS + 30)],
+            session="PREMARKET", max_symbols=10**6,
+            now=SESSION_CASES["PREMARKET"][1], env=_env(tmp_path))
+        assert len(state["entries"]) == active_watch.MAX_LOGICAL_WATCH_SYMBOLS
+        assert state["dropped"] == 30
 
 
 class TestAllSessionFastWatch:

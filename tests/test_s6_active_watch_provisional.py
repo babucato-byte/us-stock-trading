@@ -93,6 +93,43 @@ class TestRecordAndReadProvisional:
         assert active_watch._read_provisional(DAY, SESSION, env=_env(tmp_path))[0]["symbol"] == "RACE"
 
 
+class TestProvisionalIdempotencyIsScopedToOneScan:
+    """The docstring's own claim ("within one scan") was not actually
+    enforced: a later PASS for the same symbol under a DIFFERENT
+    (newer) scan_id inherited the OLDER scan's discovery instant,
+    because the idempotency check compared only symbols, never scan_id.
+    """
+
+    def test_a_new_scan_generation_does_not_inherit_the_old_ones_discovery_time(self, tmp_path):
+        from s6_live import active_watch
+
+        active_watch.record_provisional_pass(DAY, SESSION, {
+            "symbol": "META", "scan_id": "old-run",
+        }, now=datetime(2026, 9, 9, 10, 23, tzinfo=timezone.utc), env=_env(tmp_path))
+        active_watch.record_provisional_pass(DAY, SESSION, {
+            "symbol": "META", "scan_id": "new-run",
+            "candidate_discovered_at": "2026-09-09T12:02:33.434897+00:00",
+        }, now=datetime(2026, 9, 9, 12, 2, 33, tzinfo=timezone.utc), env=_env(tmp_path))
+        rows = active_watch._read_provisional(DAY, SESSION, env=_env(tmp_path))
+        row = next(r for r in rows if r["symbol"] == "META")
+        assert row["scan_id"] == "new-run"
+        assert row["candidate_discovered_at"] == "2026-09-09T12:02:33.434897+00:00"
+
+    def test_a_repeated_pass_within_the_same_scan_still_keeps_the_first_time(self, tmp_path):
+        from s6_live import active_watch
+
+        active_watch.record_provisional_pass(DAY, SESSION, {
+            "symbol": "META", "scan_id": "run-1",
+            "candidate_discovered_at": "2026-09-09T08:44:49Z",
+        }, now=NOW, env=_env(tmp_path))
+        active_watch.record_provisional_pass(DAY, SESSION, {
+            "symbol": "META", "scan_id": "run-1",
+            "candidate_discovered_at": "2026-09-09T08:50:00Z",
+        }, now=NOW + timedelta(minutes=6), env=_env(tmp_path))
+        rows = active_watch._read_provisional(DAY, SESSION, env=_env(tmp_path))
+        assert rows[0]["candidate_discovered_at"] == "2026-09-09T08:44:49Z"
+
+
 class TestRefreshIncorporatesProvisional:
     def _patch_sources(self, monkeypatch, *, subscribed=(), final_rows=(), market_session=SESSION):
         monkeypatch.setattr(
@@ -402,21 +439,45 @@ class TestLiveProvisionalSafety:
         assert state["entries"] == []
 
     def test_new_provisional_cannot_evict_existing_authoritative_watch_entry(self, tmp_path, monkeypatch):
+        """The task's §10: a fresh PASS when all 41 WebSocket slots are
+        full is admitted to the (decoupled, larger) LOGICAL watchlist as
+        a REST-backed entry -- it does not evict an established
+        WebSocket-backed entry, and it does not become a 42nd
+        subscription (that count is the collector's own read-only fact,
+        untouched by this admission)."""
         from s6_live import active_watch
         active_watch.record_provisional_pass(DAY, SESSION,
                                              {"symbol": "NEW", "scan_id": "live-1"},
                                              now=NOW, env=_env(tmp_path))
         self._sources(monkeypatch, state=SimpleNamespace(running=True, run_id="live-1"))
-        # Preserve ordering is exercised at the provider ceiling in production.
+        # All 41 physical WebSocket slots already occupied by established,
+        # authoritative (collector-backed) watch entries.
         existing = [{"symbol": f"K{i}", "source": "KIS_COLLECTOR"}
-                    for i in range(active_watch.MAX_SYMBOLS)]
+                    for i in range(active_watch.MAX_SUBSCRIPTIONS)]
         active_watch.merge(DAY, existing, session=SESSION, now=NOW, env=_env(tmp_path))
-        monkeypatch.setattr("market_data.collector_status.describe",
-                            lambda *a, **k: {"subscribed_symbols": [f"K{i}" for i in range(active_watch.MAX_SYMBOLS)],
-                                             "market_session": SESSION, "state": "RUNNING",
-                                             "subscription_count": active_watch.MAX_SYMBOLS,
-                                             "subscription_requested": active_watch.MAX_SYMBOLS})
+        monkeypatch.setattr(
+            "market_data.collector_status.describe",
+            lambda *a, **k: {"subscribed_symbols": [f"K{i}" for i in range(active_watch.MAX_SUBSCRIPTIONS)],
+                             "market_session": SESSION, "state": "RUNNING",
+                             "subscription_count": active_watch.MAX_SUBSCRIPTIONS,
+                             "subscription_requested": active_watch.MAX_SUBSCRIPTIONS})
         state = active_watch.refresh_from_existing_sources(
             DAY, session=SESSION, trading_day=DAY, now=NOW, env=_env(tmp_path))
-        assert [r["symbol"] for r in state["entries"]] == [f"K{i}" for i in range(active_watch.MAX_SYMBOLS)]
-        assert state["dropped"] >= 1
+        symbols = [r["symbol"] for r in state["entries"]]
+        # The 41 established entries are undisturbed, in their original
+        # order -- nothing was evicted.
+        assert symbols[:active_watch.MAX_SUBSCRIPTIONS] == \
+            [f"K{i}" for i in range(active_watch.MAX_SUBSCRIPTIONS)]
+        # NEW is admitted anyway: the logical cap has room even though
+        # the physical WebSocket cap does not.
+        assert "NEW" in symbols
+        assert state["dropped"] == 0
+        new_row = next(r for r in state["entries"] if r["symbol"] == "NEW")
+        assert new_row["transport_source"] == active_watch.TRANSPORT_REST
+        assert new_row["strategy_source"] == active_watch.PROVISIONAL_SOURCE
+        # The collector's own subscription count -- the actual physical
+        # fact -- is exactly what it was: admitting NEW logically cannot
+        # and did not request a 42nd WebSocket subscription.
+        assert state["metadata"]["subscription_count"] == active_watch.MAX_SUBSCRIPTIONS
+        assert state["websocket_backed"] == active_watch.MAX_SUBSCRIPTIONS
+        assert state["rest_backed"] == 1

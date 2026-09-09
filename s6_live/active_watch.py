@@ -32,8 +32,46 @@ logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = "s6_active_watch_v2"
 SUBDIR = "s6_active_watch"
-MAX_SYMBOLS = wire.MAX_SUBSCRIPTIONS
 EASTERN = ZoneInfo("America/New_York")
+
+#: The PHYSICAL WebSocket transport ceiling. One appkey streams at most
+#: this many symbols -- measured, not chosen -- and it is untouched and
+#: unreachable from this module: the actual subscription REQUEST is made
+#: by market_data.bootstrap_watchlist (pre-session symbol selection,
+#: capped the same way) and scripts/run_realtime_bar_collector.py (which
+#: refuses subscription 42 outright). Kept here ONLY as a read-only
+#: reference so this module can classify an entry as WS-backed vs
+#: REST-backed; nothing in this file ever requests a subscription.
+MAX_SUBSCRIPTIONS = wire.MAX_SUBSCRIPTIONS
+
+#: The LOGICAL active-watch capacity -- how many symbols the fast-watch
+#: tick may hold under evaluation at once. Deliberately NOT
+#: MAX_SUBSCRIPTIONS: that conflation is the defect this constant exists
+#: to remove. Only WebSocket-backed entries are limited to 41 (a
+#: transport fact enforced elsewhere, see MAX_SUBSCRIPTIONS above); a
+#: symbol outside that set is REST-evaluated within fast_watch's existing
+#: 30-second pretrade budget (S6_PRETRADE_BUDGET_SECONDS, ~12 symbols per
+#: tick at the measured 2.44s/symbol chart-read cost -- see
+#: pretrade_validation and kis_minute_chart), which defers what it cannot
+#: afford to the next tick rather than dropping it.
+#:
+#: 120 = 41 (physical WS ceiling) plus headroom sized against that same
+#: REST throughput: roughly ten ticks' worth (~12/tick) of non-WS
+#: backlog, comfortably longer than the few minutes it takes a fresh
+#: PASS to reach the front of the queue (see the fast-watch source's own
+#: symbol-ordering method, which puts S6-discovered entries ahead of bare
+#: collector-membership ones), while staying a small, fixed, auditable
+#: number rather than an unbounded one. Measured against real production
+#: PASS rates (11 in one ~16-minute PREMARKET scan segment, 2026-09-09),
+#: this is generous headroom, not a tight fit.
+MAX_LOGICAL_WATCH_SYMBOLS = 120
+
+#: How a watched symbol's market data actually arrives THIS cycle --
+#: independent of WHY it is being watched. Recomputed every refresh from
+#: the collector's live subscription set, so a symbol that rotates in or
+#: out of the WebSocket stream is reclassified automatically.
+TRANSPORT_WEBSOCKET = "KIS_WEBSOCKET"
+TRANSPORT_REST = "KIS_REST"
 
 #: Incremental (mid-scan) PASS admissions, separate from the main
 #: active-watch file so a scanner still running does not contend for the
@@ -43,6 +81,18 @@ EASTERN = ZoneInfo("America/New_York")
 #: SOURCE, exactly like the collector and the completed manifest.
 PROVISIONAL_SCHEMA_VERSION = "s6_active_watch_provisional_v1"
 PROVISIONAL_SOURCE = "S6_PROVISIONAL_PASS"
+
+#: The completed-manifest strategy_source, referenced by name in more
+#: than one place below.
+FULL_DISCOVERY_SOURCE = "S6_FULL_DISCOVERY"
+
+#: Set ONLY when a symbol has no S6 discovery claim at all -- neither a
+#: live provisional PASS nor a completed-manifest row -- and is watched
+#: purely because the collector already streams it. Distinct from
+#: TRANSPORT_WEBSOCKET: this is a STRATEGY reason (why watched), that is
+#: a TRANSPORT fact (how its data arrives); a symbol can be
+#: WebSocket-backed for either reason.
+COLLECTOR_MEMBERSHIP_SOURCE = "KIS_COLLECTOR_MEMBERSHIP"
 
 #: Kept only as the default for callers that name no session.
 SESSION = "PREMARKET"
@@ -132,21 +182,57 @@ def read(session_date, *, session=SESSION, now=None, env=None) -> Dict[str, Any]
             continue
         seen.add(symbol)
         entries.append(dict(row, symbol=symbol))
-    if len(entries) > MAX_SYMBOLS:
+    if len(entries) > MAX_LOGICAL_WATCH_SYMBOLS:
         return {**payload, "status": "OVER_CAPACITY", "entries": [], "path": str(target)}
     return {**payload, "status": "ACTIVE", "entries": entries, "path": str(target)}
 
 
+#: Fields that describe a symbol's S6 discovery GENERATION.  Only a
+#: STRATEGY addition (one that names a strategy_source) may ever set
+#: these; a TRANSPORT-only addition (collector membership) must never
+#: touch them, so a symbol's generation identity survives untouched
+#: across cycles where only transport facts are being refreshed.
+_GENERATION_FIELDS = ("full_scan_started_at", "symbol_evaluated_at",
+                     "candidate_discovered_at", "provisional",
+                     "final_generation_published", "scan_id",
+                     "scanner_variant")
+
+
 def merge(session_date, additions: Iterable[Dict[str, Any]], *, session=SESSION,
-          now=None, env=None, max_symbols=MAX_SYMBOLS,
+          now=None, env=None, max_symbols=MAX_LOGICAL_WATCH_SYMBOLS,
           replace=False, metadata=None, trading_day=None,
           preserve_existing_order=False) -> Dict[str, Any]:
     """Atomically add/update rows, preserving first-added time and cap.
 
-    The capacity defaults to the measured KIS subscription ceiling.  Callers
-    may lower it in tests, never raise it above the provider limit.
+    The capacity defaults to the LOGICAL watch ceiling, independent of the
+    physical WebSocket transport limit (see MAX_LOGICAL_WATCH_SYMBOLS).
+    Callers may lower it in tests; it is never raised above that ceiling.
+
+    Generation identity vs transport
+    ---------------------------------
+    Each addition is either a STRATEGY addition (carries a
+    `strategy_source` -- an S6 discovery: a live provisional PASS or a
+    completed manifest row -- or, as a legacy synonym, a bare `source`)
+    or a TRANSPORT-only addition (carries none; a pure collector-
+    membership fact). A strategy addition is a COMPLETE, authoritative
+    statement of the symbol's current generation: every field in
+    `_GENERATION_FIELDS` is set FROM it, including clearing one that is
+    legitimately absent this cycle, because that addition speaks for the
+    whole generation, not a patch onto whatever a differently-sourced row
+    left behind. A transport-only addition never touches those fields --
+    it may only ever ESTABLISH a `strategy_source` when the row has none
+    at all (pure collector sweep, no S6 signal), and always refreshes
+    `transport_source`, which is a live fact independent of why the
+    symbol is being watched at all.
+
+    Two same-symbol strategy additions in one call are resolved by the
+    caller's ordering (this function processes `additions` in order and
+    the LAST strategy addition for a symbol wins) -- see
+    `refresh_from_existing_sources` for the actual generation-precedence
+    rule (current provisional over old final) applied before this is
+    ever called.
     """
-    cap = min(int(max_symbols), MAX_SYMBOLS)
+    cap = min(int(max_symbols), MAX_LOGICAL_WATCH_SYMBOLS)
     if cap < 1:
         raise ValueError("active-watch capacity must be positive")
     moment = _utc(now or datetime.now(timezone.utc))
@@ -178,28 +264,57 @@ def merge(session_date, additions: Iterable[Dict[str, Any]], *, session=SESSION,
                     if preserve_existing_order else []))
         expires_at = _session_expiry(session_date, session).isoformat()
         for raw in raw_additions:
-            symbol = _normal_symbol((raw or {}).get("symbol"))
+            raw = raw or {}
+            symbol = _normal_symbol(raw.get("symbol"))
             if not symbol:
                 continue
             row = dict(prior.get(symbol) or {})
             if symbol not in ordered:
                 ordered.append(symbol)
-            row.update({
-                "symbol": symbol,
-                "added_at": row.get("added_at") or moment.isoformat(),
-                "updated_at": moment.isoformat(),
-                "source": str((raw or {}).get("source") or "UNKNOWN"),
-                "discovery_generation": (raw or {}).get("discovery_generation"),
-                "reason": str((raw or {}).get("reason") or "source admission"),
-                "expires_at": expires_at,
-            })
-            for key in ("full_scan_started_at", "symbol_evaluated_at",
-                        "candidate_discovered_at", "provisional",
-                        "final_generation_published", "scan_id", "scanner_variant"):
-                if (raw or {}).get(key) is not None:
-                    row[key] = (raw or {}).get(key)
+            row["symbol"] = symbol
+            row["added_at"] = row.get("added_at") or moment.isoformat()
+            row["updated_at"] = moment.isoformat()
+            row["expires_at"] = expires_at
+            transport_source = raw.get("transport_source")
+            if transport_source is not None:
+                row["transport_source"] = str(transport_source)
+            # `strategy_source` is the current name; a bare `source` is a
+            # legacy synonym still accepted so a caller stating one
+            # explicitly is always treated as a strategy addition.
+            strategy_source = raw.get("strategy_source")
+            if strategy_source is None:
+                strategy_source = raw.get("source")
+            if strategy_source is not None:
+                row["strategy_source"] = str(strategy_source)
+                row["source"] = row["strategy_source"]  # legacy alias
+                row["reason"] = str(raw.get("reason") or "source admission")
+                row["discovery_generation"] = raw.get("discovery_generation")
+                for key in _GENERATION_FIELDS:
+                    row[key] = raw.get(key)
+            elif not row.get("strategy_source"):
+                # TRANSPORT-only addition and no S6 discovery identity
+                # exists yet for this symbol: collector membership alone
+                # is a legitimate, minimal reason to watch it.
+                row["strategy_source"] = COLLECTOR_MEMBERSHIP_SOURCE
+                row["source"] = row["strategy_source"]
+                row["reason"] = str(raw.get("reason") or "current collector subscription")
+                row["discovery_generation"] = raw.get("discovery_generation")
+                row.setdefault("provisional", False)
+                row.setdefault("final_generation_published", False)
+                # A uniform row shape: every generation field exists
+                # (as None where there is no S6 claim behind it) so a
+                # reader can always .get()/[] any of them consistently.
+                for key in _GENERATION_FIELDS:
+                    row.setdefault(key, None)
+            # else: transport-only addition for a symbol that already
+            # carries an S6 discovery identity -- only transport_source/
+            # updated_at/expires_at above are touched; the generation
+            # fields survive untouched from `prior[symbol]`.
             prior[symbol] = row
         kept = ordered[:cap]
+        kept_rows = [prior[s] for s in kept]
+        websocket_backed = sum(1 for r in kept_rows
+                               if r.get("transport_source") == TRANSPORT_WEBSOCKET)
         payload = {
             "schema_version": SCHEMA_VERSION,
             "session_date": str(session_date),
@@ -208,8 +323,10 @@ def merge(session_date, additions: Iterable[Dict[str, Any]], *, session=SESSION,
             "capacity": cap,
             "updated_at": moment.isoformat(),
             "expires_at": expires_at,
-            "entries": [prior[s] for s in kept],
+            "entries": kept_rows,
             "dropped": max(0, len(ordered) - cap),
+            "websocket_backed": websocket_backed,
+            "rest_backed": len(kept_rows) - websocket_backed,
             "metadata": dict(metadata or {}),
         }
         temp = target.with_suffix(".tmp")
@@ -284,6 +401,12 @@ def record_provisional_pass(session_date, session, row: Dict[str, Any], *,
                 }
             entries = payload.get("entries") or {}
             existing = entries.get(symbol) or {}
+            # Idempotency is scoped to the SAME scan: a later PASS for
+            # this symbol under a DIFFERENT (newer) scan_id is a new
+            # generation, not a repeat of the old one, and must not
+            # silently inherit its predecessor's discovery instant.
+            same_scan = str(existing.get("scan_id") or "") == \
+                str((row or {}).get("scan_id") or "")
             entries[symbol] = {
                 "symbol": symbol,
                 "source": PROVISIONAL_SOURCE,
@@ -296,7 +419,8 @@ def record_provisional_pass(session_date, session, row: Dict[str, Any], *,
                 # (should not happen -- one evaluation per symbol per run --
                 # but idempotent either way) keeps the FIRST discovery time,
                 # so latency lineage always reflects the earliest signal.
-                "candidate_discovered_at": existing.get("candidate_discovered_at")
+                "candidate_discovered_at":
+                    (existing.get("candidate_discovered_at") if same_scan else None)
                     or (row or {}).get("candidate_discovered_at") or moment.isoformat(),
                 "updated_at": moment.isoformat(),
                 "provisional": True,
@@ -378,38 +502,34 @@ def refresh_from_existing_sources(session_date, *, session=SESSION,
     `session_date` scopes the watchlist; `trading_day` is the key the
     SCANNER published its candidates under, which for a session that
     crosses midnight is not the same string.
+
+    Generation precedence: OLD FINAL < CURRENT RUNNING PROVISIONAL <
+    CURRENT FINAL. `_live_provisional` returns a row for a symbol ONLY
+    while the scan that produced it still holds the cycle lock (see its
+    own docstring) -- and a scan cannot have published its OWN completed
+    manifest while it still holds that lock. So whenever both a live
+    provisional row and a completed-manifest row exist for the same
+    symbol in one refresh, the manifest row is NECESSARILY from an
+    older, already-finished generation: building the final rows first
+    and then letting provisional OVERWRITE them for any symbol both name
+    encodes exactly that precedence. The moment the producing scan
+    completes, `_live_provisional` stops returning it (lock released),
+    and the (now current) final row is used with nothing left to
+    outrank it -- CURRENT FINAL supersedes CURRENT PROVISIONAL without
+    any extra rule, purely because the lock-liveness gate already
+    retired the provisional side.
     """
-    additions: List[Dict[str, Any]] = []
     from market_data import collector_status
 
     status = collector_status.describe(env=env, now=now)
     subscribed = [_normal_symbol(s) for s in status.get("subscribed_symbols") or ()]
     subscribed = [s for s in subscribed if s]
-    discovery_additions = []
-    # Provisional (mid-scan) PASS admissions go in FIRST: they establish a
-    # symbol's ordered-list position (and therefore its priority under the
-    # cap) from the moment it was actually discovered, not from whenever
-    # the run eventually finishes. If the same symbol also appears in the
-    # completed manifest below, that later entry OVERWRITES this row's
-    # content when merge() builds it (final publication stays
-    # authoritative, per policy) while the symbol keeps the earlier
-    # position it earned by being found first.
-    for row in _live_provisional(session_date, session, trading_day, env=env):
-        symbol = _normal_symbol(row.get("symbol"))
-        if not symbol:
-            continue
-        discovery_additions.append({
-            "symbol": symbol, "source": PROVISIONAL_SOURCE,
-            "discovery_generation": row.get("scan_id"),
-            "reason": "provisional S6 discovery (full scan still in progress)",
-            "full_scan_started_at": row.get("full_scan_started_at"),
-            "symbol_evaluated_at": row.get("symbol_evaluated_at"),
-            "candidate_discovered_at": row.get("candidate_discovered_at"),
-            "provisional": True,
-            "final_generation_published": False,
-            "scan_id": row.get("scan_id"),
-            "scanner_variant": row.get("scanner_variant"),
-        })
+    subscribed_set = set(subscribed)
+
+    def _transport_for(symbol: str) -> str:
+        return TRANSPORT_WEBSOCKET if symbol in subscribed_set else TRANSPORT_REST
+
+    final_by_symbol: Dict[str, Dict[str, Any]] = {}
     try:
         from config import s6_sessions
         from scanners.publish import candidates
@@ -425,54 +545,81 @@ def refresh_from_existing_sources(session_date, *, session=SESSION,
                 continue
             seen.add(symbol)
             provenance = row.get("provenance") or {}
-            discovery_additions.append({"symbol": symbol, "source": "S6_FULL_DISCOVERY",
-                              "discovery_generation": row.get("scanner_run_id"),
-                              "reason": "completed S6 discovery candidate",
-                              "full_scan_started_at": provenance.get(
-                                  "full_scan_started_at") or row.get("generated_at"),
-                              "symbol_evaluated_at": provenance.get(
-                                  "symbol_evaluated_at") or provenance.get("signal_timestamp"),
-                              "candidate_discovered_at": provenance.get(
-                                  "candidate_discovered_at") or provenance.get(
-                                      "signal_timestamp") or row.get("generated_at"),
-                              "provisional": False,
-                              "final_generation_published": True,
-                              "scan_id": row.get("scanner_run_id")})
+            final_by_symbol[symbol] = {
+                "symbol": symbol, "strategy_source": FULL_DISCOVERY_SOURCE,
+                "transport_source": _transport_for(symbol),
+                "discovery_generation": row.get("scanner_run_id"),
+                "reason": "completed S6 discovery candidate",
+                "full_scan_started_at": provenance.get(
+                    "full_scan_started_at") or row.get("generated_at"),
+                "symbol_evaluated_at": provenance.get(
+                    "symbol_evaluated_at") or provenance.get("signal_timestamp"),
+                "candidate_discovered_at": provenance.get(
+                    "candidate_discovered_at") or provenance.get(
+                        "signal_timestamp") or row.get("generated_at"),
+                "provisional": False,
+                "final_generation_published": True,
+                "scan_id": row.get("scanner_run_id"),
+            }
     except Exception:
         # The collector seed is independently useful.  A discovery read
         # failure is surfaced by the full scanner's own health path.
         pass
-    # A symbol found provisionally and then confirmed in the completed
-    # manifest must cost the REST budget exactly ONCE, not once per
-    # source -- collapse to one row per symbol (last write wins: final
-    # discovery's content over provisional's, same rule merge() itself
-    # applies) before the budget accounting below ever sees it.
-    deduped_by_symbol: Dict[str, Dict[str, Any]] = {}
-    for row in discovery_additions:
-        deduped_by_symbol[row["symbol"]] = row
-    discovery_additions = list(deduped_by_symbol.values())
-    # Discovery has priority, but an outsider costs one measured REST chart
-    # request.  Bound those names by the existing 30-second pretrade budget;
-    # subscribed names are local snapshot reads and consume no REST slot.
+
+    provisional_by_symbol: Dict[str, Dict[str, Any]] = {}
+    for row in _live_provisional(session_date, session, trading_day, env=env):
+        symbol = _normal_symbol(row.get("symbol"))
+        if not symbol:
+            continue
+        provisional_by_symbol[symbol] = {
+            "symbol": symbol, "strategy_source": PROVISIONAL_SOURCE,
+            "transport_source": _transport_for(symbol),
+            "discovery_generation": row.get("scan_id"),
+            "reason": "provisional S6 discovery (full scan still in progress)",
+            "full_scan_started_at": row.get("full_scan_started_at"),
+            "symbol_evaluated_at": row.get("symbol_evaluated_at"),
+            "candidate_discovered_at": row.get("candidate_discovered_at"),
+            "provisional": True,
+            "final_generation_published": False,
+            "scan_id": row.get("scan_id"),
+            "scanner_variant": row.get("scanner_variant"),
+        }
+
+    # Final first, provisional overwrites -- see the precedence rule in
+    # this function's docstring. A symbol found in both this cycle costs
+    # its evaluation budget exactly ONCE either way: this collapses to
+    # one row per symbol before anything downstream sees it.
+    discovery_by_symbol: Dict[str, Dict[str, Any]] = dict(final_by_symbol)
+    discovery_by_symbol.update(provisional_by_symbol)
+    discovery_additions = list(discovery_by_symbol.values())
+
+    # Kept for observability/reporting only (§14/§17 funnel): the REST
+    # throughput fast_watch's own per-tick Budget actually enforces at
+    # EVALUATION time (evaluate what fits, defer the rest, retry next
+    # tick -- s6_live/fast_watch.py). Admission itself is no longer
+    # gated by it: an admission-time REST cap on TOP of that budget used
+    # to silently drop an outsider discovery symbol from `additions`
+    # some cycles and not others (ordering-dependent), which could evict
+    # an already-admitted, still-authoritative watch symbol the very
+    # next cycle purely because it fell outside that cycle's outsider
+    # slice -- exactly the "current same-symbol refresh must never be
+    # dropped" failure this task rules out. The LOGICAL cap
+    # (MAX_LOGICAL_WATCH_SYMBOLS) is now the only thing bounding
+    # admission.
     from market_data import kis_minute_chart
     from s6_live import pretrade_validation
     rest_capacity = max(0, int(pretrade_validation.budget_seconds(env) /
                                kis_minute_chart.MEASURED_SECONDS_PER_SYMBOL))
-    subscribed_set = set(subscribed)
-    outsiders = 0
-    for row in discovery_additions:
-        symbol = row["symbol"]
-        if symbol not in subscribed_set:
-            if outsiders >= rest_capacity:
-                continue
-            outsiders += 1
-        additions.append(row)
+
+    additions: List[Dict[str, Any]] = list(discovery_additions)
     if str(status.get("market_session") or "").upper() == str(session).upper():
         for symbol in subscribed:
-            additions.append({"symbol": symbol, "source": "KIS_COLLECTOR",
-                              "discovery_generation": status.get("collector_started_at"),
-                              "reason": "current collector subscription",
-                              "candidate_discovered_at": status.get("collector_started_at")})
+            additions.append({
+                "symbol": symbol, "transport_source": TRANSPORT_WEBSOCKET,
+                "discovery_generation": status.get("collector_started_at"),
+                "reason": "current collector subscription",
+                "candidate_discovered_at": status.get("collector_started_at"),
+            })
     return merge(session_date, additions, session=session, now=now, env=env,
                  replace=True, preserve_existing_order=True,
                  trading_day=trading_day, metadata={

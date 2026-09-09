@@ -380,6 +380,30 @@ def _funnel(source, results, *, since):
 
     _record_shadow_signals(source, results, since=since)
     _announce_fast_watch_health(source)
+    _log_s6_transport_funnel(source, ready=ready, watching=watching)
+
+
+def _log_s6_transport_funnel(source, *, ready, watching) -> None:
+    """One extra line, S6-only: the transport/admission breakdown the
+    physical-vs-logical cap split needs to be provable from logs alone
+    (logical watch size, WebSocket- vs REST-backed, deferred). Universe
+    and scanner-PASS counts are the SCANNER's own numbers, not this
+    runner's, and are read from its log directly rather than guessed
+    here.
+    """
+    if getattr(source, "name", None) is None or not hasattr(source, "describe") \
+            or getattr(source, "_scope", "missing") == "missing":
+        return
+    try:
+        info = source.describe()
+        logger.info(
+            "FUNNEL_S6_TRANSPORT logical_watch=%s websocket_backed=%s rest_backed=%s "
+            "fast_evaluated=%s deferred=%s watching=%d ready=%d",
+            info.get("watchlist_size"), info.get("websocket_backed"),
+            info.get("rest_backed"), info.get("fast_evaluated"),
+            info.get("deferred"), watching, ready)
+    except Exception:  # noqa: BLE001 -- reporting must never affect trading
+        logger.warning("could not log S6 transport funnel", exc_info=True)
 
 
 def _announce_fast_watch_health(source) -> None:

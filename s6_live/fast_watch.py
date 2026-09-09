@@ -45,6 +45,7 @@ class ActiveWatchSource:
         self.evaluations: Dict[str, precision_watch.WatchEvaluation] = {}
         self.waiting_for_data: List[str] = []
         self.validation_report: Dict[str, Any] = {}
+        self.transport_counts: Dict[str, int] = {}
         self._consumed_at = None
 
     def _load(self):
@@ -70,12 +71,34 @@ class ActiveWatchSource:
         self._consumed_at = datetime.now(timezone.utc)
         return self._state
 
+    #: A symbol S6 actually discovered (a live provisional PASS, or a
+    #: completed-manifest row) is evaluated ahead of a symbol watched for
+    #: no reason but that the collector happens to stream it. Evaluation
+    #: is wall-clock budgeted (pretrade_validation.Budget, shared across
+    #: every symbol in the tick regardless of transport -- see
+    #: symbols() below), so with a logical watchlist that can hold far
+    #: more than the ~17-18 symbols one tick's budget actually reaches,
+    #: list POSITION decides who gets judged this minute. A fresh PASS
+    #: is the entire reason this store exists; it must not queue behind
+    #: dozens of speculative collector-membership names with no S6
+    #: signal behind them at all. This does not touch admission order
+    #: (active_watch.merge()'s own FIFO/capacity-fairness ordering,
+    #: which decides who gets EVICTED under the cap) -- it is a stable
+    #: re-sort applied only to the order fast_watch ITERATES for
+    #: evaluation this tick.
+    _DISCOVERY_STRATEGY_SOURCES = frozenset({
+        "S6_PROVISIONAL_PASS", "S6_FULL_DISCOVERY"})
+
     def _active_symbols(self) -> List[str]:
         state = self._load()
         if state.get("status") != "ACTIVE":
             return []
-        return [str(r.get("symbol") or "").upper()
-                for r in state.get("entries") or () if r.get("symbol")]
+        entries = [r for r in state.get("entries") or () if r.get("symbol")]
+        ranked = sorted(
+            enumerate(entries),
+            key=lambda pair: (0 if pair[1].get("strategy_source")
+                              in self._DISCOVERY_STRATEGY_SOURCES else 1, pair[0]))
+        return [str(r.get("symbol") or "").upper() for _, r in ranked]
 
     def _operator_allowed(self, symbols) -> FrozenSet[str]:
         available = frozenset(symbols)
@@ -90,11 +113,20 @@ class ActiveWatchSource:
         budget = pretrade_validation.Budget(self._budget_seconds)
         ready = []
         self.waiting_for_data = []
+        # Transport tally for the funnel report (§14/§17): counted from
+        # the watchlist entry each symbol actually carries, not
+        # re-derived, so it can never disagree with what active_watch
+        # itself classified this cycle.
+        self.transport_counts = {active_watch.TRANSPORT_WEBSOCKET: 0,
+                                 active_watch.TRANSPORT_REST: 0, "UNKNOWN": 0}
         for symbol in offered:
+            entry = self._entry(symbol)
+            transport = entry.get("transport_source") or "UNKNOWN"
             if not budget.allows():
                 budget.defer(symbol)
                 self.waiting_for_data.append(symbol)
                 continue
+            self.transport_counts[transport] = self.transport_counts.get(transport, 0) + 1
             evaluated_at = datetime.now(timezone.utc)
             live_minutes = s6_sessions.orb_minutes_for(self._session)
             features = realtime_features.build(
@@ -116,12 +148,13 @@ class ActiveWatchSource:
             if evaluation.ready:
                 self._rows[symbol] = self._row_from(evaluation)
                 ready.append(symbol)
-            entry = self._entry(symbol)
             active_watch.record_evaluation(self._scope, {
                 "symbol": symbol, "session": self._session,
                 "trading_day": self._trading_day,
                 "session_date": self._scope,
                 "scanner_variant": s6_sessions.scanner_variant_for(self._session),
+                "strategy_source": entry.get("strategy_source"),
+                "transport_source": transport,
                 "orb_minutes": live_minutes,
                 "provider": getattr(features, "price_source", None),
                 "bar_interval_minutes": BAR_WIDTH_MINUTES,
@@ -228,7 +261,13 @@ class ActiveWatchSource:
             "session": self._session,
             "watchlist_status": state.get("status"),
             "watchlist_size": len(state.get("entries") or ()),
-            "watchlist_capacity": state.get("capacity", active_watch.MAX_SYMBOLS),
+            "watchlist_capacity": state.get("capacity", active_watch.MAX_LOGICAL_WATCH_SYMBOLS),
+            "websocket_subscription_cap": active_watch.MAX_SUBSCRIPTIONS,
+            "websocket_backed": state.get("websocket_backed"),
+            "rest_backed": state.get("rest_backed"),
+            "deferred": len(self.waiting_for_data),
+            "fast_evaluated": len(self.evaluations),
+            "transport_counts": dict(self.transport_counts),
             "session_date": self._scope,
             "scanner_variant": s6_sessions.scanner_variant_for(self._session),
             "shadow_variant": (s6_sessions.SHADOW_SCANNER_VARIANT
