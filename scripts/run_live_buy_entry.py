@@ -844,7 +844,14 @@ def _record_shadow_signals(source, results, *, since):
             from market_hours import us_trading_day
             from s6_live import range_shadow
 
-            range_shadow.record_cycle(source, trading_day=us_trading_day(since), now=since)
+            # A live py-spy trace on 2026-09-09 caught this loop still
+            # running ~4s/symbol well past the tick's own budget, because
+            # it had no deadline of its own -- the same "runs unbounded
+            # once already inside the outer gate" shape as the closed-bar
+            # shadow's per-symbol loop, fixed the same way.
+            range_shadow.record_cycle(
+                source, trading_day=us_trading_day(since), now=since,
+                deadline=lambda: _shadow_budget_remaining(since) <= 0)
         except Exception:  # noqa: BLE001 -- research, and the cycle is over
             logger.warning("could not record the ORB15 range shadow", exc_info=True)
 

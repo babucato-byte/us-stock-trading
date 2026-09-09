@@ -144,12 +144,24 @@ def append(record, *, trading_day, env=None) -> bool:
         return False
 
 
-def record_cycle(source, *, trading_day, now, env=None, store=None) -> int:
+def record_cycle(source, *, trading_day, now, env=None, store=None,
+                 deadline=None) -> int:
     """After a live cycle: the ORB15 verdict for every symbol it judged.
 
     Returns how many rows were written. Silent (0) when the session's
     live range already IS 15 minutes -- nothing to compare -- or when
     the collector store has no bars.
+
+    `deadline`, when given, is a zero-argument callable returning True
+    once this research work should stop starting new symbols -- see
+    scripts/run_live_buy_entry.py's hard tick budget. Omitted (the
+    default) it is unlimited, exactly the prior behaviour: every
+    existing caller that does not pass one is unaffected. `evaluate_symbol`
+    reads the SAME kind of entry-quality baseline `s6_live/kis_bar_features.py`'s
+    closed-bar shadow does -- a live py-spy trace on 2026-09-09 caught a
+    tick still running here, ~4s/symbol, well after the tick's own 50s
+    budget had passed, because this loop had no deadline of its own to
+    check.
     """
     from config import s6_sessions
     from s6_live import kis_bar_features
@@ -177,6 +189,11 @@ def record_cycle(source, *, trading_day, now, env=None, store=None) -> int:
         return 0
     written = 0
     for symbol, live in sorted(evaluations.items()):
+        if deadline is not None and deadline():
+            logger.info(
+                "RANGE_SHADOW_DEFERRED_BUDGET written=%d remaining=%d",
+                written, len(evaluations) - written)
+            break
         try:
             record = evaluate_symbol(symbol, store=bars, session=session, now=now,
                                      shadow_minutes=shadow_minutes,

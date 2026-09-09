@@ -316,3 +316,75 @@ class TestClosedBarShadowPerSymbolBudget:
         # pushes elapsed past the budget, so BBB is never started.
         assert calls["compare"] == ["AAA"]
         assert calls["compare_readiness"] == ["AAA"]
+
+
+class TestRangeShadowDeadline:
+    """The SAME "unbounded per-symbol research loop" shape as
+    _record_closed_bar_shadow, found the same way: a live py-spy trace
+    on 2026-09-09 caught scripts/run_live_buy_entry.py's tick still
+    running ~4s/symbol inside range_shadow.record_cycle, well past the
+    tick's own 50s budget, because that loop had no deadline of its
+    own to check -- only fixed for closed-bar shadow in the prior
+    round. `deadline` defaults to None (unlimited) so every existing
+    caller that does not pass one keeps its exact prior behaviour."""
+
+    def _source(self, symbols):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            _session="PREMARKET",
+            evaluations={s: SimpleNamespace() for s in symbols})
+
+    def test_no_deadline_processes_every_symbol_as_before(self, monkeypatch):
+        from s6_live import range_shadow
+
+        seen = []
+        monkeypatch.setattr(range_shadow, "evaluate_symbol",
+                            lambda symbol, **k: seen.append(symbol) or None)
+        written = range_shadow.record_cycle(
+            self._source(["AAA", "BBB", "CCC"]), trading_day=DAY, now=NOW,
+            store=object())
+        assert seen == ["AAA", "BBB", "CCC"]
+        assert written == 0
+
+    def test_deadline_stops_before_the_next_symbol(self, monkeypatch):
+        from s6_live import range_shadow
+
+        seen = []
+        monkeypatch.setattr(range_shadow, "evaluate_symbol",
+                            lambda symbol, **k: seen.append(symbol) or None)
+        calls = {"n": 0}
+
+        def _deadline():
+            calls["n"] += 1
+            return calls["n"] > 1  # true from the second check onward
+        range_shadow.record_cycle(
+            self._source(["AAA", "BBB", "CCC"]), trading_day=DAY, now=NOW,
+            store=object(), deadline=_deadline)
+        assert seen == ["AAA"]
+
+    def test_run_live_buy_entry_wires_the_tick_budget_as_the_deadline(self, monkeypatch):
+        """The call site passes _shadow_budget_remaining, not a fresh
+        clock -- so this deadline agrees with the audit-write loop's
+        own budget rather than tracking a second, independent one."""
+        from scripts import run_live_buy_entry as runner
+        import s6_live.range_shadow as range_shadow
+
+        captured = {}
+        monkeypatch.setattr(
+            range_shadow, "record_cycle",
+            lambda *a, deadline=None, **k: captured.setdefault("deadline", deadline))
+        monkeypatch.setattr(runner, "_announce_quality_blocks", lambda *a, **k: None)
+
+        class FakeSource:
+            _session = SESSION
+            evaluations = {}
+
+            def candidate_row(self, symbol):
+                return None
+
+        runner._record_shadow_signals(
+            FakeSource(), {"blocked": (), "skipped": (), "submitted": ()},
+            since=datetime.now(timezone.utc))
+        assert callable(captured["deadline"])
+        assert captured["deadline"]() is False  # freshly within budget
