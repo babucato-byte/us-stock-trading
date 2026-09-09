@@ -41,6 +41,13 @@
 #: Mutable operational data, deliberately a sibling of the releases
 #: rather than inside one.
 : "${SCANNER_DATA_ROOT:=/home/ubuntu/releases/us-stock-trading/shared/scanner}"
+# EXPORTED, not just set: the wrappers only ever used it to build their own
+# log paths, so a plain shell variable was enough. s6_live/active_watch.py
+# resolves its store from this variable in PYTHON, and without the export
+# every scanner PASS and every 1-minute active-watch refresh raised
+# "S6 active-watch needs SCANNER_DATA_ROOT or S6_ACTIVE_WATCH_DIR" --
+# fail-closed, but it left S6 with nothing to watch at all.
+export SCANNER_DATA_ROOT
 
 SHARED_CANDIDATE_DIR_KEY=SCANNER_CANDIDATE_DIR
 
