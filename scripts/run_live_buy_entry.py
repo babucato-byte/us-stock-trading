@@ -738,17 +738,37 @@ def _record_shadow_signals(source, results, *, since):
     # shadow-signal import -- so when that import was wrong, this never
     # ran either, and two independent observations were lost to one
     # bug. Neither of them can take the other down now.
-    try:
-        from market_hours import us_trading_day
-        from scanners.base import scan_session
+    #
+    # Also its own HARD TICK BUDGET check, re-measured here rather than
+    # reusing `elapsed` above: this is the same "presentation or
+    # research, never the trading decision" category as the block above
+    # it, but it was not actually covered by that check (each symbol
+    # runs a full entry-quality baseline computation -- one or more
+    # JSON snapshot loads apiece -- and a live py-spy trace on
+    # 2026-09-09 caught a production tick still inside this exact call
+    # chain, six-plus minutes in, for a REGULAR-session watchlist).
+    # Uncapped per-symbol research work here is exactly what turns a
+    # correctly budgeted 30s live-evaluation pass into a multi-minute
+    # tick, so it gets the same treatment as Slack and the ORB15
+    # shadow: skip once the tick has already overrun.
+    elapsed = (datetime.now(timezone.utc) - since).total_seconds()
+    if elapsed > _TICK_HARD_BUDGET_SECONDS:
+        logger.warning(
+            "TICK_BUDGET_EXCEEDED elapsed=%.1fs limit=%.0fs -- skipping "
+            "the closed-bar shadow comparison this tick",
+            elapsed, _TICK_HARD_BUDGET_SECONDS)
+    else:
+        try:
+            from market_hours import us_trading_day
+            from scanners.base import scan_session
 
-        _record_closed_bar_shadow(
-            source, sorted(getattr(source, "evaluations", None) or {}),
-            session=scan_session.session_at(),
-            day=us_trading_day(since), since=since)
-    except Exception:  # noqa: BLE001
-        logger.warning("could not record the closed-bar comparison",
-                       exc_info=True)
+            _record_closed_bar_shadow(
+                source, sorted(getattr(source, "evaluations", None) or {}),
+                session=scan_session.session_at(),
+                day=us_trading_day(since), since=since)
+        except Exception:  # noqa: BLE001
+            logger.warning("could not record the closed-bar comparison",
+                           exc_info=True)
 
 
 
@@ -765,8 +785,19 @@ def _record_closed_bar_shadow(source, symbols, *, session, day, since):
     Production is untouched: this records what the other reading WOULD
     have said, so a later argument for closed bars can be made from
     evidence rather than from that plausible story.
+
+    Also budgeted, PER SYMBOL, not just once before the loop: a live
+    py-spy trace on 2026-09-09 caught a single symbol's `compare` +
+    `compare_readiness` pair (each its own entry-quality baseline
+    computation) running for minutes on its own in a REGULAR-session
+    tick, so a check only before the whole call would not have stopped
+    an overrun starting on the very first symbol. The caller's own
+    check (just above) still skips this entirely once already over
+    budget; this one covers the loop once it is under way.
     """
     try:
+        from datetime import datetime, timezone
+
         from s6_live import closed_bar_shadow, kis_bar_features
 
         if not session:
@@ -775,6 +806,15 @@ def _record_closed_bar_shadow(source, symbols, *, session, day, since):
         if store is None:
             return
         for symbol in symbols:
+            elapsed = (datetime.now(timezone.utc) - since).total_seconds()
+            if elapsed > _TICK_HARD_BUDGET_SECONDS:
+                logger.warning(
+                    "TICK_BUDGET_EXCEEDED elapsed=%.1fs limit=%.0fs -- "
+                    "stopping the closed-bar shadow comparison mid-loop "
+                    "at %s; %d of %d symbols were not reached",
+                    elapsed, _TICK_HARD_BUDGET_SECONDS, symbol,
+                    len(symbols) - symbols.index(symbol), len(symbols))
+                return
             comparison = closed_bar_shadow.compare(
                 symbol, store=store, session=session, now=since)
             if comparison is not None:

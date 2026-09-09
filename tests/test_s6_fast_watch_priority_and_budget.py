@@ -122,13 +122,46 @@ class TestHardTickBudget:
         assert calls["quality_blocks"] == 0, "Slack must be skipped once over budget"
         assert calls["range_shadow"] == 0, "ORB15 shadow must be skipped once over budget"
 
+    def test_budget_exceeded_also_skips_the_closed_bar_shadow(self, tmp_path, monkeypatch):
+        """Production evidence 2026-09-09 (post-fix): a live py-spy trace
+        caught a tick still running 6+ minutes inside
+        _record_closed_bar_shadow -> closed_bar_shadow.compare ->
+        kis_bar_features.build_from_bars -> entry_quality.compute ->
+        time_bucket_baseline -> load_store -> json.loads. That call sat
+        in its own try/except AFTER the budget check above, so it was
+        never actually covered by the hard tick budget -- this is the
+        gap that let the fix in this file still overrun."""
+        from scripts import run_live_buy_entry as runner
+
+        calls = {"closed_bar_shadow": 0}
+        monkeypatch.setattr(runner, "_record_closed_bar_shadow",
+                            lambda *a, **k: calls.__setitem__(
+                                "closed_bar_shadow", calls["closed_bar_shadow"] + 1))
+
+        class FakeSource:
+            _session = SESSION
+            evaluations = {}
+
+            def candidate_row(self, symbol):
+                return None
+
+        long_ago = NOW - __import__("datetime").timedelta(
+            seconds=runner._TICK_HARD_BUDGET_SECONDS + 5)
+        runner._record_shadow_signals(FakeSource(), {"blocked": (), "skipped": (),
+                                                      "submitted": ()}, since=long_ago)
+        assert calls["closed_bar_shadow"] == 0, \
+            "the closed-bar shadow comparison must be skipped once over budget"
+
     def test_within_budget_runs_everything_as_before(self, tmp_path, monkeypatch):
         from scripts import run_live_buy_entry as runner
 
-        calls = {"quality_blocks": 0, "range_shadow": 0}
+        calls = {"quality_blocks": 0, "range_shadow": 0, "closed_bar_shadow": 0}
         monkeypatch.setattr(runner, "_announce_quality_blocks",
                             lambda *a, **k: calls.__setitem__(
                                 "quality_blocks", calls["quality_blocks"] + 1))
+        monkeypatch.setattr(runner, "_record_closed_bar_shadow",
+                            lambda *a, **k: calls.__setitem__(
+                                "closed_bar_shadow", calls["closed_bar_shadow"] + 1))
 
         class FakeSource:
             _session = SESSION
@@ -147,6 +180,7 @@ class TestHardTickBudget:
             since=datetime.now(timezone.utc))
         assert calls["quality_blocks"] == 1
         assert calls["range_shadow"] == 1
+        assert calls["closed_bar_shadow"] == 1
 
     def test_the_hard_budget_leaves_headroom_under_the_cron_interval(self):
         from scripts import run_live_buy_entry as runner
@@ -183,3 +217,68 @@ class TestLazySchedulersBaseImport:
         from scanners.base import session_range as srange
 
         assert srange.window_for("PREMARKET") is not None
+
+
+class TestClosedBarShadowPerSymbolBudget:
+    """`_record_closed_bar_shadow` sits after the tick-level gate but
+    runs its OWN per-symbol loop of entry-quality baseline computations
+    -- a second live py-spy trace on 2026-09-09 (after the first fix
+    was deployed) caught a REGULAR-session tick still running 6+
+    minutes inside exactly this loop, one symbol at a time. A gate
+    checked only once, before the whole call, would not have stopped
+    an overrun starting on the very first symbol -- this budget is
+    re-checked before each symbol instead."""
+
+    def _patched(self, monkeypatch, *, compare_side_effect=None):
+        from scripts import run_live_buy_entry as runner
+        import s6_live.closed_bar_shadow as closed_bar_shadow
+        import s6_live.kis_bar_features as kis_bar_features
+
+        calls = {"compare": [], "compare_readiness": []}
+        monkeypatch.setattr(kis_bar_features, "load_store",
+                            lambda *a, **k: object())
+
+        def _compare(symbol, **k):
+            if compare_side_effect:
+                compare_side_effect()
+            calls["compare"].append(symbol)
+            return None
+
+        monkeypatch.setattr(closed_bar_shadow, "compare", _compare)
+        monkeypatch.setattr(closed_bar_shadow, "compare_readiness",
+                            lambda symbol, **k: calls["compare_readiness"].append(symbol))
+        return runner, calls
+
+    def test_already_over_budget_reaches_no_symbol(self, monkeypatch):
+        runner, calls = self._patched(monkeypatch)
+        long_ago = NOW - __import__("datetime").timedelta(
+            seconds=runner._TICK_HARD_BUDGET_SECONDS + 5)
+        runner._record_closed_bar_shadow(
+            None, ["AAA", "BBB", "CCC"], session=SESSION, day=DAY, since=long_ago)
+        assert calls["compare"] == []
+        assert calls["compare_readiness"] == []
+
+    def test_within_budget_reaches_every_symbol(self, monkeypatch):
+        runner, calls = self._patched(monkeypatch)
+        runner._record_closed_bar_shadow(
+            None, ["AAA", "BBB", "CCC"], session=SESSION, day=DAY,
+            since=datetime.now(timezone.utc))
+        assert calls["compare"] == ["AAA", "BBB", "CCC"]
+        assert calls["compare_readiness"] == ["AAA", "BBB", "CCC"]
+
+    def test_budget_exhausted_mid_loop_stops_before_the_next_symbol(self, monkeypatch):
+        import time
+
+        def _slow():
+            time.sleep(0.15)
+
+        runner, calls = self._patched(monkeypatch, compare_side_effect=_slow)
+        monkeypatch.setattr(runner, "_TICK_HARD_BUDGET_SECONDS", 0.05)
+        runner._record_closed_bar_shadow(
+            None, ["AAA", "BBB", "CCC"], session=SESSION, day=DAY,
+            since=datetime.now(timezone.utc))
+        # AAA is reached (elapsed ~0 < budget), its slow compare() then
+        # pushes elapsed past the budget, so BBB is never started.
+        assert calls["compare"] == ["AAA"]
+        assert calls["compare_readiness"] == ["AAA"]
+

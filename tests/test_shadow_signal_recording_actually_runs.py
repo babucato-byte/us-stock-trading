@@ -76,9 +76,14 @@ class TestOneObservationCannotKillTheOther:
 
         from datetime import datetime, timezone
 
+        # Recent `since`, not a fixed past date: the hard tick budget
+        # (added 2026-09-09) skips this same call once a tick's elapsed
+        # time is over budget, and this test is about the shadow-log
+        # failure not taking the comparison down with it -- not about
+        # the budget -- so it must stay within budget to observe that.
         entry._record_shadow_signals(
             _Src(), {"submitted": [], "blocked": [], "skipped": []},
-            since=datetime(2026, 8, 31, 4, 0, tzinfo=timezone.utc))
+            since=datetime.now(timezone.utc))
         assert called.get("yes") is True
 
     def test_neither_failure_raises_out_of_the_recorder(self, monkeypatch):
