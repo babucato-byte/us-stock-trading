@@ -360,7 +360,7 @@ def _execution_funnel(source, claimed, results, *, since):
             symbol, first_ready_at, latency_ms, outcome)
 
 
-def _funnel(source, results, *, since):
+def _funnel(source, results, *, since, expect_no_submission=False):
     """One line describing what happened to every candidate this tick.
 
     The counts exist because "no BUY today" has several very different
@@ -376,6 +376,13 @@ def _funnel(source, results, *, since):
     recorded; a second count kept alongside the submission loop could
     disagree with the gate, and then the number meant to expose the
     defect would be derived from the code suspected of having it.
+
+    `expect_no_submission`: the fast-watch tick (strategy="s6", since
+    2026-09-10) never submits anything itself -- READY only produces a
+    BUY_INTENT, and the execution worker submits later, in a different
+    process. "ready>0, submitted=0" there is the intended steady state,
+    not a defect signal, so it skips the classification below (still
+    used for s1 and any strategy that reaches the shared cycle inline).
     """
     scanned = watching = ready = executable = 0
     evaluations = getattr(source, "evaluations", None) or {}
@@ -440,11 +447,15 @@ def _funnel(source, results, *, since):
     # no candidates at all. Which is every tick when discovery is empty:
     # the check meant to catch a silent execution defect was itself
     # failing silently, once a minute.
-    if ready > 0 and submitted == 0:
+    if ready > 0 and submitted == 0 and not expect_no_submission:
         label, level, detail = _classify_no_submission(results, executable)
         logger.log(
             level, "%s ready=%d executable=%d submitted=0 -- %s",
             label, ready, executable, detail)
+    elif ready > 0 and expect_no_submission:
+        logger.info(
+            "ENTRY_READY_HANDED_OFF ready=%d -- BUY_INTENT written for the "
+            "execution worker; this tick never submits", ready)
     for symbol, evaluation in sorted(evaluations.items()):
         if not getattr(evaluation, "ready", False):
             logger.info("FUNNEL_WATCHING %s state=%s blocking=%s", symbol,
@@ -1003,7 +1014,8 @@ def run_once(broker=None, *, strategy="s1"):
     if strategy == "s6":
         ready_symbols, _written = _s6_write_intents(source, now=now)
         try:
-            _funnel(source, {"submitted": [], "blocked": [], "skipped": []}, since=now)
+            _funnel(source, {"submitted": [], "blocked": [], "skipped": []},
+                   since=now, expect_no_submission=True)
         except Exception:  # noqa: BLE001 -- a reporting fault must not
             # change what the tick already did, nor mask its result.
             logger.warning("funnel report failed", exc_info=True)

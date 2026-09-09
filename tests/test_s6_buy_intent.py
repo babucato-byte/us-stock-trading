@@ -268,3 +268,50 @@ class TestS1Untouched:
 
         source = inspect.getsource(s1_executor)
         assert "klt.run_live_buy_entry_cycle(broker=broker, now=now)" in source
+
+
+class TestFunnelDoesNotMisreadTheHandoffAsADefect:
+    """ready>0/submitted=0 is the s6 fast-watch tick's intended steady
+    state now (READY only ever produces a BUY_INTENT there) -- it must
+    not be logged as EXECUTION_DEFECT_SUSPECTED/ENTRY_YIELDED_EXPECTED,
+    the way an s1 tick with the same shape correctly still is."""
+
+    def _source_with_one_ready(self):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(evaluations={
+            "BH": SimpleNamespace(ready=True, state="READY", blocking=()),
+        })
+
+    def test_s6_fast_watch_tick_does_not_classify_the_handoff_as_a_defect(
+            self, monkeypatch, caplog):
+        import logging
+
+        from scripts import run_live_buy_entry as runner
+
+        called = {"n": 0}
+        monkeypatch.setattr(
+            runner, "_classify_no_submission",
+            lambda *a, **k: called.__setitem__("n", called["n"] + 1) or ("X", 40, "X"))
+
+        with caplog.at_level(logging.INFO, logger="live_buy_entry"):
+            runner._funnel(
+                self._source_with_one_ready(),
+                {"submitted": [], "blocked": [], "skipped": []},
+                since=NOW, expect_no_submission=True)
+        assert called["n"] == 0
+        assert any("ENTRY_READY_HANDED_OFF" in r.message for r in caplog.records)
+
+    def test_other_strategies_still_classify_ready_with_no_submission(self, monkeypatch):
+        from scripts import run_live_buy_entry as runner
+
+        called = {"n": 0}
+        monkeypatch.setattr(
+            runner, "_classify_no_submission",
+            lambda *a, **k: called.__setitem__("n", called["n"] + 1) or ("X", 40, "X"))
+
+        runner._funnel(
+            self._source_with_one_ready(),
+            {"submitted": [], "blocked": [], "skipped": []},
+            since=NOW)  # expect_no_submission defaults to False
+        assert called["n"] == 1
