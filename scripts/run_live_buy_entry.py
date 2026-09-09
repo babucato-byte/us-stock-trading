@@ -626,6 +626,14 @@ def _announce_quality_blocks(source, *, since) -> None:
             pass
 
 
+#: How long ONE entry tick may run before its own non-critical
+#: post-processing starts skipping itself, so it cannot push the tick
+#: past the 60-second cron interval and cause the next one to be
+#: OVERLAP_SKIPPED. Below the cron interval on purpose -- there is
+#: cleanup (return, log flush) after this check too.
+_TICK_HARD_BUDGET_SECONDS = 50.0
+
+
 def _record_shadow_signals(source, results, *, since):
     """Persist what happened to every candidate this tick.
 
@@ -635,6 +643,8 @@ def _record_shadow_signals(source, results, *, since):
     makes "is this gate blocking good trades" a question nobody can
     answer.
     """
+    from datetime import datetime, timezone
+
     try:
         from config import s6_sessions
         from market_hours import us_trading_day
@@ -689,18 +699,40 @@ def _record_shadow_signals(source, results, *, since):
         # not alter a cycle that has already finished trading.
         logger.warning("could not record shadow signals", exc_info=True)
 
-    try:
-        _announce_quality_blocks(source, since=since)
-    except Exception:  # noqa: BLE001 -- presentation only
-        logger.warning("could not announce entry-quality blocks", exc_info=True)
+    # HARD TICK BUDGET: everything from here down is presentation or
+    # research, never the trading decision itself (that already happened,
+    # durably, in the shadow_signal_log.append() calls above and in
+    # klt.run_live_buy_entry_cycle()). A logical watchlist large enough to
+    # need it can push this tick's OWN cost past the 60-second cron
+    # interval, and a tick that overruns causes the NEXT cron trigger to
+    # be OVERLAP_SKIPPED -- which is worse for latency than skipping
+    # optional work THIS tick, because it silently doubles the effective
+    # cadence for every candidate, not just this one. Measured
+    # 2026-09-09: a 73.7s tick against a 60s cron interval. Slack must
+    # never be why a candidate misses its tick, so it is the first thing
+    # dropped, and ORB15 shadow (comparison research, explicitly never an
+    # order -- see s6_live/range_shadow.py) is the second.
+    elapsed = (datetime.now(timezone.utc) - since).total_seconds()
+    if elapsed > _TICK_HARD_BUDGET_SECONDS:
+        logger.warning(
+            "TICK_BUDGET_EXCEEDED elapsed=%.1fs limit=%.0fs -- skipping "
+            "entry-quality Slack announcements and ORB15 shadow recording "
+            "this tick; the required shadow_signal_log audit rows above "
+            "were still written",
+            elapsed, _TICK_HARD_BUDGET_SECONDS)
+    else:
+        try:
+            _announce_quality_blocks(source, since=since)
+        except Exception:  # noqa: BLE001 -- presentation only
+            logger.warning("could not announce entry-quality blocks", exc_info=True)
 
-    try:
-        from market_hours import us_trading_day
-        from s6_live import range_shadow
+        try:
+            from market_hours import us_trading_day
+            from s6_live import range_shadow
 
-        range_shadow.record_cycle(source, trading_day=us_trading_day(since), now=since)
-    except Exception:  # noqa: BLE001 -- research, and the cycle is over
-        logger.warning("could not record the ORB15 range shadow", exc_info=True)
+            range_shadow.record_cycle(source, trading_day=us_trading_day(since), now=since)
+        except Exception:  # noqa: BLE001 -- research, and the cycle is over
+            logger.warning("could not record the ORB15 range shadow", exc_info=True)
 
     # In its OWN try. It used to sit inside the block above, after the
     # shadow-signal import -- so when that import was wrong, this never

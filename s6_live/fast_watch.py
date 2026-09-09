@@ -71,33 +71,56 @@ class ActiveWatchSource:
         self._consumed_at = datetime.now(timezone.utc)
         return self._state
 
-    #: A symbol S6 actually discovered (a live provisional PASS, or a
-    #: completed-manifest row) is evaluated ahead of a symbol watched for
-    #: no reason but that the collector happens to stream it. Evaluation
-    #: is wall-clock budgeted (pretrade_validation.Budget, shared across
-    #: every symbol in the tick regardless of transport -- see
-    #: symbols() below), so with a logical watchlist that can hold far
-    #: more than the ~17-18 symbols one tick's budget actually reaches,
-    #: list POSITION decides who gets judged this minute. A fresh PASS
-    #: is the entire reason this store exists; it must not queue behind
-    #: dozens of speculative collector-membership names with no S6
-    #: signal behind them at all. This does not touch admission order
-    #: (active_watch.merge()'s own FIFO/capacity-fairness ordering,
-    #: which decides who gets EVICTED under the cap) -- it is a stable
-    #: re-sort applied only to the order fast_watch ITERATES for
-    #: evaluation this tick.
-    _DISCOVERY_STRATEGY_SOURCES = frozenset({
-        "S6_PROVISIONAL_PASS", "S6_FULL_DISCOVERY"})
+    #: Evaluation is wall-clock budgeted (pretrade_validation.Budget,
+    #: shared across every symbol in the tick regardless of transport --
+    #: see symbols() below), so with a logical watchlist that can hold
+    #: far more than one tick's budget actually reaches, list POSITION
+    #: decides who gets judged this minute -- not admission time, not
+    #: alphabetical order, and not the raw watchlist-file order (which
+    #: exists to protect CAPACITY fairness under the cap, a different
+    #: question from EVALUATION priority; active_watch.merge() owns
+    #: that ordering and this never touches it, only re-sorts the
+    #: symbols this ONE tick iterates for evaluation).
+    #:
+    #: Priority, highest first:
+    #:   P0  a live PASS from the scan CURRENTLY holding the cycle lock
+    #:       (active_watch._live_provisional's own liveness gate is what
+    #:       makes strategy_source == PROVISIONAL_SOURCE synonymous with
+    #:       "current run": a dead scan's rows are excluded before they
+    #:       ever reach the watchlist, and a completed scan's rows have
+    #:       already become FULL_DISCOVERY_SOURCE by the time its lock
+    #:       releases -- see refresh_from_existing_sources's precedence
+    #:       rule). This is the whole point of incremental admission: a
+    #:       fresh PASS must not queue behind an established backlog.
+    #:   P1  S6 already discovered this symbol this session (a published,
+    #:       completed-manifest row) -- a real signal, just not the one
+    #:       that just happened.
+    #:   P2  no S6 signal at all, but WebSocket-backed: a local snapshot
+    #:       read costs no REST budget, so judging it is nearly free.
+    #:   P3  no S6 signal, REST-backed: costs the scarce per-tick budget
+    #:       for a symbol S6 never actually flagged.
+    #: What the tick's Budget cannot reach this minute is deferred, not
+    #: invalidated, and is retried from a (possibly changed) priority
+    #: position on the next tick -- see symbols() below.
+    _PROVISIONAL_STRATEGY_SOURCE = "S6_PROVISIONAL_PASS"
+    _FULL_DISCOVERY_STRATEGY_SOURCE = "S6_FULL_DISCOVERY"
+
+    @classmethod
+    def _priority_tier(cls, entry) -> int:
+        strategy = entry.get("strategy_source")
+        if strategy == cls._PROVISIONAL_STRATEGY_SOURCE:
+            return 0
+        if strategy == cls._FULL_DISCOVERY_STRATEGY_SOURCE:
+            return 1
+        return 2 if entry.get("transport_source") == active_watch.TRANSPORT_WEBSOCKET else 3
 
     def _active_symbols(self) -> List[str]:
         state = self._load()
         if state.get("status") != "ACTIVE":
             return []
         entries = [r for r in state.get("entries") or () if r.get("symbol")]
-        ranked = sorted(
-            enumerate(entries),
-            key=lambda pair: (0 if pair[1].get("strategy_source")
-                              in self._DISCOVERY_STRATEGY_SOURCES else 1, pair[0]))
+        ranked = sorted(enumerate(entries),
+                        key=lambda pair: (self._priority_tier(pair[1]), pair[0]))
         return [str(r.get("symbol") or "").upper() for _, r in ranked]
 
     def _operator_allowed(self, symbols) -> FrozenSet[str]:
