@@ -1338,7 +1338,19 @@ def main(argv=None, *, provider=None) -> int:
     # a scheduled scan is already going.
     publishing = [name for name in (names or ALL_SCANNERS)
                   if name in PUBLISHING_SCANNERS]
-    with scan_cycle.hold_all(day, session, scanners=publishing) as cycle:
+    # The run id is minted HERE, before the hold, so the cycle marker can
+    # carry it. `active_watch._live_provisional()` admits a mid-scan PASS
+    # only when the row's scan_id matches the run that still holds the
+    # cycle lock -- which is what makes an aborted scan's rows ineligible.
+    # Minting it inside run_scanners() left the marker's run_id null, so
+    # that match could never succeed and every provisional row was
+    # discarded: observed in production 2026-09-09, ACN and MELI written
+    # at 11:04Z and never admitted.
+    from scanners.base import run_context as _run_context
+
+    identifier = _run_context.new_run_id(day, args.profile)
+    with scan_cycle.hold_all(day, session, scanners=publishing,
+                             run_id=identifier) as cycle:
         if cycle.skipped:
             print(f"[SCAN CYCLE] skipped -- {cycle.detail()}")
             logger.warning("scan skipped, previous run still in progress: %s",
@@ -1358,11 +1370,12 @@ def main(argv=None, *, provider=None) -> int:
             logger.error("candidate hand-off cannot be locked: %s",
                          cycle.detail())
         return _run_and_report(args, names=names, symbols=symbols, day=day,
-                               session=session, provider=provider)
+                               session=session, provider=provider,
+                               run_id=identifier)
 
 
 def _run_and_report(args, *, names, symbols, day, session,
-                    provider=None) -> int:
+                    provider=None, run_id=None) -> int:
     """One scan, its notifications and its publication.
 
     Split out of `main` so the cycle lock wraps the whole of it -- the
@@ -1372,6 +1385,7 @@ def _run_and_report(args, *, names, symbols, day, session,
     """
     report = run_scanners(
         provider=provider,
+        run_id=run_id,
         scanners=names or None,
         symbols=symbols,
         limit=args.limit,
