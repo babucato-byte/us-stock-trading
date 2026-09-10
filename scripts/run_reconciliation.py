@@ -42,7 +42,7 @@ from execution.order_repository import (  # noqa: E402
     FatalRepositoryConnectionError,
 )
 from execution.secret_redaction import install_logging_redaction  # noqa: E402
-from reconciliation import exit_intent_resolution, fill_window  # noqa: E402
+from reconciliation import exit_intent_resolution, fill_window, sell_projection  # noqa: E402
 from reconciliation import reconciliation_state  # noqa: E402
 from reconciliation import snapshot as reconciliation_snapshot  # noqa: E402
 from reconciliation.order_reconciler import (  # noqa: E402
@@ -221,6 +221,18 @@ def run_once(*, broker=None, now=None, conn=None, account_id=None):
                     "settled": settled, "exit_intents": exit_intents,
                     "snapshot": None}
 
+        repaired_sell_projections = sell_projection.reconcile_closed_sell_projections(
+            conn, snapshot=snapshot, now=current)
+        if repaired_sell_projections:
+            # Rebuild after the durable repair so this pass records the
+            # state it actually leaves behind rather than a one-pass-old
+            # mismatch caused by the stale projection itself.
+            snapshot = reconciliation_snapshot.build_snapshot(
+                broker=broker, conn=conn,
+                account_id=account_id if account_id is not None else broker.config.account_no or "",
+                symbol=None, now=current, source="reconcile_service",
+            )
+
         try:
             from operations import kill_switch
 
@@ -241,6 +253,7 @@ def run_once(*, broker=None, now=None, conn=None, account_id=None):
             "status": "clean" if snapshot.is_clean() else "mismatch",
             "resolved": resolved, "settled": settled, "snapshot": snapshot,
             "exit_intents": exit_intents,
+            "repaired_sell_projections": repaired_sell_projections,
             "purged_audit_rows": purged_rows, "purged_log_files": len(purged_files),
         }
     finally:

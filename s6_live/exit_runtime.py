@@ -315,16 +315,18 @@ def _settle_intent(conn, position_id, sold, *, done):
     try:
         intent = eil.get_active_intent(conn, position_id)
         if not intent:
-            return
+            return None
         if done:
             eil.mark_confirmed(conn, intent["intent_id"],
                                confirmed_filled_qty=sold)
         else:
             eil.update_progress(conn, intent["intent_id"], sold)
+        return intent
     except Exception:  # noqa: BLE001
         logger.warning("S6 could not settle the exit intent for %s; the "
                        "position itself is closed", position_id,
-                       exc_info=True)
+                     exc_info=True)
+        return None
 
 
 def sync_sell_fills(conn, *, fills_for, session=None, now=None) -> List[Dict[str, Any]]:
@@ -392,7 +394,22 @@ def sync_sell_fills(conn, *, fills_for, session=None, now=None) -> List[Dict[str
                 conn, pid, reason=row.get("exit_reason"),
                 exit_price=fill.get("average_fill_price"),
                 exit_session=_session_name(session), now=now)
-            _settle_intent(conn, pid, sold, done=True)
+            intent = _settle_intent(conn, pid, sold, done=True)
+            if intent:
+                # The broker fill that closed the position is direct,
+                # positive execution evidence.  Keep the idempotency
+                # projection terminal too; failure here never reopens the
+                # position or causes a new SELL.
+                from reconciliation import sell_projection
+
+                sell_projection.settle_confirmed_sell(
+                    conn, client_order_id=intent.get("client_order_id"),
+                    broker_order_id=intent.get("broker_order_id") or fill.get("order_id"),
+                    confirmed_filled_qty=sold,
+                    expected_quantity=intent.get("requested_qty"),
+                    event_type="SELL_FILL_SYNCED",
+                    evidence="broker_fill_sync", now=now,
+                )
             _record_broker_fill_time(conn, pid, fill.get("broker_timestamp"))
             results.append({"position_id": pid, "symbol": symbol,
                             "status": "CLOSED", "sold": sold,

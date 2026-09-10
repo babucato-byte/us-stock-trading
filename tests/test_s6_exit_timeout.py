@@ -363,14 +363,26 @@ class TestS1AndOtherS6ExitBehaviorUnchanged:
         assert "exit_timeout" not in inspect.getsource(s1_exit)
 
     def test_recover_dead_exits_and_reconcile_unconfirmed_exits_unchanged(self):
-        """git diff proof: the existing exit_runtime.py functions this
-        module hands off to (_abort_intent, release_dead_exit via
-        position_store) are called, not reimplemented."""
+        """`s1_live/exit_runtime.py`, `s6_live/position_store.py` and
+        `state_store/exit_intent_ledger.py` stay untouched by this
+        module's own work -- a byte-diff proof, since nothing about
+        exit_timeout.py has any reason to touch them.
+
+        `s6_live/exit_runtime.py` is deliberately NOT included here: a
+        later, independent change (reconciliation/sell_projection.py's
+        settle-on-fill hook inside sync_sell_fills) legitimately touches
+        that file without touching anything this module depends on --
+        `_abort_intent` and `position_store.release_dead_exit`, both
+        exercised end-to-end and still passing in
+        TestOpenCancelableSellEntersCancelFlow above. A whole-file diff
+        proof cannot distinguish "this module broke" from "an unrelated
+        change landed in the same file", so it checks only the files
+        that should never have either.
+        """
         import subprocess
 
         diff = subprocess.run(
-            ["git", "diff", "--stat", "HEAD", "--", "s6_live/exit_runtime.py",
-             "s1_live/exit_runtime.py", "s6_live/position_store.py",
-             "state_store/exit_intent_ledger.py"],
+            ["git", "diff", "--stat", "HEAD", "--", "s1_live/exit_runtime.py",
+             "s6_live/position_store.py", "state_store/exit_intent_ledger.py"],
             capture_output=True, text=True).stdout
         assert diff.strip() == "", diff
