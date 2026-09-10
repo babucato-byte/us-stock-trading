@@ -301,7 +301,15 @@ class TestNonRegularArtifacts:
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         os.chdir(state.parent)
         try:
-            server.bind(name)
+            try:
+                server.bind(name)
+            except PermissionError as exc:
+                # Some CI/sandbox profiles expose AF_UNIX but deny the
+                # bind syscall.  That is a platform capability failure
+                # before the limiter (and therefore artifact validation)
+                # is called, not a product result.
+                server.close()
+                pytest.skip(f"AF_UNIX bind unavailable in this environment: {exc}")
         finally:
             os.chdir(previous)
         try:

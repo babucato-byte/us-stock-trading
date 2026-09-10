@@ -254,6 +254,12 @@ class TestAdmitS6PassProvisionallyHook:
         from s6_live import active_watch
 
         monkeypatch.setenv("S6_ACTIVE_WATCH_DIR", str(tmp_path))
+        # The runner correctly scopes a live provisional PASS to the
+        # current session.  This historical fixture instead exercises
+        # 2026-09-09, so inject that clock-derived value rather than
+        # accidentally writing today's provisional file and reading the
+        # fixture day's file below.
+        monkeypatch.setattr(active_watch, "session_scope", lambda _session: DAY)
         runner._admit_s6_pass_provisionally(
             self._signal(), trading_day=DAY, session=SESSION,
             scan_id="run-1", full_scan_started_at="2026-09-09T08:02:12Z")
