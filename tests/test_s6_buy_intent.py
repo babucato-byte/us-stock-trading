@@ -337,3 +337,89 @@ class TestFunnelDoesNotMisreadTheHandoffAsADefect:
             {"submitted": [], "blocked": [], "skipped": []},
             since=NOW)  # expect_no_submission defaults to False
         assert called["n"] == 1
+
+
+class TestExecutionFunnelAnnouncesBlocks:
+    """A worker tick's own blocks (INSUFFICIENT_CASH, RISK_BLOCKED,
+    SESSION_BLOCKED, ...) must reach stock-live-trading exactly like a
+    fast-watch tick's blocks always have -- `_execution_funnel` used to
+    log FUNNEL_EXECUTION_SYMBOL and stop there, never calling
+    `_announce_blocks`, so every block the decoupled worker itself
+    produced went completely unannounced."""
+
+    def test_execution_funnel_calls_announce_blocks(self, monkeypatch):
+        from scripts import run_live_buy_entry as runner
+
+        seen = []
+        monkeypatch.setattr(runner, "_announce_blocks", lambda blocked: seen.append(list(blocked)))
+
+        source = SimpleNamespace(intent_metadata=lambda s: {})
+        results = {"submitted": [], "skipped": [],
+                  "blocked": [("BH", "insufficient KIS orderable cash for even 1 share "
+                                     "available=16.00 required=356.83 shortfall=340.83")]}
+        runner._execution_funnel(source, ["BH"], results, since=NOW)
+        assert seen == [[("BH", "insufficient KIS orderable cash for even 1 share "
+                               "available=16.00 required=356.83 shortfall=340.83")]]
+
+    def test_execution_funnel_with_no_blocks_calls_announce_blocks_with_empty(self):
+        from scripts import run_live_buy_entry as runner
+
+        source = SimpleNamespace(intent_metadata=lambda s: {})
+        calls = {"n": 0}
+
+        def _record(blocked):
+            calls["n"] += 1
+            assert list(blocked) == []
+        import unittest.mock
+        with unittest.mock.patch.object(runner, "_announce_blocks", _record):
+            runner._execution_funnel(
+                source, [], {"submitted": [], "blocked": [], "skipped": []}, since=NOW)
+        assert calls["n"] == 1
+
+
+class TestExecutionWorkerFailureAlert:
+    """An unhandled crash in the execution worker must not be silent --
+    claimed BUY_INTENTs sit unprocessed until the next minute, and an
+    operator needs to know the worker itself is failing, not just infer
+    it from a gap in FUNNEL_EXECUTION lines."""
+
+    def test_worker_failure_sends_a_live_alert(self, monkeypatch):
+        from scripts import run_live_buy_entry as runner
+
+        monkeypatch.setattr(runner, "refusal_reason", lambda: None)
+        monkeypatch.setattr(runner, "_s1_is_falling_behind", lambda: False)
+
+        def _boom(*, strategy):
+            raise RuntimeError("boom")
+        monkeypatch.setattr(runner, "run_once", _boom)
+
+        alerted = {}
+        import operations.alerts as alerts
+        monkeypatch.setattr(alerts, "send_alert",
+                            lambda message: alerted.setdefault("message", message) or True)
+
+        status = runner.main(["--strategy", "s6_buy_worker"])
+        assert status == runner.EXIT_ERROR
+        assert "execution worker failed" in alerted["message"]
+
+    def test_s1_failure_does_not_send_the_worker_alert(self, monkeypatch):
+        """Scoped to the new worker strategy only -- S1's own failure
+        modes are unrelated to this task and already have their own
+        (different) monitoring; this must not change S1's behavior."""
+        from scripts import run_live_buy_entry as runner
+
+        monkeypatch.setattr(runner, "refusal_reason", lambda: None)
+        monkeypatch.setattr(runner, "_s1_is_falling_behind", lambda: False)
+
+        def _boom(*, strategy):
+            raise RuntimeError("boom")
+        monkeypatch.setattr(runner, "run_once", _boom)
+
+        alerted = {"n": 0}
+        import operations.alerts as alerts
+        monkeypatch.setattr(alerts, "send_alert",
+                            lambda message: alerted.__setitem__("n", alerted["n"] + 1))
+
+        status = runner.main(["--strategy", "s1"])
+        assert status == runner.EXIT_ERROR
+        assert alerted["n"] == 0

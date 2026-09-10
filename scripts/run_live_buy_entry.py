@@ -336,6 +336,16 @@ def _execution_funnel(source, claimed, results, *, since):
     logger.info(
         "FUNNEL_EXECUTION claimed=%d submitted=%d blocked=%d skipped=%d",
         len(claimed), len(submitted), len(blocked), len(skipped))
+    # `_funnel()` (the fast-watch tick) announces blocks to stock-live-
+    # trading; this is the worker's own funnel and never called that,
+    # so every INSUFFICIENT_CASH/RISK_BLOCKED/SESSION_BLOCKED/etc. the
+    # worker's own gates produced went completely unannounced -- logged,
+    # never presented, since the day READY was decoupled from
+    # submission. The routine/transient codes (execution-lock
+    # contention, symbol-already-held) stay silent exactly as before --
+    # that filtering lives in operations.slack_presentation.
+    # SILENT_BLOCK_CODES, not here.
+    _announce_blocks(results.get("blocked") or ())
     for symbol in sorted(claimed):
         meta = source.intent_metadata(symbol) if hasattr(source, "intent_metadata") else {}
         first_ready_at = meta.get("first_ready_at")
@@ -1097,6 +1107,23 @@ def main(argv=None):
         return EXIT_FATAL_DB
     except Exception as exc:  # noqa: BLE001 -- service entrypoint
         logger.exception("live buy-entry cycle failed: %s", exc)
+        if args.strategy == "s6_buy_worker":
+            # The execution worker is the one process that can reach the
+            # broker for S6; an unhandled crash here means claimed
+            # BUY_INTENTs sit unprocessed until the next minute silently
+            # retries -- exactly the "execution worker failure" case
+            # operators need to see on stock-live-alerts, not just in a
+            # log line nobody is watching between ticks.
+            try:
+                from operations import alerts
+                alerts.send_alert(
+                    "*S6 execution worker failed*\n"
+                    f"- cause: {type(exc).__name__}\n"
+                    "- effect: claimed BUY_INTENTs were not processed this tick; "
+                    "the next minute retries automatically"
+                )
+            except Exception:  # noqa: BLE001 -- alerting must not mask the fault
+                logger.error("could not alert on execution worker failure", exc_info=True)
         return EXIT_ERROR
 
     logger.info(
