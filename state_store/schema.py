@@ -1363,6 +1363,32 @@ MIGRATION_28_STATEMENTS = [
 ]
 
 
+# Migration 29: EXIT V2 PHASE 2 -- the shadow decision, on the SAME row
+# as the live one it was computed alongside, so "run side by side" is
+# literal: one row, both verdicts. See s6_live/exit_shadow.py. Shadow
+# columns decide nothing live; nothing outside exit_shadow.py/
+# exit_snapshot.py writes them.
+_S6_EXIT_SNAPSHOTS_SHADOW_COLUMNS = (
+    ("live_exit_reason", "TEXT"),
+    ("shadow_vwap_state", "TEXT"),
+    ("shadow_vwap_breach_streak", "INTEGER"),
+    ("shadow_liquidity_state", "TEXT"),
+    ("shadow_structure_state", "TEXT"),
+    ("shadow_momentum_state", "TEXT"),
+    ("shadow_time_stop_state", "TEXT"),
+    ("shadow_v2_decision", "TEXT"),
+    ("shadow_v2_reason", "TEXT"),
+    ("shadow_confidence", "REAL"),
+    ("shadow_evidence", "TEXT"),
+    ("would_exit_now", "INTEGER"),
+    ("would_hold_now", "INTEGER"),
+)
+MIGRATION_29_STATEMENTS = [
+    f"ALTER TABLE s6_exit_snapshots ADD COLUMN {name} {kind}"
+    for name, kind in _S6_EXIT_SNAPSHOTS_SHADOW_COLUMNS
+]
+
+
 # Every table this schema version creates -- used by export.py's
 # export_all() and by tests asserting the full table set exists.
 ALL_TABLES = [

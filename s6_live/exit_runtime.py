@@ -479,17 +479,29 @@ def evaluate_position(conn, *, broker_adapter, position_id, row,
             ", ".join(diagnostics["unavailable_rules"]))
         diagnostics["position_data_unavailable"] = bool(whole_view_missing)
 
-    # EXIT V2 PHASE 1: durable instrumentation, never a trading input.
-    # Persisted for HOLD and SELL alike, after the decision above is
-    # already final -- nothing here can change it. See
-    # s6_live/exit_snapshot.py.
+    # EXIT V2 PHASE 1+2: durable instrumentation and a shadow decision,
+    # never a trading input. Computed and persisted for HOLD and SELL
+    # alike, after the decision above is already final -- nothing below
+    # can change it, and the shadow decision (exit_shadow.py) only READS
+    # decision.reason/.action, it does not call exit_policy.decide()
+    # again or touch position_store/exit_intent_ledger for anything but
+    # the read-only active-intent lookup exit_snapshot.build() already
+    # does. See s6_live/exit_snapshot.py and s6_live/exit_shadow.py.
     try:
-        from s6_live import exit_snapshot
+        from s6_live import exit_shadow, exit_snapshot
 
+        prior_row = exit_snapshot.last_snapshot(conn, position_id)
         snapshot = exit_snapshot.build(
             conn=conn, position_id=position_id, row=refreshed,
             features=features, diagnostics=diagnostics, decision=decision,
-            now=now)
+            now=now, prior_row=prior_row)
+        try:
+            snapshot = exit_shadow.build(
+                prior_row=prior_row, snapshot=snapshot, live_action=decision.action)
+        except Exception:  # noqa: BLE001 - the Phase 1 snapshot must
+            # still persist even if the Phase 2 shadow computation fails.
+            logger.warning("S6 exit shadow decision failed for %s", symbol,
+                           exc_info=True)
         exit_snapshot.persist(conn, snapshot, now=now)
     except Exception:  # noqa: BLE001 - instrumentation must never affect
         # the exit decision or stop the tick that already made it.

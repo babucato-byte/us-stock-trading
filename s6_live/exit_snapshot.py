@@ -39,6 +39,11 @@ from s6_live import exit_policy
 
 logger = logging.getLogger(__name__)
 
+#: Distinguishes "the caller did not pass prior_row, fetch it" from
+#: "the caller passed prior_row=None, meaning genuinely no history" --
+#: None is a real, meaningful value here (a position's first tick).
+_UNSET = object()
+
 #: `exit_policy.decide()`'s own priority order, restated as a rank so a
 #: replay can sort/compare without re-reading the module docstring.
 #: 0 is the pre-priority corrupted-state check; SELL reasons that never
@@ -103,18 +108,21 @@ def _parse_at(stamp) -> Optional[datetime]:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def _last_snapshot(conn, position_id) -> Optional[Dict[str, Any]]:
-    """The most recently persisted row for this position, or None.
+def last_snapshot(conn, position_id) -> Optional[Dict[str, Any]]:
+    """The most recently persisted row for this position (every column,
+    live and Phase 2 shadow alike), or None.
 
     One indexed local read (idx_s6_exit_snapshots_position), never a
-    network call -- used only to classify a state TRANSITION (a breach
-    vs. a continuing below), never to alter this tick's own measurements.
+    network call. Public so a caller building both the live snapshot and
+    the Phase 2 shadow decision for the same tick (see
+    `s6_live.exit_runtime`) reads it once and passes it to both, rather
+    than each independently re-querying the same row.
     """
     if conn is None:
         return None
     try:
         row = conn.execute(
-            "SELECT vwap_state FROM s6_exit_snapshots WHERE position_id = ? "
+            "SELECT * FROM s6_exit_snapshots WHERE position_id = ? "
             "ORDER BY evaluated_at DESC, snapshot_id DESC LIMIT 1",
             (position_id,),
         ).fetchone()
@@ -164,11 +172,17 @@ def _momentum_state(conditions, would_sell_reason) -> str:
 
 
 def build(*, conn, position_id, row, features, diagnostics, decision,
-         now=None) -> Dict[str, Any]:
+         now=None, prior_row=_UNSET) -> Dict[str, Any]:
     """The full persisted record for one tick. Never raises -- a failure
     to build a shadow record must not touch the trading decision that
     already happened; the caller wraps this in its own try/except too,
-    but a partial record here is still better than none."""
+    but a partial record here is still better than none.
+
+    `prior_row`: pass the result of `last_snapshot(conn, position_id)`
+    if the caller already fetched it this tick (e.g. to also build a
+    Phase 2 shadow record from the same row) to avoid querying twice;
+    omitted, this fetches it itself exactly as before.
+    """
     moment = now or datetime.now(timezone.utc)
     quality = getattr(features, "entry_quality", None)
     price = diagnostics.get("price")
@@ -178,7 +192,7 @@ def build(*, conn, position_id, row, features, diagnostics, decision,
     peak_price = _finite(peak.get("peak_price"))
     conditions = diagnostics.get("conditions") or {}
 
-    previous = _last_snapshot(conn, position_id)
+    previous = last_snapshot(conn, position_id) if prior_row is _UNSET else prior_row
     previous_vwap_state = (previous or {}).get("vwap_state")
     vwap_state = _vwap_state(price, vwap, previous_vwap_state)
 
@@ -280,6 +294,17 @@ _COLUMNS = (
     "liquidity_state", "momentum_state",
 )
 
+#: EXIT V2 PHASE 2 (migration 29): the shadow decision, persisted on the
+#: SAME row as the live fields above -- optional, so a Phase-1-only
+#: caller (a record dict that never set these) still writes cleanly,
+#: with every shadow column simply NULL. See s6_live/exit_shadow.py.
+_SHADOW_COLUMNS = (
+    "live_exit_reason", "shadow_vwap_state", "shadow_vwap_breach_streak",
+    "shadow_liquidity_state", "shadow_structure_state", "shadow_momentum_state",
+    "shadow_time_stop_state", "shadow_v2_decision", "shadow_v2_reason",
+    "shadow_confidence", "shadow_evidence", "would_exit_now", "would_hold_now",
+)
+
 
 def _json_default(value):
     if isinstance(value, datetime):
@@ -295,12 +320,21 @@ def persist(conn, record: Dict[str, Any], *, now=None) -> None:
     row, never the tick that computed it."""
     try:
         moment = now or datetime.now(timezone.utc)
-        values = [record.get(name) for name in _COLUMNS]
-        values[_COLUMNS.index("exit_submitted")] = (
+        all_columns = _COLUMNS + _SHADOW_COLUMNS
+        values = [record.get(name) for name in all_columns]
+        # exit_submitted is NOT NULL DEFAULT 0: never leave it NULL.
+        # would_exit_now/would_hold_now are nullable (absent for a
+        # Phase-1-only record) and stay NULL when genuinely unset.
+        values[all_columns.index("exit_submitted")] = (
             1 if record.get("exit_submitted") else 0)
-        placeholders = ", ".join("?" for _ in _COLUMNS)
+        for name in ("would_exit_now", "would_hold_now"):
+            idx = all_columns.index(name)
+            raw = record.get(name)
+            if raw is not None:
+                values[idx] = 1 if raw else 0
+        placeholders = ", ".join("?" for _ in all_columns)
         conn.execute(
-            f"INSERT INTO s6_exit_snapshots ({', '.join(_COLUMNS)}, "
+            f"INSERT INTO s6_exit_snapshots ({', '.join(all_columns)}, "
             "diagnostics_json, created_at) VALUES "
             f"({placeholders}, ?, ?)",
             (*values, json.dumps(record.get("diagnostics_json") or {},
