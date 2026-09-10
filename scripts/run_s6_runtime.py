@@ -67,6 +67,7 @@ def run_once(*, now=None) -> dict:
               "unconfirmed_exits": [],
               "adopted_fills": [],
               "recovered_exits": [],
+              "stale_sell_timeouts": [],
               "errors": []}
 
     with open_db() as conn:
@@ -151,6 +152,19 @@ def run_once(*, now=None) -> dict:
                 conn, fills_for=_sell_fill_lookup(
                     conn, broker, now=moment, open_orders=open_orders),
                 session=session, now=moment)),
+            # AFTER the sell sync, so a SELL that just filled is already
+            # closed and never reaches this. Handles the OTHER gap
+            # `recovered_exits` below cannot: a SELL KIS keeps genuinely
+            # OPEN, unfilled, past a safe wait -- SCL on 2026-09-10, six
+            # hours ACCEPTED with nothing anywhere that would ever act
+            # on it. Cancels through the same sanctioned engine path a
+            # BUY timeout uses, confirms the cancel before releasing
+            # anything, and leaves the position EXIT_PENDING for the
+            # ordinary `retried` stage to pick up on the NEXT tick --
+            # same one-tick delay `recovered_exits` already uses below,
+            # so a cancel and an immediate resubmission never race.
+            ("stale_sell_timeouts", lambda: _stale_sell_timeouts(
+                conn, broker=broker, moment=moment)),
             # AFTER the sell sync, so a SELL that actually filled has
             # already closed its position and never reaches this. What is
             # left is an exit that is finished at the broker and did NOT
@@ -245,6 +259,20 @@ def _entry_timeouts(conn, *, broker, session, moment, capability):
     return entry_timeout.evaluate(
         conn, broker=broker, account_id=account_id, source=source,
         now=moment, session_orderable=capability.entry_supported)
+
+def _stale_sell_timeouts(conn, *, broker, moment):
+    """Cancel S6 SELLs that have rested, genuinely still open at KIS,
+    past the safe timeout -- see s6_live/exit_timeout.py."""
+    from s6_live import exit_timeout
+
+    account_id = None
+    try:
+        account_id = broker.config.account_no
+    except Exception:  # noqa: BLE001
+        pass
+
+    return exit_timeout.evaluate(conn, broker=broker, account_id=account_id, now=moment)
+
 
 def _attach_session_report(report, *, conn, session, now) -> None:
     """Generate the shadow-session report automatically, on the tick.

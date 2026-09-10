@@ -86,6 +86,14 @@ DB_FAILURE = "DB_FAILURE"
 HALT_ACTIVATED = "HALT_ACTIVATED"
 KILL_SWITCH_ACTIVATED = "KILL_SWITCH_ACTIVATED"
 WATCHDOG_ESCALATED = "WATCHDOG_ESCALATED"
+#: A protective SELL rested, genuinely open at KIS, past
+#: s6_live.exit_timeout's safe timeout -- see that module. Fired once
+#: per position (dedupe_subject=position_id), not once per tick.
+SELL_STUCK_TIMEOUT = "SELL_STUCK_TIMEOUT"
+#: The subsequent cancel attempt for that SELL was ambiguous, failed,
+#: or did not actually clear KIS's book. No replacement is attempted
+#: while this stands -- reconciliation owns it.
+SELL_CANCEL_UNRESOLVED = "SELL_CANCEL_UNRESOLVED"
 
 # -- end of day ----------------------------------------------------------
 DAILY_SUMMARY = "DAILY_SUMMARY"
@@ -99,6 +107,7 @@ EVENTS = frozenset({
     CANCEL_REQUESTED, CANCEL_COMPLETED, CANCEL_FAILED,
     RECONCILIATION_MISMATCH, POSITION_MISMATCH, KIS_API_FAILURE, DB_FAILURE,
     HALT_ACTIVATED, KILL_SWITCH_ACTIVATED, WATCHDOG_ESCALATED,
+    SELL_STUCK_TIMEOUT, SELL_CANCEL_UNRESOLVED,
     DAILY_SUMMARY,
 })
 
@@ -108,6 +117,7 @@ URGENT_EVENTS = frozenset({
     ORDER_UNKNOWN, CANCEL_FAILED, RECONCILIATION_MISMATCH,
     POSITION_MISMATCH, KIS_API_FAILURE, DB_FAILURE, HALT_ACTIVATED,
     KILL_SWITCH_ACTIVATED, WATCHDOG_ESCALATED,
+    SELL_STUCK_TIMEOUT, SELL_CANCEL_UNRESOLVED,
 })
 
 #: Intermediate states of a lifecycle that already has a final message.
