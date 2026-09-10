@@ -33,20 +33,36 @@ class TestPriorityTiers:
             self._entry("A", strategy_source="S6_PROVISIONAL_PASS",
                         transport_source=active_watch.TRANSPORT_REST)) == 0
 
-    def test_published_discovery_is_tier_one(self):
+    def test_ready_near_is_tier_one_regardless_of_strategy_source(self):
+        """A symbol the LAST evaluation left one condition away from
+        READY is scheduled right after a fresh provisional PASS -- ahead
+        of a merely-discovered symbol with no such recent promise."""
+        assert fast_watch.ActiveWatchSource._priority_tier(
+            self._entry("A", strategy_source=active_watch.COLLECTOR_MEMBERSHIP_SOURCE,
+                        transport_source=active_watch.TRANSPORT_REST),
+            ready_near=True) == 1
+
+    def test_published_discovery_is_tier_two(self):
         assert fast_watch.ActiveWatchSource._priority_tier(
             self._entry("A", strategy_source="S6_FULL_DISCOVERY",
-                        transport_source=active_watch.TRANSPORT_REST)) == 1
+                        transport_source=active_watch.TRANSPORT_REST)) == 2
 
-    def test_websocket_backed_no_signal_is_tier_two(self):
+    def test_websocket_backed_no_signal_is_tier_three(self):
         assert fast_watch.ActiveWatchSource._priority_tier(
             self._entry("A", strategy_source=active_watch.COLLECTOR_MEMBERSHIP_SOURCE,
-                        transport_source=active_watch.TRANSPORT_WEBSOCKET)) == 2
+                        transport_source=active_watch.TRANSPORT_WEBSOCKET)) == 3
 
-    def test_rest_backed_no_signal_is_tier_three_the_lowest(self):
+    def test_rest_backed_no_signal_is_tier_four_the_lowest(self):
         assert fast_watch.ActiveWatchSource._priority_tier(
             self._entry("A", strategy_source=active_watch.COLLECTOR_MEMBERSHIP_SOURCE,
-                        transport_source=active_watch.TRANSPORT_REST)) == 3
+                        transport_source=active_watch.TRANSPORT_REST)) == 4
+
+    def test_tier_groups_map_to_hot_warm_cold(self):
+        assert fast_watch.ActiveWatchSource.tier_group(0) == "HOT"
+        assert fast_watch.ActiveWatchSource.tier_group(1) == "HOT"
+        assert fast_watch.ActiveWatchSource.tier_group(2) == "WARM"
+        assert fast_watch.ActiveWatchSource.tier_group(3) == "WARM"
+        assert fast_watch.ActiveWatchSource.tier_group(4) == "COLD"
 
     def test_a_fresh_pass_is_scheduled_ahead_of_a_deep_backlog(self, tmp_path, monkeypatch):
         """The exact production scenario: 80 established collector-

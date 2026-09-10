@@ -643,3 +643,31 @@ def record_evaluation(session_date, record, *, session=SESSION, env=None) -> Non
         # This is observability after the decision. It must not manufacture
         # a different decision because its own disk is unavailable.
         return
+
+
+def record_evaluations_batch(session_date, records, *, session=SESSION, env=None) -> None:
+    """The same durable per-symbol record `record_evaluation` writes, for
+    every symbol a fast-watch tick evaluated, in ONE flock acquisition and
+    ONE write instead of one of each per symbol.
+
+    A fast-watch tick with N evaluated symbols used to pay N separate
+    open/flock/write round trips for this audit trail alone -- pure
+    observability, never read by trading, but still real per-symbol wall
+    time inside the same tick a live py-spy trace on 2026-09-09 found
+    already running close to its own budget. Batching removes that cost
+    without changing what is recorded or its shape: each row is still
+    exactly what `record_evaluation` would have written for that symbol.
+    """
+    if not records:
+        return
+    try:
+        target = _root(env) / f"{session_date}-{str(session).upper()}-evaluations.jsonl"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "a", encoding="utf-8") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            for record in records:
+                handle.write(json.dumps(record, sort_keys=True, default=str) + "\n")
+    except Exception:
+        # Same contract as record_evaluation: an observability write must
+        # never manufacture a different trading decision.
+        return

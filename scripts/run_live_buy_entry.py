@@ -487,12 +487,16 @@ def _log_s6_transport_funnel(source, *, ready, watching) -> None:
         return
     try:
         info = source.describe()
+        tiers = info.get("tier_counts") or {}
         logger.info(
             "FUNNEL_S6_TRANSPORT logical_watch=%s websocket_backed=%s rest_backed=%s "
-            "fast_evaluated=%s deferred=%s watching=%d ready=%d",
+            "fast_evaluated=%s deferred=%s watching=%d ready=%d "
+            "hot=%s warm=%s cold=%s load_ms=%s eval_loop_ms=%s",
             info.get("watchlist_size"), info.get("websocket_backed"),
             info.get("rest_backed"), info.get("fast_evaluated"),
-            info.get("deferred"), watching, ready)
+            info.get("deferred"), watching, ready,
+            tiers.get("HOT"), tiers.get("WARM"), tiers.get("COLD"),
+            info.get("load_ms"), info.get("eval_loop_ms"))
     except Exception:  # noqa: BLE001 -- reporting must never affect trading
         logger.warning("could not log S6 transport funnel", exc_info=True)
 

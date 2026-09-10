@@ -14,7 +14,7 @@ from typing import Any, Dict, FrozenSet, List, Optional
 
 from config import s6_sessions, scanner_live_mode
 from s6_live import active_watch, pretrade_validation, precision_watch
-from s6_live import realtime_features
+from s6_live import realtime_features, watch_priority_state
 from s6_live.candidate_source import SIGNAL_VALID_SECONDS, SOURCE_S6
 
 logger = logging.getLogger(__name__)
@@ -22,6 +22,24 @@ logger = logging.getLogger(__name__)
 #: S6's premarket input is a one-minute grid (collector store bars and the
 #: closed-bar filter in kis_bar_features both use whole minutes).
 BAR_WIDTH_MINUTES = 1.0
+
+#: How much of the TICK's own wall clock (measured from `self._now`, the
+#: tick's true start -- see __init__) this whole symbols() call may
+#: spend: loading/prioritising the watchlist AND the per-symbol
+#: evaluation loop, combined. Production evidence 2026-09-09/10: ticks
+#: ranging 37-69s with a 41% OVERLAP_SKIPPED rate, traced to the
+#: per-symbol Budget being a fresh, independent clock started only
+#: AFTER `_load()` already ran -- so a slow load left the eval loop
+#: just as much time as a fast one, and the tick's TOTAL cost was
+#: whatever the two happened to add up to, unbounded from the tick's
+#: own perspective. Constructing the Budget from the time actually
+#: LEFT in this deadline (not a fresh window) makes total wall time
+#: independent of how large the logical watchlist is: a slow load or
+#: a big backlog can only ever shrink how much evaluation happens this
+#: tick, never how long the tick itself runs. Leaves ~5-10s headroom
+#: under run_live_buy_entry.py's own 50s hard tick budget for
+#: _s6_write_intents' write and _funnel's report.
+FAST_WATCH_TICK_DEADLINE_SECONDS = 45.0
 
 
 class ActiveWatchSource:
@@ -37,6 +55,17 @@ class ActiveWatchSource:
         self._provider = provider
         self._budget_seconds = budget_seconds
         self._env = env
+        # The REAL wall clock at construction, deliberately separate from
+        # `self._now` (which callers -- tests especially -- may set to an
+        # artificial, fixed timestamp for deterministic evaluation
+        # timestamps). The tick's own deadline must be measured against
+        # actual elapsed wall time regardless of what `now` means for
+        # signal-validity/evaluation purposes; conflating the two made an
+        # early version of this budget see a "tick start" days or months
+        # in the past whenever a fixed `now` was supplied, and every
+        # symbol appeared to already be over budget before the first one
+        # was even evaluated.
+        self._constructed_at = datetime.now(timezone.utc)
         # The date this session STARTED. For OVERNIGHT_DAYTIME that is not
         # the trading day once the clock passes midnight ET.
         self._scope = active_watch.session_scope(self._session, self._now)
@@ -47,6 +76,12 @@ class ActiveWatchSource:
         self.validation_report: Dict[str, Any] = {}
         self.transport_counts: Dict[str, int] = {}
         self._consumed_at = None
+        # Profiling (§8): populated once symbols() actually runs. Zeroed
+        # here so a caller reading these before symbols() (or a session
+        # this source never scans) gets real numbers, not AttributeError.
+        self.load_ms: float = 0.0
+        self.eval_loop_ms: float = 0.0
+        self.eval_symbol_timings_ms: Dict[str, float] = {}
 
     def _load(self):
         if self._state is not None:
@@ -82,45 +117,77 @@ class ActiveWatchSource:
     #: that ordering and this never touches it, only re-sorts the
     #: symbols this ONE tick iterates for evaluation).
     #:
-    #: Priority, highest first:
-    #:   P0  a live PASS from the scan CURRENTLY holding the cycle lock
-    #:       (active_watch._live_provisional's own liveness gate is what
-    #:       makes strategy_source == PROVISIONAL_SOURCE synonymous with
-    #:       "current run": a dead scan's rows are excluded before they
-    #:       ever reach the watchlist, and a completed scan's rows have
-    #:       already become FULL_DISCOVERY_SOURCE by the time its lock
-    #:       releases -- see refresh_from_existing_sources's precedence
-    #:       rule). This is the whole point of incremental admission: a
-    #:       fresh PASS must not queue behind an established backlog.
-    #:   P1  S6 already discovered this symbol this session (a published,
-    #:       completed-manifest row) -- a real signal, just not the one
-    #:       that just happened.
-    #:   P2  no S6 signal at all, but WebSocket-backed: a local snapshot
-    #:       read costs no REST budget, so judging it is nearly free.
-    #:   P3  no S6 signal, REST-backed: costs the scarce per-tick budget
-    #:       for a symbol S6 never actually flagged.
+    #: Priority, highest first (HOT = P0-P1, WARM = P2-P3, COLD = P4):
+    #:   P0  HOT   a live PASS from the scan CURRENTLY holding the cycle
+    #:             lock (active_watch._live_provisional's own liveness
+    #:             gate is what makes strategy_source ==
+    #:             PROVISIONAL_SOURCE synonymous with "current run": a
+    #:             dead scan's rows are excluded before they ever reach
+    #:             the watchlist, and a completed scan's rows have
+    #:             already become FULL_DISCOVERY_SOURCE by the time its
+    #:             lock releases). This is the whole point of
+    #:             incremental admission: a fresh PASS must not queue
+    #:             behind an established backlog.
+    #:   P1  HOT   READY-near: the LAST tick that actually evaluated this
+    #:             symbol (watch_priority_state, not this cycle's own
+    #:             strategy verdict) left it READY or one condition away.
+    #:             A symbol S6 already almost qualified is worth judging
+    #:             again before a symbol S6 has no opinion on at all.
+    #:   P2  WARM  S6 already discovered this symbol this session (a
+    #:             published, completed-manifest row) -- a real signal,
+    #:             just not the one that just happened and not close.
+    #:   P3  WARM  no S6 signal at all, but WebSocket-backed: a local
+    #:             snapshot read costs no REST budget, so judging it is
+    #:             nearly free.
+    #:   P4  COLD  no S6 signal, REST-backed: costs the scarce per-tick
+    #:             budget for a symbol S6 never actually flagged.
     #: What the tick's Budget cannot reach this minute is deferred, not
     #: invalidated, and is retried from a (possibly changed) priority
-    #: position on the next tick -- see symbols() below.
+    #: position on the next tick -- see symbols() below. Within a tier,
+    #: a symbol deferred more consecutive times sorts first (aging/
+    #: starvation prevention, watch_priority_state.consecutive_defers):
+    #: list position alone would otherwise let a fixed set of
+    #: higher-tier symbols starve the same low-tier symbol forever.
     _PROVISIONAL_STRATEGY_SOURCE = "S6_PROVISIONAL_PASS"
     _FULL_DISCOVERY_STRATEGY_SOURCE = "S6_FULL_DISCOVERY"
 
+    #: HOT/WARM/COLD grouping of the numeric tiers above, for reporting
+    #: only (§4/§21) -- the numeric tier is what scheduling actually
+    #: uses; this never feeds back into it.
+    _TIER_GROUP = {0: "HOT", 1: "HOT", 2: "WARM", 3: "WARM", 4: "COLD"}
+
     @classmethod
-    def _priority_tier(cls, entry) -> int:
+    def _priority_tier(cls, entry, *, ready_near: bool = False) -> int:
         strategy = entry.get("strategy_source")
         if strategy == cls._PROVISIONAL_STRATEGY_SOURCE:
             return 0
-        if strategy == cls._FULL_DISCOVERY_STRATEGY_SOURCE:
+        if ready_near:
             return 1
-        return 2 if entry.get("transport_source") == active_watch.TRANSPORT_WEBSOCKET else 3
+        if strategy == cls._FULL_DISCOVERY_STRATEGY_SOURCE:
+            return 2
+        return 3 if entry.get("transport_source") == active_watch.TRANSPORT_WEBSOCKET else 4
+
+    @classmethod
+    def tier_group(cls, tier: int) -> str:
+        return cls._TIER_GROUP.get(tier, "COLD")
 
     def _active_symbols(self) -> List[str]:
         state = self._load()
         if state.get("status") != "ACTIVE":
             return []
         entries = [r for r in state.get("entries") or () if r.get("symbol")]
-        ranked = sorted(enumerate(entries),
-                        key=lambda pair: (self._priority_tier(pair[1]), pair[0]))
+        scheduling = watch_priority_state.read(self._scope, self._session, env=self._env)
+
+        def _key(pair):
+            idx, entry = pair
+            symbol = str(entry.get("symbol") or "").upper()
+            sched = scheduling.get(symbol) or {}
+            tier = self._priority_tier(
+                entry, ready_near=watch_priority_state.is_ready_near(sched))
+            aging = -watch_priority_state.consecutive_defers(sched)
+            return (tier, aging, idx)
+
+        ranked = sorted(enumerate(entries), key=_key)
         return [str(r.get("symbol") or "").upper() for _, r in ranked]
 
     def _operator_allowed(self, symbols) -> FrozenSet[str]:
@@ -132,10 +199,32 @@ class ActiveWatchSource:
         return self._operator_allowed(self._active_symbols())
 
     def symbols(self) -> List[str]:
+        load_started_at = datetime.now(timezone.utc)
         offered = [s for s in self._active_symbols() if s in self.allowed_symbols()]
-        budget = pretrade_validation.Budget(self._budget_seconds)
+        load_finished_at = datetime.now(timezone.utc)
+        self.load_ms = (load_finished_at - load_started_at).total_seconds() * 1000
+
+        # The per-symbol Budget sees what is actually LEFT of the tick's
+        # own deadline (measured from self._constructed_at, the REAL
+        # wall clock when this source was built -- not self._now, which
+        # may be an artificial fixed timestamp), not a fresh window
+        # starting whenever this line happens to run. A slow _load() --
+        # or a large logical watchlist making the priority sort itself
+        # take longer -- can only ever shrink this tick's evaluation
+        # allowance, never let the tick's own total wall time grow past
+        # FAST_WATCH_TICK_DEADLINE_SECONDS. See the constant's own
+        # docstring for the production evidence.
+        elapsed_before_eval = (load_finished_at - self._constructed_at).total_seconds()
+        remaining = max(0.0, FAST_WATCH_TICK_DEADLINE_SECONDS - elapsed_before_eval)
+        configured = (self._budget_seconds if self._budget_seconds is not None
+                     else pretrade_validation.budget_seconds())
+        budget = pretrade_validation.Budget(min(configured, remaining))
+
         ready = []
         self.waiting_for_data = []
+        self.eval_symbol_timings_ms: Dict[str, float] = {}
+        evaluated_state: Dict[str, Dict[str, Any]] = {}
+        batch_records = []
         # Transport tally for the funnel report (§14/§17): counted from
         # the watchlist entry each symbol actually carries, not
         # re-derived, so it can never disagree with what active_watch
@@ -149,8 +238,9 @@ class ActiveWatchSource:
                 budget.defer(symbol)
                 self.waiting_for_data.append(symbol)
                 continue
+            symbol_started_at = datetime.now(timezone.utc)
             self.transport_counts[transport] = self.transport_counts.get(transport, 0) + 1
-            evaluated_at = datetime.now(timezone.utc)
+            evaluated_at = symbol_started_at
             live_minutes = s6_sessions.orb_minutes_for(self._session)
             features = realtime_features.build(
                 symbol, session=self._session, now=evaluated_at, provider=None,
@@ -168,10 +258,16 @@ class ActiveWatchSource:
                 features=features, require_scanner_thesis=True)
             budget.spent_on(symbol)
             self.evaluations[symbol] = evaluation
+            self.eval_symbol_timings_ms[symbol] = (
+                datetime.now(timezone.utc) - symbol_started_at).total_seconds() * 1000
+            evaluated_state[symbol] = {
+                "state": evaluation.state,
+                "blocking_count": len(evaluation.blocking or ()),
+            }
             if evaluation.ready:
                 self._rows[symbol] = self._row_from(evaluation)
                 ready.append(symbol)
-            active_watch.record_evaluation(self._scope, {
+            batch_records.append({
                 "symbol": symbol, "session": self._session,
                 "trading_day": self._trading_day,
                 "session_date": self._scope,
@@ -192,8 +288,23 @@ class ActiveWatchSource:
                 "closed_bar_only": features.closed_bar_only,
                 "range_origin_timestamp": (features.range_origin_timestamp.isoformat()
                                            if features.range_origin_timestamp else None),
-            }, session=self._session, env=self._env)
+            })
+        # One flock/write for every symbol this tick evaluated, not one
+        # per symbol -- see active_watch.record_evaluations_batch.
+        active_watch.record_evaluations_batch(
+            self._scope, batch_records, session=self._session, env=self._env)
+        # Aging state for next tick's priority sort: resets for what was
+        # actually reached, increments for what the budget deferred.
+        watch_priority_state.update(
+            self._scope, self._session, evaluated=evaluated_state,
+            deferred=self.waiting_for_data, now=load_finished_at, env=self._env)
         self.validation_report = budget.report()
+        self.eval_loop_ms = (datetime.now(timezone.utc) - load_finished_at).total_seconds() * 1000
+        logger.info(
+            "S6_FAST_WATCH_PROFILE load_ms=%.0f eval_loop_ms=%.0f "
+            "evaluated=%d deferred=%d budget_seconds=%.1f",
+            self.load_ms, self.eval_loop_ms, len(self.evaluations),
+            len(self.waiting_for_data), self.validation_report.get("budget_seconds") or 0.0)
         return ready
 
     def _row_from(self, evaluation) -> dict:
@@ -275,6 +386,21 @@ class ActiveWatchSource:
     def signal_valid_seconds(self):
         return SIGNAL_VALID_SECONDS
 
+    def _tier_group_counts(self, state) -> Dict[str, int]:
+        """HOT/WARM/COLD counts across the WHOLE logical watch (§4/§21),
+        not just what this tick reached -- so a caller can see the
+        backlog shape even on a tick that evaluated almost none of it."""
+        entries = [r for r in state.get("entries") or () if r.get("symbol")]
+        scheduling = watch_priority_state.read(self._scope, self._session, env=self._env)
+        counts = {"HOT": 0, "WARM": 0, "COLD": 0}
+        for entry in entries:
+            symbol = str(entry.get("symbol") or "").upper()
+            sched = scheduling.get(symbol) or {}
+            tier = self._priority_tier(
+                entry, ready_near=watch_priority_state.is_ready_near(sched))
+            counts[self.tier_group(tier)] += 1
+        return counts
+
     def describe(self):
         state = self._load()
         return {
@@ -291,6 +417,9 @@ class ActiveWatchSource:
             "deferred": len(self.waiting_for_data),
             "fast_evaluated": len(self.evaluations),
             "transport_counts": dict(self.transport_counts),
+            "tier_counts": self._tier_group_counts(state),
+            "load_ms": round(self.load_ms, 1),
+            "eval_loop_ms": round(self.eval_loop_ms, 1),
             "session_date": self._scope,
             "scanner_variant": s6_sessions.scanner_variant_for(self._session),
             "shadow_variant": (s6_sessions.SHADOW_SCANNER_VARIANT
