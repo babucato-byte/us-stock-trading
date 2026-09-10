@@ -479,6 +479,22 @@ def evaluate_position(conn, *, broker_adapter, position_id, row,
             ", ".join(diagnostics["unavailable_rules"]))
         diagnostics["position_data_unavailable"] = bool(whole_view_missing)
 
+    # EXIT V2 PHASE 1: durable instrumentation, never a trading input.
+    # Persisted for HOLD and SELL alike, after the decision above is
+    # already final -- nothing here can change it. See
+    # s6_live/exit_snapshot.py.
+    try:
+        from s6_live import exit_snapshot
+
+        snapshot = exit_snapshot.build(
+            conn=conn, position_id=position_id, row=refreshed,
+            features=features, diagnostics=diagnostics, decision=decision,
+            now=now)
+        exit_snapshot.persist(conn, snapshot, now=now)
+    except Exception:  # noqa: BLE001 - instrumentation must never affect
+        # the exit decision or stop the tick that already made it.
+        logger.warning("S6 exit snapshot failed for %s", symbol, exc_info=True)
+
     if not decision.sells:
         # The diagnostics ARE the detail. An empty string here is what
         # made the DT hold unexplainable after the fact.

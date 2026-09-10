@@ -1291,6 +1291,78 @@ MIGRATION_27_STATEMENTS = [
 ]
 
 
+# Migration 28: EXIT V2 PHASE 1 -- one durable row per S6 exit evaluation,
+# HOLD and SELL alike. Instrumentation only; nothing here reads back into
+# a trading decision. See s6_live/exit_snapshot.py.
+#
+# `exit_diagnostics.evaluate()` already computes almost this whole record
+# every tick and discards it after an in-process log line -- the RIG
+# lesson (2026-08-28: the wrong exit rule got credited for a sale it did
+# not cause) happened because the tick that actually decided left no
+# durable trace once the position closed. Append-only, one row per
+# (position_id, evaluated_at): a later tick's re-evaluation is a NEW
+# fact, never a correction of the last one.
+S6_EXIT_SNAPSHOTS_TABLE = """
+CREATE TABLE IF NOT EXISTS s6_exit_snapshots (
+    snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    position_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    session TEXT,
+    evaluated_at TEXT NOT NULL,
+    entry_price REAL,
+    current_price REAL,
+    position_qty REAL,
+    time_in_trade_seconds REAL,
+    range_high REAL,
+    range_low REAL,
+    vwap REAL,
+    price_minus_vwap REAL,
+    price_vs_vwap_pct REAL,
+    ema9 REAL,
+    ema21 REAL,
+    current_exit_reason TEXT,
+    current_exit_priority INTEGER,
+    range_reentry TEXT,
+    hard_risk_cap TEXT,
+    vwap_breach TEXT,
+    ema_structure_failure TEXT,
+    recent_volume_5m REAL,
+    recent_volume_10m REAL,
+    recent_volume_15m REAL,
+    dollar_volume_5m REAL,
+    nonzero_bar_count INTEGER,
+    data_age_seconds REAL,
+    peak_price REAL,
+    peak_gain_pct REAL,
+    drawdown_from_peak_pct REAL,
+    exit_submitted INTEGER NOT NULL DEFAULT 0,
+    active_exit_intent_id TEXT,
+    active_broker_order_id TEXT,
+    vwap_state TEXT,
+    liquidity_state TEXT,
+    momentum_state TEXT,
+    diagnostics_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)
+"""
+
+S6_EXIT_SNAPSHOTS_POSITION_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_s6_exit_snapshots_position
+ON s6_exit_snapshots (position_id, evaluated_at)
+"""
+
+S6_EXIT_SNAPSHOTS_SYMBOL_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_s6_exit_snapshots_symbol
+ON s6_exit_snapshots (symbol, evaluated_at)
+"""
+
+MIGRATION_28_STATEMENTS = [
+    S6_EXIT_SNAPSHOTS_TABLE,
+    S6_EXIT_SNAPSHOTS_POSITION_INDEX,
+    S6_EXIT_SNAPSHOTS_SYMBOL_INDEX,
+]
+
+
 # Every table this schema version creates -- used by export.py's
 # export_all() and by tests asserting the full table set exists.
 ALL_TABLES = [
@@ -1301,5 +1373,5 @@ ALL_TABLES = [
     "s1_risk_state", "s1_risk_peak", "s1_verification_state",
     "s1_positions", "s2_positions", "s6_positions",
     "post_exit_tracking", "post_exit_observations", "reentry_blocks",
-    "order_lineage", "notification_ledger",
+    "order_lineage", "notification_ledger", "s6_exit_snapshots",
 ]

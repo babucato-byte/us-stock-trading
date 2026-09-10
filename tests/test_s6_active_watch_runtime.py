@@ -176,7 +176,11 @@ def test_migration_27_has_every_required_latency_timestamp():
         columns = {row[1] for row in conn.execute("PRAGMA table_info(order_lineage)")}
     finally:
         conn.close()
-    assert migrations.CURRENT_SCHEMA_VERSION == 27
+    # >= , not ==: this asserts migration 27 has been applied, not that
+    # it is the last one -- a later migration (schema version 28+)
+    # legitimately moves CURRENT_SCHEMA_VERSION past 27 without undoing
+    # anything this test checks.
+    assert migrations.CURRENT_SCHEMA_VERSION >= 27
     assert {"full_scan_started_at", "symbol_evaluated_at",
             "candidate_discovered_at", "watchlist_added_at",
             "fast_watch_evaluated_at", "candidate_published_at",
