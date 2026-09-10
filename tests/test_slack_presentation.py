@@ -185,6 +185,20 @@ class TestReasonMapping:
     def test_how_many_codes_are_mapped(self):
         assert len(sp.REASON_LABELS) >= 50
 
+    def test_execution_liquidity_reason_codes_are_mapped(self):
+        # s6_live/execution_liquidity.py's full vocabulary, presented
+        # via bare-code order_blocked_fields(reason_code=...), not
+        # free-text matching -- confirm every code has a label.
+        from s6_live import execution_liquidity as el
+
+        for code in el.REASON_CODES:
+            assert code in sp.REASON_LABELS, code
+
+    def test_order_too_large_for_liquidity_free_text_gets_a_code(self):
+        assert sp.block_code_for(
+            "ORDER_TOO_LARGE_FOR_LIQUIDITY: even 1 share exceeds the "
+            "recent-volume cap for RIG") == "ORDER_TOO_LARGE_FOR_LIQUIDITY"
+
 
 # ---------------------------------------------------------------------
 # One lifecycle, one message

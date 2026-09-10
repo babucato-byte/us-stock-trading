@@ -13,9 +13,10 @@ claims whatever fast-watch already decided was READY and wrote to the
 
 import logging
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any, Dict, FrozenSet, List, Optional
 
-from s6_live import buy_intent
+from s6_live import buy_intent, execution_liquidity
 from s6_live.candidate_source import SIGNAL_VALID_SECONDS, SOURCE_S6
 
 logger = logging.getLogger(__name__)
@@ -91,6 +92,25 @@ class IntentQueueSource:
 
     def signal_valid_seconds(self):
         return SIGNAL_VALID_SECONDS
+
+    def liquidity_max_qty(self, symbol, requested_qty: int) -> int:
+        """Cap a cash-sized quantity to what the CARRIED liquidity
+        snapshot (from the admitting fast-watch tick -- §6) supports.
+
+        A generic, optional hook: `run_live_buy_entry_cycle` calls this
+        via `getattr(source, "liquidity_max_qty", None)`, so a source
+        that does not define it (S1, S2, ...) changes nothing about
+        their sizing. Reuses the entry_quality already carried on the
+        candidate row rather than re-fetching bars -- the same snapshot
+        fast-watch's own execution-liquidity gate already judged before
+        this symbol was ever written to the intent queue.
+        """
+        row = self.candidate_row(symbol) or {}
+        raw = row.get("entry_quality")
+        quality = SimpleNamespace(**raw) if isinstance(raw, dict) else None
+        capped, _code, _detail = execution_liquidity.liquidity_capped_qty(
+            quality, requested_qty)
+        return capped
 
     def intent_metadata(self, symbol) -> Dict[str, Any]:
         """first_ready_at/last_seen_ready_at for the execution funnel's

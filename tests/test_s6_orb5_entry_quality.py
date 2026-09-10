@@ -559,6 +559,46 @@ class TestSlackForS6Blocks:
         monkeypatch.setattr(ln, "notify", boom)
         runner._announce_quality_blocks(_Source(), since=T0)   # swallowed
 
+    def test_the_entry_runner_announces_liquidity_and_cash_precheck_blocks(self, monkeypatch):
+        from scripts import run_live_buy_entry as runner
+        from s6_live import execution_liquidity as el, cash_precheck
+
+        class _Source:
+            liquidity_blocked = {
+                "RIG": (el.ABSOLUTE_LIQUIDITY_TOO_LOW,
+                       {"bar_count": 15, "recent_volume": 3.0, "dollar_volume": 17.37}),
+            }
+            cash_precheck_blocked = {
+                "KVYO": (cash_precheck.INSUFFICIENT_CASH_PRECHECK,
+                        {"available_cash": 2.0, "required_for_1_share": 16.44,
+                         "shortfall": 14.44}),
+            }
+        sent = []
+        monkeypatch.setattr(ln, "notify", lambda event, fields=None, **k: sent.append((event, fields)) or True)
+        runner._announce_liquidity_blocks(_Source())
+        assert [(e, f["symbol"], f["reason_code"]) for e, f in sent] == [
+            (ln.ORDER_BLOCKED, "RIG", el.ABSOLUTE_LIQUIDITY_TOO_LOW),
+            (ln.ORDER_BLOCKED, "KVYO", cash_precheck.INSUFFICIENT_CASH_PRECHECK),
+        ]
+        assert "17.37" in sent[0][1]["detail"]
+        assert "shortfall=14.44" in sent[1][1]["detail"]
+
+        def boom(*a, **k):
+            raise RuntimeError("slack down")
+        monkeypatch.setattr(ln, "notify", boom)
+        runner._announce_liquidity_blocks(_Source())  # swallowed
+
+    def test_no_blocks_sends_nothing(self, monkeypatch):
+        from scripts import run_live_buy_entry as runner
+
+        class _Source:
+            liquidity_blocked = {}
+            cash_precheck_blocked = {}
+        sent = []
+        monkeypatch.setattr(ln, "notify", lambda *a, **k: sent.append(1) or True)
+        runner._announce_liquidity_blocks(_Source())
+        assert sent == []
+
 
 class TestReportingAndPersistence:
     def test_shadow_rows_are_never_counted_as_fills(self):

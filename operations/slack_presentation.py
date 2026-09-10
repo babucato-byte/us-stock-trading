@@ -99,6 +99,18 @@ REASON_LABELS: Dict[str, str] = {
     "S6_PREMARKET_LIQUIDITY_WEAK": "프리장 유동성이 부족함",
     "S6_QUALITY_UNAVAILABLE": "진입 품질 지표를 계산할 수 없음",
     "ENTRY_QUALITY": "진입 품질 기준 미충족",
+    # S6 execution liquidity (s6_live/execution_liquidity.py): can this be
+    # exited, not just entered -- separate from ENTRY_QUALITY above.
+    "LIQUIDITY_OK": "유동성 기준 충족",
+    "ABSOLUTE_LIQUIDITY_TOO_LOW": "최근 거래량 절대량 부족",
+    "DOLLAR_VOLUME_TOO_LOW": "최근 거래대금 부족",
+    "NO_RECENT_TRADES": "최근 체결 데이터 부족",
+    "TOO_MANY_ZERO_VOLUME_BARS": "무거래 구간 과다",
+    "SPREAD_TOO_WIDE": "호가 스프레드 과다",
+    "QUOTE_STALE": "시세 데이터 오래됨",
+    "ORDER_TOO_LARGE_FOR_LIQUIDITY": "최근 거래량 대비 주문 수량 과다",
+    "LIQUIDITY_DATA_UNAVAILABLE": "유동성 지표 확인 불가",
+    "INSUFFICIENT_CASH_PRECHECK": "사전 점검: 주문 가능 금액 부족 예상",
     "PRICE_CHECK_FAILED": "현재가 재확인 실패",
     "ACCOUNT_READ_FAILED": "계좌 조회 실패",
     "OPEN_ORDERS_READ_FAILED": "미체결 주문 조회 실패",
@@ -252,6 +264,7 @@ _BLOCK_TEXT_TO_CODE: Tuple[Tuple[str, str], ...] = (
     ("KIS rejected the order", "BROKER_REJECTED_ANNOUNCED"),
     ("KIS did not confirm the order", "BROKER_UNKNOWN_ANNOUNCED"),
     ("position tracking failed after successful buy", "POSITION_TRACKING_FAILED"),
+    ("exceeds the recent-volume cap", "ORDER_TOO_LARGE_FOR_LIQUIDITY"),
 )
 
 # -- sessions --------------------------------------------------------------

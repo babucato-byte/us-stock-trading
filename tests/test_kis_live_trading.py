@@ -602,3 +602,118 @@ class TestSystemWideFailuresStillStopEverything:
                 live_rollout=_rollout(allowed_symbols=frozenset(self.PRICES)),
                 now=NOW)
         assert broker.submit_calls == []
+
+
+class TestS6LiquiditySizingHookIsGenericAndOptional:
+    """S6 P0 §6/§12: the shared cycle's sizing consults
+    `source.liquidity_max_qty` ONLY when a candidate source defines it.
+    Every `TestPerSymbolOutcomes`/`TestRankedFallbackOnCandidateSpecificRefusals`
+    test above uses the default (S1-shaped, PAPER_STRATEGY_ORDER_SCORE_V1)
+    source, which has no such method -- their unchanged pass is the
+    evidence S1's sizing is byte-for-byte unaffected by this hook.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _bypass_security_type_gate(self, monkeypatch):
+        # S6's source (unlike the legacy S1 watchlist) is a
+        # `STRATEGY_SOURCES` member and is therefore subject to
+        # `s1_live.security_type.require_live_eligible`, an unrelated
+        # gate whose cache these sizing-hook tests have no reason to
+        # provide.
+        from s1_live import security_type as s1_security_type
+
+        monkeypatch.setattr(s1_security_type, "require_live_eligible", lambda symbol, **kw: None)
+
+    def _broker(self, **kwargs):
+        # S6's source also reaches `s1_live.execution_price`'s
+        # today's-range check (again, scoped to STRATEGY_SOURCES), which
+        # the base `_FakeBroker` above has no `get_price_detail` for.
+        broker = _FakeBroker(**kwargs)
+        broker.get_price_detail = lambda instrument: {
+            "last": broker.price, "high": broker.price + 50.0,
+            "low": broker.price - 50.0, "today_volume": 1000.0, "currency": "USD",
+            "orderable_text": "매매 가능",
+        }
+        return broker
+
+    def _s6_row(self, *, entry_quality=None):
+        row = {
+            "strategy_id": "S6_ORB_BREAKOUT_V1", "symbol": "AAPL", "price": 100.1,
+            "range_high": 90.0, "range_low": 80.0,
+            "provenance": {"signal_id": "sig-1", "signal_timestamp": NOW.isoformat()},
+        }
+        if entry_quality is not None:
+            row["entry_quality"] = entry_quality
+        return row
+
+    def _source(self, monkeypatch, *, entry_quality=None):
+        from s6_live import buy_intent, buy_intent_source
+
+        env = {"S6_ACTIVE_WATCH_DIR": "/tmp/test-s6-liquidity-sizing-hook"}
+        import shutil
+        shutil.rmtree(env["S6_ACTIVE_WATCH_DIR"], ignore_errors=True)
+        buy_intent.write_ready("2026-07-29", "REGULAR",
+                               [self._s6_row(entry_quality=entry_quality)],
+                               now=NOW, env=env)
+        return buy_intent_source.IntentQueueSource(
+            trading_day="2026-07-29", session="REGULAR",
+            rollout=_rollout(allowed_symbols=frozenset({"AAPL"}),
+                             max_quantity_per_order=None),
+            now=NOW, env=env)
+
+    def test_carried_liquidity_snapshot_caps_the_cash_sized_quantity(self, monkeypatch):
+        from s6_live.entry_quality import EntryQuality
+
+        quality = EntryQuality(
+            symbol="AAPL", session="REGULAR", scanner_variant="S6_ORB15",
+            orb_minutes=15, bar_count=10, recent_volume_15m=50.0).as_record()
+        source = self._source(monkeypatch, entry_quality=quality)
+        broker = self._broker(cash_usd=10_000.0, price=100.1)  # would afford ~99 shares
+
+        results = klt.run_live_buy_entry_cycle(
+            broker=broker, live_rollout=_rollout(allowed_symbols=frozenset({"AAPL"}),
+                                                 max_quantity_per_order=None),
+            now=NOW, candidate_source=source)
+
+        assert results["submitted"] == ["AAPL"]
+        # 10% of recent_volume_15m=50.0 -> 5, well under the ~99 shares
+        # cash alone would afford.
+        assert broker.submit_calls[0][0].quantity == 5
+
+    def test_no_carried_snapshot_falls_back_to_cash_sizing_only(self, monkeypatch):
+        source = self._source(monkeypatch, entry_quality=None)
+        broker = self._broker(cash_usd=10_000.0, price=100.1)
+
+        results = klt.run_live_buy_entry_cycle(
+            broker=broker, live_rollout=_rollout(allowed_symbols=frozenset({"AAPL"}),
+                                                 max_quantity_per_order=None),
+            now=NOW, candidate_source=source)
+
+        assert results["submitted"] == ["AAPL"]
+        assert broker.submit_calls[0][0].quantity == 99  # cash-based only
+
+    def test_liquidity_capped_to_zero_is_distinguished_from_insufficient_cash(self, monkeypatch):
+        """§5: explicit reason codes. Even 1 share exceeding the recent-
+        volume cap must be reported as ORDER_TOO_LARGE_FOR_LIQUIDITY, not
+        folded into the generic INSUFFICIENT_CASH message -- the account
+        had plenty of cash here."""
+        from s6_live.entry_quality import EntryQuality
+        from s6_live import execution_liquidity as el
+
+        quality = EntryQuality(
+            symbol="AAPL", session="REGULAR", scanner_variant="S6_ORB15",
+            orb_minutes=15, bar_count=10, recent_volume_15m=2.0).as_record()
+        source = self._source(monkeypatch, entry_quality=quality)
+        broker = self._broker(cash_usd=10_000.0, price=100.1)
+
+        results = klt.run_live_buy_entry_cycle(
+            broker=broker, live_rollout=_rollout(allowed_symbols=frozenset({"AAPL"}),
+                                                 max_quantity_per_order=None),
+            now=NOW, candidate_source=source)
+
+        assert results["submitted"] == []
+        assert broker.submit_calls == []
+        symbol, reason = results["blocked"][0]
+        assert symbol == "AAPL"
+        assert reason.startswith(el.ORDER_TOO_LARGE_FOR_LIQUIDITY)
+        assert "INSUFFICIENT" not in reason

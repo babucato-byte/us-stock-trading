@@ -91,6 +91,7 @@ from s1_live import candidate_source as s1_candidate_source
 from s2_live import candidate_source as s2_candidate_source
 from s6_live import candidate_source as s6_candidate_source
 from s6_live import entry_lifecycle as s6_entry_lifecycle
+from s6_live import execution_liquidity
 from scanners.base import scan_session
 from config import s6_sessions, session_capability, strategy_entry_policy
 from s1_live import execution_price as s1_execution_price
@@ -970,6 +971,16 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                 # there, which silently made every order a single share
                 # however much cash was available.
                 balance_qty = whole_shares_affordable(available_usd, buffered_price)
+                cash_affordable_qty = balance_qty
+                # Execution-liquidity cap (§6): an optional hook a source
+                # may define (currently only S6's IntentQueueSource) to
+                # bound `balance_qty` further against recently traded
+                # volume. Absent for every other source, so S1/S2's
+                # sizing is byte-for-byte unchanged.
+                liquidity_cap_fn = getattr(source, "liquidity_max_qty", None)
+                if liquidity_cap_fn is not None:
+                    balance_qty = liquidity_cap_fn(symbol, balance_qty)
+                liquidity_capped_to_zero = (cash_affordable_qty >= 1 and balance_qty < 1)
                 quantity = (min(balance_qty, rollout.max_quantity_per_order)
                             if rollout.max_quantity_per_order is not None
                             else balance_qty)
@@ -986,16 +997,22 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                     if rollout.max_quantity_per_order is not None else "none",
                     quantity)
                 if quantity < 1:
-                    reason = _insufficient_cash_reason(available_usd, buffered_price)
+                    reason = (
+                        f"{execution_liquidity.ORDER_TOO_LARGE_FOR_LIQUIDITY}: even 1 "
+                        f"share exceeds the recent-volume cap for {symbol}"
+                        if liquidity_capped_to_zero
+                        else _insufficient_cash_reason(available_usd, buffered_price))
                     results["blocked"].append((symbol, reason))
                     _persist_blocked_record(
                         symbol=symbol, signal_price=signal.signal_price, kis_price=kis_quote.price_usd,
                         account_available_usd=available_usd, risk_gate_result="BLOCKED",
                         rejection_reason=reason, now=current,
                     )
-                    outcome["reason_code"] = INSUFFICIENT_CASH
+                    blocked_code = (execution_liquidity.ORDER_TOO_LARGE_FOR_LIQUIDITY
+                                    if liquidity_capped_to_zero else INSUFFICIENT_CASH)
+                    outcome["reason_code"] = blocked_code
                     _audit(run_id, shadow_audit.CASH_BLOCKED, shadow_audit.RESULT_BLOCKED, symbol=symbol,
-                           signal_id=signal.signal_id, reason_code=INSUFFICIENT_CASH,
+                           signal_id=signal.signal_id, reason_code=blocked_code,
                            detail=reason, now=current)
                     continue
 

@@ -13,7 +13,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, FrozenSet, List, Optional
 
 from config import s6_sessions, scanner_live_mode
-from s6_live import active_watch, pretrade_validation, precision_watch
+from s6_live import active_watch, cash_precheck, execution_liquidity
+from s6_live import pretrade_validation, precision_watch
 from s6_live import realtime_features, watch_priority_state
 from s6_live.candidate_source import SIGNAL_VALID_SECONDS, SOURCE_S6
 
@@ -46,7 +47,7 @@ class ActiveWatchSource:
     name = SOURCE_S6
 
     def __init__(self, *, trading_day, session, rollout, now=None, conn=None,
-                 provider=None, budget_seconds=None, env=None):
+                 provider=None, budget_seconds=None, env=None, broker=None):
         self._trading_day = str(trading_day)
         self._session = str(session or "").upper()
         self._rollout = rollout
@@ -55,6 +56,11 @@ class ActiveWatchSource:
         self._provider = provider
         self._budget_seconds = budget_seconds
         self._env = env
+        # Used only by the cash precheck (§7-9) -- optional, since not
+        # every caller (tests, other strategies' factories) has a live
+        # broker to hand it. A missing broker makes the precheck
+        # UNAVAILABLE, which fails open (see s6_live.cash_precheck).
+        self._broker = broker
         # The REAL wall clock at construction, deliberately separate from
         # `self._now` (which callers -- tests especially -- may set to an
         # artificial, fixed timestamp for deterministic evaluation
@@ -75,6 +81,12 @@ class ActiveWatchSource:
         self.waiting_for_data: List[str] = []
         self.validation_report: Dict[str, Any] = {}
         self.transport_counts: Dict[str, int] = {}
+        # Strategy PASS, execution FAIL (§4-5/§7): symbols the precision
+        # watch judged READY but that did not clear the execution
+        # liquidity gate or the cash precheck, keyed by symbol ->
+        # (reason_code, detail). Never overlaps `_rows`/`ready`.
+        self.liquidity_blocked: Dict[str, tuple] = {}
+        self.cash_precheck_blocked: Dict[str, tuple] = {}
         self._consumed_at = None
         # Profiling (§8): populated once symbols() actually runs. Zeroed
         # here so a caller reading these before symbols() (or a session
@@ -231,6 +243,15 @@ class ActiveWatchSource:
         # itself classified this cycle.
         self.transport_counts = {active_watch.TRANSPORT_WEBSOCKET: 0,
                                  active_watch.TRANSPORT_REST: 0, "UNKNOWN": 0}
+        self.liquidity_blocked = {}
+        self.cash_precheck_blocked = {}
+        # Loaded once per tick, not per symbol: the same config object
+        # `precision_watch.evaluate` already reads for entry_quality's
+        # own thresholds.
+        from scanners.base import config as scanner_config
+
+        orb_cfg = scanner_config.load_config("orb", scanner_name="orb")
+        liquidity_thresholds = execution_liquidity.thresholds_for(orb_cfg, self._session)
         for symbol in offered:
             entry = self._entry(symbol)
             transport = entry.get("transport_source") or "UNKNOWN"
@@ -265,8 +286,34 @@ class ActiveWatchSource:
                 "blocking_count": len(evaluation.blocking or ()),
             }
             if evaluation.ready:
-                self._rows[symbol] = self._row_from(evaluation)
-                ready.append(symbol)
+                # Read from evaluation.features, not the outer `features`
+                # local: `precision_watch.evaluate` is what actually
+                # decided READY, and it (not this loop) owns whether the
+                # view it judged is the same object passed in.
+                ready_feats = evaluation.features
+                quality = getattr(ready_feats, "entry_quality", None)
+                liq_verdict, liq_code, liq_detail = execution_liquidity.assess(
+                    quality, liquidity_thresholds)
+                if liq_verdict != execution_liquidity.PASS:
+                    self.liquidity_blocked[symbol] = (liq_code, liq_detail)
+                    logger.info(
+                        "S6 execution liquidity: %s strategy PASS, execution "
+                        "%s (%s)", symbol, liq_verdict, liq_code)
+                else:
+                    cash_status, cash_detail = cash_precheck.check(
+                        symbol, getattr(ready_feats, "price", None),
+                        broker=self._broker, now=evaluated_at, env=self._env)
+                    if cash_status == cash_precheck.BLOCKED:
+                        self.cash_precheck_blocked[symbol] = (
+                            cash_precheck.INSUFFICIENT_CASH_PRECHECK, cash_detail)
+                        logger.info(
+                            "S6 cash precheck: %s blocked (available=%s "
+                            "required=%s)", symbol,
+                            cash_detail.get("available_cash"),
+                            cash_detail.get("required_for_1_share"))
+                    else:
+                        self._rows[symbol] = self._row_from(evaluation)
+                        ready.append(symbol)
             batch_records.append({
                 "symbol": symbol, "session": self._session,
                 "trading_day": self._trading_day,
@@ -431,4 +478,8 @@ class ActiveWatchSource:
                                       if self._consumed_at else None),
             "precision_watch": {s: {"state": e.state, "blocking": e.blocking}
                                 for s, e in self.evaluations.items()},
+            "liquidity_blocked": {s: {"reason_code": code, "detail": detail}
+                                  for s, (code, detail) in self.liquidity_blocked.items()},
+            "cash_precheck_blocked": {s: {"reason_code": code, "detail": detail}
+                                      for s, (code, detail) in self.cash_precheck_blocked.items()},
         }

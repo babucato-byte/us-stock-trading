@@ -240,7 +240,7 @@ def _s6_source(rollout, now, *, broker=None):
             # uses the bounded REST fallback only until it joins a stream.
             provider=ptv.provider_for(session, broker=broker,
                                       trading_day=trading_day),
-            budget_seconds=ptv.budget_seconds())
+            budget_seconds=ptv.budget_seconds(), broker=broker)
 
     source = S6CandidateSource(
         trading_day=trading_day,
@@ -731,6 +731,62 @@ def _announce_quality_blocks(source, *, since) -> None:
             pass
 
 
+def _announce_liquidity_blocks(source) -> None:
+    """One 매수 차단 message per (symbol, reason code, day) for candidates
+    the execution-liquidity gate or the cash precheck stopped this tick
+    (§13) -- strategy PASS, execution FAIL, distinct from
+    `_announce_quality_blocks`'s strategy-freshness blocks.
+
+    Presentation only, deduplicated through the notification ledger
+    (`ln.notify`'s own `code:date` default dedupe_version, the same
+    mechanism `_announce_quality_blocks` and `_announce_blocks` use); a
+    Slack failure cannot reach trading (notify() never raises). A
+    symbol pinned at the same block reason for an entire session
+    produces one message, not one per tick.
+    """
+    liquidity_blocked = dict(getattr(source, "liquidity_blocked", None) or {})
+    cash_blocked = dict(getattr(source, "cash_precheck_blocked", None) or {})
+    if not liquidity_blocked and not cash_blocked:
+        return
+    from operations import live_notifications as ln
+    from state_store import db as state_db
+
+    conn = None
+    try:
+        conn = state_db.open_db()
+    except Exception:  # noqa: BLE001
+        conn = None
+    try:
+        for symbol, (code, detail) in sorted(liquidity_blocked.items()):
+            fields = ln.order_blocked_fields(
+                symbol=symbol, reason_code=code, strategy_id="S6_ORB_BREAKOUT_V1",
+                detail=(f"bar_count={detail.get('bar_count')} "
+                       f"recent_volume={detail.get('recent_volume')} "
+                       f"dollar_volume={detail.get('dollar_volume')}")[:200])
+            try:
+                ln.notify(ln.ORDER_BLOCKED, fields, dedupe_conn=conn)
+            except Exception:  # noqa: BLE001 -- belt and braces
+                logger.warning("liquidity block notice for %s failed", symbol,
+                               exc_info=True)
+        for symbol, (code, detail) in sorted(cash_blocked.items()):
+            fields = ln.order_blocked_fields(
+                symbol=symbol, reason_code=code, strategy_id="S6_ORB_BREAKOUT_V1",
+                detail=(f"available={detail.get('available_cash')} "
+                       f"required={detail.get('required_for_1_share')} "
+                       f"shortfall={detail.get('shortfall')}")[:200])
+            try:
+                ln.notify(ln.ORDER_BLOCKED, fields, dedupe_conn=conn)
+            except Exception:  # noqa: BLE001
+                logger.warning("cash-precheck block notice for %s failed", symbol,
+                               exc_info=True)
+    finally:
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 #: How long ONE entry tick may run before its own non-critical
 #: post-processing starts skipping itself, so it cannot push the tick
 #: past the 60-second cron interval and cause the next one to be
@@ -864,6 +920,12 @@ def _record_shadow_signals(source, results, *, since):
             _announce_quality_blocks(source, since=since)
         except Exception:  # noqa: BLE001 -- presentation only
             logger.warning("could not announce entry-quality blocks", exc_info=True)
+
+        try:
+            _announce_liquidity_blocks(source)
+        except Exception:  # noqa: BLE001 -- presentation only
+            logger.warning("could not announce liquidity/cash-precheck blocks",
+                           exc_info=True)
 
         try:
             from market_hours import us_trading_day
