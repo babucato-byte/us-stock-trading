@@ -1388,6 +1388,56 @@ MIGRATION_29_STATEMENTS = [
     for name, kind in _S6_EXIT_SNAPSHOTS_SHADOW_COLUMNS
 ]
 
+# Migration 30: EXIT V2 PHASE 3 -- durable management history for one
+# protective SELL lifecycle.  This is deliberately separate from the
+# append-only signal snapshots: a timeout reassessment is an execution
+# management fact, not an exit signal and must survive replacement order ids.
+S6_SELL_REASSESSMENTS_TABLE = """
+CREATE TABLE IF NOT EXISTS s6_sell_reassessments (
+    reassessment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    position_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    exit_intent_id TEXT,
+    broker_order_id TEXT,
+    broker_status TEXT NOT NULL,
+    submitted_at TEXT,
+    order_age_seconds REAL,
+    original_qty REAL,
+    filled_qty REAL,
+    remaining_qty REAL,
+    order_type TEXT,
+    order_price REAL,
+    last_trade_price REAL,
+    recent_volume_5m REAL,
+    recent_volume_10m REAL,
+    recent_volume_15m REAL,
+    dollar_volume_5m REAL,
+    nonzero_bar_count INTEGER,
+    data_age_seconds REAL,
+    session TEXT,
+    exit_reason TEXT,
+    exit_priority INTEGER,
+    sell_retry_count INTEGER NOT NULL DEFAULT 0,
+    reassessment_count INTEGER NOT NULL DEFAULT 0,
+    last_reprice_at TEXT,
+    previous_order_id TEXT,
+    previous_order_price REAL,
+    decision TEXT NOT NULL,
+    decision_reason TEXT NOT NULL,
+    evaluated_at TEXT NOT NULL
+)
+"""
+
+S6_SELL_REASSESSMENTS_POSITION_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_s6_sell_reassessments_position
+ON s6_sell_reassessments (position_id, evaluated_at)
+"""
+
+MIGRATION_30_STATEMENTS = [
+    S6_SELL_REASSESSMENTS_TABLE,
+    S6_SELL_REASSESSMENTS_POSITION_INDEX,
+]
+
 
 # Every table this schema version creates -- used by export.py's
 # export_all() and by tests asserting the full table set exists.
@@ -1400,4 +1450,5 @@ ALL_TABLES = [
     "s1_positions", "s2_positions", "s6_positions",
     "post_exit_tracking", "post_exit_observations", "reentry_blocks",
     "order_lineage", "notification_ledger", "s6_exit_snapshots",
+    "s6_sell_reassessments",
 ]

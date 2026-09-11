@@ -41,11 +41,13 @@ class Broker:
     an optional position book (release_dead_exit's own re-check does
     not run here, but cancel confirmation does)."""
 
-    def __init__(self, open_symbols=("SCL",), raises=False, qty="2", filled="0"):
+    def __init__(self, open_symbols=("SCL",), raises=False, qty="2", filled="0",
+                 extra=None):
         self._open = list(open_symbols)
         self._raises = raises
         self._qty = qty
         self._filled = filled
+        self._extra = extra or {}
         self.config = type("C", (), {"account_no": ACCOUNT})()
 
     def get_open_orders(self):
@@ -54,7 +56,7 @@ class Broker:
         return [{"pdno": s, "odno": "0000001958", "ft_ord_qty": self._qty,
                  "ft_ccld_qty": self._filled,
                  "nccs_qty": str(int(self._qty) - int(self._filled)),
-                 "ft_ord_unpr3": "61.80000000"} for s in self._open]
+                 "ft_ord_unpr3": "61.80000000", **self._extra} for s in self._open]
 
 
 def _stuck_sell(conn, *, symbol="SCL", accepted_age_seconds=700,
@@ -121,40 +123,20 @@ class TestTheClockDecidesOnlyWhenItHasRunOut:
         assert out[0]["age_seconds"] is None
 
 
-class TestOpenCancelableSellEntersCancelFlow:
-    """§2/§4: an ACCEPTED SELL that the broker STILL shows open, past
-    the timeout, is cancelled through the existing engine path -- and
-    ONLY released for retry once the cancel is broker-confirmed."""
+class TestOpenCancelableSellIsReassessed:
+    """A due OPEN SELL is kept unless broker evidence proves reprice."""
 
-    def test_a_stuck_sell_past_timeout_is_cancelled_and_released(self, conn, monkeypatch):
+    def test_a_stuck_sell_past_interval_is_kept_not_cancelled(self, conn, monkeypatch):
         pid = _stuck_sell(conn, accepted_age_seconds=700)
         sent = []
         _stub_engine(monkeypatch, sent)
-        # After the cancel, the broker no longer shows the order open --
-        # the confirmation re-check this module makes before releasing.
-        broker = Broker(open_symbols=())
-
-        # But the FIRST read (before the cancel) must still see it open,
-        # or cancel_stale_sell would report SKIPPED. Use a broker whose
-        # open-order list changes after one call.
-        calls = {"n": 0}
-        real_get = broker.get_open_orders
-
-        def _sequenced():
-            calls["n"] += 1
-            if calls["n"] == 1:
-                return [{"pdno": "SCL", "odno": "0000001958", "ft_ord_qty": "2",
-                         "ft_ccld_qty": "0", "nccs_qty": "2",
-                         "ft_ord_unpr3": "61.80000000"}]
-            return []
-        broker.get_open_orders = _sequenced
+        broker = Broker()
 
         out = xt.evaluate(conn, broker=broker, account_id=ACCOUNT, now=NOW)
-        assert out[0]["action"] == xt.ACTION_RELEASED_FOR_RETRY
-        assert out[0]["reason"] == xt.REASON_TIMEOUT
-        assert len(sent) == 1, "a cancel must be sent exactly once"
-        assert ps.load(conn, pid)["status"] == ps.EXIT_PENDING
-        assert not ps.load(conn, pid)["exit_submitted"]
+        assert out[0]["action"] == xt.KEEP_ORDER
+        assert sent == []
+        assert ps.load(conn, pid)["status"] == ps.EXIT_SUBMITTED
+        assert ps.load(conn, pid)["exit_submitted"]
 
     def test_replacement_is_not_submitted_here(self, conn, monkeypatch):
         """No new replacement-submission code exists in this module --
@@ -178,7 +160,7 @@ class TestNoReplacementBeforeCancelledConfirmation:
         monkeypatch.setattr("execution.execution_engine.submit_cancel", _boom)
 
         out = xt.evaluate(conn, broker=Broker(), account_id=ACCOUNT, now=NOW)
-        assert out[0]["action"] == xt.ACTION_CANCEL_UNKNOWN
+        assert out[0]["action"] == xt.KEEP_ORDER
         assert ps.load(conn, pid)["status"] == ps.EXIT_SUBMITTED
         assert ps.load(conn, pid)["exit_submitted"]
 
@@ -193,7 +175,7 @@ class TestNoReplacementBeforeCancelledConfirmation:
         # post-cancel confirmation.
         out = xt.evaluate(conn, broker=Broker(open_symbols=("SCL",)),
                           account_id=ACCOUNT, now=NOW)
-        assert out[0]["action"] == xt.ACTION_CANCEL_UNKNOWN
+        assert out[0]["action"] == xt.KEEP_ORDER
         assert ps.load(conn, pid)["status"] == ps.EXIT_SUBMITTED
 
     def test_an_unreadable_open_order_book_does_not_cancel(self, conn, monkeypatch):
@@ -201,7 +183,7 @@ class TestNoReplacementBeforeCancelledConfirmation:
         sent = []
         _stub_engine(monkeypatch, sent)
         out = xt.evaluate(conn, broker=Broker(raises=True), account_id=ACCOUNT, now=NOW)
-        assert out[0]["action"] == xt.ACTION_SKIPPED
+        assert out[0]["action"] == xt.BROKER_UNKNOWN
         assert sent == []
         assert ps.load(conn, pid)["status"] == ps.EXIT_SUBMITTED
 
@@ -212,8 +194,7 @@ class TestNoReplacementBeforeCancelledConfirmation:
         sent = []
         _stub_engine(monkeypatch, sent)
         out = xt.evaluate(conn, broker=Broker(open_symbols=()), account_id=ACCOUNT, now=NOW)
-        assert out[0]["action"] == xt.ACTION_SKIPPED
-        assert "no longer open" in out[0]["detail"]
+        assert out[0]["action"] == xt.TERMINAL_RECONCILE
         assert sent == []
         assert ps.load(conn, pid)["status"] == ps.EXIT_SUBMITTED
 
@@ -236,24 +217,14 @@ class TestLatchIsClearedOnlyOnSafeTerminalState:
     """§9: exit_submitted means "an active SELL may exist", not "never
     attempt another SELL for this position again"."""
 
-    def test_latch_clears_only_after_confirmed_cancel(self, conn, monkeypatch):
+    def test_latch_stays_set_for_a_valid_open_order(self, conn, monkeypatch):
         pid = _stuck_sell(conn, accepted_age_seconds=700)
-        calls = {"n": 0}
-
-        def _sequenced():
-            calls["n"] += 1
-            if calls["n"] == 1:
-                return [{"pdno": "SCL", "odno": "0000001958", "ft_ord_qty": "2",
-                         "ft_ccld_qty": "0", "nccs_qty": "2",
-                         "ft_ord_unpr3": "61.80000000"}]
-            return []
         broker = Broker()
-        broker.get_open_orders = _sequenced
         _stub_engine(monkeypatch, [])
 
         assert ps.load(conn, pid)["exit_submitted"] == 1
         xt.evaluate(conn, broker=broker, account_id=ACCOUNT, now=NOW)
-        assert not ps.load(conn, pid)["exit_submitted"]
+        assert ps.load(conn, pid)["exit_submitted"]
 
     def test_latch_stays_set_on_an_unresolved_cancel(self, conn, monkeypatch):
         pid = _stuck_sell(conn, accepted_age_seconds=700)
@@ -281,11 +252,53 @@ class TestUnknownDoesNotDuplicateSell:
         monkeypatch.setattr("execution.execution_engine.submit_cancel", _boom)
         xt.evaluate(conn, broker=Broker(), account_id=ACCOUNT, now=NOW)
         xt.evaluate(conn, broker=Broker(), account_id=ACCOUNT, now=NOW)
-        # Each tick may re-attempt (the row is still ACCEPTED+open+past
-        # timeout) -- what must NEVER happen is a REPLACEMENT sell being
-        # submitted while this stands, which the absence of any
-        # _submit_sell call in this module already guarantees.
-        assert len(calls) == 2
+        # Reassessment never makes age itself a cancel trigger.
+        assert len(calls) == 0
+
+
+class TestPhase3ReassessmentDecisions:
+    def test_partial_fill_is_managed_without_a_new_sell(self, conn, monkeypatch):
+        pid = _stuck_sell(conn, accepted_age_seconds=700, quantity=28)
+        sent = []
+        _stub_engine(monkeypatch, sent)
+        out = xt.evaluate(conn, broker=Broker(qty="28", filled="10"),
+                          account_id=ACCOUNT, now=NOW)
+        assert out[0]["action"] == xt.PARTIAL_FILL_MANAGE
+        assert out[0]["remaining_qty"] == 18
+        assert sent == []
+        assert ps.load(conn, pid)["quantity"] == 28
+
+    def test_proven_reprice_waits_for_cancel_confirmation(self, conn, monkeypatch):
+        pid = _stuck_sell(conn, accepted_age_seconds=700)
+        sent = []
+        _stub_engine(monkeypatch, sent)
+        broker = Broker(extra={"reprice_proven": True})
+        calls = {"n": 0}
+        def _book():
+            calls["n"] += 1
+            return ([{"pdno": "SCL", "odno": "0000001958", "ft_ord_qty": "2",
+                     "ft_ccld_qty": "0", "nccs_qty": "2",
+                     "ft_ord_unpr3": "61.8", "reprice_proven": True}]
+                    if calls["n"] <= 2 else [])
+        broker.get_open_orders = _book
+        out = xt.evaluate(conn, broker=broker, account_id=ACCOUNT, now=NOW)
+        assert out[0]["action"] == xt.REPRICE_ORDER
+        assert len(sent) == 1
+        assert ps.load(conn, pid)["status"] == ps.EXIT_PENDING
+
+    def test_reassessment_history_survives_order_ids_and_bounds_churn(self, conn):
+        pid = _stuck_sell(conn, accepted_age_seconds=700)
+        for n in range(4):
+            conn.execute(
+                "INSERT INTO s6_sell_reassessments (position_id, symbol, broker_status, "
+                "sell_retry_count, reassessment_count, decision, decision_reason, evaluated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (pid, "SCL", "OPEN_CANCELABLE", n + 1, n + 1,
+                 xt.REPRICE_ORDER, "TEST", NOW.isoformat()))
+        conn.commit()
+        out = xt.evaluate(conn, broker=Broker(), account_id=ACCOUNT, now=NOW)
+        assert out[0]["action"] == xt.EXIT_ESCALATION_REQUIRED
+        assert out[0]["sell_retry_count"] == 4
 
 
 class TestAlertsDedupeAndRoute:

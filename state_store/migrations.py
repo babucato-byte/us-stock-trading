@@ -22,6 +22,7 @@ from state_store.schema import (
     MIGRATION_23_STATEMENTS, MIGRATION_24_STATEMENTS,
     MIGRATION_25_STATEMENTS, MIGRATION_26_STATEMENTS,
     MIGRATION_27_STATEMENTS, MIGRATION_28_STATEMENTS, MIGRATION_29_STATEMENTS,
+    MIGRATION_30_STATEMENTS,
 )
 
 MIGRATIONS = [
@@ -97,6 +98,8 @@ MIGRATIONS = [
     (29, "EXIT V2 PHASE 2: shadow decision columns on s6_exit_snapshots -- "
          "live and shadow verdicts on the same row, shadow decides nothing live",
      MIGRATION_29_STATEMENTS),
+    (30, "EXIT V2 PHASE 3: durable broker-first protective SELL reassessments",
+     MIGRATION_30_STATEMENTS),
 ]
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1][0]

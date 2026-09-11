@@ -74,8 +74,8 @@ from s6_live.entry_timeout import (
 
 logger = logging.getLogger(__name__)
 
-#: How long an unfilled, still-open protective SELL may rest before
-#: this module proactively cancels it so a replacement can be tried.
+#: How long an unfilled protective SELL may rest before it is reassessed.
+#: Age is never, by itself, a cancel instruction.
 #:
 #: Longer than the BUY TTL (180s) on purpose: a SELL earns no edge from
 #: acting fast the way a breakout entry does, and cancelling too eagerly
@@ -83,7 +83,10 @@ logger = logging.getLogger(__name__)
 #: fault) would itself manufacture unnecessary broker traffic. Ten
 #: minutes is well past ordinary fill latency and well short of "the
 #: position sits exposed all day".
-SELL_FILL_TIMEOUT_SECONDS = 600
+SELL_REASSESSMENT_SECONDS = 600
+# Backward-compatible import name for callers and release tooling.  Its
+# semantic name is deliberately no longer "timeout".
+SELL_FILL_TIMEOUT_SECONDS = SELL_REASSESSMENT_SECONDS
 
 # -- outcomes ------------------------------------------------------------
 ACTION_HELD = "HELD"
@@ -91,8 +94,21 @@ ACTION_CANCEL_REQUESTED = "CANCEL_REQUESTED"
 ACTION_CANCEL_UNKNOWN = "CANCEL_UNKNOWN"
 ACTION_SKIPPED = "SKIPPED"
 ACTION_RELEASED_FOR_RETRY = "RELEASED_FOR_RETRY"
+KEEP_ORDER = "KEEP_ORDER"
+REPRICE_ORDER = "REPRICE_ORDER"
+PARTIAL_FILL_MANAGE = "PARTIAL_FILL_MANAGE"
+TERMINAL_RECONCILE = "TERMINAL_RECONCILE"
+LIQUIDITY_DRY = "LIQUIDITY_DRY"
+BROKER_UNKNOWN = "BROKER_UNKNOWN"
+EXIT_ESCALATION_REQUIRED = "EXIT_ESCALATION_REQUIRED"
 
-REASON_TIMEOUT = "SELL_FILL_TIMEOUT_EXPIRED"
+REASON_TIMEOUT = "SELL_REASSESSMENT_DUE"
+
+# RIG had three blind cancel/replacement cycles before its fourth order
+# filled; SCL established that an OPEN thin-market order can be valid for
+# hours.  Four completed reprices is therefore a conservative provisional
+# ceiling, not a liquidity or price threshold.  Reaching it stops churn.
+MAX_SELL_REPRICES = 4
 
 
 class ExitTimeoutError(Exception):
@@ -133,6 +149,21 @@ def _alert_stuck_timeout(conn, symbol, position_id, age_seconds) -> None:
                  dedupe_version=ln.SELL_STUCK_TIMEOUT)
     except Exception:  # noqa: BLE001
         logger.error("could not alert on stuck SELL timeout", exc_info=True)
+
+
+def _alert_reassessment_escalation(conn, symbol, position_id, retry_count) -> None:
+    """One operator notice once bounded reprice history is exhausted."""
+    try:
+        from operations import live_notifications as ln
+        ln.notify(ln.WATCHDOG_ESCALATED,
+                  {"symbol": symbol, "position_id": position_id,
+                   "sell_retry_count": retry_count,
+                   "reason": "EXIT_ESCALATION_REQUIRED"},
+                  dedupe_conn=conn, dedupe_subject=position_id,
+                  dedupe_version="EXIT_ESCALATION_REQUIRED")
+    except Exception:  # noqa: BLE001
+        logger.error("could not alert on SELL reassessment escalation",
+                     exc_info=True)
 
 
 def _now(now=None):
@@ -345,13 +376,198 @@ def cancel_stale_sell(conn, *, broker, row, reason, account_id, now=None) -> Dic
             "broker_order_id": broker_order_id, "released": bool(released)}
 
 
-def evaluate(conn, *, broker, account_id, now=None,
-             timeout_seconds=SELL_FILL_TIMEOUT_SECONDS) -> List[Dict[str, Any]]:
-    """Decide what happens to every still-unfilled, still-submitted S6
-    SELL. Runs alongside the other exit_runtime stages every tick; a
-    row this module is not ready to act on (age unknown, still within
-    the timeout) is simply HELD, exactly as before this module existed.
+def _number(row, *names):
+    for name in names:
+        try:
+            value = float((row or {}).get(name))
+        except (TypeError, ValueError):
+            continue
+        if value >= 0:
+            return value
+    return None
+
+
+def _latest_exit_snapshot(conn, position_id):
+    """Local Phase-1/2 evidence only; never a new market-data request."""
+    try:
+        from s6_live import exit_snapshot
+        return exit_snapshot.last_snapshot(conn, position_id) or {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _prior_reassessment(conn, position_id):
+    try:
+        row = conn.execute(
+            "SELECT * FROM s6_sell_reassessments WHERE position_id = ? "
+            "ORDER BY reassessment_id DESC LIMIT 1", (position_id,)).fetchone()
+        return dict(row) if row else {}
+    except Exception:  # noqa: BLE001 - an unavailable history must not cancel
+        return {}
+
+
+def _broker_open_order(broker, *, symbol, broker_order_id):
+    """Read the authoritative book once and match the actual order id.
+
+    Returning ``None`` means unreadable, ``False`` means read but no current
+    order.  The latter is reconciliation evidence, not permission to retry.
     """
+    try:
+        rows = broker.get_open_orders() or ()
+    except Exception:  # noqa: BLE001
+        logger.warning("S6 sell reassessment: broker open-order read failed",
+                       exc_info=True)
+        return None
+    wanted_symbol = str(symbol or "").upper()
+    wanted_id = str(broker_order_id or "")
+    for item in rows:
+        item_id = str(item.get("odno") or item.get("ODNO") or "")
+        item_symbol = str(item.get("pdno") or item.get("PDNO") or "").upper()
+        if wanted_id and item_id == wanted_id:
+            return item
+        if not wanted_id and item_symbol == wanted_symbol:
+            return item
+    return False
+
+
+def _persist_reassessment(conn, record):
+    """Append a management fact. Failure is fail-closed: no action changes."""
+    columns = (
+        "position_id", "symbol", "exit_intent_id", "broker_order_id",
+        "broker_status", "submitted_at", "order_age_seconds", "original_qty",
+        "filled_qty", "remaining_qty", "order_type", "order_price",
+        "last_trade_price", "recent_volume_5m", "recent_volume_10m",
+        "recent_volume_15m", "dollar_volume_5m", "nonzero_bar_count",
+        "data_age_seconds", "session", "exit_reason", "exit_priority",
+        "sell_retry_count", "reassessment_count", "last_reprice_at",
+        "previous_order_id", "previous_order_price", "decision",
+        "decision_reason", "evaluated_at",
+    )
+    try:
+        conn.execute(
+            f"INSERT INTO s6_sell_reassessments ({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' for _ in columns)})",
+            tuple(record.get(c) for c in columns))
+        conn.commit()
+    except Exception:  # noqa: BLE001
+        logger.warning("S6 sell reassessment persist failed for %s",
+                       record.get("position_id"), exc_info=True)
+
+
+def _decision_for_open(*, order, snapshot, retry_count):
+    """Classify an OPEN order without manufacturing market certainty.
+
+    Phase 1/2 stores last-trade and liquidity observations, but no reliable
+    executable bid/ask.  Therefore an open order is kept unless a future
+    broker adapter provides explicit, authoritative ``reprice_proven``
+    evidence.  This intentionally makes price movement alone insufficient.
+    """
+    filled = _number(order, "ft_ccld_qty", "FT_CCLD_QTY") or 0
+    remaining = _number(order, "nccs_qty", "NCCS_QTY")
+    original = _number(order, "ft_ord_qty", "FT_ORD_QTY")
+    if remaining is None and original is not None:
+        remaining = max(0, original - filled)
+    if filled > 0 and (remaining is None or remaining > 0):
+        return PARTIAL_FILL_MANAGE, "BROKER_PARTIAL_FILL"
+    if str(order.get("cancelable") or order.get("CANCELABLE") or "").upper() in {"N", "FALSE", "0"}:
+        return KEEP_ORDER, "OPEN_NOT_CANCELABLE"
+    if retry_count >= MAX_SELL_REPRICES:
+        return EXIT_ESCALATION_REQUIRED, "REPRICE_LIMIT_REACHED"
+    if bool(order.get("reprice_proven")):
+        return REPRICE_ORDER, "AUTHORITATIVE_NONCOMPETITIVE_EVIDENCE"
+    if str(snapshot.get("liquidity_state") or "").upper() == "CRITICAL":
+        return LIQUIDITY_DRY, "THIN_LIQUIDITY_KEEP_VALID_ORDER"
+    return KEEP_ORDER, "NO_RELIABLE_REPRICE_EVIDENCE"
+
+
+def reassess_sell(conn, *, broker, row, account_id, now, age_seconds):
+    """Broker-first Phase-3 decision for one due protective SELL.
+
+    The only cancel path remains ``cancel_stale_sell`` and is reached only
+    after an explicit REPRICE decision.  A terminal/missing broker order is
+    left for existing fill/recovery/reconciliation stages; no latch is
+    released from this function on inference alone.
+    """
+    from state_store import exit_intent_ledger as eil
+
+    position_id, symbol = row["position_id"], row["symbol"]
+    intent = eil.get_active_intent(conn, position_id) or {}
+    prior = _prior_reassessment(conn, position_id)
+    snapshot = _latest_exit_snapshot(conn, position_id)
+    broker_order_id = intent.get("broker_order_id")
+    open_order = _broker_open_order(broker, symbol=symbol,
+                                    broker_order_id=broker_order_id)
+    retry_count = int(prior.get("sell_retry_count") or 0)
+    reassessment_count = int(prior.get("reassessment_count") or 0) + 1
+    if open_order is None:
+        decision, reason, broker_status = BROKER_UNKNOWN, "OPEN_ORDER_BOOK_UNREADABLE", "UNKNOWN"
+    elif open_order is False:
+        decision, reason, broker_status = TERMINAL_RECONCILE, "ORDER_NOT_IN_OPEN_BOOK", "UNKNOWN_TERMINAL"
+    else:
+        decision, reason = _decision_for_open(order=open_order, snapshot=snapshot,
+                                               retry_count=retry_count)
+        broker_status = "OPEN_CANCELABLE"
+
+    order_price = _sell_price(open_order) if open_order else None
+    original_qty = _number(open_order, "ft_ord_qty", "FT_ORD_QTY") if open_order else None
+    filled_qty = _number(open_order, "ft_ccld_qty", "FT_CCLD_QTY") if open_order else None
+    remaining_qty = _number(open_order, "nccs_qty", "NCCS_QTY") if open_order else None
+    record = {
+        "position_id": position_id, "symbol": symbol,
+        "exit_intent_id": intent.get("intent_id"), "broker_order_id": broker_order_id,
+        "broker_status": broker_status,
+        "submitted_at": ((accepted_at(conn, intent.get("client_order_id")) or now).isoformat()),
+        "order_age_seconds": age_seconds, "original_qty": original_qty,
+        "filled_qty": filled_qty, "remaining_qty": remaining_qty,
+        "order_type": "limit" if open_order else None, "order_price": order_price,
+        "last_trade_price": snapshot.get("current_price"),
+        "recent_volume_5m": snapshot.get("recent_volume_5m"),
+        "recent_volume_10m": snapshot.get("recent_volume_10m"),
+        "recent_volume_15m": snapshot.get("recent_volume_15m"),
+        "dollar_volume_5m": snapshot.get("dollar_volume_5m"),
+        "nonzero_bar_count": snapshot.get("nonzero_bar_count"),
+        "data_age_seconds": snapshot.get("data_age_seconds"),
+        "session": snapshot.get("session"), "exit_reason": row.get("exit_reason"),
+        "exit_priority": snapshot.get("current_exit_priority"),
+        "sell_retry_count": retry_count, "reassessment_count": reassessment_count,
+        "last_reprice_at": prior.get("last_reprice_at"),
+        "previous_order_id": prior.get("previous_order_id"),
+        "previous_order_price": prior.get("previous_order_price"),
+        "decision": decision, "decision_reason": reason, "evaluated_at": now.isoformat(),
+    }
+    _persist_reassessment(conn, record)
+    if decision == EXIT_ESCALATION_REQUIRED:
+        _alert_reassessment_escalation(conn, symbol, position_id, retry_count)
+    result = {"position_id": position_id, "symbol": symbol, "action": decision,
+              "reason": reason, "broker_order_id": broker_order_id,
+              "age_seconds": age_seconds, "remaining_qty": remaining_qty,
+              "sell_retry_count": retry_count}
+    if decision != REPRICE_ORDER:
+        return result
+
+    # A reprice uses the old sanctioned cancel/release path.  The prior
+    # record remains the durable lineage; a second record marks the confirmed
+    # retry only after that path reports an actual release.
+    cancelled = cancel_stale_sell(conn, broker=broker, row=row,
+                                  reason="SELL_REPRICE_CONFIRMED", account_id=account_id,
+                                  now=now)
+    if cancelled.get("action") == ACTION_RELEASED_FOR_RETRY:
+        record.update({"sell_retry_count": retry_count + 1,
+                       "last_reprice_at": now.isoformat(),
+                       "previous_order_id": broker_order_id,
+                       "previous_order_price": order_price,
+                       "decision": REPRICE_ORDER,
+                       "decision_reason": "CANCELLED_CONFIRMED_RELEASED_FOR_ONE_RETRY",
+                       "evaluated_at": now.isoformat()})
+        _persist_reassessment(conn, record)
+    result.update(cancelled)
+    result["action"] = REPRICE_ORDER
+    return result
+
+
+def evaluate(conn, *, broker, account_id, now=None,
+             timeout_seconds=SELL_REASSESSMENT_SECONDS) -> List[Dict[str, Any]]:
+    """Reassess, never blindly cancel, an aged still-submitted S6 SELL."""
     current = _now(now)
     outcomes: List[Dict[str, Any]] = []
 
@@ -369,10 +585,7 @@ def evaluate(conn, *, broker, account_id, now=None,
                              "timeout_seconds": timeout_seconds})
             continue
 
-        _alert_stuck_timeout(conn, symbol, position_id, age)
-        result = cancel_stale_sell(
-            conn, broker=broker, row=row, reason=REASON_TIMEOUT,
-            account_id=account_id, now=current)
-        result["age_seconds"] = age
-        outcomes.append(result)
+        outcomes.append(reassess_sell(
+            conn, broker=broker, row=row, account_id=account_id,
+            now=current, age_seconds=age))
     return outcomes

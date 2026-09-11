@@ -153,16 +153,11 @@ def run_once(*, now=None) -> dict:
                     conn, broker, now=moment, open_orders=open_orders),
                 session=session, now=moment)),
             # AFTER the sell sync, so a SELL that just filled is already
-            # closed and never reaches this. Handles the OTHER gap
-            # `recovered_exits` below cannot: a SELL KIS keeps genuinely
-            # OPEN, unfilled, past a safe wait -- SCL on 2026-09-10, six
-            # hours ACCEPTED with nothing anywhere that would ever act
-            # on it. Cancels through the same sanctioned engine path a
-            # BUY timeout uses, confirms the cancel before releasing
-            # anything, and leaves the position EXIT_PENDING for the
-            # ordinary `retried` stage to pick up on the NEXT tick --
-            # same one-tick delay `recovered_exits` already uses below,
-            # so a cancel and an immediate resubmission never race.
+            # closed and never reaches this.  Phase 3 reassesses an aged,
+            # genuinely open SELL using broker truth and local Phase-1/2
+            # evidence.  Age alone never cancels: a valid/thin OPEN order
+            # remains live; only a proven reprice uses the existing
+            # confirmed-cancel -> next-tick retry sequence.
             ("stale_sell_timeouts", lambda: _stale_sell_timeouts(
                 conn, broker=broker, moment=moment)),
             # AFTER the sell sync, so a SELL that actually filled has
@@ -261,8 +256,7 @@ def _entry_timeouts(conn, *, broker, session, moment, capability):
         now=moment, session_orderable=capability.entry_supported)
 
 def _stale_sell_timeouts(conn, *, broker, moment):
-    """Cancel S6 SELLs that have rested, genuinely still open at KIS,
-    past the safe timeout -- see s6_live/exit_timeout.py."""
+    """Reassess aged S6 SELLs; this does not imply a cancellation."""
     from s6_live import exit_timeout
 
     account_id = None
