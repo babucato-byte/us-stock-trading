@@ -69,11 +69,12 @@ def _available(features, names) -> bool:
 
 
 def evaluate(state, *, features=None, price=None, session=None, now=None,
-             decision=None) -> Dict[str, Any]:
+             decision=None, profit_protection=None) -> Dict[str, Any]:
     """One tick's full picture. Never raises."""
     try:
         return _evaluate(state, features=features, price=price,
-                         session=session, now=now, decision=decision)
+                         session=session, now=now, decision=decision,
+                         profit_protection=profit_protection)
     except Exception as exc:  # noqa: BLE001 - diagnostics must not stop a tick
         logger.warning("S6 exit diagnostics failed", exc_info=True)
         return {"error": f"{type(exc).__name__}: {exc}"}
@@ -98,7 +99,8 @@ def _predicate(reason, state, features, price, session, now) -> Optional[dict]:
     return None
 
 
-def _evaluate(state, *, features, price, session, now, decision):
+def _evaluate(state, *, features, price, session, now, decision,
+              profit_protection):
     conditions: Dict[str, str] = {}
     detail: Dict[str, Any] = {}
 
@@ -118,6 +120,14 @@ def _evaluate(state, *, features, price, session, now, decision):
         conditions[reason] = TRUE if hit else FALSE
         if hit:
             detail[reason] = hit
+
+    # The live integrated rule consumes durable history assembled by the
+    # runtime, rather than recomputing a competing rule here.
+    if profit_protection is not None:
+        conditions[exit_policy.REASON_PROFIT_PROTECTION_EXIT] = (
+            TRUE if profit_protection.get("trigger") else FALSE)
+        if profit_protection.get("trigger"):
+            detail[exit_policy.REASON_PROFIT_PROTECTION_EXIT] = profit_protection
 
     entry = getattr(state, "entry_price", None)
     pnl_pct = None
@@ -144,6 +154,7 @@ def _evaluate(state, *, features, price, session, now, decision):
                                                  price=price),
         "conditions": conditions,
         "fired": detail,
+        "profit_protection": profit_protection or {},
     }
     # The headline for the shadow rule: set when the give-back exit
     # fired as designed and was not enforced. Never set when it sold.

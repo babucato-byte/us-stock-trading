@@ -117,6 +117,30 @@ class TestTheSellUsesTheSharedPath:
                          price_fn=lambda s: 99.4, session="REGULAR", now=T0)
         assert len(adapter.calls) == 1, "exit_submitted is one-way"
 
+    def test_profit_protection_uses_the_same_single_sell_path(self, conn, monkeypatch):
+        """P4 chooses a reason; it never introduces a second submitter."""
+        from s6_live import exit_policy
+
+        opened(conn)
+        monkeypatch.setattr(
+            exit_policy, "profit_protection_assessment",
+            lambda *args, **kwargs: {"trigger": True, "armed": True,
+                                     "giveback_warning": True,
+                                     "evidence": ["EMA9_LE_EMA21"]})
+        adapter = Adapter()
+        first = er.run_exits(
+            conn, broker_adapter=adapter,
+            features_fn=lambda s: Features(price=101.0),
+            price_fn=lambda s: 101.0, session="REGULAR", now=T0)
+        second = er.run_exits(
+            conn, broker_adapter=adapter,
+            features_fn=lambda s: Features(price=101.0),
+            price_fn=lambda s: 101.0, session="REGULAR", now=T0)
+        assert first[0]["reason"] == "PROFIT_PROTECTION_EXIT"
+        assert second[0]["reason"] == "S6_EXIT_ALREADY_SUBMITTED"
+        assert len(adapter.calls) == 1
+        assert adapter.calls[0]["side"] == "sell"
+
     def test_an_ambiguous_submit_latches_rather_than_retrying(self, conn):
         """The behaviour learned on S1: never auto-retry an ambiguous
         send, and never clear the trigger."""

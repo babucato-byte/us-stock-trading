@@ -80,6 +80,7 @@ NEVER_DELAYED_REASONS = frozenset({
     exit_policy.REASON_EMERGENCY, exit_policy.REASON_HARD_RISK_CAP,
     exit_policy.REASON_NO_STRUCTURE, exit_policy.REASON_SESSION_EXIT,
     exit_policy.REASON_RANGE_REENTRY, exit_policy.REASON_EMA_STRUCTURE_FAILURE,
+    exit_policy.REASON_PROFIT_PROTECTION_EXIT,
     exit_policy.REASON_VOLUME_DECAY_PRICE_WEAKNESS,
 })
 

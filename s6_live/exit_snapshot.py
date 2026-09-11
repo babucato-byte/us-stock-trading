@@ -54,10 +54,11 @@ PRIORITY_BY_REASON = {
     exit_policy.REASON_EMERGENCY: 1,
     exit_policy.REASON_HARD_RISK_CAP: 2,
     exit_policy.REASON_RANGE_REENTRY: 3,
-    exit_policy.REASON_VWAP_FAILURE: 4,
-    exit_policy.REASON_EMA_STRUCTURE_FAILURE: 5,
-    exit_policy.REASON_VOLUME_DECAY_PRICE_WEAKNESS: 6,
-    exit_policy.REASON_SESSION_EXIT: 7,
+    exit_policy.REASON_PROFIT_PROTECTION_EXIT: 4,
+    exit_policy.REASON_VWAP_FAILURE: 5,
+    exit_policy.REASON_EMA_STRUCTURE_FAILURE: 6,
+    exit_policy.REASON_VOLUME_DECAY_PRICE_WEAKNESS: 7,
+    exit_policy.REASON_SESSION_EXIT: 8,
 }
 
 # -- vwap_state ---------------------------------------------------------
@@ -131,6 +132,27 @@ def last_snapshot(conn, position_id) -> Optional[Dict[str, Any]]:
         logger.debug("exit_snapshot: could not read prior snapshot for %s",
                      position_id, exc_info=True)
         return None
+
+
+def recent_prices(conn, position_id, *, limit=32):
+    """Chronological Phase-1 prices for causal structure classification.
+
+    This indexed local read intentionally excludes the current tick; the
+    runtime appends the newly observed price exactly once before deciding.
+    """
+    if conn is None:
+        return []
+    try:
+        rows = conn.execute(
+            "SELECT current_price FROM s6_exit_snapshots WHERE position_id = ? "
+            "ORDER BY evaluated_at DESC, snapshot_id DESC LIMIT ?",
+            (position_id, int(limit)),
+        ).fetchall()
+        return [dict(row).get("current_price") for row in reversed(rows)]
+    except Exception:  # noqa: BLE001 - absent history is unconfirmed, never fatal
+        logger.debug("exit_snapshot: could not read prices for %s", position_id,
+                     exc_info=True)
+        return []
 
 
 def _vwap_state(price, vwap, previous_state) -> str:

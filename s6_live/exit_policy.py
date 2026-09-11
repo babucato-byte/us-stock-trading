@@ -51,6 +51,7 @@ SELL = "SELL"
 REASON_EMERGENCY = "EMERGENCY"
 REASON_HARD_RISK_CAP = "HARD_RISK_CAP"
 REASON_RANGE_REENTRY = "RANGE_REENTRY"
+REASON_PROFIT_PROTECTION_EXIT = "PROFIT_PROTECTION_EXIT"
 REASON_VWAP_FAILURE = "VWAP_FAILURE"
 REASON_EMA_STRUCTURE_FAILURE = "EMA_STRUCTURE_FAILURE"
 REASON_VOLUME_DECAY_PRICE_WEAKNESS = "VOLUME_DECAY_PRICE_WEAKNESS"
@@ -58,7 +59,8 @@ REASON_SESSION_EXIT = "SESSION_EXIT"
 REASON_NO_STRUCTURE = "NO_STRUCTURE_TO_PROTECT"
 
 EXIT_REASONS = (REASON_EMERGENCY, REASON_HARD_RISK_CAP, REASON_RANGE_REENTRY,
-                REASON_VWAP_FAILURE, REASON_EMA_STRUCTURE_FAILURE,
+                REASON_PROFIT_PROTECTION_EXIT, REASON_VWAP_FAILURE,
+                REASON_EMA_STRUCTURE_FAILURE,
                 REASON_VOLUME_DECAY_PRICE_WEAKNESS, REASON_SESSION_EXIT,
                 REASON_NO_STRUCTURE)
 
@@ -155,6 +157,87 @@ def ema_structure_failed(features) -> Optional[Dict[str, Any]]:
     if fast is None or slow is None or fast > slow:
         return None
     return {"ema9": fast, "ema21": slow}
+
+
+def causal_price_structure(prices) -> Dict[str, Any]:
+    """Classify confirmed lower-high/lower-low structure without lookahead.
+
+    A pivot at index ``i`` is only considered after price ``i + 1`` has
+    arrived.  Thus every high/low used here was knowable on this tick; the
+    function never labels the current unfinished bar a swing point.  The
+    inputs are Phase-1 snapshot prices followed by the current observed
+    price, all for one position and in chronological order.
+    """
+    series = [number for number in (_finite(p) for p in (prices or ()))
+              if number is not None]
+    highs, lows = [], []
+    for index in range(1, len(series) - 1):
+        before, point, after = series[index - 1:index + 2]
+        if point > before and point > after:
+            highs.append(point)
+        if point < before and point < after:
+            lows.append(point)
+    lower_high = len(highs) >= 2 and highs[-1] < highs[-2]
+    lower_low = len(lows) >= 2 and lows[-1] < lows[-2]
+    return {
+        "price_structure": "LOWER_HIGH_LOWER_LOW" if lower_high and lower_low
+        else "LOWER_HIGH" if lower_high else "LOWER_LOW" if lower_low
+        else "UNCONFIRMED",
+        "higher_high": len(highs) >= 2 and highs[-1] > highs[-2],
+        "higher_low": len(lows) >= 2 and lows[-1] > lows[-2],
+        "lower_high": lower_high,
+        "lower_low": lower_low,
+        "confirmed_swing_highs": highs[-2:],
+        "confirmed_swing_lows": lows[-2:],
+    }
+
+
+def profit_protection_assessment(state, *, features=None, current_price=None,
+                                 vwap_state=None, price_history=()) -> Dict[str, Any]:
+    """Return the one approved profit-protection assessment for this tick.
+
+    This is deliberately a predicate/detail builder, not an execution path.
+    The caller supplies Phase-2's already durable VWAP state and Phase-1
+    prices.  Missing data therefore produces an unarmed HOLD rather than a
+    guessed structure.
+    """
+    price = _price_of(features, current_price)
+    peak = _finite(state.peak_price)
+    entry = _finite(state.entry_price)
+    peak_gain_pct = ((peak / entry - 1.0) * 100.0
+                     if peak is not None and entry not in (None, 0) else None)
+    drawdown_pct = ((peak - price) / peak * 100.0
+                    if peak not in (None, 0) and price is not None else None)
+    armed = bool(peak_gain_pct is not None and
+                 peak_gain_pct >= policy.PROFIT_PROTECTION_PEAK_GAIN_PCT)
+    giveback_warning = bool(armed and drawdown_pct is not None and
+                            drawdown_pct >= policy.PROFIT_PROTECTION_DRAWDOWN_PCT)
+    ema_failure = ema_structure_failed(features)
+    structure = causal_price_structure([*price_history, price])
+    vwap_confirmed = vwap_state == "VWAP_FAILURE_CONFIRMED"
+    evidence = []
+    if vwap_confirmed:
+        evidence.append("VWAP_FAILURE_CONFIRMED")
+    if ema_failure:
+        evidence.append("EMA9_LE_EMA21")
+    if structure["lower_high"] and structure["lower_low"]:
+        evidence.append("LOWER_HIGH+LOWER_LOW")
+    trigger = bool(armed and giveback_warning and evidence)
+    return {
+        "armed": armed,
+        "giveback_warning": giveback_warning,
+        "peak_gain_pct": peak_gain_pct,
+        "drawdown_from_peak_pct": drawdown_pct,
+        "peak_gain_threshold_pct": policy.PROFIT_PROTECTION_PEAK_GAIN_PCT,
+        "drawdown_threshold_pct": policy.PROFIT_PROTECTION_DRAWDOWN_PCT,
+        "vwap_state": vwap_state,
+        "vwap_failure_confirmed": vwap_confirmed,
+        "ema_structure_failure": bool(ema_failure),
+        "ema_detail": ema_failure,
+        **structure,
+        "evidence": evidence,
+        "trigger": trigger,
+    }
 
 
 def volume_decayed(state, features) -> Optional[Dict[str, Any]]:
@@ -373,7 +456,8 @@ def session_ending(session=None, now=None) -> Optional[Dict[str, Any]]:
 
 
 def decide(state: S6PositionState, *, current_price=None, features=None,
-           session=None, now=None, emergency: bool = False) -> ExitDecision:
+           session=None, now=None, emergency: bool = False,
+           profit_protection=None) -> ExitDecision:
     """One action for one position. Never places an order."""
     if state.exit_submitted:
         return ExitDecision(HOLD, reason=REASON_ALREADY_SUBMITTED)
@@ -405,6 +489,15 @@ def decide(state: S6PositionState, *, current_price=None, features=None,
         if reentered:
             return ExitDecision(SELL, reason=REASON_RANGE_REENTRY,
                                 detail={**context, **reentered})
+
+    # EXIT V2's only new live rule.  The assessment is built by the runtime
+    # from Phase-1/2 durable history before this decision is called.  It is
+    # below the unchanged price/range safety exits and above the existing
+    # standalone VWAP/EMA exits, so one action still has exactly one reason.
+    protection = profit_protection or {}
+    if protection.get("trigger"):
+        return ExitDecision(SELL, reason=REASON_PROFIT_PROTECTION_EXIT,
+                            detail={**context, **protection})
 
     if policy.EXIT_ON_VWAP_FAILURE:
         lost = vwap_failed(features)

@@ -450,9 +450,33 @@ def evaluate_position(conn, *, broker_adapter, position_id, row,
     refreshed = position_store.load(conn, position_id) or row
 
     state = position_store.to_state(refreshed)
+    # EXIT V2 integrated live input: only durable Phase-1/2 evidence and
+    # this tick's already-observed features.  It neither calls a broker nor
+    # writes state before the decision.  The normal snapshot persisted below
+    # records the same assessment for replay.
+    prior_row = None
+    profit_protection = None
+    try:
+        from s6_live import exit_shadow, exit_snapshot
+
+        prior_row = exit_snapshot.last_snapshot(conn, position_id)
+        current = exit_policy._price_of(features, current_price)
+        vwap_state, _streak = exit_shadow.vwap_shadow_state(
+            current, getattr(features, "vwap", None),
+            prior_state=(prior_row or {}).get("shadow_vwap_state"),
+            prior_streak=(prior_row or {}).get("shadow_vwap_breach_streak") or 0)
+        profit_protection = exit_policy.profit_protection_assessment(
+            state, features=features, current_price=current,
+            vwap_state=vwap_state,
+            price_history=exit_snapshot.recent_prices(conn, position_id))
+    except Exception:  # noqa: BLE001 - incomplete research history cannot exit
+        logger.warning("S6 profit-protection assessment unavailable for %s", symbol,
+                       exc_info=True)
+        profit_protection = None
     decision = exit_policy.decide(
         state, current_price=current_price,
-        features=features, session=session, now=now, emergency=emergency)
+        features=features, session=session, now=now, emergency=emergency,
+        profit_protection=profit_protection)
 
     # Every tick records what each rule answered, including the ones that
     # could not answer at all. A HOLD that was really "three rules had no
@@ -461,7 +485,8 @@ def evaluate_position(conn, *, broker_adapter, position_id, row,
     diagnostics = exit_diagnostics.evaluate(
         state, features=features, price=exit_policy._price_of(
             features, current_price),
-        session=session, now=now, decision=decision)
+        session=session, now=now, decision=decision,
+        profit_protection=profit_protection)
     if diagnostics.get("unavailable_rules"):
         # Named explicitly when NOTHING could be read, because "every
         # rule abstained" and "the market was calm" are the same silence
@@ -479,18 +504,13 @@ def evaluate_position(conn, *, broker_adapter, position_id, row,
             ", ".join(diagnostics["unavailable_rules"]))
         diagnostics["position_data_unavailable"] = bool(whole_view_missing)
 
-    # EXIT V2 PHASE 1+2: durable instrumentation and a shadow decision,
-    # never a trading input. Computed and persisted for HOLD and SELL
-    # alike, after the decision above is already final -- nothing below
-    # can change it, and the shadow decision (exit_shadow.py) only READS
-    # decision.reason/.action, it does not call exit_policy.decide()
-    # again or touch position_store/exit_intent_ledger for anything but
-    # the read-only active-intent lookup exit_snapshot.build() already
-    # does. See s6_live/exit_snapshot.py and s6_live/exit_shadow.py.
+    # Persist Phase-1/2 evidence and the shadow verdict after every tick.
+    # The narrow live read above is limited to the approved P4 assessment;
+    # this write still does not alter a decision already made or touch the
+    # SELL intent/submission path.
     try:
         from s6_live import exit_shadow, exit_snapshot
 
-        prior_row = exit_snapshot.last_snapshot(conn, position_id)
         snapshot = exit_snapshot.build(
             conn=conn, position_id=position_id, row=refreshed,
             features=features, diagnostics=diagnostics, decision=decision,
