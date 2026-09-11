@@ -297,6 +297,7 @@ class RunReport:
             "profile": self.profile,
             "trading_day": self.trading_day,
             "started_at": self.started_at,
+            "session": self.session,
             "run_status": self.status,
             "candidate_count": self.candidate_count,
             "provider": self.provider,

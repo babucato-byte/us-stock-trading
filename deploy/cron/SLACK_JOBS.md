@@ -24,11 +24,10 @@ for that one instead.)
 
 ## Daily scanner summary (S1-S5) -> stock-sanner
 
-After the release forward-outcome job (18:33 ET) -- 18:50 ET, a minute slot
-no existing job uses (audited 2026-09-09: the only 18:xx ET job is the
-performance tracker at :33):
+After AFTER_HOURS closes at 20:00 ET, use 20:20 ET so all four session
+sections are complete and it does not collide with the 20:10 trading report:
 
-    50 22,23 * * 1-5 [ "$(TZ=America/New_York date +\%H)" = "18" ] && ... "$ROOT/scripts/run_daily_scanner_summary.py"
+    20 0,1 * * 2-6 [ "$(TZ=America/New_York date +\%H)" = "20" ] && ... "$ROOT/deploy/cron/scanner_daily_summary.sh"
 
 ## S6 entry outcomes (ORB5 fills vs ORB15 shadow) -> entry_outcomes/<day>.jsonl
 

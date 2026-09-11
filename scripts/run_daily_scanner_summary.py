@@ -48,7 +48,7 @@ def main(argv=None) -> int:
     except Exception:  # noqa: BLE001
         conn = None
     try:
-        summary = dss.build(day, conn=conn)
+        summary = {"trading_day": day, "sessions": dss.build_by_session(day, conn=conn)}
         message = dss.format_message(summary)
         print(message)
         if args.print_only:

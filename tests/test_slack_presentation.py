@@ -360,11 +360,13 @@ class TestRouting:
         from scanners.analytics import daily_scanner_summary as dss
         from scripts import run_daily_scanner_summary as script
 
-        monkeypatch.setattr(dss, "build", lambda day, conn=None: {
-            "trading_day": day, "rows": [], "best": None, "failures": [], "total_signals": 0})
+        monkeypatch.setattr(dss, "build_by_session", lambda day, conn=None: {
+            name: {"trading_day": day, "rows": [], "best": None,
+                   "failures": [], "total_signals": 0}
+            for name in ("PREMARKET", "REGULAR", "AFTER_HOURS", "OVERNIGHT_DAYTIME")})
         script.main(["--trading-day", "2026-09-08"])
         assert [url for url, _ in webhooks] == ["https://hooks.test/SCANNER"]
-        assert webhooks[0][1].startswith("[스캐너 일일 성과]")
+        assert webhooks[0][1].startswith("[스캐너 세션별 일일 성과]")
 
     def test_the_daily_trading_report_goes_only_to_the_report_channel(self, webhooks):
         from scripts import run_daily_trading_report as script

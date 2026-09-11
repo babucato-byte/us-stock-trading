@@ -26,6 +26,7 @@ Nothing here reads the order path or changes a scanner.
 """
 
 import logging
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,27 @@ MFE_FIELDS = ("mfe_1h", "mfe_30m", "mfe_15m", "mfe_1d")
 MAE_FIELDS = ("mae_1h", "mae_30m", "mae_15m", "mae_1d")
 
 NO_DATA = "데이터 없음"
+
+
+def _session_for_manifest(manifest: Dict[str, Any]) -> Optional[str]:
+    from scanners.base import scan_session
+    explicit = scan_session.normalize(manifest.get("session"))
+    if explicit:
+        return explicit
+    try:
+        stamp = datetime.fromisoformat(str(manifest.get("started_at")).replace("Z", "+00:00"))
+        return scan_session.session_at(stamp)
+    except (TypeError, ValueError):
+        return None
+
+
+def _session_for_signal(signal: Dict[str, Any]) -> Optional[str]:
+    from scanners.base import scan_session
+    try:
+        stamp = datetime.fromisoformat(str(signal.get("timestamp")).replace("Z", "+00:00"))
+        return scan_session.session_at(stamp)
+    except (TypeError, ValueError):
+        return None
 
 
 def _num(value) -> Optional[float]:
@@ -93,7 +115,7 @@ def _scanned_by_scanner(manifests: List[Dict[str, Any]]) -> Dict[str, int]:
 def _failures(manifests: List[Dict[str, Any]]) -> List[str]:
     out = []
     for manifest in manifests or []:
-        status = str(manifest.get("status") or "")
+        status = str(manifest.get("run_status") or manifest.get("status") or "")
         if status.startswith("FAILED") or status == "PARTIAL":
             profile = manifest.get("profile") or manifest.get("session") or "run"
             out.append(f"{profile}: {status}")
@@ -118,7 +140,7 @@ def _s1_trades(conn, trading_day: str) -> List[Dict[str, Any]]:
     return [dict(zip(keys, row)) for row in rows]
 
 
-def build(trading_day: str, *, signals=None, performance=None, manifests=None,
+def build(trading_day: str, session=None, *, signals=None, performance=None, manifests=None,
           conn=None) -> Dict[str, Any]:
     """The summary dict. Every value is either measured or None."""
     if signals is None or performance is None or manifests is None:
@@ -129,6 +151,13 @@ def build(trading_day: str, *, signals=None, performance=None, manifests=None,
                        if performance is None else performance)
         manifests = result_store.read_run_manifests(trading_day) if manifests is None else manifests
 
+    from scanners.base import scan_session
+    selected = scan_session.normalize(session)
+    if session is not None and selected is None:
+        raise ValueError("session must be one of scan_session.SESSIONS")
+    if selected:
+        signals = [row for row in signals if _session_for_signal(row) == selected]
+        manifests = [row for row in manifests if _session_for_manifest(row) == selected]
     scanned = _scanned_by_scanner(manifests)
     trades = _s1_trades(conn, trading_day)
     trades_by_signal = {str(t.get("source_signal_id")): t for t in trades
@@ -155,8 +184,9 @@ def build(trading_day: str, *, signals=None, performance=None, manifests=None,
                 maes.append(mae[1])
         connected = [t for t in trades if str(t.get("source_signal_id")) in
                      {str(s.get("signal_id")) for s in mine}]
-        connected += [t for t in trades if name == "hma_early_trend"
-                      and t not in connected and t.get("entry_filled_at")]
+        if selected is None:
+            connected += [t for t in trades if name == "hma_early_trend"
+                          and t not in connected and t.get("entry_filled_at")]
         closed = [t for t in connected if t.get("exit_filled_at") is not None
                   and _num(t.get("gross_pnl")) is not None]
         if closed:
@@ -187,12 +217,23 @@ def build(trading_day: str, *, signals=None, performance=None, manifests=None,
     measurable = [r for r in rows if r["avg_return"] is not None]
     best = max(measurable, key=lambda r: r["avg_return"]) if measurable else None
     return {
-        "trading_day": trading_day,
+        "trading_day": trading_day, "session": selected,
         "rows": rows,
         "best": best["label"] if best else None,
         "failures": _failures(manifests),
         "total_signals": len(signals),
+        "unattributed_live_entries": (sum(1 for t in trades if t.get("entry_filled_at")
+                                      and str(t.get("source_signal_id")) not in
+                                      {str(s.get("signal_id")) for s in signals}) if selected else 0),
     }
+
+
+def build_by_session(trading_day: str, *, signals=None, performance=None,
+                     manifests=None, conn=None) -> Dict[str, Any]:
+    from scanners.base import scan_session
+    shared = dict(signals=signals, performance=performance, manifests=manifests, conn=conn)
+    return {session: build(trading_day, session=session, **shared)
+            for session in scan_session.SESSIONS}
 
 
 def _pct(value) -> str:
@@ -200,7 +241,16 @@ def _pct(value) -> str:
 
 
 def format_message(summary: Dict[str, Any]) -> str:
-    lines = ["[스캐너 일일 성과]", str(summary.get("trading_day")), ""]
+    if "sessions" in summary:
+        lines = ["[스캐너 세션별 일일 성과]", str(summary.get("trading_day")), ""]
+        for session, item in summary["sessions"].items():
+            lines += [session, _format_rows(item), ""]
+        return "\n".join(lines).rstrip()
+    return "\n".join(["[스캐너 일일 성과]", str(summary.get("trading_day")), "", _format_rows(summary)])
+
+
+def _format_rows(summary: Dict[str, Any]) -> str:
+    lines = []
     for row in summary["rows"]:
         lines.append(row["label"])
         if row["candidates"] is None and row["scanned"] is None:
