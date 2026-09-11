@@ -379,6 +379,21 @@ class TestRangeShadowDeadline:
             store=object(), deadline=_deadline)
         assert seen == ["AAA"]
 
+    def test_operation_reserve_prevents_starting_a_slow_optional_symbol(self, monkeypatch):
+        """A nearly-expired global tick must not start another ORB15 read."""
+        from s6_live import range_shadow
+
+        seen = []
+        monkeypatch.setattr(range_shadow, "evaluate_symbol",
+                            lambda symbol, **k: seen.append(symbol) or None)
+        stats = {}
+        range_shadow.record_cycle(
+            self._source(["AAA", "BBB"]), trading_day=DAY, now=NOW,
+            store=object(), remaining_seconds=lambda: 0.01, stats=stats)
+        assert seen == []
+        assert stats["deferred"] == 2
+        assert stats["stop_reason"] == "GLOBAL_BUDGET"
+
     def test_run_live_buy_entry_wires_the_tick_budget_as_the_deadline(self, monkeypatch):
         """The call site passes _shadow_budget_remaining, not a fresh
         clock -- so this deadline agrees with the audit-write loop's

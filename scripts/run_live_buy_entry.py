@@ -22,6 +22,7 @@ import argparse
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -795,6 +796,20 @@ def _announce_liquidity_blocks(source) -> None:
 _TICK_HARD_BUDGET_SECONDS = 50.0
 
 
+class _OptionalWorkDeadline:
+    """One monotonic deadline for non-trading work in an entry tick."""
+    def __init__(self, since):
+        from datetime import datetime, timezone
+        elapsed = (datetime.now(timezone.utc) - since).total_seconds()
+        self._expires_at = time.monotonic() + max(0.0, _TICK_HARD_BUDGET_SECONDS - elapsed)
+
+    def remaining_seconds(self):
+        return self._expires_at - time.monotonic()
+
+    def expired(self):
+        return self.remaining_seconds() <= 0
+
+
 def _shadow_budget_remaining(since, *, now=None):
     """Seconds left for optional shadow work in this entry tick."""
     from datetime import datetime, timezone
@@ -821,6 +836,7 @@ def _record_shadow_signals(source, results, *, since):
     answer.
     """
     from datetime import datetime, timezone
+    optional_deadline = _OptionalWorkDeadline(since)
 
     # This is research/audit work after the order path.  It never earns an
     # extra second of the entry lock: return before imports or persistence
@@ -938,7 +954,8 @@ def _record_shadow_signals(source, results, *, since):
             # shadow's per-symbol loop, fixed the same way.
             range_shadow.record_cycle(
                 source, trading_day=us_trading_day(since), now=since,
-                deadline=lambda: _shadow_budget_remaining(since) <= 0)
+                deadline=optional_deadline.expired,
+                remaining_seconds=optional_deadline.remaining_seconds)
         except Exception:  # noqa: BLE001 -- research, and the cycle is over
             logger.warning("could not record the ORB15 range shadow", exc_info=True)
 

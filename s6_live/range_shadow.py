@@ -30,6 +30,7 @@ the store or the live evaluation.
 import json
 import logging
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -52,6 +53,10 @@ def log_path(trading_day, *, env=None) -> Optional[Path]:
 #: the gap between rows: extended-hours bars exist only for minutes that
 #: traded, so that gap measures liquidity, not the width of a bar.
 BAR_WIDTH_MINUTES = 1.0
+
+# Observed live ORB15 work has taken roughly four seconds per symbol.  This
+# is operational headroom for optional research, never a trading parameter.
+MIN_OPERATION_BUDGET_SECONDS = 5.0
 
 
 def evaluate_symbol(symbol, *, store, session, now, shadow_minutes, config=None,
@@ -145,7 +150,7 @@ def append(record, *, trading_day, env=None) -> bool:
 
 
 def record_cycle(source, *, trading_day, now, env=None, store=None,
-                 deadline=None) -> int:
+                 deadline=None, remaining_seconds=None, stats=None) -> int:
     """After a live cycle: the ORB15 verdict for every symbol it judged.
 
     Returns how many rows were written. Silent (0) when the session's
@@ -187,13 +192,21 @@ def record_cycle(source, *, trading_day, now, env=None, store=None,
             session_date=srange.current_session_date(session, now))
     if bars is None:
         return 0
-    written = 0
+    started = time.monotonic()
+    written = attempted = 0
+    stop_reason = "NO_WORK"
+    timings = []
     for symbol, live in sorted(evaluations.items()):
-        if deadline is not None and deadline():
+        remaining = remaining_seconds() if remaining_seconds is not None else None
+        if (deadline is not None and deadline()) or (
+                remaining is not None and remaining < MIN_OPERATION_BUDGET_SECONDS):
+            stop_reason = "GLOBAL_BUDGET"
             logger.info(
                 "RANGE_SHADOW_DEFERRED_BUDGET written=%d remaining=%d",
                 written, len(evaluations) - written)
             break
+        attempted += 1
+        symbol_started = time.monotonic()
         try:
             record = evaluate_symbol(symbol, store=bars, session=session, now=now,
                                      shadow_minutes=shadow_minutes,
@@ -204,6 +217,23 @@ def record_cycle(source, *, trading_day, now, env=None, store=None,
             continue
         if record is not None and append(record, trading_day=trading_day, env=env):
             written += 1
+        timings.append((time.monotonic() - symbol_started) * 1000)
+    else:
+        stop_reason = "COMPLETE"
+    elapsed_ms = (time.monotonic() - started) * 1000
+    ordered = sorted(timings)
+    def percentile(p):
+        if not ordered:
+            return 0.0
+        return ordered[min(len(ordered) - 1, int((len(ordered) - 1) * p))]
+    summary = {"attempted": attempted, "completed": written,
+               "deferred": max(0, len(evaluations) - attempted),
+               "elapsed_ms": round(elapsed_ms, 1), "stop_reason": stop_reason,
+               "p50_ms": round(percentile(.5), 1), "p95_ms": round(percentile(.95), 1),
+               "max_ms": round(max(ordered) if ordered else 0.0, 1)}
+    if stats is not None:
+        stats.update(summary)
+    logger.info("RANGE_SHADOW_ELAPSED attempted=%(attempted)d completed=%(completed)d deferred=%(deferred)d elapsed_ms=%(elapsed_ms).1f stop_reason=%(stop_reason)s p50_ms=%(p50_ms).1f p95_ms=%(p95_ms).1f max_ms=%(max_ms).1f", summary)
     return written
 
 
