@@ -20,8 +20,6 @@ from s6_live import exit_policy
 
 
 MILESTONES = (
-    ("armed_at", "armed"),
-    ("giveback_warning_at", "giveback_warning"),
     ("vwap_confirmed_failure_at", "vwap_failure_confirmed"),
     ("ema_failure_at", "ema_structure_failure"),
     ("lower_high_lower_low_at", "lower_high_lower_low"),
@@ -48,7 +46,8 @@ def replay_rows(rows):
     for row in rows:
         assessment = exit_policy.profit_protection_assessment(
             _state(row), features=_features(row), current_price=row["current_price"],
-            vwap_state=row["shadow_vwap_state"], price_history=history)
+            vwap_state=row["shadow_vwap_state"], price_history=history,
+            momentum_state=row.get("momentum_state"))
         assessment["lower_high_lower_low"] = bool(
             assessment["lower_high"] and assessment["lower_low"])
         assessment["evaluated_at"] = row["evaluated_at"]

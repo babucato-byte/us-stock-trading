@@ -468,7 +468,8 @@ def evaluate_position(conn, *, broker_adapter, position_id, row,
         profit_protection = exit_policy.profit_protection_assessment(
             state, features=features, current_price=current,
             vwap_state=vwap_state,
-            price_history=exit_snapshot.recent_prices(conn, position_id))
+            price_history=exit_snapshot.recent_prices(conn, position_id),
+            momentum_state=(prior_row or {}).get("momentum_state"))
     except Exception:  # noqa: BLE001 - incomplete research history cannot exit
         logger.warning("S6 profit-protection assessment unavailable for %s", symbol,
                        exc_info=True)

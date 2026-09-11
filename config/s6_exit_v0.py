@@ -68,16 +68,6 @@ REEVALUATION_QUESTIONS = (
 #: was the breakout, and this is the breakout undone.
 EXIT_ON_RANGE_REENTRY = True
 
-# --- integrated profit protection ---------------------------------------
-#
-# These are the explicitly approved live conditions for EXIT V2.  They are
-# position-relative measurements, not a second stop-loss: the position must
-# first have earned two percent, then have surrendered 0.8 percentage points
-# from its own high, and finally show a confirmed loss of structure.  The
-# confirmation is supplied by the durable Phase-1/2 snapshot history.
-PROFIT_PROTECTION_PEAK_GAIN_PCT = 2.0
-PROFIT_PROTECTION_DRAWDOWN_PCT = 0.8
-
 #: Below VWAP: the session's volume traded above the current price.
 EXIT_ON_VWAP_FAILURE = True
 

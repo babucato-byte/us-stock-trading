@@ -34,13 +34,13 @@ def _features(**overrides):
 
 
 def _assessment(state=None, feats=None, *, price=None, vwap_state="VWAP_HEALTHY",
-                history=()):
+                history=(), momentum_state=None):
     state = state or _state()
     feats = feats or _features()
     price = feats.price if price is None else price
     return exit_policy.profit_protection_assessment(
         state, features=feats, current_price=price, vwap_state=vwap_state,
-        price_history=history)
+        price_history=history, momentum_state=momentum_state)
 
 
 def _decide(state=None, feats=None, *, protection=None):
@@ -56,38 +56,42 @@ class TestLiveProfitProtection:
         state = _state(peak_price=103.0)
         feats = _features(price=103.0, vwap=101.0, ema9=103.0, ema21=102.0)
         assessment = _assessment(state, feats)
-        assert assessment["armed"] and not assessment["giveback_warning"]
+        assert assessment["peak_gain_pct"] == pytest.approx(3.0)
+        assert not assessment["trigger"]
         assert _decide(state, feats, protection=assessment).action == exit_policy.HOLD
 
     def test_plus_five_percent_healthy_trend_holds(self):
         state = _state(peak_price=105.0)
         feats = _features(price=104.8, vwap=103.0, ema9=104.0, ema21=103.0)
         assessment = _assessment(state, feats)
-        assert assessment["armed"] and not assessment["trigger"]
+        assert assessment["peak_gain_pct"] == pytest.approx(5.0)
+        assert not assessment["trigger"]
         assert _decide(state, feats, protection=assessment).action == exit_policy.HOLD
 
     def test_armed_alone_holds(self):
         feats = _features(price=103.0)
         assessment = _assessment(_state(), feats)
-        assert assessment["armed"] and not assessment["giveback_warning"]
+        assert assessment["peak_gain_pct"] == pytest.approx(3.0)
+        assert not assessment["trigger"]
         assert _decide(_state(), feats, protection=assessment).action == exit_policy.HOLD
 
     def test_giveback_alone_holds(self):
-        state = _state(peak_price=101.0)  # never armed at +2%
+        state = _state(peak_price=101.0)
         feats = _features(price=100.0)
         assessment = _assessment(state, feats)
-        assert not assessment["armed"] and not assessment["trigger"]
+        assert not assessment["trigger"]
         assert _decide(state, feats, protection=assessment).action == exit_policy.HOLD
 
     def test_giveback_plus_ema_failure_selects_live_sell(self):
-        feats = _features(price=102.0, vwap=100.0, ema9=100.0, ema21=101.0)
-        assessment = _assessment(_state(), feats)
-        assert assessment["giveback_warning"] and assessment["ema_structure_failure"]
+        feats = _features(price=100.0, vwap=99.0, ema9=100.0, ema21=101.0)
+        history = (100.0, 105.0, 102.0, 104.0, 101.0, 103.0)
+        assessment = _assessment(_state(), feats, history=history)
+        assert assessment["ema_structure_failure"]
         decision = _decide(_state(), feats, protection=assessment)
         assert decision.sells and decision.reason == exit_policy.REASON_PROFIT_PROTECTION_EXIT
 
     def test_giveback_plus_confirmed_vwap_failure_selects_live_sell(self):
-        feats = _features(price=102.0, vwap=103.0, ema9=102.0, ema21=101.0)
+        feats = _features(price=102.0, vwap=103.0, ema9=100.0, ema21=101.0)
         assessment = _assessment(_state(), feats,
                                  vwap_state="VWAP_FAILURE_CONFIRMED")
         assert assessment["vwap_failure_confirmed"]
@@ -97,7 +101,8 @@ class TestLiveProfitProtection:
     def test_giveback_plus_confirmed_lower_high_lower_low_selects_live_sell(self):
         feats = _features(price=100.0, vwap=99.0, ema9=101.0, ema21=100.0)
         history = (100.0, 105.0, 102.0, 104.0, 101.0, 103.0)
-        assessment = _assessment(_state(), feats, history=history)
+        assessment = _assessment(_state(), feats, history=history,
+                                 momentum_state="FAILED")
         assert assessment["lower_high"] and assessment["lower_low"]
         decision = _decide(_state(), feats, protection=assessment)
         assert decision.sells and decision.reason == exit_policy.REASON_PROFIT_PROTECTION_EXIT
@@ -164,11 +169,10 @@ def test_replay_reports_first_causal_profit_protection_tick():
             "exit_submitted": 0, "current_price": price,
             "vwap": 99.0, "ema9": 101.0, "ema21": 100.0,
             "shadow_vwap_state": "VWAP_HEALTHY",
+            "momentum_state": "FAILED",
             "evaluated_at": f"2026-09-11T15:0{number}:00+00:00",
         })
     milestones, assessments = replay_rows(rows)
-    assert milestones["armed_at"] == rows[1]["evaluated_at"]
-    assert milestones["giveback_warning_at"] == rows[2]["evaluated_at"]
     assert milestones["lower_high_lower_low_at"] == rows[5]["evaluated_at"]
     assert milestones["profit_protection_exit_at"] == rows[5]["evaluated_at"]
     assert assessments[5]["trigger"] is True

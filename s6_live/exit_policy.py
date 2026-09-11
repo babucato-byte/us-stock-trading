@@ -193,7 +193,8 @@ def causal_price_structure(prices) -> Dict[str, Any]:
 
 
 def profit_protection_assessment(state, *, features=None, current_price=None,
-                                 vwap_state=None, price_history=()) -> Dict[str, Any]:
+                                 vwap_state=None, price_history=(),
+                                 momentum_state=None) -> Dict[str, Any]:
     """Return the one approved profit-protection assessment for this tick.
 
     This is deliberately a predicate/detail builder, not an execution path.
@@ -208,13 +209,12 @@ def profit_protection_assessment(state, *, features=None, current_price=None,
                      if peak is not None and entry not in (None, 0) else None)
     drawdown_pct = ((peak - price) / peak * 100.0
                     if peak not in (None, 0) and price is not None else None)
-    armed = bool(peak_gain_pct is not None and
-                 peak_gain_pct >= policy.PROFIT_PROTECTION_PEAK_GAIN_PCT)
-    giveback_warning = bool(armed and drawdown_pct is not None and
-                            drawdown_pct >= policy.PROFIT_PROTECTION_DRAWDOWN_PCT)
     ema_failure = ema_structure_failed(features)
     structure = causal_price_structure([*price_history, price])
     vwap_confirmed = vwap_state == "VWAP_FAILURE_CONFIRMED"
+    momentum_failed = momentum_state == "FAILED"
+    lower_high_lower_low = bool(structure["lower_high"] and structure["lower_low"])
+    not_making_new_high = not structure["higher_high"]
     evidence = []
     if vwap_confirmed:
         evidence.append("VWAP_FAILURE_CONFIRMED")
@@ -222,17 +222,25 @@ def profit_protection_assessment(state, *, features=None, current_price=None,
         evidence.append("EMA9_LE_EMA21")
     if structure["lower_high"] and structure["lower_low"]:
         evidence.append("LOWER_HIGH+LOWER_LOW")
-    trigger = bool(armed and giveback_warning and evidence)
+    if momentum_failed:
+        evidence.append("MOMENTUM_FAILED")
+    combination_a = lower_high_lower_low and bool(ema_failure or vwap_confirmed or momentum_failed)
+    combination_b = bool(ema_failure and vwap_confirmed and not_making_new_high)
+    combination_c = bool(lower_high_lower_low and momentum_failed)
+    trigger = bool(combination_a or combination_b or combination_c)
     return {
-        "armed": armed,
-        "giveback_warning": giveback_warning,
         "peak_gain_pct": peak_gain_pct,
         "drawdown_from_peak_pct": drawdown_pct,
-        "peak_gain_threshold_pct": policy.PROFIT_PROTECTION_PEAK_GAIN_PCT,
-        "drawdown_threshold_pct": policy.PROFIT_PROTECTION_DRAWDOWN_PCT,
         "vwap_state": vwap_state,
         "vwap_failure_confirmed": vwap_confirmed,
         "ema_structure_failure": bool(ema_failure),
+        "momentum_state": momentum_state,
+        "momentum_failed": momentum_failed,
+        "lower_high_lower_low": lower_high_lower_low,
+        "not_making_new_high": not_making_new_high,
+        "combination_a": combination_a,
+        "combination_b": combination_b,
+        "combination_c": combination_c,
         "ema_detail": ema_failure,
         **structure,
         "evidence": evidence,
