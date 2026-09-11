@@ -419,3 +419,114 @@ class TestRangeShadowDeadline:
             since=datetime.now(timezone.utc))
         assert callable(captured["deadline"])
         assert captured["deadline"]() is False  # freshly within budget
+
+
+class TestOneGlobalOptionalDeadline:
+    """`range_shadow.record_cycle` and `_record_closed_bar_shadow` must
+    share the SAME `_OptionalWorkDeadline`, not each track its own local
+    budget -- two independent 30s/20s allowances can add up to well past
+    the 50s tick budget even though neither, alone, looks unbounded."""
+
+    def test_range_shadow_spending_time_shrinks_closed_bar_shadows_own_deadline(
+            self, monkeypatch):
+        """If range-shadow and closed-bar shadow each tracked their own
+        local clock, range-shadow spending 0.2s would not show up in
+        closed-bar shadow's budget at all -- two 20s-reserve allowances
+        could then both fit inside 50s even after real work already
+        used most of it. Sharing one `_OptionalWorkDeadline` object
+        means time range-shadow spends is visible to closed-bar shadow
+        too."""
+        import time as time_mod
+
+        from scripts import run_live_buy_entry as runner
+        import s6_live.range_shadow as range_shadow
+
+        def _spend_time(*a, **k):
+            time_mod.sleep(0.2)
+            return 0
+
+        monkeypatch.setattr(range_shadow, "record_cycle", _spend_time)
+        monkeypatch.setattr(runner, "_announce_quality_blocks", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_announce_liquidity_blocks", lambda *a, **k: None)
+
+        captured = {}
+        monkeypatch.setattr(
+            runner, "_record_closed_bar_shadow",
+            lambda *a, deadline=None, **k: captured.setdefault("deadline", deadline))
+
+        class FakeSource:
+            _session = SESSION
+            evaluations = {}
+
+            def candidate_row(self, symbol):
+                return None
+
+        before = time_mod.monotonic()
+        runner._record_shadow_signals(
+            FakeSource(), {"blocked": (), "skipped": (), "submitted": ()},
+            since=datetime.now(timezone.utc))
+        after = time_mod.monotonic()
+
+        remaining = captured["deadline"].remaining_seconds()
+        # remaining must have dropped by (at least) the 0.2s range-shadow
+        # spent, proving it shares range-shadow's own clock rather than
+        # starting a fresh, independent allowance for closed-bar shadow.
+        assert remaining <= runner._TICK_HARD_BUDGET_SECONDS - 0.2
+        assert (after - before) >= 0.2
+
+    def test_global_optional_work_markers_are_logged(self, monkeypatch, caplog):
+        from scripts import run_live_buy_entry as runner
+
+        monkeypatch.setattr(runner, "_announce_quality_blocks", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_announce_liquidity_blocks", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_record_closed_bar_shadow", lambda *a, **k: None)
+
+        import s6_live.range_shadow as range_shadow
+        monkeypatch.setattr(range_shadow, "record_cycle", lambda *a, **k: 0)
+
+        class FakeSource:
+            _session = SESSION
+            evaluations = {}
+
+            def candidate_row(self, symbol):
+                return None
+
+        with caplog.at_level("INFO"):
+            runner._record_shadow_signals(
+                FakeSource(), {"blocked": (), "skipped": (), "submitted": ()},
+                since=datetime.now(timezone.utc))
+
+        messages = "\n".join(caplog.messages)
+        assert "GLOBAL_OPTIONAL_WORK_START" in messages
+        assert "GLOBAL_OPTIONAL_WORK_STOP" in messages
+        assert "GLOBAL_BUDGET_REMAINING_AT_STOP" in messages
+
+    def test_deferred_research_does_not_touch_the_results_it_was_given(
+            self, monkeypatch):
+        """Deferring optional shadow work must never change what the
+        LIVE evaluation already decided -- `_record_shadow_signals` only
+        reads `results` (the trading outcome, already final by the time
+        it is called) and must not mutate it, even when fully over
+        budget and every optional path is skipped."""
+        from scripts import run_live_buy_entry as runner
+
+        long_ago = NOW - __import__("datetime").timedelta(
+            seconds=runner._TICK_HARD_BUDGET_SECONDS + 5)
+
+        evaluation = SimpleNamespace(ready=True, features=None, detail={},
+                                     blocking=(), state="READY",
+                                     evaluated_at=None)
+
+        class FakeSource:
+            _session = SESSION
+            evaluations = {"AAA": evaluation}
+
+            def candidate_row(self, symbol):
+                return None
+
+        results = {"blocked": (), "skipped": (), "submitted": ("AAA",)}
+        before = dict(results)
+
+        runner._record_shadow_signals(FakeSource(), results, since=long_ago)
+
+        assert results == before

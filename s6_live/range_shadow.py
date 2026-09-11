@@ -56,7 +56,20 @@ BAR_WIDTH_MINUTES = 1.0
 
 # Observed live ORB15 work has taken roughly four seconds per symbol.  This
 # is operational headroom for optional research, never a trading parameter.
-MIN_OPERATION_BUDGET_SECONDS = 5.0
+#
+# Root-caused 2026-09-12: a post-deploy trace recorded one local
+# evaluate/append operation at 14.412s. `evaluate_symbol` calls
+# `precision_watch.evaluate` -> `entry_quality.assess`, which computes a
+# `time_bucket_baseline` for TWO windows (5 and 15 minutes), each looking
+# back `entry_quality.TB_LOOKBACK_DAYS` (5) trading days and calling
+# `kis_bar_features.load_store` per day -- up to 4 on-disk JSON snapshot
+# reads per day, uncached across windows or symbols. That is file I/O
+# (local disk reads), not a network call, lock, or retry, and it cannot
+# be safely interrupted mid-read. Optional work fails toward deferral
+# instead: this allowance covers that observed cost plus finalization
+# headroom so a symbol is only ever started with enough budget left to
+# finish it.
+MIN_OPERATION_BUDGET_SECONDS = 20.0
 
 
 def evaluate_symbol(symbol, *, store, session, now, shadow_minutes, config=None,
@@ -195,7 +208,7 @@ def record_cycle(source, *, trading_day, now, env=None, store=None,
     started = time.monotonic()
     written = attempted = 0
     stop_reason = "NO_WORK"
-    timings = []
+    timings = []  # (symbol, elapsed_ms)
     for symbol, live in sorted(evaluations.items()):
         remaining = remaining_seconds() if remaining_seconds is not None else None
         if (deadline is not None and deadline()) or (
@@ -217,15 +230,16 @@ def record_cycle(source, *, trading_day, now, env=None, store=None,
             continue
         if record is not None and append(record, trading_day=trading_day, env=env):
             written += 1
-        timings.append((time.monotonic() - symbol_started) * 1000)
+        timings.append((symbol, (time.monotonic() - symbol_started) * 1000))
     else:
         stop_reason = "COMPLETE"
     elapsed_ms = (time.monotonic() - started) * 1000
-    ordered = sorted(timings)
+    ordered = sorted(ms for _, ms in timings)
     def percentile(p):
         if not ordered:
             return 0.0
         return ordered[min(len(ordered) - 1, int((len(ordered) - 1) * p))]
+    slowest = sorted(timings, key=lambda t: t[1], reverse=True)[:3]
     summary = {"attempted": attempted, "completed": written,
                "deferred": max(0, len(evaluations) - attempted),
                "elapsed_ms": round(elapsed_ms, 1), "stop_reason": stop_reason,
@@ -234,6 +248,9 @@ def record_cycle(source, *, trading_day, now, env=None, store=None,
     if stats is not None:
         stats.update(summary)
     logger.info("RANGE_SHADOW_ELAPSED attempted=%(attempted)d completed=%(completed)d deferred=%(deferred)d elapsed_ms=%(elapsed_ms).1f stop_reason=%(stop_reason)s p50_ms=%(p50_ms).1f p95_ms=%(p95_ms).1f max_ms=%(max_ms).1f", summary)
+    if slowest:
+        logger.info("RANGE_SHADOW_SLOWEST %s",
+                    ", ".join(f"{sym}={ms:.1f}ms" for sym, ms in slowest))
     return written
 
 

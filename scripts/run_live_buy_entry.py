@@ -923,14 +923,16 @@ def _record_shadow_signals(source, results, *, since):
     # never be why a candidate misses its tick, so it is the first thing
     # dropped, and ORB15 shadow (comparison research, explicitly never an
     # order -- see s6_live/range_shadow.py) is the second.
-    elapsed = (datetime.now(timezone.utc) - since).total_seconds()
-    if elapsed > _TICK_HARD_BUDGET_SECONDS:
+    logger.info("GLOBAL_OPTIONAL_WORK_START remaining=%.1fs",
+                optional_deadline.remaining_seconds())
+    if optional_deadline.expired():
         logger.warning(
             "TICK_BUDGET_EXCEEDED elapsed=%.1fs limit=%.0fs -- skipping "
             "entry-quality Slack announcements and ORB15 shadow recording "
             "this tick; the required shadow_signal_log audit rows above "
             "were still written",
-            elapsed, _TICK_HARD_BUDGET_SECONDS)
+            _TICK_HARD_BUDGET_SECONDS - optional_deadline.remaining_seconds(),
+            _TICK_HARD_BUDGET_SECONDS)
     else:
         try:
             _announce_quality_blocks(source, since=since)
@@ -976,12 +978,12 @@ def _record_shadow_signals(source, results, *, since):
     # correctly budgeted 30s live-evaluation pass into a multi-minute
     # tick, so it gets the same treatment as Slack and the ORB15
     # shadow: skip once the tick has already overrun.
-    elapsed = (datetime.now(timezone.utc) - since).total_seconds()
-    if elapsed > _TICK_HARD_BUDGET_SECONDS:
+    if optional_deadline.expired():
         logger.warning(
             "TICK_BUDGET_EXCEEDED elapsed=%.1fs limit=%.0fs -- skipping "
             "the closed-bar shadow comparison this tick",
-            elapsed, _TICK_HARD_BUDGET_SECONDS)
+            _TICK_HARD_BUDGET_SECONDS - optional_deadline.remaining_seconds(),
+            _TICK_HARD_BUDGET_SECONDS)
     else:
         try:
             from market_hours import us_trading_day
@@ -990,14 +992,19 @@ def _record_shadow_signals(source, results, *, since):
             _record_closed_bar_shadow(
                 source, sorted(getattr(source, "evaluations", None) or {}),
                 session=scan_session.session_at(),
-                day=us_trading_day(since), since=since)
+                day=us_trading_day(since), since=since,
+                deadline=optional_deadline)
         except Exception:  # noqa: BLE001
             logger.warning("could not record the closed-bar comparison",
                            exc_info=True)
 
+    logger.info("GLOBAL_OPTIONAL_WORK_STOP")
+    logger.info("GLOBAL_BUDGET_REMAINING_AT_STOP remaining=%.1fs",
+                optional_deadline.remaining_seconds())
 
 
-def _record_closed_bar_shadow(source, symbols, *, session, day, since):
+
+def _record_closed_bar_shadow(source, symbols, *, session, day, since, deadline=None):
     """The same features read off closed bars only, recorded beside the
     live reading.
 
@@ -1030,18 +1037,33 @@ def _record_closed_bar_shadow(source, symbols, *, session, day, since):
         store = kis_bar_features.load_store(session, day)
         if store is None:
             return
+        from s6_live.range_shadow import MIN_OPERATION_BUDGET_SECONDS
+
+        started = time.monotonic()
+        timings = []  # (symbol, elapsed_ms)
+        completed = 0
+        stop_reason = "COMPLETE"
         for symbol in symbols:
-            elapsed = (datetime.now(timezone.utc) - since).total_seconds()
-            if elapsed > _TICK_HARD_BUDGET_SECONDS:
-                logger.warning(
-                    "TICK_BUDGET_EXCEEDED elapsed=%.1fs limit=%.0fs -- "
-                    "stopping the closed-bar shadow comparison mid-loop "
-                    "at %s; %d of %d symbols were not reached",
-                    elapsed, _TICK_HARD_BUDGET_SECONDS, symbol,
-                    len(symbols) - symbols.index(symbol), len(symbols))
-                return
+            remaining = (deadline.remaining_seconds() if deadline is not None
+                        else _shadow_budget_remaining(since))
+            if deadline is not None and remaining < MIN_OPERATION_BUDGET_SECONDS:
+                stop_reason = "GLOBAL_BUDGET"
+                break
+            if deadline is None and remaining <= 0:
+                stop_reason = "GLOBAL_BUDGET"
+                break
+            symbol_started = time.monotonic()
             comparison = closed_bar_shadow.compare(
                 symbol, store=store, session=session, now=since)
+            # Re-checked between the two expensive stages, not just once
+            # before the loop: each of compare() and compare_readiness()
+            # below runs its own entry-quality baseline computation, so a
+            # symbol whose compare() alone exhausts the deadline must not
+            # also start compare_readiness().
+            if deadline is not None and deadline.expired():
+                stop_reason = "GLOBAL_BUDGET"
+                timings.append((symbol, (time.monotonic() - symbol_started) * 1000))
+                break
             if comparison is not None:
                 closed_bar_shadow.append(comparison, trading_day=day)
             # Whether the difference reaches the DECISION, which the
@@ -1052,6 +1074,18 @@ def _record_closed_bar_shadow(source, symbols, *, session, day, since):
                 symbol, store=store, session=session, now=since)
             if verdict is not None:
                 closed_bar_shadow.append(verdict, trading_day=day)
+            completed += 1
+            timings.append((symbol, (time.monotonic() - symbol_started) * 1000))
+        ordered = sorted(ms for _, ms in timings)
+        p = lambda q: ordered[min(len(ordered) - 1, int((len(ordered) - 1) * q))] if ordered else 0.0
+        logger.info("CLOSED_BAR_SHADOW_ELAPSED attempted=%d completed=%d deferred=%d elapsed_ms=%.1f stop_reason=%s p50_ms=%.1f p95_ms=%.1f max_ms=%.1f",
+                    len(timings), completed, len(symbols) - len(timings),
+                    (time.monotonic() - started) * 1000, stop_reason, p(.5), p(.95),
+                    max(ordered) if ordered else 0.0)
+        slowest = sorted(timings, key=lambda t: t[1], reverse=True)[:3]
+        if slowest:
+            logger.info("CLOSED_BAR_SHADOW_SLOWEST %s",
+                        ", ".join(f"{sym}={ms:.1f}ms" for sym, ms in slowest))
     except Exception:  # noqa: BLE001 - research, and the cycle is over
         logger.warning("could not record the closed-bar comparison",
                        exc_info=True)
