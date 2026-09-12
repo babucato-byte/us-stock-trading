@@ -375,7 +375,7 @@ def _s6_candidate_row(source, symbol):
 IDEMPOTENCY_LOCK_BUSY = "IDEMPOTENCY_LOCK_BUSY"
 
 
-def _session_permitted(source, rollout) -> bool:
+def _session_permitted(source, rollout, *, now=None) -> bool:
     """May THIS strategy order in the session we are actually in?
 
     Per strategy, because `rollout.regular_session_only` is one global
@@ -396,6 +396,17 @@ def _session_permitted(source, rollout) -> bool:
     already patched, so a ledger that should have refused a duplicate
     accepted it. A hot path in the order cycle is the worst possible
     place to import anything.
+
+    `now`, when given, is the cycle's own simulated moment -- the SAME
+    one `run_live_buy_entry_cycle` already resolved as `current` before
+    calling here. `session_capability.order_session` falls back to the
+    real wall clock when its own `now` is None, so leaving this
+    unthreaded silently swapped the cycle's moment for the real one on
+    the S6 branch only: a real production call already passes the real
+    current time as `now`, so this changes nothing there, but any
+    caller (a test, a replay) simulating a different moment was
+    evaluated against whatever time it happened to actually run at
+    instead.
     """
     if getattr(source, "name", None) == s6_candidate_source.SOURCE_S6:
         # Asked of the shared resolver rather than of the session policy
@@ -408,7 +419,7 @@ def _session_permitted(source, rollout) -> bool:
         # evening OVERNIGHT_DAYTIME and permitted an order into a day the
         # market never opened.
         return session_capability.order_session(
-            strategy_id=s6_sessions.STRATEGY_ID) is not None
+            strategy_id=s6_sessions.STRATEGY_ID, now=now) is not None
 
     return pso.get_us_market_session() == "regular" \
         if rollout.regular_session_only else True
@@ -704,7 +715,7 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
         _audit_cycle_block(cycle_run_id, shadow_audit.CONFIG_BLOCKED, "ACCOUNT_UNCONFIGURED", reason, now=current)
         raise KISLiveTradingError(reason)
 
-    is_regular_session = _session_permitted(candidate_source, rollout)
+    is_regular_session = _session_permitted(candidate_source, rollout, now=current)
 
     # Resolved AFTER every structural precondition above, so a cycle that
     # was going to refuse anyway never reads a candidate file.

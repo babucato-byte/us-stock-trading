@@ -511,3 +511,33 @@ class TestS1IsUnaffected:
 
         loose = type("R", (), {"regular_session_only": False})()
         assert klt._session_permitted(legacy, loose) is True
+
+    def test_s6_branch_consults_the_simulated_now_not_the_real_clock(self):
+        """`_session_permitted`'s S6 branch used to call
+        `session_capability.order_session(strategy_id=...)` without its
+        `now`, so it silently fell back to the real wall clock instead
+        of the cycle's own simulated moment -- deterministic in
+        production (which always passes the real time anyway) but a
+        pure flake in any test or replay that simulates a different
+        one, including previously-passing tests that only failed once
+        run for real on a weekend. Both assertions below must hold
+        regardless of when this suite actually runs."""
+        from datetime import timedelta
+
+        import kis_live_trading as klt
+        from market_hours import EASTERN
+        from s6_live.candidate_source import SOURCE_S6
+
+        s6_source = type("S6Source", (), {"name": SOURCE_S6})()
+        rollout = type("R", (), {"regular_session_only": True})()
+
+        regular_moment = datetime(2026, 8, 26, 12, 0, tzinfo=EASTERN)  # WED_REGULAR
+        closed_moment = datetime(2026, 8, 29, 12, 0, tzinfo=EASTERN)  # a Saturday
+
+        assert klt._session_permitted(s6_source, rollout, now=regular_moment) is True
+        assert klt._session_permitted(s6_source, rollout, now=closed_moment) is False
+
+        # Sanity: these two moments are far enough apart, and the closed
+        # one far enough from "whenever this test actually executes",
+        # that a real-clock fallback bug could not accidentally pass.
+        assert closed_moment - regular_moment > timedelta(days=1)
