@@ -12,6 +12,7 @@ from brokers.kis_broker import (
     KISAmbiguousResponseError,
     KISBroker,
     KISBrokerError,
+    KISDaytimeEligibilityError,
     KISOrderableCashUnavailableError,
 )
 from brokers.kis_config import KISConfig, KISConfigError
@@ -416,6 +417,30 @@ class TestSubmitOrderGate:
 
 
 class TestSubmitOrderSuccessAndFailure:
+    def test_daytime_buy_uses_orderability_read_then_daytime_route(self):
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", TOKEN_OK)
+        session.queue("/uapi/overseas-price/v1/quotations/price-detail",
+                      _StubResponse(200, {"rt_cd": "0", "output": {"e_ordyn": "매매 가능"}}))
+        session.queue("/uapi/overseas-stock/v1/trading/daytime-order",
+                      _StubResponse(200, {"rt_cd": "0", "output": {"ODNO": "day-1"}}))
+        broker = _broker(config=_config(kis_env="live", live_order_enabled=True), session=session)
+        oi = _order_intent(session="OVERNIGHT_DAYTIME")
+        broker.submit_order(oi, _instrument(), authorization=_authorize(oi))
+        call = next(r for r in session.requests if r[1].endswith("/trading/daytime-order"))
+        assert call[2]["headers"]["tr_id"] == "TTTS6036U"
+
+    @pytest.mark.parametrize("value", ["", "매매 불가"])
+    def test_daytime_buy_ineligible_never_posts(self, value):
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", TOKEN_OK)
+        session.queue("/uapi/overseas-price/v1/quotations/price-detail",
+                      _StubResponse(200, {"rt_cd": "0", "output": {"e_ordyn": value}}))
+        broker = _broker(config=_config(kis_env="live", live_order_enabled=True), session=session)
+        oi = _order_intent(session="OVERNIGHT_DAYTIME")
+        with pytest.raises(KISDaytimeEligibilityError):
+            broker.submit_order(oi, _instrument(), authorization=_authorize(oi))
+        assert not any("/trading/daytime-order" in r[1] for r in session.requests)
     def test_success_returns_accepted(self):
         session = _FakeSession()
         session.queue("/oauth2/tokenP", TOKEN_OK)

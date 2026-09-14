@@ -714,6 +714,10 @@ class KISBrokerError(Exception):
     증권사로 자동 우회 주문하지 않는다")."""
 
 
+class KISDaytimeEligibilityError(KISBrokerError):
+    """A read-only daytime eligibility check refused before the POST."""
+
+
 class KISAccountSweepError(KISBrokerError):
     """ORACLE-HIGH-01: one venue leg of an account-wide read failed, so
     the result would be a PARTIAL account. Callers must treat it as
@@ -1675,6 +1679,23 @@ class KISBroker:
         # durable row instead of leaving it possibly-in-flight.
         self.config.validate_live_order_allowed(
             bootstrap_capability=bootstrap_capability, order_intent=order_intent)
+        if (str(order_intent.side).lower() == "buy"
+                and str(getattr(order_intent, "session", "")).upper()
+                == "OVERNIGHT_DAYTIME"):
+            try:
+                detail = self.get_price_detail(instrument)
+                orderable = str(detail.get("orderable_text") or "").strip()
+            except Exception as exc:
+                logger.warning("DAYTIME_SYMBOL_ELIGIBILITY symbol=%s session=%s result=UNREADABLE reason=%s",
+                               instrument.kis_symbol, order_intent.session, type(exc).__name__)
+                raise KISDaytimeEligibilityError("DAYTIME_SYMBOL_NOT_ORDERABLE: unreadable") from exc
+            if "가능" not in orderable:
+                logger.warning("DAYTIME_SYMBOL_ELIGIBILITY symbol=%s session=%s result=INELIGIBLE orderable_text=%r reason=DAYTIME_SYMBOL_NOT_ORDERABLE",
+                               instrument.kis_symbol, order_intent.session, orderable)
+                raise KISDaytimeEligibilityError("DAYTIME_SYMBOL_NOT_ORDERABLE")
+            logger.info("DAYTIME_SYMBOL_ELIGIBILITY symbol=%s session=%s result=ELIGIBLE orderable_text=%r checked_at=%s",
+                        instrument.kis_symbol, order_intent.session, orderable,
+                        detail.get("fetched_at"))
         if order_intent.order_type != "limit":
             raise KISBrokerError("only limit orders are permitted in this pilot")
         # The route is chosen from the SESSION, not assumed. REGULAR and

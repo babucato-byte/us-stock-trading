@@ -48,10 +48,10 @@ BOOTSTRAP_ENV = {
 }
 
 
-def _intent(symbol=SYMBOL, side="buy", quantity=1, order_type="limit"):
+def _intent(symbol=SYMBOL, side="buy", quantity=1, order_type="limit", strategy_id="S"):
     from datetime import datetime, timezone
     return OrderIntent(
-        internal_order_id="kisboot-x", signal_id="sig-1", strategy_id="S",
+        internal_order_id="kisboot-x", signal_id="sig-1", strategy_id=strategy_id,
         symbol=symbol, exchange="NASDAQ", side=side, quantity=quantity,
         order_type=order_type, limit_price=24.5, stop_price=None, target_price=None,
         created_at=datetime(2026, 8, 10, tzinfo=timezone.utc))
@@ -285,15 +285,82 @@ class TestOnlyTheBootstrapMintsCapabilities:
 # ---------------------------------------------------------------------
 
 class TestPreTransportRejectionReleasesTheSlot:
-    def test_H_a_config_refusal_is_classified_as_never_attempted(self):
+    def test_H_a_config_refusal_is_classified_as_never_attempted(self, tmp_path, monkeypatch):
         """H: pre-transport config rejection -> durable terminal REJECTED,
         broker_order_id NULL, slots released."""
-        source = (REPO_ROOT / "execution" / "execution_engine.py").read_text(encoding="utf-8")
-        block = source.split("except KISConfigError as exc:", 1)[1].split("except KISAmbiguousResponseError", 1)[0]
-        assert "_reject(" in block
-        assert "REASON_PRE_TRANSPORT_CONFIG" in block
-        assert "transport_attempted" in block
-        assert "_force_unknown" not in block
+        from datetime import datetime, timezone
+
+        from domain.instrument import build_instrument
+        from domain.signal import build_signal
+        from execution import entry_limits, execution_engine, idempotency, order_gate
+        from execution.execution_engine import ExecutionEngineError
+        from state_store import db as state_db
+        import entry_limit_fixtures
+        import shadow_audit
+
+        monkeypatch.setenv("STATE_STORE_DB_FILE", str(tmp_path / "TEST_STATE.db"))
+        monkeypatch.setenv("OPERATIONS_HALT_STATE_FILE", str(tmp_path / "OPS_HALT.json"))
+        monkeypatch.setattr(idempotency, "_LOCK_FILE", tmp_path / "KIS_ORDER_IDEMPOTENCY.lock")
+        now = datetime(2026, 8, 10, tzinfo=timezone.utc)
+        order_intent = _intent(strategy_id="S1_HMA_EARLY_TREND_V1")
+        instrument = build_instrument(SYMBOL, exchange="NASDAQ")
+        signal = build_signal(
+            strategy_id="S1_HMA_EARLY_TREND_V1", strategy_version="v1", config_version="cfg",
+            code_commit="test", symbol=SYMBOL, exchange="NASDAQ", signal_price=24.5,
+            score=1.0, entry_reason="test", valid_for_seconds=300, now=now,
+        )
+
+        class GuardRefusingBroker:
+            guard_calls = 0
+            transport_attempted = 0
+
+            def get_positions(self):
+                return []
+
+            def get_open_orders(self):
+                return []
+
+            def get_fills(self, *, start_date, end_date):
+                return []
+
+            def submit_order(self, *_args, **_kwargs):
+                self.guard_calls += 1
+                # This represents KISBroker's pre-wire configuration guard.
+                raise KISConfigError("live ordering disabled")
+
+        broker = GuardRefusingBroker()
+
+        def passing_context(_reconciliation):
+            return order_gate.BuyGateContext(
+                execution_broker="kis", live_order_enabled=True, entry_disabled=False,
+                validated_commit="test", deployed_commit="test", kis_account_no="123",
+                allowed_account_no="123", order_intent=order_intent, instrument=instrument,
+                signal=signal, is_regular_session=True, kis_price_usd=24.5,
+                max_price_deviation_percent=1.0, usd_orderable_cash=1000.0,
+                has_open_order_for_symbol=False, has_order_for_signal_id=False,
+                allowed_symbols=frozenset({SYMBOL}), reconciliation=_reconciliation,
+                entry_limits=entry_limit_fixtures.unlimited(), now=now,
+            )
+
+        conn = state_db.open_db()
+        with pytest.raises(ExecutionEngineError) as caught:
+            execution_engine.submit_buy_order(
+                order_intent=order_intent, buy_gate_context_builder=passing_context,
+                conn=conn, broker=broker, instrument=instrument, account_id="123",
+                audit_run_id=shadow_audit.new_run_id(), now=now,
+            )
+
+        assert caught.value.reason_code == execution_engine.REASON_PRE_TRANSPORT_CONFIG
+        assert broker.guard_calls == 1
+        assert broker.transport_attempted == 0
+        row = idempotency.find_existing(
+            conn, internal_order_id=order_intent.internal_order_id,
+            signal_id=order_intent.signal_id, symbol=order_intent.symbol,
+            side=order_intent.side, trading_date=now.date().isoformat(),
+        )
+        assert row["status"] == "REJECTED"
+        assert row["broker_order_id"] is None
+        assert entry_limits._never_reached_the_broker(row) is True
 
     def test_H_the_guard_runs_before_any_network_call(self):
         """The classification is only sound because the config check

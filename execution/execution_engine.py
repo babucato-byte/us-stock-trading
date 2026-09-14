@@ -43,7 +43,8 @@ import logging
 import sqlite3
 from datetime import datetime, timezone
 
-from brokers.kis_broker import KISAmbiguousResponseError, KISBrokerError
+from brokers.kis_broker import (KISAmbiguousResponseError, KISBrokerError,
+                                KISDaytimeEligibilityError)
 from brokers.kis_config import KISConfigError
 from execution import authorization, idempotency, order_gate, order_repository
 from execution.authorization import UnauthorizedExecutionError
@@ -519,7 +520,7 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
                                  if bootstrap_capability is not None else {})
             execution_record = broker.submit_order(
                 order_intent, instrument, authorization=authorized, **_transport_kwargs)
-        except KISConfigError as exc:
+        except (KISConfigError, KISDaytimeEligibilityError) as exc:
             # The broker's own last-line guard refused BEFORE any network
             # call -- validate_live_order_allowed() runs ahead of the
             # request and touches nothing. So this order definitively did
@@ -1262,4 +1263,3 @@ def _cancel_inner(*, order_intent, broker_order_id, cancel_gate_context_builder,
             internal_order_id=order_intent.internal_order_id, status=execution_record.status,
             execution_record=execution_record,
         )
-
