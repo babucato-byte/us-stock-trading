@@ -918,6 +918,19 @@ def _parse_orderable_amount(body, *, symbol=None):
         raise _fail("body_not_an_object")
     output = body.get("output")
     if not isinstance(output, dict):
+        # TEMPORARY DIAGNOSTIC (remove once the REGULAR-session
+        # ORDERABLE_CASH_UNAVAILABLE_PRECHECK root cause is captured):
+        # every isolated reproduction of this failure has succeeded, so
+        # the one thing missing is the raw rt_cd/msg_cd/msg1 from an
+        # ACTUAL in-process failure. `body` here carries no account
+        # number/token/secret (those are request-side, not in a KIS
+        # response body) -- rt_cd/msg_cd/msg1 are business-response
+        # fields only.
+        logger.warning(
+            "ORDERABLE_AMOUNT_DIAGNOSTIC symbol=%s rt_cd=%r msg_cd=%r msg1=%r "
+            "body_keys=%s",
+            symbol, body.get("rt_cd"), body.get("msg_cd"), body.get("msg1"),
+            sorted(body.keys()))
         raise _fail("output_missing" if output is None else "output_not_an_object")
     if ORDERABLE_AMOUNT_FIELD not in output:
         raise _fail("field_missing")
