@@ -143,7 +143,7 @@ class TestReportingCannotAffectTrading:
         """`_funnel` is called inside a try/except that swallows, after
         the orders are already placed."""
         source = (REPO_ROOT / "scripts/run_live_buy_entry.py").read_text()
-        block = source[source.index("_funnel(source, results, since=now)"):]
+        block = source[source.index("_funnel(source, results, since=now, session=session)"):]
         assert "except Exception" in block[:400]
         assert "return results" in block[:800]
 

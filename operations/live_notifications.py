@@ -94,6 +94,18 @@ SELL_STUCK_TIMEOUT = "SELL_STUCK_TIMEOUT"
 #: or did not actually clear KIS's book. No replacement is attempted
 #: while this stands -- reconciliation owns it.
 SELL_CANCEL_UNRESOLVED = "SELL_CANCEL_UNRESOLVED"
+#: S-02/S-14: the account-wide reconciliation pass's own CLEAN -> DIRTY
+#: (RECONCILIATION_MISMATCH, reused -- it already names exactly this
+#: fact) and DIRTY -> CLEAN recovery. Distinct from POSITION_MISMATCH,
+#: which is a per-symbol disagreement kis_position_manager already
+#: reports; this is the account-level snapshot `run_reconciliation.py`
+#: takes every pass.
+RECONCILIATION_RECOVERED = "RECONCILIATION_RECOVERED"
+#: S-03: a held S6 position whose exit could not be evaluated (data/API
+#: failure) for REPEATED_REJECTION_THRESHOLD-many consecutive ticks, and
+#: the recovery once it can be evaluated again.
+EXIT_EVALUATION_FAILING = "EXIT_EVALUATION_FAILING"
+EXIT_EVALUATION_RECOVERED = "EXIT_EVALUATION_RECOVERED"
 
 # -- end of day ----------------------------------------------------------
 DAILY_SUMMARY = "DAILY_SUMMARY"
@@ -105,9 +117,11 @@ EVENTS = frozenset({
     PARTIAL_FILL, FILL_COMPLETED,
     EXIT_TRIGGERED, SELL_SUBMITTED, SELL_FILLED,
     CANCEL_REQUESTED, CANCEL_COMPLETED, CANCEL_FAILED,
-    RECONCILIATION_MISMATCH, POSITION_MISMATCH, KIS_API_FAILURE, DB_FAILURE,
+    RECONCILIATION_MISMATCH, RECONCILIATION_RECOVERED,
+    POSITION_MISMATCH, KIS_API_FAILURE, DB_FAILURE,
     HALT_ACTIVATED, KILL_SWITCH_ACTIVATED, WATCHDOG_ESCALATED,
     SELL_STUCK_TIMEOUT, SELL_CANCEL_UNRESOLVED,
+    EXIT_EVALUATION_FAILING, EXIT_EVALUATION_RECOVERED,
     DAILY_SUMMARY,
 })
 
@@ -117,14 +131,27 @@ URGENT_EVENTS = frozenset({
     ORDER_UNKNOWN, CANCEL_FAILED, RECONCILIATION_MISMATCH,
     POSITION_MISMATCH, KIS_API_FAILURE, DB_FAILURE, HALT_ACTIVATED,
     KILL_SWITCH_ACTIVATED, WATCHDOG_ESCALATED,
-    SELL_STUCK_TIMEOUT, SELL_CANCEL_UNRESOLVED,
+    SELL_STUCK_TIMEOUT, SELL_CANCEL_UNRESOLVED, EXIT_EVALUATION_FAILING,
 })
+
+#: Recovery messages. Not urgent (no 🚨) but still LIVE_ALERTS -- the
+#: same people who saw the alert are the audience for its resolution.
+RECOVERY_EVENTS = frozenset({RECONCILIATION_RECOVERED, EXIT_EVALUATION_RECOVERED})
 
 #: Intermediate states of a lifecycle that already has a final message.
 #: Logged at INFO, never sent. The durable audit trail keeps them.
+#:
+#: ORDER_ACCEPTED and ORDER_PENDING used to be here too -- the audit
+#: found a BUY/SELL that reached the broker and was accepted stayed
+#: invisible in Slack until (if ever) the fill message followed, often
+#: minutes or hours later. They are the first BROKER-CONFIRMED fact
+#: about an order (unlike ORDER_SUBMITTED, which only means the wire was
+#: touched), so they are presented now -- see `_notify_submitted`'s
+#: `dedupe_subject=broker_order_id` for the durability that keeps this
+#: to one message per order id across a process restart.
 INTERNAL_EVENTS = frozenset({
     BUY_CANDIDATE_SELECTED, LIVE_ORDER_PREPARED, ORDER_SUBMITTED,
-    ORDER_ACCEPTED, ORDER_PENDING, SELL_SUBMITTED, EXIT_TRIGGERED,
+    SELL_SUBMITTED, EXIT_TRIGGERED,
     CANCEL_REQUESTED, PARTIAL_FILL,
 })
 
@@ -132,6 +159,7 @@ INTERNAL_EVENTS = frozenset({
 LIVE_TRADING_EVENTS = frozenset({
     MARKET_START, SESSION_BLOCKED, FILL_COMPLETED, SELL_FILLED,
     CANCEL_COMPLETED, ORDER_REJECTED, ORDER_BLOCKED,
+    ORDER_ACCEPTED, ORDER_PENDING,
 })
 
 REPORT_EVENTS = frozenset({DAILY_SUMMARY})
@@ -195,6 +223,8 @@ def channel_for(event):
         return None
     if event in URGENT_EVENTS:
         return sp.LIVE_ALERTS
+    if event in RECOVERY_EVENTS:
+        return sp.LIVE_ALERTS
     if event in REPORT_EVENTS:
         return sp.TRADING_REPORT
     if event in LIVE_TRADING_EVENTS:
@@ -229,6 +259,8 @@ def _format(event, fields, *, test=False, validation=False):
         body = sp.order_failed(fields)
     elif event == ORDER_BLOCKED:
         body = sp.order_blocked(fields)
+    elif event in (ORDER_ACCEPTED, ORDER_PENDING):
+        body = sp.order_accepted(fields, pending=(event == ORDER_PENDING))
     elif event in (MARKET_START, SESSION_BLOCKED):
         body = sp.session_ready(fields)
     elif event == DAILY_SUMMARY:
@@ -237,6 +269,8 @@ def _format(event, fields, *, test=False, validation=False):
         body = sp.critical(event, fields)
         if event == ORDER_UNKNOWN:
             body += f"\n{UNKNOWN_RETRY_LINE}\n{UNKNOWN_RECONCILIATION_LINE}"
+    elif event in RECOVERY_EVENTS:
+        body = sp.recovered(event, fields)
     else:
         body = _generic(event, fields)
     return prefix + body
@@ -526,7 +560,7 @@ def order_blocked_fields(*, symbol, reason_code, detail=None, side="buy",
 
 def unknown_order_fields(*, symbol, side, quantity=None, limit_price=None,
                          broker_order_id=None, internal_order_id=None,
-                         durable_state=None):
+                         durable_state=None, session=None):
     """RETRY=BLOCKED / RECONCILIATION_REQUIRED are appended by _format()."""
     fields = {"symbol": symbol, "side": side}
     if quantity is not None:
@@ -537,6 +571,8 @@ def unknown_order_fields(*, symbol, side, quantity=None, limit_price=None,
     if internal_order_id:
         fields["idempotency_key"] = internal_order_id
     fields["durable_state"] = durable_state or "UNKNOWN"
+    if session is not None:
+        fields["session"] = session
     return fields
 
 

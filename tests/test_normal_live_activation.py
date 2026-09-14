@@ -347,7 +347,7 @@ class TestTheTickIsLegibleAfterwards:
         """The report runs after the orders are already placed. It must
         not be able to turn a completed cycle into a failed one."""
         text = self.RUNNER.read_text(encoding="utf-8")
-        block = text[text.index("_funnel(source, results, since=now)"):]
+        block = text[text.index("_funnel(source, results, since=now, session=session)"):]
         assert "except Exception" in block[:400]
         assert "return results" in block[:800]
 

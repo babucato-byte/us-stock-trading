@@ -65,13 +65,17 @@ class TestChannelRouting:
 
 
 class TestLifecycleIsOneMessage:
-    """PREPARED / SUBMITTED / ACCEPTED / PENDING are log-only."""
+    """PREPARED / SUBMITTED / PENDING are log-only. ORDER_ACCEPTED is not
+    (S-01): it is the first BROKER-CONFIRMED fact about an order, and was
+    previously invisible in Slack until, sometimes much later, the fill.
+    So a normal lifecycle is now two messages -- accepted, then filled --
+    not the old zero-then-one."""
 
-    SUPPRESSED = ("LIVE_ORDER_PREPARED", "ORDER_SUBMITTED", "ORDER_ACCEPTED",
-                  "ORDER_PENDING", "SELL_SUBMITTED", "CANCEL_REQUESTED",
+    SUPPRESSED = ("LIVE_ORDER_PREPARED", "ORDER_SUBMITTED",
+                  "SELL_SUBMITTED", "CANCEL_REQUESTED",
                   "EXIT_TRIGGERED", "PARTIAL_FILL")
     FINAL = ("FILL_COMPLETED", "SELL_FILLED", "CANCEL_COMPLETED",
-             "ORDER_REJECTED", "ORDER_BLOCKED")
+             "ORDER_REJECTED", "ORDER_BLOCKED", "ORDER_ACCEPTED", "ORDER_PENDING")
 
     def test_intermediate_events_send_nothing(self, monkeypatch):
         sent = []
@@ -88,18 +92,22 @@ class TestLifecycleIsOneMessage:
             assert event in ln.LIVE_TRADING_EVENTS, name
             assert ln.channel_for(event) == "LIVE_TRADING", name
 
-    def test_one_sell_lifecycle_produces_one_slack_message(self):
+    def test_one_sell_lifecycle_produces_accepted_then_filled(self):
         """The HDB case: PREPARED + SELL_SUBMITTED + ACCEPTED + FILLED."""
         sent = []
         send = lambda message: sent.append(message) or True  # noqa: E731
-        fields = {"symbol": "HDB", "quantity": 5, "strategy_id": "S6_ORB_BREAKOUT_V1",
+        fields = {"symbol": "HDB", "side": "sell", "quantity": 5,
+                  "strategy_id": "S6_ORB_BREAKOUT_V1",
                   "session": "REGULAR", "average_fill_price": 22.48}
-        for event in (ln.LIVE_ORDER_PREPARED, ln.SELL_SUBMITTED, ln.ORDER_ACCEPTED):
+        for event in (ln.LIVE_ORDER_PREPARED, ln.SELL_SUBMITTED):
             ln.notify(event, fields, send_fn=send)
         assert sent == []
-        ln.notify(ln.SELL_FILLED, fields, send_fn=send)
+        ln.notify(ln.ORDER_ACCEPTED, fields, send_fn=send)
         assert len(sent) == 1
-        assert sent[0].startswith("[매도 체결]")
+        assert sent[0].startswith("[매도 주문 접수 완료]")
+        ln.notify(ln.SELL_FILLED, fields, send_fn=send)
+        assert len(sent) == 2
+        assert sent[1].startswith("[매도 체결]")
 
 
 class TestKoreanPresentation:

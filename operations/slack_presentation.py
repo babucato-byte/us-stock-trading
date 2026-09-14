@@ -111,6 +111,7 @@ REASON_LABELS: Dict[str, str] = {
     "ORDER_TOO_LARGE_FOR_LIQUIDITY": "최근 거래량 대비 주문 수량 과다",
     "LIQUIDITY_DATA_UNAVAILABLE": "유동성 지표 확인 불가",
     "INSUFFICIENT_CASH_PRECHECK": "사전 점검: 주문 가능 금액 부족 예상",
+    "ORDERABLE_CASH_UNAVAILABLE_PRECHECK": "사전 점검: 주문 가능 금액 확인 실패",
     "PRICE_CHECK_FAILED": "현재가 재확인 실패",
     "ACCOUNT_READ_FAILED": "계좌 조회 실패",
     "OPEN_ORDERS_READ_FAILED": "미체결 주문 조회 실패",
@@ -513,6 +514,25 @@ def sell_filled(fields: Dict[str, Any]) -> str:
     return _join(lines)
 
 
+def order_accepted(fields: Dict[str, Any], *, pending: bool = False) -> str:
+    """The broker-confirmed accepted/submitted order (S-01). Distinct from
+    the fill message: this is the FIRST broker-confirmed fact about the
+    order, not its outcome. `pending` covers the defensive branch where
+    the broker answered with a status other than ACCEPTED."""
+    side = _side(fields)
+    title = "대기" if pending else "접수 완료"
+    lines = [f"[{_side_word(side)} 주문 {title}]", "",
+             f"종목: {fields.get('symbol', '-')}",
+             f"전략: {strategy_label(_first(fields, 'strategy_id', 'strategy', 'source'))}",
+             f"세션: {session_label(_first(fields, 'session'))}",
+             f"수량: {shares(_first(fields, 'quantity', 'qty'))}",
+             f"상태: {status_label(_first(fields, 'state'), default=title)}"]
+    order_id = _first(fields, "broker_order_id")
+    if order_id and str(order_id) != "pending":
+        lines.append(f"주문번호: {order_id}")
+    return _join(lines)
+
+
 def order_cancelled(fields: Dict[str, Any]) -> str:
     side = _side(fields)
     quantity = _first(fields, "quantity", "requested_qty", "qty")
@@ -626,6 +646,7 @@ CRITICAL_TITLES = {
     "KILL_SWITCH_ACTIVATED": "킬 스위치 작동",
     "WATCHDOG_ESCALATED": "감시 장치 작동: 신규 진입 차단",
     "ORDER_REJECTED_REPEATED": "반복된 브로커 주문 거부",
+    "EXIT_EVALUATION_FAILING": "포지션 청산 평가 반복 실패",
 }
 
 #: Field names translated on critical messages. Anything else prints
@@ -642,6 +663,10 @@ CRITICAL_FIELD_LABELS = {
     "status": "상태", "detail": "상세", "note": "비고",
     "silent_minutes": "무응답 시간(분)", "kill_switch": "안전 중지 상태",
     "sell_path": "매도 경로", "stage": "단계", "consequence": "영향",
+    # S-04/S-05: a block/reject/UNKNOWN/cancel alert must not drop which
+    # session the order belonged to.
+    "session": "세션",
+    "consecutive_failures": "연속 실패 횟수", "mismatch_count": "불일치 건수",
 }
 
 #: Values of `action`-shaped fields, as an operator reads them. Only the
@@ -682,6 +707,8 @@ def _critical_value(key: str, value: Any) -> str:
         return "예" if value else "아니오"
     if key == "side":
         return _SIDE_WORDS.get(str(value), str(value))
+    if key == "session":
+        return session_label(value)
     if key == "action":
         return ACTION_LABELS.get(str(value).strip().upper(), str(value))
     if key in _TECHNICAL_FIELDS:
@@ -692,6 +719,28 @@ def _critical_value(key: str, value: Any) -> str:
         text = str(value).strip()
         return status_label(text) if text and " " not in text else text
     return str(value)
+
+
+#: Korean titles for S-14's recovery messages -- the resolution half of
+#: an alert already raised via `critical()`.
+RECOVERY_TITLES = {
+    "RECONCILIATION_RECOVERED": "계좌 대조 정상 복구",
+    "EXIT_EVALUATION_RECOVERED": "포지션 청산 평가 정상 복구",
+}
+
+
+def recovered(event: str, fields: Dict[str, Any]) -> str:
+    """The resolution half of an alert `critical()` already sent.
+
+    Deliberately not marked 🚨 -- this is good news, but it still goes
+    to the alert channel so the same audience sees the condition end.
+    """
+    title = RECOVERY_TITLES.get(event, event)
+    lines = [f"✅ [{title}]", ""]
+    for key, value in (fields or {}).items():
+        label = CRITICAL_FIELD_LABELS.get(key, key)
+        lines.append(f"{label}: {_critical_value(key, value)}")
+    return _join(lines)
 
 
 def critical(event: str, fields: Dict[str, Any]) -> str:

@@ -318,7 +318,7 @@ def _s6_write_intents(source, *, now):
     return ready_symbols, written
 
 
-def _execution_funnel(source, claimed, results, *, since):
+def _execution_funnel(source, claimed, results, *, since, session=None):
     """The execution worker's own funnel (§18/§20): READY -> BUY_INTENT
     (already true by the time this runs -- `claimed` IS that hand-off) ->
     execution started -> qualification -> cash/risk -> submitted/
@@ -346,7 +346,7 @@ def _execution_funnel(source, claimed, results, *, since):
     # contention, symbol-already-held) stay silent exactly as before --
     # that filtering lives in operations.slack_presentation.
     # SILENT_BLOCK_CODES, not here.
-    _announce_blocks(results.get("blocked") or ())
+    _announce_blocks(results.get("blocked") or (), session=session)
     for symbol in sorted(claimed):
         meta = source.intent_metadata(symbol) if hasattr(source, "intent_metadata") else {}
         first_ready_at = meta.get("first_ready_at")
@@ -371,7 +371,7 @@ def _execution_funnel(source, claimed, results, *, since):
             symbol, first_ready_at, latency_ms, outcome)
 
 
-def _funnel(source, results, *, since, expect_no_submission=False):
+def _funnel(source, results, *, since, expect_no_submission=False, session=None):
     """One line describing what happened to every candidate this tick.
 
     The counts exist because "no BUY today" has several very different
@@ -476,7 +476,7 @@ def _funnel(source, results, *, since, expect_no_submission=False):
         logger.info("FUNNEL_SKIPPED %s reason=%s", symbol, reason)
     for symbol, reason in (results.get("blocked") or ()):
         logger.info("FUNNEL_BLOCKED %s reason=%s", symbol, reason)
-    _announce_blocks(results.get("blocked") or ())
+    _announce_blocks(results.get("blocked") or (), session=session)
     for symbol in (results.get("submitted") or ()):
         logger.info("FUNNEL_SUBMITTED %s", symbol)
 
@@ -630,7 +630,20 @@ def _classify_no_submission(results, executable):
             f"as expected: {sorted(set(blocked))[:5]}")
 
 
-def _announce_blocks(blocked) -> None:
+def _current_session_label():
+    """The session enum for DISPLAY only (S-04/S-05) -- never used to
+    gate or route anything. `run_once` already resolves this the same
+    way for its own log line; this is the same read for a caller that
+    does not have it in scope."""
+    try:
+        from scanners.base import scan_session
+
+        return scan_session.session_at()
+    except Exception:  # noqa: BLE001 -- presentation only
+        return None
+
+
+def _announce_blocks(blocked, *, session=None) -> None:
     """One 매수 차단 message per (symbol, reason code, trading day).
 
     Presentation only. The block itself was decided and logged above;
@@ -643,6 +656,8 @@ def _announce_blocks(blocked) -> None:
     """
     if not blocked:
         return
+    if session is None:
+        session = _current_session_label()
     try:
         from operations import live_notifications as ln
         from operations import slack_presentation as sp
@@ -667,7 +682,8 @@ def _announce_blocks(blocked) -> None:
             ln.notify(ln.ORDER_BLOCKED,
                       ln.order_blocked_fields(symbol=symbol, reason_code=code,
                                               detail=str(reason)[:200],
-                                              strategy_id="S6_ORB_BREAKOUT_V1"),
+                                              strategy_id="S6_ORB_BREAKOUT_V1",
+                                              session=session),
                       dedupe_conn=conn)
     except Exception:  # noqa: BLE001 - reporting must never affect trading
         logger.warning("block notifications failed", exc_info=True)
@@ -732,7 +748,32 @@ def _announce_quality_blocks(source, *, since) -> None:
             pass
 
 
-def _announce_liquidity_blocks(source) -> None:
+#: s6_live.cash_precheck's own reason string for the one case where the
+#: number in `available_cash` is not current: a low CACHED read that
+#: triggered a fresh refresh, and the refresh itself failed. Displaying
+#: that stale figure under "available" claims a current fact the system
+#: never confirmed (S-07) -- presentation only, the BLOCKED decision
+#: itself is untouched.
+_CASH_PRECHECK_REFRESH_FAILED_REASON = (
+    "authoritative refresh failed after a low cached read")
+
+
+def _cash_precheck_detail_text(detail) -> str:
+    """The one-line `상세` text for a cash-precheck block.
+
+    `detail` is exactly the dict `s6_live.cash_precheck.check()` returns;
+    this only chooses how to WORD it, never what it means.
+    """
+    if detail.get("reason") == _CASH_PRECHECK_REFRESH_FAILED_REASON:
+        return (f"available=UNKNOWN cached_available={detail.get('available_cash')} "
+               f"refresh_failed=true required={detail.get('required_for_1_share')} "
+               f"shortfall={detail.get('shortfall')}")[:200]
+    return (f"available={detail.get('available_cash')} "
+           f"required={detail.get('required_for_1_share')} "
+           f"shortfall={detail.get('shortfall')}")[:200]
+
+
+def _announce_liquidity_blocks(source, *, session=None) -> None:
     """One 매수 차단 message per (symbol, reason code, day) for candidates
     the execution-liquidity gate or the cash precheck stopped this tick
     (§13) -- strategy PASS, execution FAIL, distinct from
@@ -749,6 +790,8 @@ def _announce_liquidity_blocks(source) -> None:
     cash_blocked = dict(getattr(source, "cash_precheck_blocked", None) or {})
     if not liquidity_blocked and not cash_blocked:
         return
+    if session is None:
+        session = _current_session_label()
     from operations import live_notifications as ln
     from state_store import db as state_db
 
@@ -761,6 +804,7 @@ def _announce_liquidity_blocks(source) -> None:
         for symbol, (code, detail) in sorted(liquidity_blocked.items()):
             fields = ln.order_blocked_fields(
                 symbol=symbol, reason_code=code, strategy_id="S6_ORB_BREAKOUT_V1",
+                session=session,
                 detail=(f"bar_count={detail.get('bar_count')} "
                        f"recent_volume={detail.get('recent_volume')} "
                        f"dollar_volume={detail.get('dollar_volume')}")[:200])
@@ -772,9 +816,8 @@ def _announce_liquidity_blocks(source) -> None:
         for symbol, (code, detail) in sorted(cash_blocked.items()):
             fields = ln.order_blocked_fields(
                 symbol=symbol, reason_code=code, strategy_id="S6_ORB_BREAKOUT_V1",
-                detail=(f"available={detail.get('available_cash')} "
-                       f"required={detail.get('required_for_1_share')} "
-                       f"shortfall={detail.get('shortfall')}")[:200])
+                session=session,
+                detail=_cash_precheck_detail_text(detail))
             try:
                 ln.notify(ln.ORDER_BLOCKED, fields, dedupe_conn=conn)
             except Exception:  # noqa: BLE001
@@ -1142,7 +1185,7 @@ def run_once(broker=None, *, strategy="s1"):
         ready_symbols, _written = _s6_write_intents(source, now=now)
         try:
             _funnel(source, {"submitted": [], "blocked": [], "skipped": []},
-                   since=now, expect_no_submission=True)
+                   since=now, expect_no_submission=True, session=session)
         except Exception:  # noqa: BLE001 -- a reporting fault must not
             # change what the tick already did, nor mask its result.
             logger.warning("funnel report failed", exc_info=True)
@@ -1153,9 +1196,10 @@ def run_once(broker=None, *, strategy="s1"):
         broker=resolved_broker, candidate_source=source)
     try:
         if strategy == "s6_buy_worker":
-            _execution_funnel(source, source.claimed_symbols(), results, since=now)
+            _execution_funnel(source, source.claimed_symbols(), results, since=now,
+                              session=session)
         else:
-            _funnel(source, results, since=now)
+            _funnel(source, results, since=now, session=session)
     except Exception:  # noqa: BLE001 -- a reporting fault must not
         # change what the cycle already did, nor mask its result.
         logger.warning("funnel report failed", exc_info=True)

@@ -184,6 +184,44 @@ def settle_live_orders(conn, broker, *, now):
     return settled
 
 
+def _announce_reconciliation_transition(conn, *, clean, was_clean, mismatch_count,
+                                        detail, now) -> None:
+    """S-02/S-14: one durable LIVE_ALERTS message on the CLEAN -> DIRTY
+    transition, and one recovery message on DIRTY -> CLEAN. Never on
+    "still dirty" or "still clean" -- reconciliation runs every few
+    minutes and a channel that repeated the same mismatch every tick
+    would be exactly the noise the notification ledger elsewhere exists
+    to prevent.
+
+    `was_clean=None` (no previous recorded result at all) is treated as
+    "unknown", not as "was clean": a fresh deployment or a stale/missing
+    state file must not manufacture a false CLEAN baseline that then
+    hides the very first dirty result as "no transition".
+    """
+    try:
+        from operations import live_notifications as ln
+
+        if not clean and was_clean is not False:
+            ln.notify(
+                ln.RECONCILIATION_MISMATCH,
+                {"mismatch_count": mismatch_count,
+                 "detail": " | ".join(detail)[:400] if detail else None,
+                 "action": "RECONCILE"},
+                dedupe_conn=conn, dedupe_subject="ACCOUNT",
+                dedupe_version=f"DIRTY_AT:{now.isoformat()}",
+            )
+        elif clean and was_clean is False:
+            ln.notify(
+                ln.RECONCILIATION_RECOVERED,
+                {"note": "계좌 대조가 다시 CLEAN 상태로 회복되었습니다."},
+                dedupe_conn=conn, dedupe_subject="ACCOUNT",
+                dedupe_version=f"CLEAN_AT:{now.isoformat()}",
+            )
+    except Exception:  # noqa: BLE001 -- a notification failure must never
+        # affect the reconciliation result already durably recorded above.
+        logger.warning("could not announce a reconciliation transition", exc_info=True)
+
+
 def run_once(*, broker=None, now=None, conn=None, account_id=None):
     current = now or datetime.now(timezone.utc)
     broker = broker or KISBroker()
@@ -239,6 +277,12 @@ def run_once(*, broker=None, now=None, conn=None, account_id=None):
             halted = kill_switch.is_halted()
         except Exception:                             # noqa: BLE001
             halted = True                             # unreadable -> halted
+        # S-02: read the PREVIOUS recorded result before this pass
+        # overwrites it, so a CLEAN -> DIRTY (and the S-14 DIRTY -> CLEAN
+        # recovery) transition can be told apart from "still dirty" /
+        # "still clean", which must not re-alert every 5 minutes.
+        previous_result = reconciliation_state.get_last_result()
+        was_clean = previous_result.clean if previous_result is not None else None
         reconciliation_state.record_result(
             clean=snapshot.is_clean(), mismatch_count=snapshot.mismatch_count(),
             unknown_count=idempotency.count_unknown_orders(conn), halt=halted,
@@ -247,6 +291,9 @@ def run_once(*, broker=None, now=None, conn=None, account_id=None):
         if not snapshot.is_clean():
             for line in snapshot.detail:
                 logger.error("reconciliation mismatch: %s", line)
+        _announce_reconciliation_transition(
+            conn, clean=snapshot.is_clean(), was_clean=was_clean,
+            mismatch_count=snapshot.mismatch_count(), detail=snapshot.detail, now=current)
         purged_rows = shadow_audit.purge_old_events(now=current, conn=conn)
         purged_files = shadow_mode.purge_old_files(now=current)
         return {

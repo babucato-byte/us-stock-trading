@@ -71,7 +71,7 @@ class _Recorder:
     def install(self, monkeypatch):
         real_format = live_notifications._format
 
-        def _spy(event, fields=None, *, test=False, send_fn=None):
+        def _spy(event, fields=None, *, test=False, send_fn=None, **_dedupe_kwargs):
             self.events.append(event)
             self.messages.append(real_format(event, fields or {}, test=test))
             if self._fail:

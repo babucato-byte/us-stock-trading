@@ -298,10 +298,12 @@ def reconciliation(env, now: datetime) -> Check:
     return Check("reconciliation", OK, f"CLEAN, unknown_count=0, {age:.0f}s old")
 
 
-def collector(env, deployed_sha: str, ps_text: Optional[str] = None) -> List[Check]:
+def collector(env, deployed_sha: str, ps_text: Optional[str] = None,
+              now: Optional[datetime] = None) -> List[Check]:
     checks: List[Check] = []
     root = env.get("SCANNER_DATA_ROOT") or "/home/ubuntu/releases/us-stock-trading/shared/scanner"
     status_path = Path(root) / "realtime_bars" / "collector_status.json"
+    current = _now(now)
     try:
         status = json.loads(status_path.read_text(encoding="utf-8"))
         connected = status.get("connection_state") == "CONNECTED"
@@ -310,6 +312,26 @@ def collector(env, deployed_sha: str, ps_text: Optional[str] = None) -> List[Che
                             f"{status.get('state')} subscriptions {got}/{req}"))
         if req and got != req:
             checks.append(Check("collector:subscriptions", FAIL, f"{got}/{req}"))
+        # S-10: connection_state=CONNECTED is the collector's OWN last
+        # report -- it says nothing about whether that report is still
+        # current. A wedged collector (process alive, socket dead, loop
+        # stopped writing) can leave CONNECTED behind it forever. The
+        # heartbeat age is the independent, computed fact: how long ago
+        # the collector last proved it was still running at all.
+        heartbeat = _parse(status.get("last_heartbeat_at"))
+        if heartbeat is None:
+            checks.append(Check("collector:heartbeat", WARN,
+                                "no last_heartbeat_at in collector_status.json"))
+        else:
+            age = (current - heartbeat).total_seconds()
+            try:
+                from market_data.collector_status import DEFAULT_HEARTBEAT_STALE_SECONDS as _STALE
+            except Exception:  # noqa: BLE001
+                _STALE = 90.0
+            checks.append(Check(
+                "collector:heartbeat", OK if age <= _STALE else FAIL,
+                f"last heartbeat {age:.0f}s ago (stale at {_STALE:.0f}s), "
+                f"computed_state={'STALE' if age > _STALE else status.get('state')}"))
     except Exception as exc:  # noqa: BLE001
         checks.append(Check("collector:connected", FAIL, f"status unreadable: {type(exc).__name__}"))
     text = ps_text if ps_text is not None else _run(["ps", "-eo", "args"])
@@ -374,12 +396,24 @@ def _last_stamp(path: Path) -> Optional[datetime]:
     return None
 
 
+#: S-11: this health check's OWN cron log(s), and the marker its
+#: generated summary lines carry (`run_health_report.py`'s
+#: `logger.error("HEALTH: %s", problem)`). Counting either one recurses:
+#: a day with N failed/warned checks writes N ERROR lines that say so,
+#: and the NEXT run counted those as N new errors nobody caused --
+#: inflating `recent_errors` with this report's own output about itself.
+_SELF_LOG_NAME_MARKERS = ("health_check", "health_report")
+_SELF_GENERATED_LINE_MARKER = "HEALTH: "
+
+
 def recent_errors(env, now: datetime) -> Check:
     root = env.get("SCANNER_DATA_ROOT") or "/home/ubuntu/releases/us-stock-trading/shared/scanner"
     directory = Path(root) / "logs" / "cron"
     cutoff = now - timedelta(days=1)
     count, samples = 0, []
     for path in sorted(directory.glob("*.log")) if directory.exists() else []:
+        if any(marker in path.name.lower() for marker in _SELF_LOG_NAME_MARKERS):
+            continue
         try:
             with open(path, "rb") as handle:
                 handle.seek(0, os.SEEK_END)
@@ -389,6 +423,8 @@ def recent_errors(env, now: datetime) -> Check:
             continue
         for line in tail.splitlines():
             if " ERROR " not in line and "Traceback" not in line:
+                continue
+            if _SELF_GENERATED_LINE_MARKER in line:
                 continue
             match = _STAMP.match(line)
             stamp = _parse(match.group(1).replace(" ", "T")) if match else None
@@ -455,7 +491,7 @@ def build_report(env=None, *, now=None, analytics_dir=None, crontab_text=None,
     checks += scanner_runs(env, current, analytics_dir)
     checks += daytime_routes()
     checks += [kis_token(env, current), account_match(env), reconciliation(env, current)]
-    checks += collector(env, deployed, ps_text)
+    checks += collector(env, deployed, ps_text, now=current)
     checks += [kill_switches(env), entry_runner(env, current), recent_errors(env, current)]
     failed = [c.name for c in checks if c.verdict == FAIL]
     warned = [c.name for c in checks if c.verdict == WARN]
@@ -470,7 +506,11 @@ def build_report(env=None, *, now=None, analytics_dir=None, crontab_text=None,
         "market_day": market_day,
         "checks": [c.as_dict() for c in checks],
         "failed": failed, "warned": warned,
-        "overall": "NORMAL" if not failed else "ATTENTION",
+        # S-09: an active WARN (a daytime route still pending live
+        # evidence, a stale-but-not-dead collector heartbeat, ...) is not
+        # nothing -- NORMAL must mean "no open item at all", not merely
+        # "nothing failed outright".
+        "overall": "NORMAL" if not failed and not warned else "ATTENTION",
         "performance": live_performance(env.get("STATE_STORE_DB_FILE") or env.get("TRADING_STATE_DB")),
     }
 
@@ -492,6 +532,7 @@ CHECK_LABELS = (("kis_token", "KIS 토큰"), ("kis_account", "KIS 계좌"),
                 ("collector:connected", "Collector 연결"),
                 ("collector:subscriptions", "Collector 구독"),
                 ("collector:process", "Collector 프로세스"),
+                ("collector:heartbeat", "Collector 하트비트"),
                 ("kill_switch", "킬 스위치"), ("entry_runner", "진입 러너"),
                 ("cron", "예약 작업"), ("recent_errors", "최근 오류"))
 
@@ -526,7 +567,13 @@ def format_message(report: Dict[str, Any]) -> str:
         lines.append(f"{label}: {_verdict(item)} {item['detail']}")
     lines.append("")
     perf = report.get("performance") or {}
-    lines.append("📈 실거래 성과 (S6, 위치: TRADING_STATE.db)")
+    # S-08: this reads cumulative CLOSED rows from s6_positions only --
+    # there is no broker-fill lineage proving these are LIVE, executed
+    # trades rather than, say, a row abandoned before ever reaching KIS.
+    # The old label asserted "live trading performance" in Korean, which
+    # is exactly the thing not proven here, so it is named for what it
+    # actually is: a cumulative read of this system's own state book.
+    lines.append("📊 S6 누적 상태 기록 성과 (broker 체결 이력 미검증, 위치: TRADING_STATE.db)")
     if perf.get("available"):
         lines += [f"  청산 거래: {perf['closed_trades']}건 (승 {perf['wins']} / 패 {perf['losses']})",
                   f"  실현 손익: {perf['realized_pnl_usd']:.2f} USD",
@@ -553,6 +600,15 @@ def main() -> int:
     print(message)
     if not send_system_health_message(message):
         print("SYSTEM_HEALTH_NOTIFICATION_UNCONFIGURED_OR_FAILED")
+    # S-14: a WARN/FAIL check that recovered since the last run gets its
+    # own message -- otherwise an operator who saw the alert has no way
+    # to learn, from Slack, that it ended.
+    try:
+        from operations import health_recovery
+
+        health_recovery.notify_recoveries(report["checks"])
+    except Exception:  # noqa: BLE001 -- recovery tracking must never fail the report
+        pass
     return 0 if report["overall"] == "NORMAL" else 1
 
 

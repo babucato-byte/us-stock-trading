@@ -351,7 +351,8 @@ class TestExecutionFunnelAnnouncesBlocks:
         from scripts import run_live_buy_entry as runner
 
         seen = []
-        monkeypatch.setattr(runner, "_announce_blocks", lambda blocked: seen.append(list(blocked)))
+        monkeypatch.setattr(runner, "_announce_blocks",
+                            lambda blocked, **k: seen.append(list(blocked)))
 
         source = SimpleNamespace(intent_metadata=lambda s: {})
         results = {"submitted": [], "skipped": [],
@@ -367,7 +368,7 @@ class TestExecutionFunnelAnnouncesBlocks:
         source = SimpleNamespace(intent_metadata=lambda s: {})
         calls = {"n": 0}
 
-        def _record(blocked):
+        def _record(blocked, **k):
             calls["n"] += 1
             assert list(blocked) == []
         import unittest.mock

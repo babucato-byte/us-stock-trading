@@ -520,6 +520,82 @@ def evaluate_position(conn, *, broker_adapter, position_id, row,
                         store=position_store, prefix=CLIENT_ORDER_PREFIX)
 
 
+#: S-03: how many consecutive ticks a HELD position's exit evaluation may
+#: fail (a data/API fault, not a HOLD decision) before it escalates to
+#: the alert channel. Same bounded-alert shape as
+#: `live_notifications.REPEATED_REJECTION_THRESHOLD` -- not silence, and
+#: not one message per tick either.
+EXIT_EVALUATION_FAILURE_THRESHOLD = 3
+
+_EXIT_HEALTH_TABLE = "s6_exit_evaluation_health"
+
+
+def _ensure_exit_health_table(conn) -> None:
+    conn.execute(
+        f"CREATE TABLE IF NOT EXISTS {_EXIT_HEALTH_TABLE} ("
+        "position_id TEXT PRIMARY KEY, symbol TEXT, "
+        "consecutive_failures INTEGER NOT NULL DEFAULT 0, updated_at TEXT)")
+
+
+def _record_exit_evaluation_outcome(conn, position_id, symbol, *, ok, now=None) -> None:
+    """Durable, per-position consecutive-failure count (S-03).
+
+    A dedicated table rather than a column on `s6_positions`: this is
+    purely notification bookkeeping and must never be read by, or
+    influence, the exit DECISION itself. Never fatal -- a failure here
+    must not cost the position its actual exit evaluation, which has
+    already happened by the time this runs.
+    """
+    try:
+        _ensure_exit_health_table(conn)
+        row = conn.execute(
+            f"SELECT consecutive_failures FROM {_EXIT_HEALTH_TABLE} WHERE position_id = ?",
+            (position_id,)).fetchone()
+        previous = int(row[0]) if row else 0
+        current = now or datetime.now(timezone.utc)
+        if ok:
+            if previous >= EXIT_EVALUATION_FAILURE_THRESHOLD:
+                _notify_exit_evaluation_transition(
+                    conn, position_id, symbol, failing=False,
+                    consecutive_failures=previous)
+            if previous:
+                conn.execute(
+                    f"DELETE FROM {_EXIT_HEALTH_TABLE} WHERE position_id = ?",
+                    (position_id,))
+                conn.commit()
+            return
+        count = previous + 1
+        conn.execute(
+            f"INSERT INTO {_EXIT_HEALTH_TABLE} "
+            "(position_id, symbol, consecutive_failures, updated_at) VALUES (?,?,?,?) "
+            "ON CONFLICT(position_id) DO UPDATE SET "
+            "consecutive_failures = excluded.consecutive_failures, "
+            "updated_at = excluded.updated_at",
+            (position_id, symbol, count, current.isoformat()))
+        conn.commit()
+        if count == EXIT_EVALUATION_FAILURE_THRESHOLD:
+            _notify_exit_evaluation_transition(
+                conn, position_id, symbol, failing=True, consecutive_failures=count)
+    except Exception:  # noqa: BLE001 -- bookkeeping must never affect the exit
+        logger.warning("S6 exit-evaluation health tracking failed for %s",
+                       symbol, exc_info=True)
+
+
+def _notify_exit_evaluation_transition(conn, position_id, symbol, *, failing,
+                                       consecutive_failures) -> None:
+    try:
+        from operations import live_notifications as ln
+
+        event = ln.EXIT_EVALUATION_FAILING if failing else ln.EXIT_EVALUATION_RECOVERED
+        fields = {"symbol": symbol, "consecutive_failures": consecutive_failures,
+                  "action": "RECONCILE" if failing else "NONE"}
+        ln.notify(event, fields, dedupe_conn=conn, dedupe_subject=position_id,
+                  dedupe_version=f"{'FAILING' if failing else 'RECOVERED'}:{consecutive_failures}")
+    except Exception:  # noqa: BLE001 -- a message must never touch the book
+        logger.warning("S6 exit-evaluation health notice for %s not sent",
+                       symbol, exc_info=True)
+
+
 def run_exits(conn, *, broker_adapter, features_fn, price_fn, session=None,
               now=None, orders_allowed=True, emergency=False
               ) -> List[Dict[str, Any]]:
@@ -539,12 +615,14 @@ def run_exits(conn, *, broker_adapter, features_fn, price_fn, session=None,
                 current_price=price_fn(symbol), session=session, now=now,
                 orders_allowed=orders_allowed, emergency=emergency)
             outcomes.append(outcome.as_dict())
+            _record_exit_evaluation_outcome(conn, position_id, symbol, ok=True, now=now)
         except Exception as exc:  # noqa: BLE001
             logger.error("S6 exit evaluation failed for %s", symbol,
                          exc_info=True)
             outcomes.append(ExitOutcome(position_id, symbol, ACTION_BLOCKED,
                                         None, f"evaluation failed: {exc}"
                                         ).as_dict())
+            _record_exit_evaluation_outcome(conn, position_id, symbol, ok=False, now=now)
     return outcomes
 
 

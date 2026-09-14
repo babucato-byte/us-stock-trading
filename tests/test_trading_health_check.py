@@ -48,7 +48,8 @@ def world(tmp_path, monkeypatch):
     (root / "logs" / "scanners" / "signals" / f"{DAY}.jsonl").write_text("{}\n{}\n")
     (root / "realtime_bars" / "collector_status.json").write_text(json.dumps({
         "state": "CONNECTED_NO_TRADES", "connection_state": "CONNECTED",
-        "subscription_requested": 32, "subscription_count": 32}))
+        "subscription_requested": 32, "subscription_count": 32,
+        "last_heartbeat_at": (NOW - timedelta(seconds=5)).isoformat()}))
     (root / "logs" / "cron" / "s6_buy_entry.log").write_text(
         f"{(NOW - timedelta(minutes=1)).strftime('%Y-%m-%dT%H:%M:%SZ')} tick sha={SHA}\n")
     state = tmp_path / "state"
@@ -93,13 +94,39 @@ class TestAHealthyWorldIsNormal:
     def test_normal_with_no_failures(self, world):
         rep = report(world)
         assert rep["failed"] == [], rep["checks"]
+        # S-09: this fixture's daytime routes are still LIVE_RESPONSE_
+        # PENDING (a real, active WARN), so the correct overall is
+        # ATTENTION, not NORMAL -- that gap (WARN silently read as
+        # NORMAL) is exactly what the audit flagged.
+        assert rep["warned"], "fixture should still carry the daytime-route WARNs"
+        assert rep["overall"] == "ATTENTION"
+
+    def test_overall_is_normal_only_with_zero_failures_and_zero_warnings(self, world, monkeypatch):
+        # With the daytime-route WARN silenced (nothing else pending),
+        # overall must go back to NORMAL.
+        monkeypatch.setattr(hc, "daytime_routes",
+                            lambda: [hc.Check("daytime:buy", hc.OK, "VERIFIED"),
+                                    hc.Check("daytime:sell", hc.OK, "VERIFIED"),
+                                    hc.Check("daytime:cancel", hc.OK, "VERIFIED")])
+        rep = report(world)
+        assert rep["warned"] == [] and rep["failed"] == []
         assert rep["overall"] == "NORMAL"
+
+    def test_a_warn_with_zero_failures_is_still_attention_not_normal(self, world):
+        # Before the fix this reported NORMAL because only `failed` was
+        # consulted -- the exact false positive S-09 closes.
+        rep = report(world)
+        assert rep["failed"] == []
+        assert rep["warned"]
+        assert rep["overall"] == "ATTENTION"
 
     def test_the_message_has_no_paper_label_and_no_git_verdict(self, world):
         text = hc.format_message(report(world))
         assert "페이퍼" not in text
         assert "Git 변경 파일" not in text
-        assert "종합: 정상 (NORMAL)" in text
+        # S-09: this fixture still has an active (pending daytime-route)
+        # WARN, so the correct overall is ATTENTION, not NORMAL.
+        assert "종합: 확인 필요 (ATTENTION)" in text
         assert "데이장 주문 경로:" in text and "매수: " in text
         source = (REPO_ROOT / "trading_health_check.py").read_text()
         assert "performance_trades.csv" not in source
@@ -209,7 +236,11 @@ class TestLivePerformanceComesFromTheStateDb:
         assert perf["realized_pnl_usd"] == pytest.approx(1.0)
         assert perf["open_positions"] == 0 and perf["buy_never_filled"] == 1
         text = hc.format_message(report(world))
-        assert "실거래 성과" in text and "청산 거래: 2건" in text
+        # S-08: renamed away from "실거래 성과" ("live trading performance")
+        # because this block has no broker-fill lineage -- it is a
+        # cumulative read of the state book, not proven live execution.
+        assert "실거래 성과" not in text
+        assert "누적 상태 기록 성과" in text and "청산 거래: 2건" in text
 
     def test_a_missing_db_says_so_rather_than_zero(self, world):
         perf = hc.live_performance("/nonexistent/TRADING_STATE.db")

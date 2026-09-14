@@ -185,7 +185,9 @@ class TestEveryMessageIsTitled:
                                              - live_notifications.INTERNAL_EVENTS))
     def test_no_presented_event_is_untitled(self, event):
         first = live_notifications._format(event, {}).splitlines()[0]
-        assert first.startswith("[") or first.startswith("🚨 ["), first
+        # ✅ [...] is S-14's recovery marker -- still a title, just not an
+        # alert or a plain lifecycle message.
+        assert first.startswith("[") or first.startswith("🚨 [") or first.startswith("✅ ["), first
 
     def test_the_test_marker_still_comes_first(self):
         """An operator scanning for real traffic must see [TEST] before

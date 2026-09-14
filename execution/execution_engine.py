@@ -540,7 +540,8 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
                 {"symbol": order_intent.symbol, "side": side_label,
                  "quantity": order_intent.quantity, "limit_price": order_intent.limit_price,
                  "reason": REASON_PRE_TRANSPORT_CONFIG,
-                 "transport_attempted": False},
+                 "transport_attempted": False,
+                 "session": getattr(order_intent, "session", None)},
             )
             raise ExecutionEngineError(
                 f"{side_label} order refused by the broker guard before transport: {exc}",
@@ -559,7 +560,8 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
                     symbol=order_intent.symbol, side=side_label,
                     quantity=order_intent.quantity, limit_price=order_intent.limit_price,
                     internal_order_id=order_intent.internal_order_id,
-                    durable_state="UNKNOWN"),
+                    durable_state="UNKNOWN",
+                    session=getattr(order_intent, "session", None)),
             )
             raise
         except KISBrokerError as exc:
@@ -568,11 +570,12 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
                 live_notifications.ORDER_REJECTED,
                 {"symbol": order_intent.symbol, "side": side_label,
                  "quantity": order_intent.quantity, "limit_price": order_intent.limit_price,
-                 "reason": type(exc).__name__},
+                 "reason": type(exc).__name__,
+                 "session": getattr(order_intent, "session", None)},
             )
             raise
 
-        _notify_submitted(order_intent, side_label=side_label, record=execution_record)
+        _notify_submitted(order_intent, side_label=side_label, record=execution_record, conn=conn)
 
         try:
             record = order_repository.advance(
@@ -600,7 +603,8 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
                     quantity=order_intent.quantity, limit_price=order_intent.limit_price,
                     broker_order_id=execution_record.broker_order_id,
                     internal_order_id=order_intent.internal_order_id,
-                    durable_state="UNKNOWN"),
+                    durable_state="UNKNOWN",
+                    session=getattr(order_intent, "session", None)),
             )
             live_notifications.notify(
                 live_notifications.DB_FAILURE,
@@ -671,11 +675,19 @@ def _prepared_fields(order_intent, *, side_label, gate_context):
     )
 
 
-def _notify_submitted(order_intent, *, side_label, record):
+def _notify_submitted(order_intent, *, side_label, record, conn=None):
     """ORDER_SUBMITTED (or SELL_SUBMITTED) plus the accepted/pending
-    follow-up, in that order, immediately after the wire returned."""
+    follow-up, in that order, immediately after the wire returned.
+
+    The follow-up is the one BROKER-CONFIRMED, human-facing message for
+    this order (S-01): it is claimed durably in the notification ledger
+    keyed on `broker_order_id`, so a process restart between the wire
+    call and this notify() cannot re-send it, and a ledger read failure
+    still errs toward sending (see `notification_ledger`).
+    """
     status = getattr(record, "status", None)
     broker_order_id = getattr(record, "broker_order_id", None)
+    session = getattr(order_intent, "session", None)
     event = (live_notifications.SELL_SUBMITTED if side_label == "sell"
              else live_notifications.ORDER_SUBMITTED)
     live_notifications.notify(event, live_notifications.order_submitted_fields(
@@ -691,9 +703,17 @@ def _notify_submitted(order_intent, *, side_label, record):
         follow_up = live_notifications.ORDER_ACCEPTED
     else:
         follow_up = live_notifications.ORDER_PENDING
-    live_notifications.notify(follow_up, {
-        "symbol": order_intent.symbol, "side": side_label,
-        "broker_order_id": broker_order_id or "pending", "state": status})
+    live_notifications.notify(
+        follow_up,
+        {"symbol": order_intent.symbol, "side": side_label,
+         "quantity": order_intent.quantity, "strategy_id": order_intent.strategy_id,
+         "session": session,
+         "broker_order_id": broker_order_id or "pending", "state": status},
+        # Durable, one-per-broker-order-id: a fill message covers the
+        # OUTCOME later, this one covers the fact that the broker has
+        # already confirmed the order exists.
+        dedupe_conn=conn, dedupe_subject=broker_order_id or order_intent.internal_order_id,
+        dedupe_version="BROKER_CONFIRMED")
 
 
 def _force_unknown(conn, record, *, reason, now, broker_order_id=None):
@@ -1126,7 +1146,8 @@ def _cancel_inner(*, order_intent, broker_order_id, cancel_gate_context_builder,
         live_notifications.notify(
             live_notifications.CANCEL_REQUESTED,
             {"symbol": order_intent.symbol, "broker_order_id": broker_order_id,
-             "quantity": order_intent.quantity, "state": "CANCEL_PENDING"},
+             "quantity": order_intent.quantity, "state": "CANCEL_PENDING",
+             "session": getattr(order_intent, "session", None)},
         )
 
         # From here on, any failure is a POST-transport failure.
@@ -1143,7 +1164,8 @@ def _cancel_inner(*, order_intent, broker_order_id, cancel_gate_context_builder,
             live_notifications.notify(
                 live_notifications.CANCEL_FAILED,
                 {"symbol": order_intent.symbol, "broker_order_id": broker_order_id,
-                 "reason": "ambiguous response", "durable_state": "UNKNOWN"},
+                 "reason": "ambiguous response", "durable_state": "UNKNOWN",
+                 "session": getattr(order_intent, "session", None)},
             )
             live_notifications.notify(
                 live_notifications.ORDER_UNKNOWN,
@@ -1151,7 +1173,8 @@ def _cancel_inner(*, order_intent, broker_order_id, cancel_gate_context_builder,
                     symbol=order_intent.symbol, side="cancel",
                     broker_order_id=broker_order_id,
                     internal_order_id=order_intent.internal_order_id,
-                    durable_state="UNKNOWN"),
+                    durable_state="UNKNOWN",
+                    session=getattr(order_intent, "session", None)),
             )
             raise
         except KISBrokerError as exc:
@@ -1159,7 +1182,8 @@ def _cancel_inner(*, order_intent, broker_order_id, cancel_gate_context_builder,
             live_notifications.notify(
                 live_notifications.CANCEL_FAILED,
                 {"symbol": order_intent.symbol, "broker_order_id": broker_order_id,
-                 "reason": type(exc).__name__, "durable_state": "UNKNOWN"},
+                 "reason": type(exc).__name__, "durable_state": "UNKNOWN",
+                 "session": getattr(order_intent, "session", None)},
             )
             raise
         transport["completed"] = True
@@ -1174,7 +1198,8 @@ def _cancel_inner(*, order_intent, broker_order_id, cancel_gate_context_builder,
                 live_notifications.CANCEL_FAILED,
                 {"symbol": order_intent.symbol, "broker_order_id": broker_order_id,
                  "reason": f"KIS did not confirm the cancel (status={execution_record.status!r})",
-                 "durable_state": "UNKNOWN"},
+                 "durable_state": "UNKNOWN",
+                 "session": getattr(order_intent, "session", None)},
             )
             return ExecutionResult(
                 internal_order_id=order_intent.internal_order_id, status="UNKNOWN",

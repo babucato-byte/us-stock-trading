@@ -204,11 +204,18 @@ class TestReasonMapping:
 # One lifecycle, one message
 # ---------------------------------------------------------------------
 class TestOneMessagePerLifecycle:
+    """Renamed in spirit, not literally: ORDER_ACCEPTED/ORDER_PENDING are
+    now presented too (S-01 -- a broker-confirmed accepted/submitted
+    order was previously invisible until, sometimes much later, the
+    fill). So a normal lifecycle is now exactly TWO messages -- accepted,
+    then filled -- never the old zero-then-one, and never one per
+    intermediate state either."""
+
     def _capture(self):
         sent = []
         return sent, (lambda m: sent.append(m) or True)
 
-    def test_a_normal_buy_produces_exactly_one_message(self):
+    def test_a_normal_buy_produces_accepted_then_filled_only(self):
         sent, send = self._capture()
         sequence = [
             (ln.BUY_CANDIDATE_SELECTED, {"symbol": "NVDA"}),
@@ -221,10 +228,11 @@ class TestOneMessagePerLifecycle:
         ]
         for event, fields in sequence:
             ln.notify(event, fields, send_fn=send, track_health=False)
-        assert len(sent) == 1
-        assert sent[0].startswith("[매수 체결]")
+        assert len(sent) == 2
+        assert sent[0].startswith("[매수 주문 접수 완료]")
+        assert sent[1].startswith("[매수 체결]")
 
-    def test_a_normal_sell_produces_exactly_one_message(self):
+    def test_a_normal_sell_produces_accepted_then_filled_only(self):
         sent, send = self._capture()
         sequence = [
             (ln.EXIT_TRIGGERED, {"symbol": "NVDA", "reason": "RANGE_REENTRY"}),
@@ -236,10 +244,11 @@ class TestOneMessagePerLifecycle:
         ]
         for event, fields in sequence:
             ln.notify(event, fields, send_fn=send, track_health=False)
-        assert len(sent) == 1
-        assert sent[0].startswith("[매도 체결]")
+        assert len(sent) == 2
+        assert sent[0].startswith("[매도 주문 접수 완료]")
+        assert sent[1].startswith("[매도 체결]")
 
-    def test_a_cancelled_buy_produces_only_the_cancel(self):
+    def test_a_cancelled_buy_produces_accepted_then_the_cancel(self):
         sent, send = self._capture()
         for event, fields in [
                 (ln.ORDER_SUBMITTED, {"symbol": "ABC", "side": "buy"}),
@@ -248,7 +257,7 @@ class TestOneMessagePerLifecycle:
                 (ln.CANCEL_COMPLETED, {"symbol": "ABC", "state": "CANCELLED", "side": "buy",
                                        "quantity": 1})]:
             ln.notify(event, fields, send_fn=send, track_health=False)
-        assert [m.splitlines()[0] for m in sent] == ["[매수 주문 취소]"]
+        assert [m.splitlines()[0] for m in sent] == ["[매수 주문 접수 완료]", "[매수 주문 취소]"]
 
     def test_a_blocked_buy_produces_only_the_block(self):
         sent, send = self._capture()
@@ -536,7 +545,8 @@ class TestDurableBehaviourUnchanged:
         source = (REPO_ROOT / "execution" / "execution_engine.py").read_text()
         assert 'event_type="TRANSPORT_SUBMITTING"' in source or "TRANSPORT_SUBMITTING" in source
         assert 'event_type="TRANSPORT_RESULT"' in source
-        assert "_notify_submitted(order_intent, side_label=side_label, record=execution_record)" in source
+        assert ("_notify_submitted(order_intent, side_label=side_label, "
+               "record=execution_record, conn=conn)") in source
 
     def test_notify_results_never_steer_control_flow(self):
         """Every production notify() call is a bare statement."""
