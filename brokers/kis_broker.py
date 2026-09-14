@@ -1548,11 +1548,25 @@ class KISBroker:
         """
         self.config.validate_read_allowed()
         tr_id = TR_ID_PSAMOUNT[self._env_key()]
+        # Confirmed root cause (2026-09-14, REGULAR session):
+        # `str(limit_price_usd)` on the raw evaluated price -- e.g.
+        # `532.3800048828125`, a float32-widening artifact -- produced a
+        # string longer than KIS's OVRS_ORD_UNPR field accepts, and KIS
+        # answered rt_cd=2 msg_cd=OPSQ2002 "INVALID INPUT_FILED_SIZE",
+        # a response with no `output` at all. `wire_price()` is the
+        # SAME normalization the real BUY order already applies to this
+        # exact field (`brokers/order_price.py`, APTR0057's two-decimal
+        # rule) -- reusing it means this inquiry asks about affordability
+        # at the identical price the order would actually use, not a
+        # second, independently-formatted number.
+        from brokers.order_price import wire_price
+
         try:
             body = self._get(PSAMOUNT_PATH, tr_id, {
                 "CANO": self.config.account_no, "ACNT_PRDT_CD": self.config.account_product_cd,
                 "OVRS_EXCG_CD": _order_excg_for(instrument.exchange),
-                "OVRS_ORD_UNPR": str(limit_price_usd), "ITEM_CD": instrument.kis_symbol,
+                "OVRS_ORD_UNPR": wire_price(limit_price_usd, side="buy"),
+                "ITEM_CD": instrument.kis_symbol,
             })
         except KISBrokerError as exc:
             # Network fault, auth failure or a non-success KIS body. All

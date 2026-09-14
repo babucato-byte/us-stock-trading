@@ -279,7 +279,9 @@ class TestPerCandidateAnswers:
     def test_the_answer_depends_on_symbol_and_price(self):
         """KIS's orderable amount is not an account-wide constant, so the
         same account can answer differently per candidate."""
-        answers = {("AAPL", "5.82"): "30.99", ("MSFT", "400.0"): "0"}
+        # KIS-wire-normalized keys (brokers.order_price.wire_price,
+        # two decimals) -- not the raw Python float repr.
+        answers = {("AAPL", "5.82"): "30.99", ("MSFT", "400.00"): "0"}
         session = _Session()
         session.queue("/oauth2/tokenP", TOKEN_OK)
 

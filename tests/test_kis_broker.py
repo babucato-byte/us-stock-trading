@@ -341,6 +341,105 @@ class TestAccountAndPositions:
         call = next(r for r in session.requests if r[1].endswith("/inquire-psamount"))
         assert call[2]["params"]["OVRS_EXCG_CD"] == "NASD"
 
+    def test_get_orderable_usd_sends_a_wire_normalized_price_not_the_raw_float(self):
+        """B/C: reproduces the confirmed 2026-09-14 REGULAR-session root
+        cause and its fix. `532.3800048828125` -- a real evaluated price
+        carrying float32-widening garbage digits -- must reach KIS as
+        `532.38` (the SAME normalization `wire_price()` applies to a real
+        BUY order's price, APTR0057's two-decimal rule), not as the raw
+        17-character string that produced KIS's rt_cd=2 msg_cd=OPSQ2002
+        'INVALID INPUT_FILED_SIZE [OVRS_ORD_UNPR]' in production."""
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", TOKEN_OK)
+        session.queue(
+            "/uapi/overseas-stock/v1/trading/inquire-psamount",
+            _StubResponse(200, {"output": {"ovrs_ord_psbl_amt": "149.63"}}),
+        )
+        amount = _broker(session=session).get_orderable_usd(
+            _instrument(), 532.3800048828125)
+        call = next(r for r in session.requests if r[1].endswith("/inquire-psamount"))
+        assert call[2]["params"]["OVRS_ORD_UNPR"] == "532.38"
+        assert amount == pytest.approx(149.63)
+
+    def test_A_the_raw_float_reproduces_kis_rejecting_field_size_before_the_fix(self):
+        """A: proves the FAILURE MODE this fix addresses is real --
+        KIS's own production response shape (rt_cd=2, msg_cd=OPSQ2002,
+        no `output` key) for an oversized OVRS_ORD_UNPR, fed straight
+        through `_parse_orderable_amount` exactly as `get_orderable_usd`
+        would receive it, fails closed rather than crashing or
+        fabricating a number."""
+        from brokers.kis_broker import KISOrderableCashUnavailableError, _parse_orderable_amount
+
+        kis_response_for_oversized_price_field = {
+            "rt_cd": "2", "msg_cd": "OPSQ2002",
+            "msg1": "ERROR INVALID INPUT_FILED_SIZE [OVRS_ORD_UNPR]",
+        }
+        with pytest.raises(KISOrderableCashUnavailableError) as exc_info:
+            _parse_orderable_amount(kis_response_for_oversized_price_field, symbol="NOC")
+        assert exc_info.value.detail == "output_missing"
+
+    def test_D_a_genuinely_malformed_response_still_fails_closed(self):
+        """D: the fix narrows WHAT price string is sent; it must not
+        narrow what counts as a usable response. A response with no
+        `output` for an UNRELATED reason still fails closed exactly as
+        before."""
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", TOKEN_OK)
+        session.queue(
+            "/uapi/overseas-stock/v1/trading/inquire-psamount",
+            _StubResponse(200, {"rt_cd": "1", "msg_cd": "APBK0013",
+                                "msg1": "unrelated failure"}),
+        )
+        from brokers.kis_broker import KISOrderableCashUnavailableError
+
+        with pytest.raises(KISOrderableCashUnavailableError):
+            _broker(session=session).get_orderable_usd(_instrument(), 532.3800048828125)
+
+    def test_E_no_retry_semantics_were_added(self):
+        """E: this is a parameter-formatting fix, not a retry. A single
+        queued response is consumed by a single request -- if a retry
+        had been added, the fake session would raise on running out of
+        queued responses before this assertion, or the call count would
+        exceed 1."""
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", TOKEN_OK)
+        session.queue(
+            "/uapi/overseas-stock/v1/trading/inquire-psamount",
+            _StubResponse(200, {"output": {"ovrs_ord_psbl_amt": "149.63"}}),
+        )
+        _broker(session=session).get_orderable_usd(_instrument(), 532.3800048828125)
+        psamount_calls = [r for r in session.requests if r[1].endswith("/inquire-psamount")]
+        assert len(psamount_calls) == 1
+
+    def test_F_premarket_style_clean_price_is_unaffected(self):
+        """F: a normal, already-clean price (PREMARKET's SCHW fill used
+        prices like this) must produce the identical wire value it
+        always did -- this fix must not touch the already-working path."""
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", TOKEN_OK)
+        session.queue(
+            "/uapi/overseas-stock/v1/trading/inquire-psamount",
+            _StubResponse(200, {"output": {"ovrs_ord_psbl_amt": "149.63"}}),
+        )
+        _broker(session=session).get_orderable_usd(_instrument(), 92.0)
+        call = next(r for r in session.requests if r[1].endswith("/inquire-psamount"))
+        assert call[2]["params"]["OVRS_ORD_UNPR"] == "92.00"
+
+    def test_G_regular_session_affected_symbol_class_now_succeeds(self):
+        """G: NYSE-listed, non-round, float-garbage prices -- the exact
+        class of REGULAR-session symbol/price combination observed
+        failing in production (NOC, OTIS, MHK, MSGS) -- now reach KIS
+        with a valid field and get back a real orderable amount."""
+        session = _FakeSession()
+        session.queue("/oauth2/tokenP", TOKEN_OK)
+        session.queue(
+            "/uapi/overseas-stock/v1/trading/inquire-psamount",
+            _StubResponse(200, {"output": {"ovrs_ord_psbl_amt": "149.63"}}),
+        )
+        amount = _broker(session=session).get_orderable_usd(
+            _instrument(exchange="NYSE"), 531.7150000000001)
+        assert amount == pytest.approx(149.63)
+
     def test_get_open_orders(self):
         """ORACLE-HIGH-01: an account read sweeps every supported venue.
         The same stub answers all three legs, so the identical order must
