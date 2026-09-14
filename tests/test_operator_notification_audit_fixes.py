@@ -279,17 +279,34 @@ class TestS04S05SessionIsPreserved:
 # stale current figure.
 # ---------------------------------------------------------------------
 class TestS07CashPrecheckRefreshFailurePresentation:
-    def test_refresh_failure_detail_reads_unknown_not_stale_available(self):
+    """`s6_live/cash_precheck.py` now reads `get_orderable_usd()` fresh
+    every time (no cache), so there is no longer a STALE cached figure
+    to distinguish from a fresh one -- the remaining risk S-07 guards
+    against is rendering Python's `None` as if it were a real balance
+    when the authoritative read itself never produced a number at all
+    (`ORDERABLE_CASH_UNAVAILABLE_PRECHECK`: the KIS call raised, or
+    returned an unusable amount)."""
+
+    def test_unavailable_read_detail_reads_unknown_not_none(self):
+        from s6_live import cash_precheck
         from scripts.run_live_buy_entry import _cash_precheck_detail_text
 
-        detail = {"reason": "authoritative refresh failed after a low cached read",
-                  "available_cash": 11.98, "required_for_1_share": 149.63,
-                  "shortfall": 137.65}
+        detail = {"reason": "authoritative KIS orderability read failed",
+                  "reason_code": cash_precheck.ORDERABLE_CASH_UNAVAILABLE_PRECHECK,
+                  "symbol": "IOT", "price": 39.06}
         text = _cash_precheck_detail_text(detail)
         assert "available=UNKNOWN" in text
-        assert "cached_available=11.98" in text
-        assert "refresh_failed=true" in text
-        assert not text.startswith("available=11.98")  # not presented as the current figure
+        assert "None" not in text
+
+    def test_unusable_amount_detail_also_reads_unknown(self):
+        from s6_live import cash_precheck
+        from scripts.run_live_buy_entry import _cash_precheck_detail_text
+
+        detail = {"reason": "authoritative KIS orderability amount is unusable",
+                  "reason_code": cash_precheck.ORDERABLE_CASH_UNAVAILABLE_PRECHECK,
+                  "symbol": "IOT", "price": 39.06}
+        text = _cash_precheck_detail_text(detail)
+        assert "available=UNKNOWN" in text
 
     def test_an_ordinary_block_still_shows_available(self):
         from scripts.run_live_buy_entry import _cash_precheck_detail_text

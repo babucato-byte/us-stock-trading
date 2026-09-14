@@ -748,26 +748,27 @@ def _announce_quality_blocks(source, *, since) -> None:
             pass
 
 
-#: s6_live.cash_precheck's own reason string for the one case where the
-#: number in `available_cash` is not current: a low CACHED read that
-#: triggered a fresh refresh, and the refresh itself failed. Displaying
-#: that stale figure under "available" claims a current fact the system
-#: never confirmed (S-07) -- presentation only, the BLOCKED decision
-#: itself is untouched.
-_CASH_PRECHECK_REFRESH_FAILED_REASON = (
-    "authoritative refresh failed after a low cached read")
-
-
 def _cash_precheck_detail_text(detail) -> str:
     """The one-line `상세` text for a cash-precheck block.
 
     `detail` is exactly the dict `s6_live.cash_precheck.check()` returns;
     this only chooses how to WORD it, never what it means.
+
+    `s6_live.cash_precheck.check()` no longer caches anything -- every
+    read is the authoritative `get_orderable_usd()` call, so there is no
+    stale figure to distinguish from a fresh one (the earlier S-07 fix
+    was written against a cached-read design this module no longer has).
+    What it CAN still do is fail without ever obtaining a number at all
+    (`ORDERABLE_CASH_UNAVAILABLE_PRECHECK` -- the KIS read raised, or the
+    amount it returned was not usable): that case has no
+    `available_cash`/`shortfall` in `detail`, and must say UNKNOWN rather
+    than render Python's `None` as if it were a real balance.
     """
-    if detail.get("reason") == _CASH_PRECHECK_REFRESH_FAILED_REASON:
-        return (f"available=UNKNOWN cached_available={detail.get('available_cash')} "
-               f"refresh_failed=true required={detail.get('required_for_1_share')} "
-               f"shortfall={detail.get('shortfall')}")[:200]
+    from s6_live import cash_precheck
+
+    if detail.get("reason_code") == cash_precheck.ORDERABLE_CASH_UNAVAILABLE_PRECHECK:
+        return (f"available=UNKNOWN reason={detail.get('reason')} "
+               f"required={detail.get('required_for_1_share', detail.get('price'))}")[:200]
     return (f"available={detail.get('available_cash')} "
            f"required={detail.get('required_for_1_share')} "
            f"shortfall={detail.get('shortfall')}")[:200]
