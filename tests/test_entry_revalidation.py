@@ -53,6 +53,10 @@ class _Broker:
         self._orders = list(open_orders)
         self._orderable = orderable
         self._fail = fail
+        self.orderable_calls = []
+
+    def get_account_cash_usd(self):
+        raise AssertionError("settled cash must not be used before submit")
 
     def get_open_orders(self):
         if self._fail == "orders":
@@ -60,6 +64,7 @@ class _Broker:
         return self._orders
 
     def get_orderable_usd(self, instrument, price):
+        self.orderable_calls.append((instrument.symbol, price))
         if self._fail == "cash":
             raise RuntimeError("KIS unreachable")
         return self._orderable
@@ -215,6 +220,13 @@ class TestDuplicateOrderPrevention:
 
 class TestCashIsReReadUnderTheLock:
     """Again: refreshed here, refused by the gate."""
+
+    def test_authoritative_orderability_not_settled_cash_is_reread(self, conn):
+        state = {"available_usd": 11.98}
+        broker = _Broker(orderable=149.63)
+        assert _revalidate(conn, broker, live_state=state) is None
+        assert state["available_usd"] == 149.63
+        assert broker.orderable_calls == [("HBAN", 17.01)]
 
     def test_cash_spent_during_analysis_reaches_the_gate(self, conn):
         state = {"available_usd": 5000.0}

@@ -1,29 +1,18 @@
-"""The last observed account-level USD cash, for the READY -> BUY_INTENT
-cash precheck (`s6_live.execution_liquidity`'s sibling for §7-9).
+"""The last observed account-level settled USD cash.
 
 Why a cache and not a fresh read
 ---------------------------------
-KIS answers orderable cash per (symbol, exchange, limit price)
-(`KISBroker.get_orderable_usd`) -- there is no single account-level
-number that IS the authoritative answer, and that per-candidate read is
-exactly the ~44-45s-per-candidate cost `s6_live/buy_intent.py` was built
-to keep off the fast-watch tick (see that module's docstring). A precheck
-that repeated it would reintroduce the problem it exists to avoid.
+KIS answers orderable cash per (symbol, exchange, limit price) through
+``KISBroker.get_orderable_usd``. There is no account-level value that may
+substitute for that answer, so S6 BUY affordability does not consume this
+cache.
 
-`KISBroker.get_account_cash_usd()` is a cheaper, coarser, already-proven
-account-level USD read (PHASE 4C; used by `s1_live/executor.py`,
-`operations/session_readiness.py`) that a live probe matched EXACTLY
-against `get_orderable_usd()` for symbol-and-price-invariant reads
-(`brokers/kis_broker.py`, `orderable_amount_is_account_level`). It is not
-per-price, so it can overstate true orderable cash when KIS's per-symbol
-answer differs -- which is exactly why this is a PRECHECK, not a gate:
-the execution worker's own `get_orderable_usd()` check remains the sole
-authority (§8).
+`KISBroker.get_account_cash_usd()` reads settled/withdrawable USD. It can
+be materially lower than buying power when KIS permits reuse of unsettled
+sale proceeds, so this cache is retained only for consumers that explicitly
+need settled account cash.
 
-This module caches that single account-level read across the small
-number of candidates a tick admits, so a tick with several newly-READY
-symbols costs at most ONE extra KIS call, and a tick with none costs
-zero. Same flock + atomic tmp-then-replace idiom as `buy_intent.py` and
+Same flock + atomic tmp-then-replace idiom as `buy_intent.py` and
 `watch_priority_state.py`.
 """
 

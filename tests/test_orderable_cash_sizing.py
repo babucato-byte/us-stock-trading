@@ -108,6 +108,20 @@ def _instrument():
 # 1. The control: a real, well-formed answer.
 # ---------------------------------------------------------------------
 class TestNormalAnswer:
+    def test_kis_final_orderable_field_wins_over_cash_components(self):
+        """11.98 settled + 138.48 reusable is not reconstructed here.
+
+        KIS's final value includes its own adjustments and is the only
+        authoritative buying-power figure.
+        """
+        broker, _ = _broker_with_psamount(_StubResponse(200, {"output": {
+            "ord_psbl_frcr_amt": "11.98",
+            "sll_ruse_psbl_amt": "138.48",
+            ORDERABLE_AMOUNT_FIELD: "149.63",
+        }}))
+        assert broker.get_orderable_usd(
+            _instrument(), CANDIDATE_PRICE_USD) == pytest.approx(149.63)
+
     def test_the_live_figure_is_parsed_as_a_float(self):
         broker, _ = _broker_with_psamount(
             _StubResponse(200, {"output": {ORDERABLE_AMOUNT_FIELD: "30.99"}}))
