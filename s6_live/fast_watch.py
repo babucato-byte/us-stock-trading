@@ -235,6 +235,12 @@ class ActiveWatchSource:
         ready = []
         self.waiting_for_data = []
         self.eval_symbol_timings_ms: Dict[str, float] = {}
+        # One shared slot for the cash precheck's own authoritative
+        # refresh (s6_live/cash_precheck.py) -- scoped to THIS call, so a
+        # low cached figure that trips up more than one candidate this
+        # tick costs at most one live get_account_cash_usd() call, not
+        # one per candidate.
+        cash_precheck_tick_cache: Dict[str, Any] = {}
         evaluated_state: Dict[str, Dict[str, Any]] = {}
         batch_records = []
         # Transport tally for the funnel report (§14/§17): counted from
@@ -302,7 +308,8 @@ class ActiveWatchSource:
                 else:
                     cash_status, cash_detail = cash_precheck.check(
                         symbol, getattr(ready_feats, "price", None),
-                        broker=self._broker, now=evaluated_at, env=self._env)
+                        broker=self._broker, now=evaluated_at, env=self._env,
+                        tick_cache=cash_precheck_tick_cache)
                     if cash_status == cash_precheck.BLOCKED:
                         self.cash_precheck_blocked[symbol] = (
                             cash_precheck.INSUFFICIENT_CASH_PRECHECK, cash_detail)

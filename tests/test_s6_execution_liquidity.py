@@ -301,6 +301,137 @@ class TestCashPrecheck:
         assert broker.calls == 2
 
 
+class TestCashPrecheckStaleCacheRefresh:
+    """The production defect this class regression-tests: a cached
+    `available_usd=11.98` blocked IOT/UL/RELX/CLX/NVS -- all affordable
+    against the real KIS orderable amount of $149.63. A CACHED figure
+    that looks insufficient must trigger one authoritative refresh
+    before blocking; only a fresh read may actually block."""
+
+    @pytest.fixture(autouse=True)
+    def _env(self, tmp_path):
+        self.env = {"S6_ACTIVE_WATCH_DIR": str(tmp_path)}
+
+    def test_stale_cached_low_but_authoritative_sufficient_continues(self):
+        account_cash_cache.write(11.98, now=NOW, env=self.env)
+        broker = Broker(cash=149.63)
+        status, detail = cash_precheck.check(
+            "IOT", 39.06, broker=broker, now=NOW + timedelta(seconds=5), env=self.env)
+        assert status == cash_precheck.OK
+        assert detail["available_cash"] == 149.63
+        assert detail["cash_source"] == "refreshed:get_account_cash_usd"
+        # One cached read, one authoritative refresh -- not a second
+        # fresh-cache write-then-reread.
+        assert broker.calls == 1
+
+    def test_cached_low_and_authoritative_also_low_blocks(self):
+        account_cash_cache.write(11.98, now=NOW, env=self.env)
+        broker = Broker(cash=20.00)
+        status, detail = cash_precheck.check(
+            "IOT", 39.06, broker=broker, now=NOW + timedelta(seconds=5), env=self.env)
+        assert status == cash_precheck.BLOCKED
+        assert detail["available_cash"] == 20.00
+        assert detail["shortfall"] == pytest.approx(19.06)
+        assert broker.calls == 1
+
+    def test_authoritative_refresh_failure_after_low_cache_fails_closed(self):
+        account_cash_cache.write(11.98, now=NOW, env=self.env)
+        broker = Broker(raises=True)
+        status, detail = cash_precheck.check(
+            "IOT", 39.06, broker=broker, now=NOW + timedelta(seconds=5), env=self.env)
+        # Fail CLOSED here specifically -- unlike a cache-miss read
+        # failure (which is UNAVAILABLE and fails open), a refresh
+        # triggered by an already-suspicious low cached figure that
+        # cannot be cleared blocks rather than letting the candidate
+        # through.
+        assert status == cash_precheck.BLOCKED
+        assert "authoritative refresh failed" in detail["reason"]
+
+    def test_multiple_candidates_same_tick_cost_at_most_one_refresh(self):
+        account_cash_cache.write(11.98, now=NOW, env=self.env)
+        broker = Broker(cash=149.63)
+        tick_cache: dict = {}
+        moment = NOW + timedelta(seconds=5)
+        results = [
+            cash_precheck.check(sym, price, broker=broker, now=moment,
+                                env=self.env, tick_cache=tick_cache)
+            for sym, price in (("IOT", 39.06), ("UL", 62.95), ("RELX", 34.90),
+                              ("CLX", 88.77), ("NVS", 140.28))
+        ]
+        assert all(status == cash_precheck.OK for status, _ in results)
+        assert broker.calls == 1
+        # The last (NVS, $140.28) is within the refreshed $149.63 but
+        # would not have been under the stale $11.98 -- proving each
+        # candidate was actually re-evaluated against the refreshed
+        # figure, not just waved through.
+        assert results[-1][1]["available_cash"] == 149.63
+
+    def test_multiple_candidates_same_tick_shares_a_failed_refresh_too(self):
+        """The one-refresh-per-tick budget applies to a FAILED refresh as
+        well -- a second candidate must not retry the live call and must
+        still fail closed."""
+        account_cash_cache.write(11.98, now=NOW, env=self.env)
+        broker = Broker(raises=True)
+        tick_cache: dict = {}
+        moment = NOW + timedelta(seconds=5)
+        s1 = cash_precheck.check("IOT", 39.06, broker=broker, now=moment,
+                                 env=self.env, tick_cache=tick_cache)
+        s2 = cash_precheck.check("UL", 62.95, broker=broker, now=moment,
+                                 env=self.env, tick_cache=tick_cache)
+        assert s1[0] == cash_precheck.BLOCKED
+        assert s2[0] == cash_precheck.BLOCKED
+        assert broker.calls == 1
+
+    def test_fresh_cache_miss_read_that_is_low_still_blocks_directly(self):
+        """Only a CACHED read gets the second-chance refresh -- a read
+        that was already fresh (no cache entry at all) blocking is the
+        module's original, unchanged behaviour; there is no second
+        authoritative read to fall back to because the first one already
+        was authoritative."""
+        broker = Broker(cash=2.00)
+        status, detail = cash_precheck.check(
+            "RIG", 5.79, broker=broker, now=NOW, env=self.env)
+        assert status == cash_precheck.BLOCKED
+        assert detail["cash_source"] == "fresh:get_account_cash_usd"
+        assert broker.calls == 1
+
+
+class TestFinalExecutionCashRecheckUnaffected:
+    """Requirement 7: the authoritative `get_orderable_usd()` reread
+    immediately before real broker submit, under the execution lock
+    (`kis_live_trading.py` / `execution/order_gate.py`), is untouched by
+    this fix -- it is a different call, on a different object
+    (per-price, order-time), reached only after this precheck already
+    let the candidate through. This is a targeted regression check, not
+    a re-audit of that path (already covered by
+    tests/test_kis_live_trading.py where present)."""
+
+    def test_cash_precheck_module_does_not_touch_order_gate_or_execution_engine(self):
+        import inspect
+
+        from s6_live import cash_precheck
+
+        source = inspect.getsource(cash_precheck)
+        assert "order_gate" not in source
+        assert "execution_engine" not in source
+        assert "submit_order" not in source
+
+    def test_a_precheck_pass_does_not_mean_the_order_will_be_sized_from_it(self):
+        """OK from this precheck means only "worth writing a
+        BUY_INTENT" -- the actual orderable-cash figure used to size and
+        gate the real order is read again, fresh, by the execution
+        worker's own `get_orderable_usd()` call, never from this
+        module's return value."""
+        broker = Broker(cash=149.63)
+        status, detail = cash_precheck.check(
+            "IOT", 39.06, broker=broker, now=NOW, env={"S6_ACTIVE_WATCH_DIR": "/tmp/x"})
+        assert status == cash_precheck.OK
+        # The precheck's detail is diagnostic only -- nothing here is an
+        # order-sizing figure the execution worker is expected to read.
+        assert "order_intent" not in detail
+        assert "quantity" not in detail
+
+
 # -- integration: the gate wired into the live fast-watch tick -------------
 
 def _feats(entry_quality=None, **overrides):
