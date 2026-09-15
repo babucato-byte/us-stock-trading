@@ -78,6 +78,10 @@ class ActiveWatchSource:
         self._state: Optional[dict] = None
         self._rows: Dict[str, dict] = {}
         self.evaluations: Dict[str, precision_watch.WatchEvaluation] = {}
+        #: Watchlist entries excluded from S6 evaluation for being
+        #: transport-only. Defaulted here so a caller that reads it
+        #: before symbols() runs gets an empty list, not AttributeError.
+        self.not_s6_owned: List[str] = []
         self.waiting_for_data: List[str] = []
         self.validation_report: Dict[str, Any] = {}
         self.transport_counts: Dict[str, int] = {}
@@ -213,6 +217,26 @@ class ActiveWatchSource:
     def symbols(self) -> List[str]:
         load_started_at = datetime.now(timezone.utc)
         offered = [s for s in self._active_symbols() if s in self.allowed_symbols()]
+        # The S6-applicability boundary, and the only one.
+        #
+        # A watchlist entry is not a strategy claim. `KIS_COLLECTOR_
+        # MEMBERSHIP` is set ONLY for a symbol with no S6 discovery
+        # behind it -- it says the collector already streams this, which
+        # is a TRANSPORT fact. Evaluating it here gave it S6 features, an
+        # S6 verdict and, when its session origin was not covered, an S6
+        # error, for a strategy that never flagged it.
+        #
+        # Filtered HERE rather than in `_active_symbols` on purpose: the
+        # watchlist, its transport classification and `allowed_symbols`
+        # are all unchanged, so the collector keeps streaming exactly
+        # what it streamed. Only entry into feature evaluation is gated.
+        # Excluded symbols never reach the Budget either, so they cannot
+        # spend a tick that a real candidate is waiting for -- on
+        # 2026-09-15 PREMARKET that was 41 of 43 entries.
+        self.not_s6_owned = [s for s in offered
+                             if active_watch.is_transport_only(self._entry(s))]
+        if self.not_s6_owned:
+            offered = [s for s in offered if s not in set(self.not_s6_owned)]
         load_finished_at = datetime.now(timezone.utc)
         self.load_ms = (load_finished_at - load_started_at).total_seconds() * 1000
 

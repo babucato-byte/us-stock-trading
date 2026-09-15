@@ -94,6 +94,52 @@ FULL_DISCOVERY_SOURCE = "S6_FULL_DISCOVERY"
 #: WebSocket-backed for either reason.
 COLLECTOR_MEMBERSHIP_SOURCE = "KIS_COLLECTOR_MEMBERSHIP"
 
+#: Sources that put a symbol in the watchlist for TRANSPORT reasons only.
+#:
+#: The distinction this makes operational
+#: --------------------------------------
+#: `COLLECTOR_MEMBERSHIP_SOURCE` above is set ONLY when a symbol has no
+#: S6 discovery claim at all. That was already written down; nothing
+#: enforced it. The fast watch evaluated every watchlist entry as an S6
+#: input, so a symbol the collector merely happens to stream was given
+#: S6 features, an S6 verdict and -- when its session origin was not
+#: covered -- an S6 error, for a strategy that never flagged it.
+#:
+#: Measured 2026-09-15 PREMARKET: 41 of 43 watch entries were collector
+#: membership and 2 were real S6 candidates, so ~95% of the tick's
+#: evaluation budget was spent on symbols S6 never chose.
+#:
+#: Only the EXPLICIT transport-only source is excluded. An unknown or
+#: absent source stays eligible on purpose: dropping a row because its
+#: provenance is unreadable would silently starve a real candidate,
+#: which is a worse failure than evaluating one extra symbol.
+TRANSPORT_ONLY_SOURCES = frozenset({COLLECTOR_MEMBERSHIP_SOURCE})
+
+
+def strategy_source_of(entry) -> str:
+    """The row's strategy source, under either spelling.
+
+    `strategy_source` is the current name and a bare `source` is the
+    older one; the merge above normalises to the former, but a row read
+    straight off disk can still carry the latter.
+    """
+    if not isinstance(entry, dict):
+        return str(entry or "")
+    value = entry.get("strategy_source")
+    if value is None:
+        value = entry.get("source")
+    return str(value or "")
+
+
+def is_transport_only(entry) -> bool:
+    """Is this row in the watchlist purely because the collector streams
+    it -- i.e. NOT an S6 strategy input?
+
+    Accepts a row or a bare source string, so a caller with either one
+    asks the same question of the same table.
+    """
+    return strategy_source_of(entry) in TRANSPORT_ONLY_SOURCES
+
 #: Kept only as the default for callers that name no session.
 SESSION = "PREMARKET"
 
