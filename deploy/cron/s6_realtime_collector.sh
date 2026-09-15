@@ -126,11 +126,28 @@ if [ -z "${SYMBOLS:-}" ]; then
     exit 0
 fi
 
+# Lifetime, and why it is not a round hour.
+#
+# cron supervises this every five minutes, and the runner is given a
+# bounded life so a wedged socket cannot outlive its session. At 3600s
+# those two periods were exact multiples of each other: the process
+# exited at the same moment the cron that would replace it ran, pgrep
+# still saw it, the supervisor exited 0, and the replacement landed a
+# FULL five minutes later. Every hour the feed went dark for ~5 minutes
+# -- long enough for the fast watch to mark every symbol
+# ACTIVE_WATCH_STALE and for a session to lose those bars. Measured
+# 2026-09-14: starts spaced 65 minutes, staleness announced 18:57,
+# 20:02, 21:07, 22:32, 23:37 UTC, each 3 minutes before the next start.
+#
+# 3540 makes the life 59 minutes, so expiry falls strictly BETWEEN cron
+# ticks. A start is a tick plus the bootstrap's 10-35s, leaving a gap of
+# 60s minus that -- 25 to 50 seconds, never a whole interval. Any
+# multiple of 300 reintroduces the race; keep this off that grid.
 setsid nohup env TRADING_PROJECT_ROOT="$SCANNER_RUNTIME_ROOT" \
       KIS_LOCK_OWNER=S6_COLLECTOR \
   "$SCANNER_RUNTIME_ROOT/venv/bin/python" \
     "$SCANNER_RUNTIME_ROOT/scripts/run_realtime_bar_collector.py" \
-      --symbols "$SYMBOLS" --seconds 3600 \
+      --symbols "$SYMBOLS" --seconds 3540 \
   < /dev/null >> "$LOG" 2>&1 &
 
 echo "$(date -u +%FT%TZ) collector started symbols=$(echo "$SYMBOLS" | tr ',' '\n' | wc -l)" >> "$LOG"
