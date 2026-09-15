@@ -176,10 +176,35 @@ def current_session_date(session, now=None) -> Optional[date]:
 
 
 def official_origin(session, session_date) -> Optional[datetime]:
-    """The session's nominal start as an Eastern-aware timestamp."""
+    """The session's nominal start as an Eastern-aware timestamp.
+
+    주간거래 is anchored in KST, not ET
+    ----------------------------------
+    The other three sessions open at a fixed Eastern time and this is
+    just `combine`. The daytime session does not: KIS publishes it as
+    10:00 KST, and the KST->ET offset moves with US daylight saving, so
+    its ET open is 20:00 in standard time and 21:00 under DST. Deriving
+    it from the ET window start gave an origin an hour before KIS opened
+    under DST -- and since `kis_bar_features` requires a real bar at or
+    before the origin, and the venue had none, the daytime opening range
+    could never be covered.
+
+    So this asks the schedule for the same instant the order path uses,
+    and the answer is 10:00 KST (01:00 UTC) either way, which is what the
+    ORB is measured from: ORB5 is 01:00-01:05 UTC, ORB15 01:00-01:15.
+    """
     window = window_for(session)
     if window is None or session_date is None:
         return None
+    if str(session or "").strip().upper() == "OVERNIGHT_DAYTIME":
+        from config.kis_market_schedule import KST, daytime_open_time
+
+        # The ET window start names the EVENING the session belongs to;
+        # its KST date is the calendar day KIS opens 주간거래 on.
+        evening = datetime.combine(session_date, window[0], tzinfo=EASTERN)
+        kst_date = evening.astimezone(KST).date()
+        return datetime.combine(
+            kst_date, daytime_open_time(), tzinfo=KST).astimezone(EASTERN)
     return datetime.combine(session_date, window[0], tzinfo=EASTERN)
 
 

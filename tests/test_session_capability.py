@@ -60,11 +60,18 @@ class TestCapabilityIsNotTheVenuesOwnState:
         from market_hours import get_market_state
         from scanners.base import scan_session
 
-        for hour in (20, 21, 22, 23, 0, 1, 2, 3):
+        for hour in (21, 22, 23, 0, 1, 2, 3):
             day = 25 if hour >= 20 else 26
             t = datetime(2026, 8, day, hour, 0, tzinfo=EASTERN)
             assert scan_session.session_at(t) == "OVERNIGHT_DAYTIME"
             assert get_market_state(t) == "CLOSED"
+
+        # 20:00 ET is no longer daytime at all -- 09:00 KST, between the
+        # aftermarket extension and 주간거래 -- and the market is still
+        # CLOSED there, so the structural property holds either way.
+        twenty = datetime(2026, 8, 25, 20, 0, tzinfo=EASTERN)
+        assert scan_session.session_at(twenty) == "CLOSED"
+        assert get_market_state(twenty) == "CLOSED"
 
 
 class TestTheCalendarGuardSurvivedTheRemoval:

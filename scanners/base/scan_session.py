@@ -68,7 +68,22 @@ REGULAR = "REGULAR"
 AFTER_HOURS = "AFTER_HOURS"
 OVERNIGHT_DAYTIME = "OVERNIGHT_DAYTIME"
 
-#: Clock order, starting at the premarket boundary.
+#: No venue is open. NOT one of `SESSIONS`, deliberately: it is the
+#: absence of one, and everything that takes a session must refuse it
+#: rather than treat it as a fifth thing to scan.
+#:
+#: The hour this exists for: under US DST, the aftermarket extension ends
+#: at 09:00 KST and 주간거래 does not open until 10:00, so 00:00-01:00 UTC
+#: belongs to no session at all. `session_at` used to answer
+#: OVERNIGHT_DAYTIME there because daytime was its final `return` -- a
+#: catch-all for "none of the other three" rather than a window. The
+#: order path already refused that hour (`session_capability` reads the
+#: KST schedule and answers MARKET_CLOSED), so nothing could trade; but
+#: the scan path believed it was in session and started a collector, a
+#: watch scope and a snapshot for a venue that was shut.
+CLOSED = "CLOSED"
+
+#: Clock order, starting at the premarket boundary. CLOSED is not here.
 SESSIONS = (PREMARKET, REGULAR, AFTER_HOURS, OVERNIGHT_DAYTIME)
 
 #: Sessions for which the official specification defines an order route.
@@ -137,15 +152,30 @@ def session_at(moment: Optional[datetime] = None) -> str:
         moment = datetime.now(EASTERN)
     elif moment.tzinfo is None:
         moment = moment.replace(tzinfo=EASTERN)
-    clock: time = moment.astimezone(EASTERN).time()
 
+    # 주간거래 is asked of the KST schedule, not of an Eastern clock.
+    #
+    # KIS publishes it in KST and the KST->ET offset moves with US DST,
+    # so a window fixed in ET is wrong for half the year. Asserting it
+    # here as 20:00->04:00 ET is what produced a daytime session an hour
+    # before KIS opened one. `config.kis_market_schedule` is the single
+    # definition, and `session_capability` -- the order path -- already
+    # reads it; deriving from the same module is what stops the scan path
+    # and the order path from disagreeing about what time it is.
+    from config import kis_market_schedule as schedule
+
+    if schedule.window_at(moment) == schedule.WINDOW_DAYTIME:
+        return OVERNIGHT_DAYTIME
+
+    clock: time = moment.astimezone(EASTERN).time()
     if MARKET_PREMARKET_START <= clock < MARKET_REGULAR_START:
         return PREMARKET
     if MARKET_REGULAR_START <= clock < MARKET_REGULAR_END:
         return REGULAR
     if MARKET_REGULAR_END <= clock < MARKET_AFTERMARKET_END:
         return AFTER_HOURS
-    return OVERNIGHT_DAYTIME
+    # Not a catch-all any more. No window claims this moment.
+    return CLOSED
 
 
 def order_route_verified(session) -> bool:

@@ -23,7 +23,7 @@ SESSIONS = [
     ("PREMARKET", 4, 0, "OVERNIGHT_DAYTIME"),
     ("REGULAR", 9, 30, "PREMARKET"),
     ("AFTER_HOURS", 16, 0, "REGULAR"),
-    ("OVERNIGHT_DAYTIME", 20, 0, "AFTER_HOURS"),
+    ("OVERNIGHT_DAYTIME", 21, 0, "AFTER_HOURS"),   # 10:00 KST under DST
 ]
 
 
@@ -127,11 +127,13 @@ class TestOwnOpeningRangeIsReadable:
 
 class TestCrossMidnight:
     def test_the_overnight_open_survives_midnight(self, tmp_path):
-        """20:00 lives under one date key, 01:00 under the next."""
+        """21:00 lives under one date key, 01:00 under the next."""
         from s6_live import kis_bar_features as kbf
 
         root = tmp_path / "overnight"
-        open_et = datetime(2026, 9, 8, 20, 0, tzinfo=ET)
+        # 21:00 ET under DST is the daytime open (10:00 KST). The hour
+        # before it belongs to no venue and is filtered out.
+        open_et = datetime(2026, 9, 8, 21, 0, tzinfo=ET)
         _write_snapshot(root, "2026-09-08", "OVERNIGHT_DAYTIME",
                         {"AAPL": _minutes(open_et, 60)}, session_label="OVERNIGHT_DAYTIME")
         _write_snapshot(root, "2026-09-09", "OVERNIGHT_DAYTIME",
@@ -146,7 +148,7 @@ class TestCrossMidnight:
         bars = store.bars("AAPL", "OVERNIGHT_DAYTIME")
         stamps = sorted(b.minute for b in bars)
         assert len(stamps) == len(set(stamps)) == 120
-        assert stamps[0].astimezone(ET).hour == 20          # the 20:00 origin
+        assert stamps[0].astimezone(ET).hour == 21          # the 21:00 origin
         assert stamps[-1].astimezone(ET).day == 9           # and past midnight
 
         # and after midnight the ORB5 range is still constructible
@@ -155,7 +157,7 @@ class TestCrossMidnight:
                                     now=now, range_minutes=5, closed_bar_only=True)
         assert feats.error is None
         assert feats.range_high is not None
-        assert feats.range_origin_timestamp.astimezone(ET).hour == 20
+        assert feats.range_origin_timestamp.astimezone(ET).hour == 21
 
     def test_a_window_that_holds_no_bars_reads_as_no_store(self, tmp_path):
         """Not an empty range that looks measured -- nothing at all."""

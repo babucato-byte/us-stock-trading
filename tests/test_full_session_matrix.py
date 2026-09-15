@@ -30,8 +30,8 @@ def _at(y, m, d, hh, mm=0):
 
 #: (label, moment, expected clock session, expected operational day)
 MATRIX = [
-    ("Sun 20:00 -> Monday daytime", _at(2026, 8, 30, 20, 0),
-     "OVERNIGHT_DAYTIME", None),          # KIS daytime opens 21:00 ET
+    ("Sun 20:00 -> no venue open", _at(2026, 8, 30, 20, 0),
+     "CLOSED", None),                     # KIS daytime opens 21:00 ET
     ("Sun 21:30 daytime open",      _at(2026, 8, 30, 21, 30),
      "OVERNIGHT_DAYTIME", "2026-08-31"),
     ("Mon 03:59 daytime",           _at(2026, 8, 31, 3, 59),
@@ -58,12 +58,27 @@ class TestTheClockSessionAtEveryBoundary:
                                                    session, _day):
         assert scan_session.session_at(moment) == session
 
-    def test_twenty_hundred_starts_the_next_overnight_context(self):
-        """The clock rolls into OVERNIGHT_DAYTIME at 20:00 ET even though
-        KIS's daytime window does not open until 21:00 under DST -- which
-        is the disagreement that produced a Sunday trading day."""
-        assert scan_session.session_at(_at(2026, 8, 31, 20, 0)) \
-            == "OVERNIGHT_DAYTIME"
+    def test_the_clock_and_the_schedule_no_longer_disagree(self):
+        """20:00-21:00 ET under DST is 09:00-10:00 KST: the aftermarket
+        extension has ended and 주간거래 has not opened.
+
+        The clock used to answer OVERNIGHT_DAYTIME for that hour while
+        `session_capability`, reading the KST schedule, correctly said
+        CLOSED. That disagreement is what produced a Sunday trading day.
+        It is settled at the source now -- `session_at` derives daytime
+        from the same schedule -- so the two cannot drift apart again.
+        """
+        from config import session_capability
+
+        for minute in (0, 30, 59):
+            moment = _at(2026, 8, 31, 20, minute)
+            assert scan_session.session_at(moment) == "CLOSED"
+            assert session_capability.capability_at(moment).entry_reason \
+                == "MARKET_CLOSED"
+
+        opens = _at(2026, 8, 31, 21, 0)
+        assert scan_session.session_at(opens) == "OVERNIGHT_DAYTIME"
+        assert session_capability.capability_at(opens).window == "DAYTIME"
 
 
 class TestTheOperationalTradingDayAtEveryBoundary:

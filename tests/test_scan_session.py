@@ -42,7 +42,11 @@ class TestTheBucketsPartitionTheClock:
         (16, 0, ss.AFTER_HOURS),
         (18, 0, ss.AFTER_HOURS),
         (19, 59, ss.AFTER_HOURS),
-        (20, 0, ss.OVERNIGHT_DAYTIME),
+        # 20:00 ET is 09:00 KST: the aftermarket extension has ended and
+        # 주간거래 has not opened. No venue claims this hour.
+        (20, 0, ss.CLOSED),
+        (20, 59, ss.CLOSED),
+        (21, 0, ss.OVERNIGHT_DAYTIME),   # 10:00 KST, KIS daytime opens
         (23, 30, ss.OVERNIGHT_DAYTIME),
         (0, 30, ss.OVERNIGHT_DAYTIME),
         (3, 59, ss.OVERNIGHT_DAYTIME),
@@ -51,14 +55,28 @@ class TestTheBucketsPartitionTheClock:
         assert ss.session_at(et(hour, minute)) == expected
 
     def test_every_minute_of_the_day_is_covered_exactly_once(self):
-        """The property, not a sample of it."""
+        """The property, not a sample of it.
+
+        CLOSED is part of the partition now: the clock is covered by the
+        four sessions PLUS the hour no venue is open. Asserting only
+        `SESSIONS` is what made daytime a catch-all in the first place.
+        """
+        buckets = set(ss.SESSIONS) | {ss.CLOSED}
         seen = set()
         for hour in range(24):
             for minute in range(60):
                 bucket = ss.session_at(et(hour, minute))
-                assert bucket in ss.SESSIONS, (hour, minute, bucket)
+                assert bucket in buckets, (hour, minute, bucket)
                 seen.add(bucket)
-        assert seen == set(ss.SESSIONS), "a bucket no minute reaches is dead"
+        assert seen == buckets, "a bucket no minute reaches is dead"
+
+    def test_closed_is_not_a_session(self):
+        """Everything that takes a session must refuse it, rather than
+        treat it as a fifth thing to scan."""
+        assert ss.CLOSED not in ss.SESSIONS
+        assert ss.is_session(ss.CLOSED) is False
+        assert ss.normalize(ss.CLOSED) is None
+        assert ss.order_route_verified(ss.CLOSED) is False
 
     def test_a_naive_datetime_is_read_as_eastern(self):
         """Not as UTC. A naive 10:00 treated as UTC is 06:00 ET, which

@@ -146,6 +146,17 @@ def window_at(moment) -> str:
     return WINDOW_CLOSED
 
 
+def daytime_open_time():
+    """주간거래's opening KST time -- one definition, read by everything.
+
+    The OPEN is 10:00 KST in both halves of the year; only the close
+    moves (17:00 under US DST, 18:00 in standard time, so that the ET
+    close stays 04:00). Callers that need the opening instant should use
+    this rather than re-deriving it from an ET constant.
+    """
+    return _DST[WINDOW_DAYTIME][0]
+
+
 def family_for_window(window) -> Optional[str]:
     """The API family for a window, or None when none is established."""
     return FAMILY_BY_WINDOW.get(window)

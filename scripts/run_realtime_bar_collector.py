@@ -263,16 +263,40 @@ def main(argv=None):
     install_logging_redaction()
 
     from config.operational_calendar import operational_trading_day
-    from market_hours import us_trading_day
+    from config import s6_sessions
     from scanners.base import scan_session
 
     now = datetime.now(timezone.utc)
     session = args.session or scan_session.session_at()
+
+    # No venue, no collection.
+    #
+    # Under US DST, 00:00-01:00 UTC is 09:00-10:00 KST: the aftermarket
+    # extension has ended and 주간거래 has not opened. Starting here
+    # created a DAYTIME snapshot an hour before KIS had a session, and
+    # its coverage_started_at then preceded an origin no bar could reach.
+    # A session the scanner does not scan is not one to collect either.
+    if session not in s6_sessions.SCAN_SESSIONS:
+        logger.info("COLLECTOR_NO_SESSION session=%s -- no venue is open; "
+                    "not starting", session)
+        return 0
+
     # The OPERATIONAL trading day. An overnight window that began on
     # Sunday evening belongs to Monday, and storing its bars under
     # Sunday puts them where nothing will look for them -- the features
     # layer loads by (session, trading_day) and would find no file.
-    trading_day = operational_trading_day(now) or us_trading_day(now)
+    #
+    # FAIL CLOSED. This used to fall back to `us_trading_day`, the plain
+    # Eastern calendar date -- which is exactly the value the operational
+    # calendar exists to replace, and on a Sunday evening it is Sunday.
+    # A snapshot filed under a day nothing reads is worse than no
+    # snapshot: the features layer cannot tell them apart.
+    trading_day = operational_trading_day(now)
+    if not trading_day:
+        logger.error("COLLECTOR_NO_TRADING_DAY session=%s -- the operational "
+                     "calendar could not resolve a trading day; not starting",
+                     session)
+        return 0
 
     pairs = []
     for token in args.symbols.split(","):

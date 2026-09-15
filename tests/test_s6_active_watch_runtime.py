@@ -337,7 +337,8 @@ SESSIONS = ("OVERNIGHT_DAYTIME", "PREMARKET", "REGULAR", "AFTER_HOURS")
 
 #: The canonical open of each session, and a moment inside it.
 SESSION_CASES = {
-    "OVERNIGHT_DAYTIME": (20, datetime(2026, 9, 9, 1, 30, tzinfo=timezone.utc)),
+    # 21:00 ET under DST == 10:00 KST, 주간거래's canonical open.
+    "OVERNIGHT_DAYTIME": (21, datetime(2026, 9, 9, 1, 30, tzinfo=timezone.utc)),
     "PREMARKET": (4, datetime(2026, 9, 9, 9, 30, tzinfo=timezone.utc)),
     "REGULAR": (9, datetime(2026, 9, 9, 15, 0, tzinfo=timezone.utc)),
     "AFTER_HOURS": (16, datetime(2026, 9, 9, 21, 0, tzinfo=timezone.utc)),
@@ -355,7 +356,10 @@ class TestSessionOrigin:
     def test_each_session_anchors_on_its_own_canonical_open(self):
         from scanners.base import session_range as sr
 
-        expected = {"OVERNIGHT_DAYTIME": 20, "PREMARKET": 4,
+        # OVERNIGHT_DAYTIME anchors on 10:00 KST, which is 21:00 ET under
+        # DST and 20:00 ET in standard time -- the reason it is the one
+        # session whose origin is not a fixed Eastern hour.
+        expected = {"OVERNIGHT_DAYTIME": 21, "PREMARKET": 4,
                     "REGULAR": 9, "AFTER_HOURS": 16}
         for session, hour in expected.items():
             origin = sr.official_origin(session, datetime(2026, 9, 9).date())
