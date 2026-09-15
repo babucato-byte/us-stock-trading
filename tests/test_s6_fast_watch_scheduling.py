@@ -31,8 +31,17 @@ def _env(tmp_path):
 
 
 def _entries(n, *, prefix="RS", transport=active_watch.TRANSPORT_REST):
+    """Filler rows for the SCHEDULING tests, which are about the tick
+    budget and not about ownership.
+
+    These must be S6-owned. `KIS_COLLECTOR_MEMBERSHIP` means the symbol
+    has no S6 discovery behind it, and the fast watch excludes those
+    before the Budget ever sees them -- so a watchlist made of them
+    defers nothing, evaluates nothing, and would make a deadline test
+    pass for the wrong reason.
+    """
     return [{"symbol": f"{prefix}{i}",
-            "strategy_source": active_watch.COLLECTOR_MEMBERSHIP_SOURCE,
+            "strategy_source": active_watch.FULL_DISCOVERY_SOURCE,
             "transport_source": transport} for i in range(n)]
 
 

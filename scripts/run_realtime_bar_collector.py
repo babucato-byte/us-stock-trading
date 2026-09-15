@@ -174,16 +174,16 @@ def collect(symbols, *, session, trading_day, seconds, env=None,
             st.connection_state = status_module.CONNECTION_CONNECTED
             beat()
             subscribed = 0
+            # The SESSION picks the venue below, not a global default. A
+            # global default is what put the D-prefix (the regular book)
+            # on the daytime venue and left the collector subscribed,
+            # acknowledged and silent for the whole window.
             for symbol, exchange in symbols:
                 # One symbol we cannot address must not cost the session
                 # its data. The first live bootstrap died on a single
                 # "NASDAQ" where the wire wants "NAS", and the collector
                 # never started at all.
                 try:
-                    # The SESSION picks the venue, not a global default.
-                    # A global default is what put the D-prefix (regular
-                    # book) on the daytime venue and left the collector
-                    # subscribed, ack'd and silent for the whole window.
                     key = wire.tr_key_for_session(symbol, exchange, session)
                 except ValueError as exc:
                     logger.warning("skipping %s: %s", symbol, exc)
