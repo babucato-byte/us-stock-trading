@@ -71,8 +71,16 @@ class TestPartialFillsKeepTheRemainder:
             in S6_EXIT
 
     def test_both_strategies_share_one_implementation(self):
-        """One place to be right, and one place to check."""
-        assert "from s1_live.exit_runtime import ExitOutcome, _submit_sell" in S6_EXIT
+        """One place to be right, and one place to check.
+
+        Asserted on the imported NAME rather than one spelling of the
+        import line: S6 wraps the shared submitter in its own execution
+        lock, which made the import a parenthesised block.
+        """
+        assert "from s1_live.exit_runtime import (" in S6_EXIT
+        assert "_submit_sell," in S6_EXIT
+        assert "def _submit_sell(" not in S6_EXIT, (
+            "S6 must call the shared submitter, never define a second one")
 
 
 class TestALatchedExitIsRetriedNotReEvaluated:
