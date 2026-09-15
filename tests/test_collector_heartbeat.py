@@ -158,33 +158,34 @@ class TestTheCollectorRecordsWhatItDid:
         assert "beat()" in block[:200]
 
 
-class TestTheCollectorUsesTheFeedThatDelivers:
-    """Measured one feed at a time during REGULAR on 2026-08-28:
-    RBAQ (realtime) returned SUBSCRIBE SUCCESS and 0 trades in seventy
-    seconds; DNAS (delayed) returned 1124. The realtime subscription is a
-    false positive -- KIS accepts it and sends nothing -- so
-    "SUBSCRIBE SUCCESS" is not evidence that data will arrive.
+class TestTheCollectorAddressesTheRightVenue:
+    """R and D are two VENUES, not paid-vs-delayed data.
 
-    An earlier probe subscribed both at once and the trades were credited
-    to realtime without proof. The collector was then configured for
-    realtime alone and collected nothing while truthfully reporting
-    41 of 41 subscribed.
+    Measured one feed at a time during REGULAR on 2026-08-28: RBAQ
+    returned SUBSCRIBE SUCCESS and 0 trades in seventy seconds, DNAS
+    returned 1124. Both numbers are real; the conclusion once drawn from
+    them -- that RBAQ is a false positive -- was wrong. RBAQ addresses
+    미국주간거래, which is CLOSED during REGULAR, so its silence was a
+    shut venue answering correctly. That misreading left OVERNIGHT_DAYTIME
+    with no market data at all.
     """
 
-    def test_the_default_feed_is_the_one_that_delivered(self):
+    def test_the_collector_picks_the_venue_from_the_session(self):
+        assert "tr_key_for_session" in RUNNER
+        assert "wire.DEFAULT_FEED" not in RUNNER, (
+            "a global default is what mis-routed the daytime venue")
+
+    def test_the_two_venue_tables_are_distinct(self):
         from market_data import kis_hdfscnt0 as wire
 
-        assert wire.DEFAULT_FEED == wire.FEED_DELAYED
+        assert set(wire.STANDARD_PREFIX.values()) == {"DNAS", "DNYS", "DAMS"}
+        assert set(wire.DAYTIME_PREFIX.values()) == {"RBAQ", "RBAY", "RBAA"}
 
-    def test_the_collector_subscribes_with_it(self):
-        assert "wire.DEFAULT_FEED" in RUNNER
-        assert "wire.FEED_REALTIME" not in RUNNER
-
-    def test_the_measurement_is_recorded_beside_the_constant(self):
+    def test_the_measurement_and_its_correction_are_both_recorded(self):
         source = (REPO_ROOT / "market_data" / "kis_hdfscnt0.py").read_text(
             encoding="utf-8")
-        assert "1124" in source
-        assert "FALSE POSITIVE" in source
+        assert "1124" in source, "keep the measurement"
+        assert "was wrong" in source, "and keep why it was misread"
 
     def test_the_measured_lag_is_recorded(self):
         """Despite the name, the feed is effectively real time: median

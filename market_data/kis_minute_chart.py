@@ -58,6 +58,44 @@ MEASURED_SECONDS_PER_SYMBOL = 2.44
 
 SOURCE = "KIS_REST_CHART"
 
+#: The daytime venue's EXCD codes, isolated deliberately.
+#:
+#: The generic table in `brokers.kis_broker` answers NAS/NYS/AMS -- the
+#: US regular/extended book. 미국주간거래 is a different venue with its
+#: own codes, and asking the generic table during DAYTIME returns the
+#: PREVIOUS regular session's bars: a correct answer to the wrong
+#: question, which reads exactly like "this endpoint has no daytime
+#: data". Measured 2026-09-15 at 14:42 UTC, AAPL: EXCD=NAS gave
+#: 12:43-14:42 (the live regular session) while EXCD=BAQ gave
+#: 05:49-07:59, the tail of that day's daytime window -- 120 of 120 bars
+#: with volume in both.
+#:
+#: Kept here rather than merged into the generic mapping so the daytime
+#: venue stays an explicit, greppable exception instead of a silent
+#: branch inside a table every session shares.
+#: Keyed by the STANDARD code rather than by exchange name, so the one
+#: canonical normalisation in `_excd_for` still does all the spelling
+#: work (NASDAQ / NAS / NASD / "NEW YORK STOCK EXCHANGE" ...) and this
+#: table only has to state the venue difference.
+DAYTIME_EXCD = {"NAS": "BAQ", "NYS": "BAY", "AMS": "BAA"}
+DAYTIME_SESSION = "OVERNIGHT_DAYTIME"
+
+
+def excd_for_session(exchange, session):
+    """The chart EXCD for this exchange IN THIS SESSION.
+
+    Every non-daytime session keeps the exact code it had; an exchange
+    with no daytime counterpart keeps its standard code rather than
+    failing, since the caller's own freshness check is what decides
+    whether the answer is usable.
+    """
+    from brokers.kis_broker import _excd_for
+
+    code = _excd_for(exchange)
+    if str(session or "").strip().upper() == DAYTIME_SESSION:
+        return DAYTIME_EXCD.get(code, code)
+    return code
+
 
 def _bar_time(row) -> Optional[datetime]:
     """`xymd` + `xhms` as an Eastern-aware datetime.
@@ -128,17 +166,15 @@ def parse_rows(rows, *, trading_day=None) -> List[Dict[str, Any]]:
 
 
 def fetch(broker, *, symbol, exchange, trading_day=None,
-          bars=BARS_PER_CALL) -> List[Dict[str, Any]]:
+          bars=BARS_PER_CALL, session=None) -> List[Dict[str, Any]]:
     """One symbol's recent minute bars. Read-only; never raises.
 
     Returns [] on anything unusable, because a warmup that cannot be
     filled is a candidate that stays WARMING_UP -- not a scan that dies.
     """
-    from brokers.kis_broker import _excd_for
-
     try:
         broker.config.validate_read_allowed()
-        excd = _excd_for(exchange)
+        excd = excd_for_session(exchange, session)
         body = broker._get(CHART_PATH, TR_ID_CHART, {
             "AUTH": "", "EXCD": excd, "SYMB": str(symbol).upper(),
             "NMIN": "1", "PINC": "1", "NEXT": "", "NREC": str(int(bars)),

@@ -168,9 +168,12 @@ class KISBarMarketDataProvider(BarMarketDataProvider):
         # decides what belongs to this session; an EMA legitimately seeds
         # from earlier bars, while VWAP and the opening range must not.
         # Filtering here would take that choice away from both.
+        # The SESSION decides the venue. 미국주간거래 has its own EXCD
+        # codes, and the generic ones answer with the previous regular
+        # session's bars during DAYTIME -- which reads like "no data".
         records = kis_minute_chart.fetch(
             broker, symbol=symbol, exchange=exchange,
-            trading_day=self._trading_day)
+            trading_day=self._trading_day, session=self._session)
         if not records:
             raise MarketDataUnavailable(
                 f"{symbol}: KIS returned no minute bars")

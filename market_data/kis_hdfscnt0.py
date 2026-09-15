@@ -83,27 +83,58 @@ _NYSE = ("NYS", "NYSE", "NEW YORK STOCK EXCHANGE",
 _AMEX = ("AMS", "AMEX", "NYSE AMERICAN", "NYSE_AMERICAN",
          "NYSE MKT", "NYSE_MKT", "AMERICAN")
 
-DELAYED_PREFIX = {name: prefix for names, prefix in (
+#: The D-prefix venue: the US regular/extended book. PREMARKET, REGULAR
+#: and AFTER_HOURS all address it.
+STANDARD_PREFIX = {name: prefix for names, prefix in (
     (_NASDAQ, "DNAS"), (_NYSE, "DNYS"), (_AMEX, "DAMS")) for name in names}
-REALTIME_PREFIX = {name: prefix for names, prefix in (
+
+#: The R-prefix venue: 미국주간거래, the OVERNIGHT_DAYTIME session.
+#:
+#: These are the SAME wire values an earlier reading of this file called
+#: "purchased real-time", and that reading was wrong. R and D do not
+#: distinguish paid data from delayed data -- they address two different
+#: VENUES. Subscribing RBAQ during REGULAR returns SUBSCRIBE SUCCESS and
+#: no trades because the daytime venue is shut then, not because the
+#: feed is a false positive; the same is true of DNAS during DAYTIME.
+#: Confirmed against KIS's specification and measured on the chart
+#: endpoint, whose EXCD codes split the same way (NAS vs BAQ).
+DAYTIME_PREFIX = {name: prefix for names, prefix in (
     (_NASDAQ, "RBAQ"), (_NYSE, "RBAY"), (_AMEX, "RBAA")) for name in names}
+
+#: The session whose data lives on the daytime venue.
+DAYTIME_SESSION = "OVERNIGHT_DAYTIME"
+
+#: Deprecated spellings, kept so existing callers and tests keep working.
+#: The names are misleading -- see DAYTIME_PREFIX above -- and nothing new
+#: should use them.
+DELAYED_PREFIX = STANDARD_PREFIX
+REALTIME_PREFIX = DAYTIME_PREFIX
 FEED_DELAYED = "delayed"
 FEED_REALTIME = "realtime"
 
-#: The feed that actually carries data for this account.
+#: Deprecated. The venue a session addresses is `prefix_table_for_session`,
+#: and nothing should choose one globally -- see below for why.
 #:
 #: MEASURED on 2026-08-28 during REGULAR, one feed at a time:
-#:   RBAQ (realtime) -> SUBSCRIBE SUCCESS, and 0 trades in 70 seconds
-#:   DNAS (delayed)  -> 1124 trades in 70 seconds
+#:   RBAQ -> SUBSCRIBE SUCCESS, and 0 trades in 70 seconds
+#:   DNAS -> 1124 trades in 70 seconds
 #:
-#: The realtime subscription is a FALSE POSITIVE: KIS accepts it and
-#: sends nothing, so "SUBSCRIBE SUCCESS" is not evidence that data will
-#: arrive. An earlier dual-feed probe subscribed both at once and I
-#: credited the trades to realtime without proving it -- the collector
-#: was then configured for realtime alone and collected nothing while
-#: reporting 41 of 41 subscribed.
+#: Both numbers are real. The CONCLUSION drawn from them -- that RBAQ is
+#: a "false positive" and D is simply the feed that works -- was wrong,
+#: and it cost the daytime session its market data for weeks.
 #:
-#: Despite the name, this feed is effectively real time.
+#: R and D are not paid-vs-delayed. They are two VENUES: D is the US
+#: regular/extended book, R is 미국주간거래. The measurement above was
+#: taken during REGULAR, when the daytime venue is closed, so RBAQ's
+#: silence was the correct behaviour of a shut market -- not a broken
+#: entitlement. Running the same comparison during DAYTIME is the test
+#: that was never done, and "SUBSCRIBE SUCCESS then silence" means only
+#: that you have asked a closed venue.
+#:
+#: The chart endpoint splits the same way and shows it plainly. AAPL on
+#: 2026-09-15 at 14:42 UTC: EXCD=NAS returned 12:43-14:42 (the live
+#: regular session) and EXCD=BAQ returned 05:49-07:59 (the tail of that
+#: day's daytime window), 120 of 120 bars with volume in both.
 DEFAULT_FEED = FEED_DELAYED
 
 #: How far behind it runs, measured PER TRADE at ingest:
@@ -123,7 +154,32 @@ DEFAULT_FEED = FEED_DELAYED
 OBSERVED_FEED_LAG_SECONDS = 0.57
 
 
+def prefix_table_for_session(session):
+    """The venue prefix table this session's data lives on."""
+    if str(session or "").strip().upper() == DAYTIME_SESSION:
+        return DAYTIME_PREFIX
+    return STANDARD_PREFIX
+
+
+def tr_key_for_session(symbol, exchange, session):
+    """The HDFSCNT0 tr_key for this symbol IN THIS SESSION.
+
+    The session is required, not defaulted. A global default is what put
+    DNAS on the daytime venue and left the collector subscribed, ack'd
+    and silent for the whole window.
+    """
+    table = prefix_table_for_session(session)
+    prefix = table.get(str(exchange or "").upper())
+    if not prefix:
+        raise ValueError(
+            f"no KIS venue prefix for exchange {exchange!r} in session "
+            f"{session!r}")
+    return f"{prefix}{str(symbol).upper()}"
+
+
 def tr_key(symbol, exchange, feed=FEED_REALTIME):
+    """Deprecated: selects a venue by `feed`, which does not mean what its
+    name says. Use `tr_key_for_session`."""
     table = REALTIME_PREFIX if feed == FEED_REALTIME else DELAYED_PREFIX
     prefix = table.get(str(exchange or "").upper())
     if not prefix:
