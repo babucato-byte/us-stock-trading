@@ -49,6 +49,33 @@ mkdir -p "$(dirname "$LOG")" /home/ubuntu/logs/cron
 # and a feed that is genuinely down is not restarted every five minutes.
 STATUS_FILE="${SCANNER_DATA_ROOT}/realtime_bars/collector_status.json"
 MARKER_FILE="${SCANNER_DATA_ROOT}/realtime_bars/collector_restart.marker"
+# The collector resolves its session ONCE, at start, and keys its snapshot
+# and every bar by that value for its whole life. Across a session boundary
+# it therefore keeps writing the PREVIOUS session's file, and the new
+# session's snapshot is not created until the next collector STARTS -- so
+# its coverage_started_at lands after that session's official origin and
+# every symbol in it reads OFFICIAL_ORIGIN_NOT_COVERED. Measured across all
+# 2026-09-* snapshots: 13 of 16 uncovered, +5.3 to +150.2 minutes, on all
+# four sessions. No lifetime value fixes this; only replacing the process
+# at the boundary does. market_data/collector_session.py decides, exits 2
+# to ask for the restart, and rate-limits itself on its own marker so a
+# collector that came back wrong cannot be killed every five minutes.
+SESSION_MARKER="${SCANNER_DATA_ROOT}/realtime_bars/collector_session_restart.marker"
+if pgrep -f "run_realtime_bar_collector.py" > /dev/null 2>&1; then
+    SESSION_VERDICT=$("$SCANNER_RUNTIME_ROOT/venv/bin/python" -m market_data.collector_session \
+        --status "$STATUS_FILE" --marker "$SESSION_MARKER" --process-running yes 2>>"$LOG")
+    SESSION_RC=$?
+    if [ "$SESSION_RC" = "2" ]; then
+        echo "$(date -u +%FT%TZ) COLLECTOR_SESSION_RESTART $SESSION_VERDICT sha=$SCANNER_SHA" >> "$LOG"
+        "$SCANNER_RUNTIME_ROOT/venv/bin/python" -m scripts.notify_system_health \
+            COLLECTOR_SESSION_RESTART "$SESSION_VERDICT" >> "$LOG" 2>&1 || true
+        pkill -TERM -f "run_realtime_bar_collector.py" 2>/dev/null
+        sleep 5
+        pkill -KILL -f "run_realtime_bar_collector.py" 2>/dev/null
+    fi
+fi
+
+# Health, asked only of a collector that survived the session check above.
 if pgrep -f "run_realtime_bar_collector.py" > /dev/null 2>&1; then
     HEALTH=$("$SCANNER_RUNTIME_ROOT/venv/bin/python" -m market_data.collector_health \
         --status "$STATUS_FILE" --marker "$MARKER_FILE" --process-running yes 2>>"$LOG")
