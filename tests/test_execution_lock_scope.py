@@ -56,10 +56,39 @@ class TestTheWrapperNoLongerHoldsTheExecutionLock:
             "the Python side must take the SAME file the exit monitor "
             "flocks, or broker mutation has two locks and therefore none")
 
-    def test_the_monitor_still_holds_the_execution_lock(self):
-        assert any("s6_exec.lock" in ln for ln in MONITOR_WRAPPER.splitlines()
-                   if ln.strip().startswith("flock")), (
-            "the exit path must stay serialised against submissions")
+    def test_the_monitor_no_longer_holds_the_execution_lock(self):
+        """The same change entry received, for the same reason.
+
+        Measured 2026-09-15: the evaluation is network-bound at a 215.9s
+        median, so holding the broker lock for the life of the process
+        skipped 253 of 318 ticks and left 2280s between evaluations at
+        worst. The monitor starved itself.
+        """
+        flock_lines = [ln for ln in MONITOR_WRAPPER.splitlines()
+                       if ln.strip().startswith("flock")]
+        assert flock_lines, "the monitor must still guard against overlap"
+        for line in flock_lines:
+            assert "s6_exec.lock" not in line, (
+                "the monitor must not hold the broker-mutation lock for the "
+                "life of the process; that is the starvation")
+
+    def test_the_monitor_still_prevents_overlapping_evaluations(self):
+        flock_lines = [ln for ln in MONITOR_WRAPPER.splitlines()
+                       if ln.strip().startswith("flock")]
+        assert any("s6_exit.lock" in ln and "-n" in ln for ln in flock_lines), (
+            "two evaluations at once could both act on one position")
+
+    def test_the_monitor_hands_the_execution_lock_path_to_python(self):
+        assert "S6_EXECUTION_LOCK_FILE=/home/ubuntu/logs/cron/s6_exec.lock" \
+            in MONITOR_WRAPPER, (
+            "the SELL must take the SAME file the entry submission takes, "
+            "or broker mutation has two locks and therefore none")
+
+    def test_the_sell_submission_takes_the_execution_lock_in_python(self):
+        source = (REPO_ROOT / "s6_live" / "exit_runtime.py").read_text()
+        assert "execution_lock.hold(_EXEC_LOCK_OWNER_EXIT)" in source, (
+            "narrowing the wrapper without this leaves the SELL "
+            "unserialised against BUY -- strictly worse than before")
 
 
 class TestTheLockIsHeldAroundTheSubmissionOnly:
@@ -231,9 +260,14 @@ class TestTheExitPathGetsInWhileEntryAnalysisRuns:
 
 class TestTheMonitorNoLongerLosesTicksSilently:
     def test_a_skipped_tick_is_recorded(self):
-        assert "MONITOR_LOCK_SKIPPED" in MONITOR_WRAPPER, (
-            "a tick that could not take the lock must not exit silently; "
-            "that is what hid the 1-in-29 starvation")
+        assert "MONITOR_OVERLAP_SKIPPED" in MONITOR_WRAPPER, (
+            "a tick that could not run must not exit silently; that is "
+            "what hid the 1-in-29 starvation")
+
+    def test_an_overlap_skip_is_not_called_execution_contention(self):
+        """They are different faults with different fixes, and the log
+        must never conflate them again."""
+        assert "MONITOR_LOCK_SKIPPED" not in MONITOR_WRAPPER
 
     def test_every_scheduled_tick_is_recorded(self):
         assert "MONITOR_TICK" in MONITOR_WRAPPER

@@ -33,10 +33,25 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from s1_live.exit_runtime import ExitOutcome, _submit_sell
+from execution import execution_lock
+from execution.execution_lock import ExecutionLockUnavailable
+from s1_live.exit_runtime import (
+    ACTION_BLOCKED as _ACTION_BLOCKED,
+    ACTION_LATCHED as _ACTION_LATCHED,
+    ExitOutcome,
+    _submit_sell,
+)
 from s6_live import exit_diagnostics, exit_policy, position_store
 
 logger = logging.getLogger(__name__)
+
+#: Named so `EXEC_LOCK owner=...` says which side of the book took it.
+_EXEC_LOCK_OWNER_EXIT = "S6_EXIT_SUBMIT"
+
+#: Statuses from which a SELL may still be sent. SUBMITTED is excluded on
+#: purpose: that row has no fill behind it yet, so there is nothing to
+#: sell. CLOSED and EXIT_SUBMITTED are already done or already leaving.
+_SELLABLE_STATUSES = (position_store.OPEN, position_store.EXIT_PENDING)
 
 #: The held symbol's market data could not be obtained at all this tick.
 #: Distinct from a rule that read the data and said no: this is the
@@ -432,6 +447,85 @@ def sync_sell_fills(conn, *, fills_for, session=None, now=None) -> List[Dict[str
     return results
 
 
+def _sell_still_valid(fresh) -> Optional[str]:
+    """Is this row still one a SELL may be sent for? Detail string if not.
+
+    Read UNDER the execution lock, immediately before submitting. The
+    decision that got us here was made outside the lock -- that is the
+    point of the change -- so the row it was made from may be minutes
+    old by now, and a fill sync or another cycle may have moved it.
+
+    Deliberately a PRE-CHECK, not a second authority. The ledger's
+    `reserve` is still what makes a duplicate SELL impossible; this
+    refuses the obvious cases early, with a reason a human can read,
+    rather than letting them surface as a DuplicateExitIntentError.
+    """
+    if fresh is None:
+        return "position row no longer exists"
+    status = fresh.get("status")
+    if status == position_store.CLOSED:
+        return "position closed while waiting for the execution lock"
+    if status == position_store.EXIT_SUBMITTED:
+        return "exit already submitted while waiting for the execution lock"
+    if status not in _SELLABLE_STATUSES:
+        return f"position status {status!r} cannot be sold"
+    if fresh.get("exit_submitted"):
+        return "exit already submitted while waiting for the execution lock"
+    try:
+        quantity = int(fresh.get("quantity") or 0)
+    except (TypeError, ValueError):
+        return f"unreadable quantity {fresh.get('quantity')!r}"
+    if quantity < 1:
+        return f"no quantity to sell (quantity={quantity})"
+    return None
+
+
+def _submit_sell_locked(conn, *, broker_adapter, position_id, row, reason,
+                        now=None) -> ExitOutcome:
+    """Take the execution lock, revalidate, and submit inside it.
+
+    Why the lock is here and not around the evaluation
+    --------------------------------------------------
+    Evaluating an exit reads bars and computes indicators; it mutates
+    nothing. Submitting one mutates the broker, the intent ledger and the
+    position row, and THAT is what must not interleave with a BUY.
+
+    The cron wrapper used to hold this lock for the whole runtime, so a
+    216-second evaluation blocked the next three one-minute ticks and the
+    monitor starved itself: 79.6% of ticks skipped, 38 minutes between
+    evaluations at worst. Entry was given this exact treatment on
+    2026-09-02 and the reasoning carries over unchanged -- what is no
+    longer serialised is the ANALYSIS, which never mutated anything.
+
+    A lock it cannot take is never a reason to sell anyway, and never a
+    terminal state: the exit LATCHES, which is the same mechanism a
+    session that cannot place orders already uses, and
+    `retry_latched_exits` sends it on the next tick.
+    """
+    symbol = row["symbol"]
+    try:
+        with execution_lock.hold(_EXEC_LOCK_OWNER_EXIT):
+            fresh = position_store.load(conn, position_id)
+            blocked = _sell_still_valid(fresh)
+            if blocked:
+                logger.warning(
+                    "S6 %s: SELL abandoned after taking the execution lock "
+                    "-- %s", symbol, blocked)
+                return ExitOutcome(position_id, symbol, _ACTION_BLOCKED,
+                                   reason, blocked)
+            return _submit_sell(
+                conn, broker_adapter=broker_adapter, position_id=position_id,
+                row=fresh, reason=reason, now=now, store=position_store,
+                prefix=CLIENT_ORDER_PREFIX)
+    except ExecutionLockUnavailable as exc:
+        position_store.latch_pending_exit(conn, position_id, reason, now=now)
+        logger.warning(
+            "S6 %s: execution lock unavailable, exit LATCHED for the next "
+            "tick rather than submitted: %s", symbol, exc)
+        return ExitOutcome(position_id, symbol, _ACTION_LATCHED, reason,
+                           f"execution lock unavailable: {exc}")
+
+
 def evaluate_position(conn, *, broker_adapter, position_id, row,
                       features=None, current_price=None, session=None,
                       now=None, orders_allowed=True,
@@ -514,10 +608,9 @@ def evaluate_position(conn, *, broker_adapter, position_id, row,
         logger.info(
             "S6 %s: selling on the latched reason %s, not this tick's %s",
             symbol, latched, decision.reason)
-    return _submit_sell(conn, broker_adapter=broker_adapter,
-                        position_id=position_id, row=refreshed,
-                        reason=latched or decision.reason, now=now,
-                        store=position_store, prefix=CLIENT_ORDER_PREFIX)
+    return _submit_sell_locked(conn, broker_adapter=broker_adapter,
+                               position_id=position_id, row=refreshed,
+                               reason=latched or decision.reason, now=now)
 
 
 #: S-03: how many consecutive ticks a HELD position's exit evaluation may
@@ -645,10 +738,9 @@ def retry_latched_exits(conn, *, broker_adapter, session=None, now=None,
             continue
         reason = row.get("pending_exit_reason") or "SESSION_EXIT"
         try:
-            outcome = _submit_sell(
+            outcome = _submit_sell_locked(
                 conn, broker_adapter=broker_adapter, position_id=position_id,
-                row=row, reason=reason, now=now, store=position_store,
-                prefix=CLIENT_ORDER_PREFIX)
+                row=row, reason=reason, now=now)
             outcomes.append(outcome.as_dict())
         except Exception as exc:  # noqa: BLE001
             logger.error("S6 latched exit retry failed for %s", row["symbol"],

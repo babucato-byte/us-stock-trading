@@ -71,8 +71,9 @@ def opened(conn, symbol="ABC", **kw):
 class TestTheSellUsesTheSharedPath:
     def test_it_imports_the_shared_submitter(self):
         source = (REPO_ROOT / "s6_live" / "exit_runtime.py").read_text()
-        assert "from s1_live.exit_runtime import ExitOutcome, _submit_sell" \
-            in source
+        assert "from s1_live.exit_runtime import (" in source
+        assert "_submit_sell," in source, (
+            "S6 must still sell through the shared submitter, not a copy")
 
     def test_it_defines_no_broker_call_of_its_own(self):
         import ast

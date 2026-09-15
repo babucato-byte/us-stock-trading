@@ -60,11 +60,28 @@ case "${HELD:-}" in
 esac
 
 LOG=/home/ubuntu/releases/us-stock-trading/shared/state/s6_exit_monitor_$(date -u +%F).log
-# Shares the runtime lock: the monitor and the 15-minute tick run the
-# same evaluation, and two of them at once could both act on one
-# position.
-# No acquire-timeout override: an exit outranks a new entry and takes
-# the default patience. It is the entry that yields, not this.
+# Two locks, and why this one is no longer the broker's.
+# ------------------------------------------------------
+# `s6_exit.lock` (here) stops two EXIT EVALUATIONS overlapping. That is
+# all it does. It is not a broker lock, and a BUY submission never waits
+# on it.
+#
+# `s6_exec.lock` still serialises BROKER MUTATION, and this wrapper no
+# longer takes it: the runtime acquires it in Python around the SELL
+# submission alone, and revalidates the position row under it
+# (s6_live/exit_runtime._submit_sell_locked).
+#
+# It used to take `s6_exec.lock` here, for the life of the process. The
+# evaluation is network-bound -- yfinance bars and KIS reads -- and
+# measured at a 215.9s median, 811.6s max, so each run blocked the next
+# three or four one-minute ticks. On 2026-09-15 that was 253 skips in
+# 318 ticks (79.6%), a median 298s between completed evaluations and
+# 2280s at worst: a one-minute exit monitor deciding roughly every five.
+#
+# This is the same change entry received on 2026-09-02, for the same
+# reason, and its comment applies here verbatim -- what is no longer
+# serialised is the ANALYSIS, which never mutated anything.
+#
 # Every scheduled tick leaves a line, whether or not it ran.
 #
 # It used to leave one only when it ran. A tick that could not take the
@@ -75,16 +92,17 @@ LOG=/home/ubuntu/releases/us-stock-trading/shared/state/s6_exit_monitor_$(date -
 # 29 had to be reconstructed afterwards from cron firings in syslog,
 # because the monitor's own log said nothing at all.
 echo "$(date -u +%FT%TZ) MONITOR_TICK held=$HELD" >> "$LOG"
-flock -n -E 99 /home/ubuntu/logs/cron/s6_exec.lock \
+flock -n -E 99 /home/ubuntu/logs/cron/s6_exit.lock \
   env PYTHONPATH="$ROOT" TRADING_PROJECT_ROOT="$ROOT" \
       KIS_LOCK_OWNER=S6_EXIT \
       S6_EXECUTION_LOCK_FILE=/home/ubuntu/logs/cron/s6_exec.lock \
   "$ROOT/venv/bin/python" "$ROOT/scripts/run_s6_runtime.py" >> "$LOG" 2>&1
 STATUS=$?
 if [ "$STATUS" -eq 99 ]; then
-    # Not a failure, and not a success either: a held position went
-    # un-evaluated this minute. Named so it can be counted.
-    echo "$(date -u +%FT%TZ) MONITOR_LOCK_SKIPPED held=$HELD lock=/home/ubuntu/logs/cron/s6_exec.lock" >> "$LOG"
+    # A previous evaluation is still running. Not a failure, and NOT
+    # execution-lock contention -- named differently so the two can never
+    # be confused in the log again.
+    echo "$(date -u +%FT%TZ) MONITOR_OVERLAP_SKIPPED held=$HELD lock=/home/ubuntu/logs/cron/s6_exit.lock" >> "$LOG"
     exit 0
 fi
 echo "$(date -u +%FT%TZ) MONITOR_EVALUATED held=$HELD status=$STATUS" >> "$LOG"
