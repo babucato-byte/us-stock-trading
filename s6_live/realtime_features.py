@@ -129,6 +129,11 @@ class SessionFeatures:
     #: instant (s6_live.entry_quality.EntryQuality). None without bars.
     range_minutes: Optional[int] = None
     range_origin_timestamp: Optional[datetime] = None
+    #: How the opening range's origin was obtained, when there is one.
+    #: Four distinct answers, because "no bar at the origin minute" has
+    #: two causes with opposite meanings -- nobody traded, or nobody was
+    #: listening -- and only one of them is a reason to refuse.
+    origin_status: Optional[str] = None
     closed_bar_only: bool = False
     entry_quality: Optional[Any] = None
 
@@ -181,6 +186,7 @@ class SessionFeatures:
             "range_minutes": self.range_minutes,
             "range_origin_timestamp": (self.range_origin_timestamp.isoformat()
                                        if self.range_origin_timestamp else None),
+            "origin_status": self.origin_status,
             "closed_bar_only": self.closed_bar_only,
             "entry_quality": (self.entry_quality.as_record()
                               if self.entry_quality is not None

@@ -16,6 +16,7 @@ from config import s6_sessions, scanner_live_mode
 from s6_live import active_watch, cash_precheck, execution_liquidity
 from s6_live import pretrade_validation, precision_watch
 from s6_live import realtime_features, watch_priority_state
+from s6_live.kis_bar_features import OFFICIAL_ORIGIN_NOT_COVERED
 from s6_live.candidate_source import SIGNAL_VALID_SECONDS, SOURCE_S6
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,8 @@ class ActiveWatchSource:
         #: transport-only. Defaulted here so a caller that reads it
         #: before symbols() runs gets an empty list, not AttributeError.
         self.not_s6_owned: List[str] = []
+        #: Per-symbol origin-backfill outcomes for this tick.
+        self.origin_backfill_reports: Dict[str, Any] = {}
         self.waiting_for_data: List[str] = []
         self.validation_report: Dict[str, Any] = {}
         self.transport_counts: Dict[str, int] = {}
@@ -298,6 +301,22 @@ class ActiveWatchSource:
                     symbol, session=self._session, now=evaluated_at,
                     provider=self._provider, range_minutes=live_minutes,
                     closed_bar_only=True)
+            elif getattr(features, "error", None) == OFFICIAL_ORIGIN_NOT_COVERED:
+                # A DIFFERENT kind of nothing, and it used to reach no
+                # fallback at all: these features have a
+                # `market_data_asof`, so the branch above never fired.
+                # The stream is healthy and the session is fully
+                # collected -- what is missing is the opening minute the
+                # collector connected too late to hear, and only that.
+                #
+                # So the opening window is fetched and merged UNDER the
+                # stream's own bars, and the features are rebuilt from
+                # the result. The healthy stream data is never replaced
+                # wholesale: REST is a summary of the same trades and
+                # can only agree or be staler.
+                features = self._with_backfilled_origin(
+                    symbol, features, now=evaluated_at,
+                    range_minutes=live_minutes) or features
             evaluation = precision_watch.evaluate(
                 symbol, session=self._session, now=evaluated_at, conn=self._conn,
                 features=features, require_scanner_thesis=True)
@@ -442,6 +461,46 @@ class ActiveWatchSource:
                 "discovery_generation": entry.get("discovery_generation"),
             },
         }
+
+    def _with_backfilled_origin(self, symbol, features, *, now, range_minutes):
+        """Fetch the missing opening window and rebuild, or None.
+
+        Returns None when nothing changed, so the caller keeps the
+        original refusal rather than a second identical one. An origin
+        that cannot be restored -- out of the chart's reach, no rows,
+        no broker -- leaves the features exactly as they were.
+        """
+        from s6_live import kis_bar_features, origin_backfill
+
+        broker = getattr(self, "_broker", None)
+        if broker is None:
+            return None
+        try:
+            from market_hours import us_trading_day
+            from scanners.base import session_range as srange
+
+            session_date = srange.current_session_date(self._session, now)
+            store = kis_bar_features.load_store(
+                self._session, us_trading_day(now), session_date=session_date)
+            if store is None:
+                return None
+            report = origin_backfill.restore_origin(
+                store, symbol, session=self._session,
+                official_origin=features.range_origin_timestamp,
+                range_minutes=range_minutes, broker=broker, now=now)
+            self.origin_backfill_reports[symbol] = report
+            if report.get("status") != origin_backfill.BACKFILLED:
+                logger.info(
+                    "S6 %s: origin not restored (%s) -- the refusal stands",
+                    symbol, report.get("status"))
+                return None
+            return kis_bar_features.build_from_bars(
+                symbol, store=store, session=self._session, now=now,
+                range_minutes=range_minutes, closed_bar_only=True)
+        except Exception:  # noqa: BLE001 - a failed backfill is not a ready
+            logger.warning("S6 %s: origin backfill raised; the refusal stands",
+                           symbol, exc_info=True)
+            return None
 
     def _entry(self, symbol) -> dict:
         for row in (self._state or {}).get("entries") or ():

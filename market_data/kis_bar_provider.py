@@ -236,14 +236,32 @@ def provider_for_session(session, *, broker=None, fallback=None,
 
 
 def _collected_store(session):
-    """The collector's store for this session, keyed the way the
-    collector keys it (the operational trading day), or None."""
+    """The collector's store for this session, or None.
+
+    TWO dates, and they are not the same one
+    ----------------------------------------
+    The snapshot FILE is named by the operational trading day, which for
+    a window that wraps midnight is the day the session PRECEDES. Which
+    bars belong to the session is decided by the session's own start
+    date -- the Eastern evening it opened. Passing only the first left
+    `load_store` computing the window for the wrong evening, so it found
+    nothing and every DAYTIME lookup through this wrapper returned None.
+
+    Measured 2026-09-16 against the live snapshot: (day=09-16) alone gave
+    0 accumulators while (day=09-16, session_date=09-15) gave 20. The
+    fast watch always passed both -- see
+    `realtime_features._build_from_kis_stream` -- so only this path was
+    affected, and it fell back to the per-symbol REST chart rather than
+    failing outright, which is why it stayed invisible.
+    """
     from datetime import datetime, timezone
 
     from config.operational_calendar import operational_trading_day
     from market_hours import us_trading_day
     from s6_live import kis_bar_features
+    from scanners.base import session_range as srange
 
     now = datetime.now(timezone.utc)
     day = operational_trading_day(now) or us_trading_day(now)
-    return kis_bar_features.load_store(session, day)
+    return kis_bar_features.load_store(
+        session, day, session_date=srange.current_session_date(session, now))

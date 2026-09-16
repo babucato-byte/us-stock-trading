@@ -29,6 +29,29 @@ from market_data import realtime_bars as rb
 
 logger = logging.getLogger(__name__)
 
+#: How the opening range's origin was obtained.
+#:
+#: The distinction that cost entries
+#: ---------------------------------
+#: `origin_covered` used to be exactly "is there a bar at or before the
+#: official open", which answers TWO different questions with one FALSE:
+#: nobody traded in that minute, and nobody was listening in that
+#: minute. The first is a fact about a quiet market and must not stop a
+#: range being built from the real trades that followed; the second is
+#: the absence of evidence this whole layer exists to refuse.
+#:
+#: MRVL and MRNA on 2026-09-16 were the first: continuously collected
+#: across 01:00 UTC, no print in the 01:00 minute itself, and refused as
+#: though the session had never been watched.
+#: The refusal every caller keys on. One definition, so the fast
+#: watch can ask for it by name rather than matching a string.
+OFFICIAL_ORIGIN_NOT_COVERED = "OFFICIAL_ORIGIN_NOT_COVERED"
+
+ORIGIN_AVAILABLE = "ORIGIN_AVAILABLE"
+ORIGIN_COVERED_NO_TRADE = "ORIGIN_COVERED_NO_TRADE"
+ORIGIN_BACKFILLED = "ORIGIN_BACKFILLED"
+ORIGIN_NOT_COVERED = "ORIGIN_NOT_COVERED"
+
 SOURCE = rb.SOURCE
 
 #: A feature snapshot is only built from a feed that is currently
@@ -225,8 +248,30 @@ def build_from_bars(symbol, *, store, session, now=None,
     origin_covered = bool(official is not None and bars[0].minute <= official)
     coverage_claimed = bool(official is not None and coverage_started is not None
                             and coverage_started <= official)
-    if strict_origin and not origin_covered:
-        unavailable["range_high"] = "OFFICIAL_ORIGIN_NOT_COVERED"
+
+    # A bar AT the origin is the strongest answer and still the default.
+    # Without one, the collector's own coverage decides which of the two
+    # meanings the silence has: listening from before the open and
+    # hearing nothing is a quiet minute, and the range may be built from
+    # the real trades inside the window. Not listening is not evidence.
+    #
+    # `coverage_started_at` is trusted here only because the session
+    # boundary restart (8589f56) made it the moment THIS session's
+    # collector connected. Before that a snapshot could carry a coverage
+    # claim from the previous session, which is why the older comment
+    # above refuses to trust it on its own -- that hazard is closed, and
+    # a bar at the origin still outranks the claim either way.
+    origin_backfilled = bool(getattr(store, "origin_backfilled", set()) and
+                             symbol in getattr(store, "origin_backfilled", set()))
+    if origin_covered:
+        origin_status = ORIGIN_BACKFILLED if origin_backfilled else ORIGIN_AVAILABLE
+    elif coverage_claimed:
+        origin_status = ORIGIN_COVERED_NO_TRADE
+    else:
+        origin_status = ORIGIN_NOT_COVERED
+
+    if strict_origin and origin_status == ORIGIN_NOT_COVERED:
+        unavailable["range_high"] = OFFICIAL_ORIGIN_NOT_COVERED
         if coverage_claimed:
             unavailable["origin_coverage_claim"] = (
                 "collector reported coverage from "
@@ -239,18 +284,26 @@ def build_from_bars(symbol, *, store, session, now=None,
             volume_status=volume_status, volume_expansion=volume_expansion,
             bar_count=len(bars), price_source=SOURCE, volume_source=SOURCE,
             feed_status=feed_status, unavailable=unavailable,
-            error="OFFICIAL_ORIGIN_NOT_COVERED", range_minutes=int(range_minutes),
-            range_origin_timestamp=official, closed_bar_only=closed_bar_only)
+            error=OFFICIAL_ORIGIN_NOT_COVERED, range_minutes=int(range_minutes),
+            range_origin_timestamp=official, origin_status=ORIGIN_NOT_COVERED,
+            closed_bar_only=closed_bar_only)
     origin = official if strict_origin else bars[0].minute
     cutoff = origin + timedelta(minutes=int(range_minutes))
     opening = ([b for b in bars if origin <= b.minute < cutoff]
                if strict_origin else bars[:int(range_minutes)])
     post = [b for b in bars if b.minute >= cutoff] if strict_origin else bars[len(opening):]
     if strict_origin and not opening:
-        # The origin is covered but its first `range_minutes` hold no
-        # bars. Same canonical failure, stated rather than shown as an
-        # ordinary "not ready".
-        unavailable["range_high"] = "OFFICIAL_ORIGIN_NOT_COVERED"
+        # Covered, or claiming to be, but the whole opening window is
+        # empty -- not one trade in `range_minutes`. There is no range to
+        # build from real data, so this stays a refusal whatever the
+        # coverage says, and a claim that cannot be reconciled with the
+        # bars is named rather than silently dropped.
+        unavailable["range_high"] = OFFICIAL_ORIGIN_NOT_COVERED
+        if coverage_claimed and not origin_covered:
+            unavailable["origin_coverage_claim"] = (
+                "collector reported coverage from "
+                f"{coverage_started.isoformat()} but holds no bar in "
+                f"[{official.isoformat()}, {cutoff.isoformat()})")
         return SessionFeatures(
             symbol=symbol, session=session, built_at=moment,
             market_data_asof=asof, price=price, vwap=vwap,
@@ -258,8 +311,9 @@ def build_from_bars(symbol, *, store, session, now=None,
             volume_status=volume_status, volume_expansion=volume_expansion,
             bar_count=len(bars), price_source=SOURCE, volume_source=SOURCE,
             feed_status=feed_status, unavailable=unavailable,
-            error="OFFICIAL_ORIGIN_NOT_COVERED", range_minutes=int(range_minutes),
-            range_origin_timestamp=official, closed_bar_only=closed_bar_only)
+            error=OFFICIAL_ORIGIN_NOT_COVERED, range_minutes=int(range_minutes),
+            range_origin_timestamp=official, origin_status=ORIGIN_NOT_COVERED,
+            closed_bar_only=closed_bar_only)
     range_high = max((b.high for b in opening), default=None)
     range_low = min((b.low for b in opening), default=None)
     opening_mean = (sum(b.volume for b in opening) / len(opening)) if opening else None
@@ -289,7 +343,8 @@ def build_from_bars(symbol, *, store, session, now=None,
         price_source=SOURCE, volume_source=SOURCE, feed_status=feed_status,
         volume_cross_check=cross_check, gap_detected=gap_detected,
         unavailable=unavailable, range_minutes=int(range_minutes),
-        range_origin_timestamp=origin, closed_bar_only=closed_bar_only,
+        range_origin_timestamp=origin, origin_status=origin_status,
+        closed_bar_only=closed_bar_only,
         entry_quality=quality)
 
 
