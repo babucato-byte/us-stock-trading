@@ -46,6 +46,7 @@ here to an order.
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -155,6 +156,20 @@ class RunReport:
     #: Which of the four clock sessions this run belongs to. A label
     #: on the run, never a condition: see scanners/base/scan_session.
     session: Optional[str] = None
+    #: What the CLOCK said when this run began -- not `session`, which is
+    #: a label the caller may set deliberately (a replay, a manual run,
+    #: a test). A boundary is a change in the clock during the run, so
+    #: that is what must be compared, or an explicitly-requested session
+    #: would look like a crossing the moment it was asked for.
+    clock_session_at_start: Optional[str] = None
+    #: Set when the clock left `clock_session_at_start` mid-run.
+    #: A run that carries it has stopped cooperatively and must not
+    #: publish: its candidates describe a session that is over.
+    session_boundary_aborted: bool = False
+    #: The session the clock had moved to when that was noticed.
+    boundary_session: Optional[str] = None
+    #: How far in the scan got before it stopped.
+    boundary_symbols_scanned: int = 0
     provider_feed: Optional[str] = None
     outcomes: List[ScanOutcome] = field(default_factory=list)
     fetch_failures: int = 0
@@ -440,6 +455,8 @@ def run_scanners(
     # in the scanner's context -- becomes live where it matters.
     scanned_session = scan_session.normalize(session) or scan_session.session_at()
     requested_session = scan_session.normalize(session)
+    #: The clock at the moment the scan began. See the field's comment.
+    clock_session_at_start = scan_session.session_at()
     day = trading_day or us_trading_day()
     # UNCACHED, deliberately.
     #
@@ -494,6 +511,7 @@ def run_scanners(
         # answers instead, because a typo quietly becoming REGULAR would
         # file an off-hours scan under the one session allowed to trade.
         session=scanned_session,
+        clock_session_at_start=clock_session_at_start,
     )
 
     requested = list(scanners or ALL_SCANNERS)
@@ -641,6 +659,7 @@ def run_scanners(
 
     outcomes = {scanner.scanner_name: scanner.new_outcome(day) for scanner in built}
     consecutive_errors = {scanner.scanner_name: 0 for scanner in built}
+    scanned_count = 0
     for bundle in _symbol_bundles(
         provider, symbols, report=report,
         daily_lookback_days=daily_lookback_days,
@@ -786,6 +805,36 @@ def run_scanners(
                                 ("candidate" if any(s.symbol == bundle.symbol for o in outcomes.values()
                                                     for s in o.signals) else "rejected"))
             timing["total_symbol_elapsed_ms"] = round((time.perf_counter() - symbol_started) * 1000.0 + timing.get("acquisition_elapsed_ms", 0.0), 3)
+
+        # The boundary check, and why it is HERE.
+        #
+        # At the end of the body the provider call for THIS symbol has
+        # returned and the generator has not been advanced, so breaking
+        # now interrupts nothing in flight and starts no new fetch. A
+        # check at the top would abandon a bundle already paid for.
+        #
+        # 2026-09-16: a DAYTIME scan held the outer lock for ~55 minutes
+        # and was still running when PREMARKET began at 08:00. It ran to
+        # completion and published a DAYTIME generation into a session
+        # that no longer existed, and the 08:02 PREMARKET invocation was
+        # skipped for a lock the previous session still held.
+        scanned_count += 1
+        current_session = scan_session.session_at()
+        if current_session != clock_session_at_start:
+            report.session_boundary_aborted = True
+            report.boundary_session = current_session
+            report.boundary_symbols_scanned = scanned_count
+            logger.warning(
+                "SESSION_BOUNDARY_ABORTED session=%s current_session=%s "
+                "pid=%s generation_id=%s started_at=%s elapsed_seconds=%.1f "
+                "symbols_scanned=%s -- stopping cooperatively; nothing "
+                "from this run will be published",
+                clock_session_at_start, current_session, os.getpid(),
+                getattr(report, "run_id", None), stamp,
+                (datetime.now(timezone.utc)
+                 - datetime.fromisoformat(stamp)).total_seconds(),
+                scanned_count)
+            break
 
     report.outcomes = [outcomes[scanner.scanner_name] for scanner in built]
 
@@ -1154,6 +1203,42 @@ def publish_report_candidates(report) -> int:
             # which range produced it. S6-R and S6-O are different
             # setups that happen to share a scanner.
             variant = s6_sessions.variant_for(session) or None
+
+        # The hard guard, asked again at the last possible moment.
+        #
+        # Defence in depth on purpose: the symbol loop's cooperative stop
+        # is the first line, but a scan can cross the boundary between
+        # its last symbol and this point -- during analytics persistence,
+        # or simply because the loop had already ended. A scan that began
+        # in DAYTIME must never publish a completed DAYTIME generation
+        # into PREMARKET, however late the boundary is noticed.
+        current_session = scan_session.session_at()
+        started_clock = getattr(report, "clock_session_at_start", None)
+        # A report that carries no captured clock -- a legacy or
+        # duck-typed caller -- is judged only on the explicit flag. The
+        # clock is compared against what it said when the scan BEGAN, so
+        # a run deliberately asked for a session other than the current
+        # one is not mistaken for a crossing.
+        crossed = started_clock is not None and current_session != started_clock
+        if getattr(report, "session_boundary_aborted", False) or crossed:
+            logger.warning(
+                "STALE_PUBLISH_BLOCKED scanner=%s session=%s "
+                "current_session=%s pid=%s generation_id=%s started_at=%s "
+                "-- candidate rows NOT written and the generation is "
+                "declared %s, which is never consumable",
+                name, session, current_session, os.getpid(), run_id,
+                started_at, generations.STATUS_SESSION_BOUNDARY_ABORTED)
+            # Declared, not merely absent. A missing record falls back to
+            # inferring the newest generation from the rows on disk, and
+            # the whole point here is that no row of this run may become
+            # visible to candidate_source, active_watch or fast_watch.
+            generations.publish(
+                day, session, generation_id=run_id, variant=variant,
+                strategy_id=strategy_id,
+                status=generations.STATUS_SESSION_BOUNDARY_ABORTED,
+                candidate_count=0, generated_at=started_at,
+                completed_at=completed_at)
+            continue
 
         if failed:
             logger.info("not publishing %s candidates: the scanner failed", name)

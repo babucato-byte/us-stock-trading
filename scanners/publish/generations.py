@@ -70,6 +70,12 @@ STATUS_COMPLETED = "COMPLETED"
 #: as zero candidates -- it is the absence of a result, not a result.
 STATUS_FAILED = "FAILED"
 
+#: The clock left the session while the scan was still running, so the
+#: run stopped cooperatively and published nothing. Distinct from FAILED:
+#: nothing went wrong, the answer simply describes a session that is
+#: over. Never consumable, and never read as zero candidates.
+STATUS_SESSION_BOUNDARY_ABORTED = "SESSION_BOUNDARY_ABORTED"
+
 CONSUMABLE_STATUSES = frozenset({STATUS_COMPLETED})
 
 

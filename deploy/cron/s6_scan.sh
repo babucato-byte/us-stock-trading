@@ -92,7 +92,16 @@ esac
 MANIFEST_PATH="$(dirname "$SCANNER_CANDIDATE_DIR")/discovery/manifest.json"
 
 echo "$(date -u +%FT%TZ) session=$SESSION scanner_sha=$SCANNER_SHA root=$SCANNER_RUNTIME_ROOT candidates=$SCANNER_CANDIDATE_DIR manifest=$MANIFEST_PATH" >> "$LOG"
-flock -n /home/ubuntu/logs/cron/s6_scan.lock \
+# The outer lock's refusal used to be silent.
+#
+# `flock -n` simply exited non-zero and the wrapper ended, so a scan that
+# never started and a scan that started and found nothing produced the
+# same thing in the log: nothing. On 2026-09-16 a DAYTIME scan held this
+# lock for ~55 minutes and the 08:02 PREMARKET invocation was skipped
+# for it, and that had to be reconstructed afterwards from cron firings
+# rather than read here. Named outcomes, so it can be counted.
+SCAN_STARTED_AT=$(date -u +%FT%TZ)
+flock -n -E 99 /home/ubuntu/logs/cron/s6_scan.lock \
   env SCANNER_CANDIDATE_DIR="$SCANNER_CANDIDATE_DIR" \
       TRADING_PROJECT_ROOT="$SCANNER_RUNTIME_ROOT" \
       SCANNER_ANALYTICS_DIR="$SCANNER_ANALYTICS_DIR" \
@@ -102,6 +111,13 @@ flock -n /home/ubuntu/logs/cron/s6_scan.lock \
     --session "$SESSION" --universe manifest \
     --manifest-path "$MANIFEST_PATH" \
     --supplement-size 50 >> "$LOG" 2>&1
+SCAN_STATUS=$?
+SCAN_ELAPSED=$(( $(date -u +%s) - $(date -u -d "$SCAN_STARTED_AT" +%s) ))
+if [ "$SCAN_STATUS" -eq 99 ]; then
+    echo "$(date -u +%FT%TZ) SCANNER_LOCK_SKIPPED session=$SESSION pid=$$ started_at=$SCAN_STARTED_AT elapsed_seconds=$SCAN_ELAPSED lock=/home/ubuntu/logs/cron/s6_scan.lock -- another session's scan still holds it" >> "$LOG"
+    exit 0
+fi
+echo "$(date -u +%FT%TZ) SCANNER_LOCK_ACQUIRED session=$SESSION pid=$$ started_at=$SCAN_STARTED_AT elapsed_seconds=$SCAN_ELAPSED status=$SCAN_STATUS" >> "$LOG"
 # --universe manifest takes the SCANNER NODE's list -- the whole market
 # ranked on today's data -- and falls back to the server's own active
 # ranking whenever that manifest is missing, stale, malformed or from
