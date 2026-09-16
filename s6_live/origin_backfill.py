@@ -44,15 +44,32 @@ FAILED = "ORIGIN_REST_FAILED"
 
 
 def _exchange_for(symbol, store, session):
-    """The venue this symbol streams on, from the store's own row."""
-    accumulator = None
+    """The venue this symbol trades on.
+
+    From `exchange_registry`, which is the authority the rest of the KIS
+    path already uses. An earlier version of this read the venue off the
+    store's accumulator, which does not carry one -- `SessionAccumulator`
+    holds symbol, session and bars and nothing about where they came
+    from -- so every lookup returned None and every backfill failed with
+    "no exchange mapping" before it reached the wire. The unit tests all
+    passed an explicit `exchange` and never exercised this path; it was
+    the live log that showed it, on HPE, MRNA, STX, GS and LRCX.
+    """
     try:
-        accumulator = store.accumulator(symbol, session)
-    except Exception:  # noqa: BLE001
-        accumulator = None
-    venue = getattr(accumulator, "exchange", None) or getattr(
-        accumulator, "venue", None)
-    return str(venue) if venue else None
+        from market_data.exchange_registry import resolve_exchange
+
+        record = resolve_exchange(symbol)
+    except Exception:  # noqa: BLE001 - an unresolvable symbol is a reason
+        record = None
+    venue = getattr(record, "exchange", None) or record
+    if venue is None:
+        return None
+    # `USExchange.NASDAQ` stringifies to "USExchange.NASDAQ", which the
+    # KIS code table does not know. Its VALUE is the spelling the rest of
+    # the path uses, and `excd_for_session` accepts either that or the
+    # enum -- never the repr.
+    return str(getattr(venue, "value", None) or getattr(venue, "name", None)
+               or venue) or None
 
 
 def restore_origin(store, symbol, *, session, official_origin, range_minutes,

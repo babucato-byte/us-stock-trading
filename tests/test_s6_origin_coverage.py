@@ -194,6 +194,38 @@ class TestD_BackfillMergesUnderTheStream:
             "the session must be passed so EXCD resolves to the daytime venue")
 
 
+class TestTheVenueIsResolvable:
+    """The gap that shipped: every test passed `exchange=` explicitly,
+    so nothing exercised the lookup, and in production it returned None
+    for every symbol -- the backfill failed before reaching the wire."""
+
+    @pytest.mark.parametrize("symbol", ["MRNA", "STX", "GS", "LRCX", "HPE"])
+    def test_a_real_symbol_resolves_to_a_usable_code(self, symbol):
+        from market_data import kis_minute_chart as mc
+
+        venue = origin_backfill._exchange_for(symbol, None, SESSION)
+        assert venue, f"{symbol} must resolve to a venue"
+        # The value must survive the KIS code table -- a repr like
+        # "USExchange.NASDAQ" does not.
+        assert mc.excd_for_session(venue, SESSION) in ("BAQ", "BAY", "BAA")
+
+    def test_an_unknown_symbol_is_a_reason_not_a_crash(self):
+        assert origin_backfill._exchange_for(
+            "NOSUCHSYMBOL", None, SESSION) is None
+
+    def test_restore_origin_resolves_the_venue_itself(self):
+        """No explicit exchange -- the production call shape."""
+        store = _store([ORIGIN + timedelta(minutes=1)],
+                       coverage_started=ORIGIN + timedelta(seconds=20),
+                       symbol="MRNA")
+        chart = _Chart(_rows(ORIGIN - timedelta(minutes=2), 30))
+        report = origin_backfill.restore_origin(
+            store, "MRNA", session=SESSION, official_origin=ORIGIN,
+            range_minutes=5, broker=object(), chart=chart)
+        assert report["status"] == origin_backfill.BACKFILLED
+        assert chart.asked and chart.asked[0][1] == "NASDAQ"
+
+
 class TestE_LateAdmissionWithinReach:
     """E. Symbol admitted at 04:00, REST can still reach 01:00."""
 
