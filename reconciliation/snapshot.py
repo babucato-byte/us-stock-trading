@@ -56,7 +56,7 @@ from typing import FrozenSet, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-from reconciliation import fill_window
+from reconciliation import consistency, fill_window
 
 DEFAULT_MAX_AGE_SECONDS = 30
 
@@ -76,6 +76,26 @@ class ReconciliationLocalStateError(ReconciliationUnavailableError):
     not answer" from "our own database did not answer"."""
 
     reason_code = "LOCAL_STATE_FAILURE"
+
+
+class ReconciliationSnapshotStale(ReconciliationUnavailableError):
+    """The internal state moved while the broker was being read.
+
+    A subclass of the unavailable error for the same reason
+    `ReconciliationLocalStateError` is one: every existing caller must
+    keep failing closed, unchanged, without knowing this case exists.
+    What the distinct type adds is that this is NOT a disagreement and
+    NOT an outage -- nothing is wrong with the account. The comparison
+    simply spanned a state change and therefore cannot be trusted in
+    either direction, so it publishes nothing and the next scheduled
+    pass takes a fresh look.
+
+    Deliberately not retried in place: the writer that moved the state
+    is usually still working, and an immediate retry loop would spend
+    the shared READ limiter re-reading KIS to lose the same race.
+    """
+
+    reason_code = consistency.STALE_REASON_CODE
 
 
 class ReconciliationBlockedError(Exception):
@@ -311,6 +331,11 @@ def build_snapshot(*, broker, conn, account_id, symbol=None, now=None,
         error.reason_code = getattr(exc, "reason_code", None) or "KIS_UNAVAILABLE"
         return error
 
+    # BEFORE the first broker read. Everything below this line is
+    # compared against a broker view collected from here onward, so this
+    # is the instant the comparison is implicitly claiming our side had.
+    consistency_before = consistency.capture(conn)
+
     try:
         kis_positions = broker.get_positions()
     except Exception as exc:
@@ -331,6 +356,24 @@ def build_snapshot(*, broker, conn, account_id, symbol=None, now=None,
         kis_fills = fill_window.read_fills(broker, conn, now=current)
     except Exception as exc:
         raise _unavailable("KIS fill-history read failed", exc) from exc
+
+    # The broker view is now fixed. If our side moved while it was being
+    # collected, the comparison below would be reading two different
+    # instants -- which is how a correctly cancelled order gets reported
+    # as one KIS knows about and we do not. Checked BEFORE any mismatch
+    # is evaluated, so no false detail is ever constructed, let alone
+    # published.
+    consistency_after = consistency.capture(conn)
+    if consistency.is_stale(consistency_before, consistency_after):
+        detail = consistency.describe_change(consistency_before,
+                                             consistency_after)
+        logger.warning("%s source=%s symbol=%s -- %s; publishing no verdict "
+                       "and leaving any existing state untouched",
+                       consistency.STALE_REASON_CODE, source, symbol, detail)
+        raise ReconciliationSnapshotStale(
+            f"internal state changed while KIS was being read ({detail}); "
+            "this comparison spans two instants and is not evidence either "
+            "way")
 
     # TCN-02A: everything below reads OUR side. A failure here is a
     # different operational state from a broker that did not answer,

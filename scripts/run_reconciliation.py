@@ -251,6 +251,26 @@ def run_once(*, broker=None, now=None, conn=None, account_id=None):
                 account_id=account_id if account_id is not None else broker.config.account_no or "",
                 symbol=None, now=current, source="reconcile_service",
             )
+        except reconciliation_snapshot.ReconciliationSnapshotStale as exc:
+            # Nothing is wrong with the account and nothing is wrong with
+            # KIS: our own state moved while the broker was being read,
+            # so the comparison spans two instants. Records NOTHING, for
+            # the same reason the unavailable branch does -- and reported
+            # under its own status because calling a healthy broker
+            # "unavailable" would send an operator looking at KIS.
+            #
+            # No retry here on purpose. The writer that moved the state
+            # is usually still working, and an immediate retry would
+            # spend the shared READ limiter to lose the same race; the
+            # */5 cycle is the retry. Both confirmed incidents recovered
+            # on the next pass.
+            logger.warning("%s: %s", reconciliation_snapshot.consistency
+                           .STALE_REASON_CODE, exc)
+            return {"status": "snapshot_stale", "resolved": resolved,
+                    "settled": settled, "exit_intents": exit_intents,
+                    "snapshot": None,
+                    "reason_code": reconciliation_snapshot
+                    .ReconciliationSnapshotStale.reason_code}
         except reconciliation_snapshot.ReconciliationUnavailableError as exc:
             # Record NOTHING: a failed read must never refresh the clean
             # timestamp the order gates read (CODEX-044).
@@ -265,11 +285,27 @@ def run_once(*, broker=None, now=None, conn=None, account_id=None):
             # Rebuild after the durable repair so this pass records the
             # state it actually leaves behind rather than a one-pass-old
             # mismatch caused by the stale projection itself.
-            snapshot = reconciliation_snapshot.build_snapshot(
-                broker=broker, conn=conn,
-                account_id=account_id if account_id is not None else broker.config.account_no or "",
-                symbol=None, now=current, source="reconcile_service",
-            )
+            #
+            # Guarded like the first build: this one re-reads KIS too, so
+            # it can lose the same race. Falling through to the generic
+            # handler would turn an ordinary busy moment into a service
+            # error AFTER the repair had already been durably applied.
+            try:
+                snapshot = reconciliation_snapshot.build_snapshot(
+                    broker=broker, conn=conn,
+                    account_id=account_id if account_id is not None else broker.config.account_no or "",
+                    symbol=None, now=current, source="reconcile_service",
+                )
+            except reconciliation_snapshot.ReconciliationSnapshotStale as exc:
+                logger.warning("%s on the post-repair rebuild: %s",
+                               reconciliation_snapshot.consistency
+                               .STALE_REASON_CODE, exc)
+                return {"status": "snapshot_stale", "resolved": resolved,
+                        "settled": settled, "exit_intents": exit_intents,
+                        "snapshot": None,
+                        "repaired_sell_projections": repaired_sell_projections,
+                        "reason_code": reconciliation_snapshot
+                        .ReconciliationSnapshotStale.reason_code}
 
         try:
             from operations import kill_switch
@@ -331,6 +367,17 @@ def main(argv=None):
         logger.exception("reconciliation pass failed: %s", exc)
         return EXIT_ERROR
 
+    if result["status"] == "snapshot_stale":
+        # Deliberately EXIT_OK. The pass did its repair work (unknown
+        # orders, settlement, exit intents) and simply published no
+        # verdict; a non-zero exit would make systemd/cron treat an
+        # ordinary busy moment as a service failure and alert on it.
+        # Nothing was recorded, so the gates keep reading the previous
+        # result and its age -- which is what makes this safe.
+        logger.warning("reconciliation published no verdict this pass (%s); "
+                       "the next scheduled pass re-reads",
+                       result.get("reason_code"))
+        return EXIT_OK
     if result["status"] == "kis_unavailable":
         return EXIT_KIS_UNAVAILABLE
     intents = result.get("exit_intents") or ()

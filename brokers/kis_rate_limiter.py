@@ -37,6 +37,7 @@ the shared state directory, and that is exactly when a shared pacing
 budget cannot be trusted.
 """
 
+import contextlib
 import errno
 import fcntl
 import json
@@ -123,6 +124,144 @@ ACQUIRE_TIMEOUT_ENV = "KIS_LOCK_ACQUIRE_TIMEOUT_SECONDS"
 #: the line is debug-level so normal operation does not flood the log.
 _TELEMETRY_NOTABLE_MS = 500.0
 
+#: Above this, a hold is reported as KIS_LIMITER_LONG_LOCK_HOLD.
+#:
+#: The critical section does a directory scan, a small JSON read, a small
+#: JSON write and two fsyncs -- single-digit milliseconds on a healthy
+#: box, which is why `_TELEMETRY_NOTABLE_MS` was set at 500ms. 1s is two
+#: orders of magnitude above the expected cost and still an order of
+#: magnitude BELOW `_STATE_LOCK_TIMEOUT` (10s), so a hold crosses this
+#: line well before it can make another caller's acquisition fail.
+#:
+#: Chosen against the 2026-09-16 CMG incident: S6_BUY_EXECUTION held the
+#: READ lock for 21,252ms, and reconciliation (12.3s wait, TTTS3018R
+#: never sent) and S6_EXIT (11.2s wait, TTTS3035R never sent) both lost
+#: their acquisitions to it. At 1s this would have been reported twenty
+#: seconds before either of them gave up.
+DEFAULT_LONG_LOCK_HOLD_MS = 1000.0
+LONG_LOCK_HOLD_ENV = "KIS_LIMITER_LONG_LOCK_HOLD_MS"
+
+#: The telemetry name an operator greps for.
+LONG_LOCK_HOLD_EVENT = "KIS_LIMITER_LONG_LOCK_HOLD"
+
+
+def long_lock_hold_ms():
+    """Env-overridable threshold; a bad override falls back to the default
+    rather than disabling the detection."""
+    raw = os.environ.get(LONG_LOCK_HOLD_ENV)
+    if raw is None:
+        return DEFAULT_LONG_LOCK_HOLD_MS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_LONG_LOCK_HOLD_MS
+    return value if value > 0 else DEFAULT_LONG_LOCK_HOLD_MS
+
+
+class ProcessLimiterMetrics:
+    """Per-process totals, so a caller can report what it actually paid.
+
+    Why this is here and not in the caller
+    --------------------------------------
+    `scanners/runner.py` reports `limiter_wait_total_ms` and
+    `network_time_total_ms` as the literal string "NOT_SEPARABLE" --
+    placeholders, not measurements. A latency audit on 2026-09-16 could
+    not answer where a scan's time went from the logs and had to
+    re-measure it live against production, because the one component
+    that dominates -- waiting for this limiter -- was never recorded.
+
+    The limiter is the only place that can separate its own wait from
+    its own hold, so it accumulates them here. Reading them is a
+    property access with no lock and no file, which is what makes it
+    safe to call from a loop that is already the hot path.
+
+    Deliberately process-local and in-memory: a shared counter would add
+    exactly the cross-process serialisation these numbers exist to find.
+    """
+
+    __slots__ = ("wait_ms", "hold_ms", "acquisitions", "failures",
+                 "deferrals", "long_holds")
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.wait_ms = 0.0
+        self.hold_ms = 0.0
+        self.acquisitions = 0
+        self.failures = 0
+        self.deferrals = 0
+        self.long_holds = 0
+
+    def as_dict(self):
+        return {
+            "limiter_wait_total_ms": round(self.wait_ms, 3),
+            "limiter_hold_total_ms": round(self.hold_ms, 3),
+            "limiter_acquisitions": self.acquisitions,
+            "limiter_acquire_failures": self.failures,
+            "limiter_queue_deferrals": self.deferrals,
+            "limiter_long_holds": self.long_holds,
+        }
+
+
+#: The process-wide totals. `metrics().as_dict()` is the whole API.
+_PROCESS_METRICS = ProcessLimiterMetrics()
+
+
+def metrics():
+    return _PROCESS_METRICS
+
+
+class _PhaseTimer:
+    """Where the time inside the lock actually went.
+
+    The CMG incident left one number -- 21,252ms held -- and no way to
+    tell a slow fsync from a descheduled process, which is the whole
+    question. This accumulates per-phase milliseconds so the next
+    occurrence names its own cause.
+
+    Every method is failure-proof by construction: timing must never be
+    able to break a request that has already been paced and reserved.
+    """
+
+    __slots__ = ("phases",)
+
+    def __init__(self):
+        self.phases = {}
+
+    @contextlib.contextmanager
+    def phase(self, name):
+        began = time.perf_counter()
+        try:
+            yield
+        finally:
+            try:
+                elapsed = (time.perf_counter() - began) * 1000.0
+                self.phases[name] = self.phases.get(name, 0.0) + elapsed
+            except Exception:  # noqa: BLE001 - never fail the caller
+                pass
+
+    def accounted_ms(self):
+        return sum(self.phases.values())
+
+    def as_log_fields(self, hold_ms=None):
+        """`NAME_MS=...` pairs, in a fixed order so lines diff cleanly.
+
+        `OTHER_CRITICAL_MS` is the hold that no phase claimed -- the
+        residual. It is the number that distinguishes "an fsync was
+        slow" from "this process was not running", because a descheduled
+        process accumulates time that belongs to no phase at all.
+        """
+        ordered = ("NAMESPACE_SCAN_MS", "ARTIFACT_ENFORCE_MS",
+                   "STALE_TEMP_CLEANUP_MS", "STATE_LOAD_MS",
+                   "RESERVATION_CALC_MS", "TEMP_WRITE_MS", "FILE_FSYNC_MS",
+                   "CHMOD_MS", "RENAME_MS", "DIR_FSYNC_MS")
+        parts = [f"{name}={self.phases.get(name, 0.0):.1f}" for name in ordered]
+        if hold_ms is not None:
+            residual = max(hold_ms - self.accounted_ms(), 0.0)
+            parts.append(f"OTHER_CRITICAL_MS={residual:.1f}")
+        return " ".join(parts)
+
 
 #: Entrypoint script -> owner, so a caller is labelled without every
 #: wrapper having to remember to export one. Several of those wrappers
@@ -135,7 +274,133 @@ _OWNER_BY_ENTRYPOINT = {
     "run_live_buy_entry.py": "S6_ENTRY",
     "run_s6_runtime.py": "S6_EXIT",
     "run_reconciliation.py": "RECONCILIATION",
+    # The scanner was the one heavy consumer with no label at all, so
+    # every one of its reads logged as owner=UNKNOWN -- including in the
+    # 2026-09-16 CMG incident. It issues one read PER SYMBOL across the
+    # whole universe, which makes it the only caller that can build a
+    # deep queue on its own, and it could not be told apart from an
+    # unmapped safety caller.
+    "run_scanners.py": "SCANNER",
 }
+
+# -- priority ------------------------------------------------------------
+#
+# Fairness only. Every priority obeys the SAME pacing interval and the
+# same reservation arithmetic; nothing here lets any caller issue
+# requests faster than the KIS quota allows. What it changes is how deep
+# a queue a caller is willing to ADD to.
+
+PRIORITY_P0 = 0   # held-position safety and broker-state truth
+PRIORITY_P1 = 1   # mutation pre-submit validation
+PRIORITY_P2 = 2   # discovery / scanning
+PRIORITY_P3 = 3   # health, reporting, observation
+
+#: Mapped from the owners production actually sets (deploy/cron/*.sh)
+#: plus the entrypoint fallbacks above, not from a guess at what might
+#: exist. An owner absent from here is treated as P1 -- see
+#: `priority_for_owner`.
+PRIORITY_BY_OWNER = {
+    # P0. An exit that cannot read cannot protect a real position, and
+    # reconciliation is what the order gates read to decide whether the
+    # account's state is even known. Both were the VICTIMS on
+    # 2026-09-16: reconciliation waited 12.3s and never sent TTTS3018R,
+    # S6_EXIT waited 11.2s and never sent TTTS3035R.
+    "S6_EXIT": PRIORITY_P0,
+    "S1_WATCHDOG": PRIORITY_P0,
+    "RECONCILIATION": PRIORITY_P0,
+    # P1. Reads taken immediately before a mutation -- buying power, the
+    # orderability check, the pre-submit snapshot. Few per order, and a
+    # BUY that skips them is worse than a BUY that waits.
+    "S6_BUY_EXECUTION": PRIORITY_P1,
+    "S6_ENTRY": PRIORITY_P1,
+    "S1_EXECUTOR": PRIORITY_P1,
+    # P2. Discovery. Bounded progress matters; individual reads do not.
+    "SCANNER": PRIORITY_P2,
+    "S6_COLLECTOR": PRIORITY_P2,
+    # P3. Nothing here is allowed to delay anything above it.
+    "HEALTH_CHECK": PRIORITY_P3,
+    "TRADING_REPORT": PRIORITY_P3,
+}
+
+#: How deep a queue each priority will ADD ITSELF TO, counted in
+#: INTERVALS -- i.e. in callers already ahead of it -- not in seconds.
+#:
+#: Intervals, because the categories are paced very differently: READ is
+#: 3s and TOKEN is 60s, so any absolute second count that bounds a READ
+#: queue sensibly also refuses the FIRST legitimately queued TOKEN
+#: caller. Depth is the thing actually being bounded, and it is the same
+#: question in every category: how many callers am I willing to put
+#: myself behind.
+#:
+#: The problem this bounds: `DEFAULT_MAX_RESERVATION_DEPTH` is 16, so at
+#: a 3s READ interval the queue may legitimately sit 48 SECONDS deep.
+#: That depth is correct for the limiter -- those reservations are real
+#: -- but it means a caller arriving behind a full discovery queue waits
+#: 48s for its slot. For a scan that is slow. For an exit holding a real
+#: position it is a missed exit, and for reconciliation it is the read
+#: never going out, which is what was observed on 2026-09-16.
+#:
+#: So a low-priority caller declines to make the queue deeper rather
+#: than taking the far slot. It fails fast and retriably; a scan skips a
+#: symbol and continues, which is the bounded-progress requirement.
+#:
+#: P0 is deliberately uncapped: a safety read must never be refused by
+#: this codebase's own fairness rule. P1 is capped generously -- normal
+#: pre-submit validation is a handful of reads and never approaches four
+#: deep -- so a runaway mutation loop still cannot monopolise the queue.
+LOW_PRIORITY_QUEUE_CAP_INTERVALS = {
+    PRIORITY_P1: 4.0,
+    PRIORITY_P2: 2.0,
+    PRIORITY_P3: 1.0,
+}
+QUEUE_CAP_ENV_BY_PRIORITY = {
+    PRIORITY_P1: "KIS_LIMITER_P1_QUEUE_CAP_INTERVALS",
+    PRIORITY_P2: "KIS_LIMITER_P2_QUEUE_CAP_INTERVALS",
+    PRIORITY_P3: "KIS_LIMITER_P3_QUEUE_CAP_INTERVALS",
+}
+
+REASON_QUEUE_TOO_DEEP = "KIS_RATE_LIMIT_QUEUE_TOO_DEEP"
+QUEUE_DEFERRED_EVENT = "KIS_LIMITER_QUEUE_DEFERRED"
+
+
+def priority_for_owner(owner=None):
+    """The caller's priority class.
+
+    An UNMAPPED owner gets P1, not P2. Treating an unknown caller as
+    low priority would let a safety reader nobody has labelled yet be
+    refused by the cap, and being wrong in that direction costs an exit;
+    being wrong the other way only costs a little queue depth.
+    """
+    name = str(owner if owner is not None else lock_owner() or "").strip().upper()
+    return PRIORITY_BY_OWNER.get(name, PRIORITY_P1)
+
+
+def queue_cap_intervals(priority):
+    """How many callers deep this priority will queue. None = uncapped."""
+    if priority == PRIORITY_P0:
+        return None
+    default = LOW_PRIORITY_QUEUE_CAP_INTERVALS.get(priority)
+    if default is None:
+        return None
+    raw = os.environ.get(QUEUE_CAP_ENV_BY_PRIORITY.get(priority, ""), None)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def queue_cap_seconds(priority, interval):
+    """The interval cap expressed against a category's own pacing."""
+    depth = queue_cap_intervals(priority)
+    if depth is None:
+        return None
+    try:
+        return depth * float(interval)
+    except (TypeError, ValueError):
+        return None
 
 
 def lock_owner():
@@ -264,6 +529,23 @@ class KISRateLimitStateUnavailable(Exception):
         super().__init__(message)
         self.reason_code = reason_code
         self.detail = detail
+
+
+class KISRateLimitQueueTooDeep(KISRateLimitStateUnavailable):
+    """A low-priority caller declined to make the reservation queue deeper.
+
+    A subclass so every existing caller fails closed exactly as it
+    already does for an unavailable limiter: the request is NOT sent.
+    What the distinct type adds is that the limiter is healthy and the
+    quota is intact -- this caller simply refused to push a safety
+    reader further back in the queue, and its own read is retriable on
+    its next cycle.
+
+    Never raised for P0: a safety read is not refused by this codebase's
+    own fairness rule.
+    """
+
+    pass
 
 
 class KISRateLimitTempCleanupError(KISRateLimitStateUnavailable):
@@ -510,6 +792,7 @@ class KisRateLimiter:
         # long. These three stamps make the next one arithmetic.
         request_at = self._clock()
         acquired_at = None
+        timer = _PhaseTimer()
         try:
             if not self._acquire(lock_handle):
                 self._alert(category, "lock could not be acquired")
@@ -520,7 +803,7 @@ class KisRateLimiter:
             acquired = True
             acquired_at = self._clock()
             try:
-                slept = self._wait_locked(path, category, interval)
+                slept = self._wait_locked(path, category, interval, timer)
             except BaseException as exc:
                 primary = exc
                 raise
@@ -529,7 +812,7 @@ class KisRateLimiter:
             # failure is reported, and it must not silently mask the
             # error that got us here.
             release_error = self._release(lock_handle, acquired, category)
-            self._report_contention(category, request_at, acquired_at)
+            self._report_contention(category, request_at, acquired_at, timer)
             if release_error is not None and primary is None:
                 raise release_error
             if release_error is not None:
@@ -547,27 +830,51 @@ class KisRateLimiter:
             self._sleeper(slept)
         return slept
 
-    def _report_contention(self, category, request_at, acquired_at):
-        """One line per acquisition: who waited, how long, how long held.
+    def _report_contention(self, category, request_at, acquired_at,
+                           timer=None):
+        """One line per acquisition: who waited, how long, how long held,
+        and -- when the hold was abnormal -- where inside it the time went.
 
         Deliberately a log line and not a database write. This runs on
         the path whose contention it measures, and a shared table would
         add exactly the kind of cross-process serialisation the numbers
         exist to find.
+
+        Nothing here carries an app key, a token or an account number:
+        the fields are an owner label, a category, a pid and durations.
         """
         try:
             released_at = self._clock()
             if acquired_at is None:
                 wait_ms = (released_at - request_at) * 1000.0
+                _PROCESS_METRICS.wait_ms += wait_ms
+                _PROCESS_METRICS.failures += 1
                 logger.warning(
                     "KIS_LOCK owner=%s category=%s outcome=NOT_ACQUIRED "
-                    "lock_wait_ms=%.1f", lock_owner(), category, wait_ms)
+                    "lock_wait_ms=%.1f pid=%d",
+                    lock_owner(), category, wait_ms, os.getpid())
                 return
             wait_ms = (acquired_at - request_at) * 1000.0
             hold_ms = (released_at - acquired_at) * 1000.0
+            _PROCESS_METRICS.wait_ms += wait_ms
+            _PROCESS_METRICS.hold_ms += hold_ms
+            _PROCESS_METRICS.acquisitions += 1
             line = ("KIS_LOCK owner=%s category=%s outcome=ACQUIRED "
-                    "lock_wait_ms=%.1f lock_hold_ms=%.1f")
-            args = (lock_owner(), category, wait_ms, hold_ms)
+                    "lock_wait_ms=%.1f lock_hold_ms=%.1f pid=%d")
+            args = (lock_owner(), category, wait_ms, hold_ms, os.getpid())
+            if timer is not None and hold_ms >= long_lock_hold_ms():
+                _PROCESS_METRICS.long_holds += 1
+                # The line the CMG incident needed and did not have. At
+                # ERROR because a hold this long is already making other
+                # callers wait, and the phases say whether that is the
+                # disk or the scheduler.
+                logger.error(
+                    "%s owner=%s category=%s lock_wait_ms=%.1f "
+                    "lock_hold_ms=%.1f pid=%d threshold_ms=%.1f %s",
+                    LONG_LOCK_HOLD_EVENT, lock_owner(), category, wait_ms,
+                    hold_ms, os.getpid(), long_lock_hold_ms(),
+                    timer.as_log_fields(hold_ms))
+                return
             if max(wait_ms, hold_ms) >= _TELEMETRY_NOTABLE_MS:
                 logger.info(line, *args)
             else:
@@ -636,15 +943,24 @@ class KisRateLimiter:
                     return False
                 self._sleeper(0.05)
 
-    def _wait_locked(self, path, category, interval):
+    def _wait_locked(self, path, category, interval, timer=None):
         # Inside the lock, before anything else and before this lifecycle
         # writes its own temporary: classify the whole namespace, refuse
         # to continue if any entry is not ours, and only then clean up.
-        artifacts = self._scan_namespace(path, category)
-        self._enforce_artifacts(artifacts, category)
-        self._cleanup_stale_temps(path, artifacts, category)
-        state = self._load_state(path, category)
-        if True:
+        #
+        # Each step is timed separately because they fail differently: a
+        # slow namespace scan is a directory that has filled up, a slow
+        # fsync is the disk, and time in neither is the scheduler.
+        timer = timer if timer is not None else _PhaseTimer()
+        with timer.phase("NAMESPACE_SCAN_MS"):
+            artifacts = self._scan_namespace(path, category)
+        with timer.phase("ARTIFACT_ENFORCE_MS"):
+            self._enforce_artifacts(artifacts, category)
+        with timer.phase("STALE_TEMP_CLEANUP_MS"):
+            self._cleanup_stale_temps(path, artifacts, category)
+        with timer.phase("STATE_LOAD_MS"):
+            state = self._load_state(path, category)
+        with timer.phase("RESERVATION_CALC_MS"):
             has_entry = category in state
             last = state.get(category)
             now = self._wall()
@@ -716,13 +1032,47 @@ class KisRateLimiter:
                     # spacing between reservations is still `interval`.
                     reserved = last + interval
                     slept = reserved - now
+                    # Fairness, checked BEFORE the slot is taken and
+                    # before any state is mutated -- declining must
+                    # leave the queue exactly as it was found.
+                    self._enforce_queue_cap(category, slept, interval)
                     now = reserved
             state[category] = now
-            # The reservation must be DURABLE before the request goes out,
-            # and before the lock is released -- a slot handed out twice
-            # would let two callers issue at the same instant.
-            self._store_state(path, state, category)
-            return slept
+        # The reservation must be DURABLE before the request goes out,
+        # and before the lock is released -- a slot handed out twice
+        # would let two callers issue at the same instant.
+        #
+        # Outside RESERVATION_CALC_MS deliberately: persistence is where
+        # the suspected cost is, and averaging it with arithmetic would
+        # hide exactly what this instrumentation is for.
+        self._store_state(path, state, category, timer)
+        return slept
+
+    def _enforce_queue_cap(self, category, slept, interval):
+        """Refuse to deepen a queue a low-priority caller should not deepen.
+
+        Raises `KISRateLimitQueueTooDeep` without touching the state, so
+        the reservation the caller would have taken is still free for
+        whoever asks next -- which is the entire point: the slot goes to
+        the exit or the reconciliation read instead of to a scan.
+        """
+        priority = priority_for_owner()
+        cap = queue_cap_seconds(priority, interval)
+        if cap is None or slept <= cap:
+            return
+        logger.warning(
+            "%s owner=%s category=%s priority=P%d would_wait_s=%.1f "
+            "cap_s=%.1f pid=%d -- declining to deepen the queue; this "
+            "read is not sent and is retriable",
+            QUEUE_DEFERRED_EVENT, lock_owner(), category, priority, slept,
+            cap, os.getpid())
+        _PROCESS_METRICS.deferrals += 1
+        raise KISRateLimitQueueTooDeep(
+            "the shared KIS reservation queue is deeper than this caller's "
+            "priority may add to",
+            reason_code=REASON_QUEUE_TOO_DEEP,
+            detail=f"priority=P{priority} would_wait={slept:.1f}s cap={cap:.1f}s",
+        )
 
     # -- artifacts -------------------------------------------------------
 
@@ -1032,7 +1382,7 @@ class KisRateLimiter:
                 detail=f"version={version!r}")
         return data
 
-    def _store_state(self, path, state, category):
+    def _store_state(self, path, state, category, timer=None):
         """Writes the state ATOMICALLY: a temporary file in the same
         directory, fsynced, then os.replace()d over the target, then the
         directory itself fsynced.
@@ -1044,6 +1394,7 @@ class KisRateLimiter:
         a partial one, and the previous state survives any failure before
         the replace.
         """
+        timer = timer if timer is not None else _PhaseTimer()
         payload = dict(state)
         payload["version"] = STATE_VERSION
         temp_path = path.with_name(
@@ -1075,21 +1426,29 @@ class KisRateLimiter:
             ) from exc
         try:
             with handle:
-                json.dump(payload, handle)
-                handle.flush()
-                os.fsync(handle.fileno())
+                with timer.phase("TEMP_WRITE_MS"):
+                    json.dump(payload, handle)
+                    handle.flush()
+                # Timed apart from the write above on purpose: the write
+                # lands in the page cache and the fsync is what waits for
+                # the device, so conflating them would leave the same
+                # ambiguity the CMG incident had.
+                with timer.phase("FILE_FSYNC_MS"):
+                    os.fsync(handle.fileno())
         except OSError as exc:
             _fail("write", exc)
         except ValueError as exc:            # unserializable state
             _fail("serialize", exc)
 
         try:
-            os.chmod(temp_path, 0o600)
+            with timer.phase("CHMOD_MS"):
+                os.chmod(temp_path, 0o600)
         except OSError as exc:
             _fail("chmod", exc)
 
         try:
-            os.replace(temp_path, path)
+            with timer.phase("RENAME_MS"):
+                os.replace(temp_path, path)
         except OSError as exc:
             _fail("replace", exc)
 
@@ -1097,8 +1456,9 @@ class KisRateLimiter:
         # the old state while this process believes the new one is live.
         dir_fd = None
         try:
-            dir_fd = os.open(str(path.parent), os.O_RDONLY)
-            os.fsync(dir_fd)
+            with timer.phase("DIR_FSYNC_MS"):
+                dir_fd = os.open(str(path.parent), os.O_RDONLY)
+                os.fsync(dir_fd)
         except OSError as exc:
             self._alert(category, "state could not be persisted (directory fsync)")
             raise KISRateLimitStateUnavailable(

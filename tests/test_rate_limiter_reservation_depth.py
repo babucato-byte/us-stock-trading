@@ -91,9 +91,22 @@ class TestPacingIsUnchanged:
         assert "reserved = last + interval" in source
 
     def test_the_slot_is_stored_before_the_request_goes_out(self):
+        """Still the same invariant, matched on the call rather than on
+        one spelling of its argument list.
+
+        The persistence call now also carries the phase timer, so pinning
+        the exact argument string made this fail on an instrumentation
+        change that moved nothing. What must stay true is that the
+        reservation is made durable inside the lock, right after it is
+        computed -- so that is what is asserted.
+        """
         source = (REPO_ROOT / "brokers" / "kis_rate_limiter.py").read_text()
         block = source[source.index("reserved = last + interval"):]
-        assert "self._store_state(path, state, category)" in block[:900]
+        head = block[:1200]
+        assert "self._store_state(path, state, category" in head, (
+            "the reserved slot must be persisted before the request is sent")
+        assert head.index("self._store_state(") < head.index("return slept"), (
+            "the store must happen before the call returns to the caller")
 
 
 class TestQueuedCallersAcrossTheDepth:
