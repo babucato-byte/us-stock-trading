@@ -279,6 +279,28 @@ class TestFreshnessIsStatedNotAssumed:
     def test_the_module_declares_itself_shadow_only(self):
         assert abp.SHADOW_ONLY is True
 
+    def test_both_authority_blockers_are_recorded_in_the_module(self):
+        """SHADOW_ONLY must not be flipped without answering these.
+
+        Two independent blockers were MEASURED on 2026-09-16 and neither
+        is fixed by this module:
+
+        1. recent-SIP entitlement -- the tape is 15-17 min behind;
+        2. odd-lot exclusion -- the bars endpoint drops condition `I`
+           trades, which is ~100% of TMO's premarket and 95% of AAPL's.
+
+        (2) is the one a subscription upgrade does NOT fix, so a future
+        reader who sees only the delay and buys the higher plan would
+        still be wrong. Asserting both are written down is cheap; losing
+        the second one costs a silent class of missed candidates.
+        """
+        import inspect
+
+        source = inspect.getsource(abp)
+        for token in ("odd-lot", "condition `I`", "TMO", "RECALL 0.0",
+                      "does not permit querying recent SIP data"):
+            assert token in source, f"the {token!r} finding must not be lost"
+
 
 class TestFeedIsNeverSubstituted:
     """§4. IEX must not stand in for SIP."""

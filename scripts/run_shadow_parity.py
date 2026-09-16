@@ -21,6 +21,19 @@ false negative is a trade that silently stops happening, with nothing in
 any log to say a candidate was ever missed. They are not symmetric and
 this report does not average them.
 
+It is not free to run, and it is not read-only in effect
+--------------------------------------------------------
+The authoritative side makes real KIS calls, and those take reservations
+from the SAME cross-process rate limiter every production job shares.
+A 40-symbol run on 2026-09-16 lost that race: the limiter raised
+`KISRateLimitStateUnavailable`, and `kis_rate_limiter._alert` turned it
+into a live operator Slack alert. Nothing traded and nothing was
+corrupted, but a measurement that pages an operator is not a passive one.
+
+So: run it against a bounded sample, prefer a window when the per-minute
+crons are quiet, and never point it at the full universe during a live
+session.
+
 What this harness will NOT do
 -----------------------------
 Publish, order, write a candidate manifest, or touch the active-watch

@@ -35,6 +35,32 @@ decision: the freshness gate would be reading a tape that is a quarter of
 an hour behind. `is_fresh_enough()` states that in code rather than in a
 comment, and `SHADOW_ONLY` marks the intended role until the entitlement
 changes.
+
+The odd-lot gap, which is the bigger problem
+--------------------------------------------
+Alpaca's BARS endpoint excludes odd-lot trades. KIS's HDFSCNT0 tick
+stream includes them. Premarket in high-priced names is almost entirely
+odd lots, so the two disagree exactly where S6 looks.
+
+Measured on TMO ($642), 2026-09-16 premarket: the SIP TRADES endpoint
+shows 62 trades across 27 distinct minutes, of which 62 -- one hundred
+percent -- are under 100 shares and carry condition `I`. The SIP BARS
+endpoint returns ONE bar for the same window. The KIS chart returned 16.
+So the ORB5 opening range was computable from KIS and not computable
+here, and the parity run recorded TMO as a false negative: KIS 1
+positive, broad 0, RECALL 0.0.
+
+It is not confined to thin names. AAPL over the same window: 7,683
+trades across 258 minutes, 95% of them odd lots, against 161 bars from
+the bars endpoint.
+
+This is a property of the endpoint, not a defect in this module, and it
+is the single strongest argument against switching authority -- stronger
+than the freshness delay, because no subscription upgrade fixes it. The
+data does exist: `/v2/stocks/trades` is multi-symbol and odd-lot
+inclusive, so bars aggregated from the trade tape would close the gap.
+That is a different and much heavier fetch (10 symbols already paginate
+past the 10,000-row cap) and is deliberately NOT attempted here.
 """
 
 import logging
