@@ -34,7 +34,7 @@ import argparse
 import json
 import logging
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -54,6 +54,22 @@ ACTIVE_POOL_PROVIDER_KEY = "kis"
 #: pool itself is whatever the ranking holds. This is not a universe size
 #: and nothing downstream may treat it as one.
 DEFAULT_ACTIVE_POOL = 600
+
+#: How far behind "now" the shadow window must END.
+#:
+#: Not a tuning knob -- an entitlement boundary. This account holds SIP
+#: HISTORICAL only, and asking for a window that reaches into the last
+#: ~15 minutes is REFUSED outright: `{"message": "subscription does not
+#: permit querying recent SIP data"}`. Measured 15.3-17.3 min across
+#: AAPL/MSFT/NVDA/TSLA on 2026-09-16, so 20 clears it with margin.
+#:
+#: The consequence is stated rather than worked around: parity is
+#: measured on [origin, now - lag], and the authoritative side is cut to
+#: the SAME window before diffing. Comparing KIS's full session against
+#: a shadow window 20 minutes shorter would report the shadow missing
+#: every minute in the tail, which is an artifact of the subscription
+#: and not a property of the feed.
+ENTITLEMENT_LAG_MINUTES = 20
 
 
 def _providers(session, symbols, *, window, trading_day):
@@ -105,8 +121,16 @@ def _evaluate(provider, scanner, symbol, *, session, trading_day):
     return (signal, features, frame, None)
 
 
-def _bar_diff(a, b):
-    """How two frames for one symbol differ, minute by minute."""
+def _bar_diff(a, b, *, window=None):
+    """How two frames for one symbol differ, minute by minute.
+
+    Both sides are cut to `window` first. The authoritative provider sees
+    the live session and the shadow cannot (see ENTITLEMENT_LAG_MINUTES),
+    so an uncut diff would attribute the subscription's lag to the feed.
+    """
+    if window is not None:
+        a = _cut(a, window)
+        b = _cut(b, window)
     if a is None or b is None:
         return {"comparable": False,
                 "kis_bars": None if a is None else len(a),
@@ -136,6 +160,17 @@ def _bar_diff(a, b):
         "volume_mismatches_over_5pct": len(volume_gaps),
         "close_mismatch_sample": close_gaps[:3],
     }
+
+
+def _cut(frame, window):
+    """`frame` restricted to [start, end]. None stays None."""
+    if frame is None or len(frame) == 0:
+        return frame
+    start, end = window
+    try:
+        return frame[(frame.index >= start) & (frame.index <= end)]
+    except TypeError:      # a naive index cannot be compared to an aware bound
+        return frame
 
 
 def _feature_diff(a, b):
@@ -177,6 +212,10 @@ def main(argv=None):
                         help="cap the universe for a smoke run; NOT a fixed "
                              "size -- omit it for the real comparison")
     parser.add_argument("--out", default=None, help="write the JSON report here")
+    parser.add_argument("--end-lag-minutes", type=int,
+                        default=ENTITLEMENT_LAG_MINUTES,
+                        help="how far behind now the compared window ends; "
+                             "an entitlement boundary, not a preference")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
 
@@ -201,7 +240,12 @@ def main(argv=None):
     # real window -- from the official origin to now. Not a day count: a
     # window that wraps midnight is why `session_range` exists.
     fetch_start = origin
-    fetch_end = now
+    fetch_end = now - timedelta(minutes=args.end_lag_minutes)
+    if fetch_end <= fetch_start:
+        raise SystemExit(
+            f"{session} has not been open longer than the "
+            f"{args.end_lag_minutes}-minute entitlement lag yet; there is no "
+            "comparable window")
 
     symbols = _resolve_symbols(args, session=session, day=day)
     if not symbols:
@@ -239,7 +283,8 @@ def main(argv=None):
             "broad_error": b_err,
             "kis_score": _r(getattr(k_sig, "score", None)) if k_sig else None,
             "broad_score": _r(getattr(b_sig, "score", None)) if b_sig else None,
-            "bars": _bar_diff(k_frame, b_frame),
+            "bars": _bar_diff(k_frame, b_frame,
+                              window=(fetch_start, fetch_end)),
             "features": _feature_diff(k_feat, b_feat),
         })
 
@@ -253,6 +298,10 @@ def main(argv=None):
         "session": session,
         "session_date": str(session_date),
         "official_origin": origin.isoformat(),
+        "compared_window": {"start": fetch_start.isoformat(),
+                            "end": fetch_end.isoformat(),
+                            "end_lag_minutes": args.end_lag_minutes,
+                            "why": "SIP historical-only entitlement"},
         "universe_size": len(symbols),
         "universe_source": "explicit" if args.symbols else args.universe,
         "authoritative_provider": getattr(authoritative, "provider_name", "?"),
