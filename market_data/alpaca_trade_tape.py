@@ -181,6 +181,130 @@ class TradeTapeClient:
                 return
 
 
+    def stream_minute_bars(self, symbols: Sequence[str], *, start: datetime,
+                           end: Optional[datetime] = None,
+                           excluded_conditions=None) -> dict:
+        """Fold each page into bars and never retain the raw prints.
+
+        Why this exists, measured rather than assumed
+        ---------------------------------------------
+        `fetch_trades` + `to_minute_bars` holds the entire tape in
+        memory. On the production host -- 956MB total, 189MB free, 2
+        cores, already swapping -- that is what costs the time: the
+        aggregation itself runs at 3.1us/trade on an unloaded machine
+        and was measured at 81us/trade there, because 743k trade dicts
+        push the box into swap.
+
+        Bars are three orders of magnitude fewer than trades (20,450
+        bars from 811,251 trades at 100 symbols), so folding as the
+        pages arrive makes peak memory O(bars) instead of O(trades) and
+        takes the tape off the critical resource on this host.
+
+        Returns the same shape `to_minute_bars` does, per symbol.
+        """
+        excluded = (EXCLUDED_CONDITIONS if excluded_conditions is None
+                    else excluded_conditions)
+        wanted = [str(s).strip().upper() for s in symbols if str(s).strip()]
+        seen = set()
+        unique = [s for s in wanted if not (s in seen or seen.add(s))]
+
+        buckets: Dict[str, dict] = {}
+        conditions: Dict[str, Counter] = {}
+        odd_lots: Dict[str, int] = {}
+        used: Dict[str, int] = {}
+
+        began = time.time()
+        for index in range(0, len(unique), self._batch_size):
+            batch = unique[index:index + self._batch_size]
+            token = None
+            while True:
+                params = {
+                    "symbols": ",".join(batch),
+                    "start": _iso(start),
+                    "feed": FEED,
+                    "limit": str(MAX_LIMIT),
+                }
+                if end is not None:
+                    params["end"] = _iso(end)
+                if token:
+                    params["page_token"] = token
+
+                payload = self._get(params)
+                self.page_count += 1
+
+                for symbol, rows in (payload.get("trades") or {}).items():
+                    target = buckets.setdefault(symbol, {})
+                    histogram = conditions.setdefault(symbol, Counter())
+                    for row in rows or []:
+                        trade = _normalize_trade(row)
+                        if trade is None:
+                            continue
+                        self.raw_trade_count += 1
+                        for code in trade["conditions"]:
+                            histogram[code] += 1
+                        if excluded and (set(trade["conditions"])
+                                         & set(excluded)):
+                            continue
+                        used[symbol] = used.get(symbol, 0) + 1
+                        if trade["size"] < 100:
+                            odd_lots[symbol] = odd_lots.get(symbol, 0) + 1
+                        _fold(target, trade)
+
+                token = payload.get("next_page_token")
+                if not token:
+                    break
+        self.fetch_seconds += time.time() - began
+
+        out = {}
+        for symbol in unique:
+            target = buckets.get(symbol) or {}
+            bars = [target[minute] for minute in sorted(target)]
+            for bar in bars:
+                bar["symbol"] = symbol
+            out[symbol] = {
+                "bars": bars,
+                "conditions": conditions.get(symbol, Counter()),
+                "odd_lot_trades": odd_lots.get(symbol, 0),
+                "trades_used": used.get(symbol, 0),
+            }
+        return out
+
+
+def _fold(buckets, trade) -> None:
+    """Merge one print into its minute bucket, in place.
+
+    Pages arrive oldest-first WITHIN a symbol, so `open` is whatever
+    landed first and `close` is simply the latest seen. The high/low
+    comparisons do not depend on order at all, which is what lets this
+    run incrementally without buffering the symbol's prints.
+    """
+    minute = trade["at"].replace(second=0, microsecond=0)
+    bucket = buckets.get(minute)
+    if bucket is None:
+        buckets[minute] = {
+            "minute": minute, "open": trade["price"], "high": trade["price"],
+            "low": trade["price"], "close": trade["price"],
+            "volume": trade["size"],
+            "price_volume": trade["price"] * trade["size"],
+            "trade_count": 1,
+            "first_trade_at": trade["at"], "last_trade_at": trade["at"],
+        }
+        return
+    if trade["price"] > bucket["high"]:
+        bucket["high"] = trade["price"]
+    if trade["price"] < bucket["low"]:
+        bucket["low"] = trade["price"]
+    if trade["at"] >= bucket["last_trade_at"]:
+        bucket["close"] = trade["price"]
+        bucket["last_trade_at"] = trade["at"]
+    if trade["at"] < bucket["first_trade_at"]:
+        bucket["open"] = trade["price"]
+        bucket["first_trade_at"] = trade["at"]
+    bucket["volume"] += trade["size"]
+    bucket["price_volume"] += trade["price"] * trade["size"]
+    bucket["trade_count"] += 1
+
+
 def _iso(moment: datetime) -> str:
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)

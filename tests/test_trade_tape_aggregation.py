@@ -200,6 +200,86 @@ class TestFetchMechanics:
         assert client.fetch_seconds >= 0.0
 
 
+class TestStreamingMatchesBatch:
+    """Folding page-by-page must give byte-identical bars.
+
+    Streaming exists because the production host has 956MB of RAM and
+    already swaps; holding 743k trade dicts is what made aggregation
+    measure 81us/trade there against 3.1us/trade unloaded. That is only
+    a safe trade if the bars come out the same, so this compares the two
+    paths on the same prints rather than trusting that they agree.
+    """
+
+    def _client(self, pages):
+        class _Client(tape.TradeTapeClient):
+            def __init__(self, pages):
+                super().__init__(key="k", secret="s")
+                self._pages = list(pages)
+
+            def _get(self, params):
+                self.api_calls += 1
+                return self._pages.pop(0)
+
+        return _Client(pages)
+
+    def _raw(self, at, price, size, conditions=("T", "I")):
+        return {"t": at, "p": price, "s": size, "c": list(conditions)}
+
+    def test_streaming_equals_batch_across_page_boundaries(self):
+        """The same minute split over two pages must not become two bars."""
+        page_one = {"trades": {"X": [
+            self._raw("2026-09-16T08:00:05Z", 10.0, 5),
+            self._raw("2026-09-16T08:00:30Z", 12.0, 5)]},
+            "next_page_token": "p2"}
+        page_two = {"trades": {"X": [
+            self._raw("2026-09-16T08:00:55Z", 9.0, 5),
+            self._raw("2026-09-16T08:01:10Z", 11.0, 5)]},
+            "next_page_token": None}
+
+        streamed = self._client([page_one, page_two]).stream_minute_bars(
+            ["X"], start=T0)["X"]["bars"]
+
+        batched = self._client([page_one, page_two])
+        raw = batched.fetch_trades(["X"], start=T0)
+        expected = tape.to_minute_bars(raw["X"], symbol="X",
+                                       session="PREMARKET")["bars"]
+
+        assert len(streamed) == 2, "one bar per minute, not one per page"
+        assert len(expected) == len(streamed)
+        for a, b in zip(streamed, expected):
+            for field in ("minute", "open", "high", "low", "close",
+                          "volume", "trade_count"):
+                assert a[field] == b[field], field
+
+    def test_open_and_close_survive_the_fold(self):
+        page = {"trades": {"X": [
+            self._raw("2026-09-16T08:00:05Z", 10.0, 5),
+            self._raw("2026-09-16T08:00:30Z", 14.0, 5),
+            self._raw("2026-09-16T08:00:55Z", 11.0, 5)]},
+            "next_page_token": None}
+        bar = self._client([page]).stream_minute_bars(["X"], start=T0)["X"]["bars"][0]
+        assert bar["open"] == 10.0
+        assert bar["close"] == 11.0
+        assert bar["high"] == 14.0
+        assert bar["low"] == 10.0
+        assert bar["volume"] == 15.0
+
+    def test_streaming_keeps_the_odd_lot_counters(self):
+        page = {"trades": {"X": [
+            self._raw("2026-09-16T08:00:05Z", 10.0, 5),
+            self._raw("2026-09-16T08:00:30Z", 10.0, 500, ("T",))]},
+            "next_page_token": None}
+        out = self._client([page]).stream_minute_bars(["X"], start=T0)["X"]
+        assert out["odd_lot_trades"] == 1
+        assert out["trades_used"] == 2
+        assert out["conditions"]["I"] == 1
+
+    def test_a_symbol_with_no_prints_returns_an_empty_entry(self):
+        page = {"trades": {}, "next_page_token": None}
+        out = self._client([page]).stream_minute_bars(["X"], start=T0)
+        assert out["X"]["bars"] == []
+
+
 class TestIsolation:
     def test_the_tape_module_never_reaches_kis(self):
         """This phase forbids a KIS read; an import that does not exist
