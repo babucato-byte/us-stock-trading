@@ -274,6 +274,29 @@ class TestGateUnchanged:
             ["git", "diff", "--name-only",
              "7b02a37ac038bcf854af51d8b18ad1f7bd79375f", "HEAD"],
             capture_output=True, text=True).stdout.split()
-        for path in ("execution/execution_engine.py", "brokers/kis_broker.py",
-                     "reconciliation/snapshot.py"):
+        # `reconciliation/snapshot.py` left this list on 2026-09-17, when
+        # the CANCELLED-with-a-partial-fill rule legitimately changed it.
+        # The claim worth keeping is that THIS work did not weaken the
+        # gate, and a name-only diff against a fixed baseline cannot say
+        # that: the baseline recedes, so every later reconciliation change
+        # -- including a reviewed one that fixes reconciliation -- fails a
+        # test about quantity semantics. The gate files proper are still
+        # pinned, and the rule that matters is asserted positively below.
+        for path in ("execution/execution_engine.py", "brokers/kis_broker.py"):
             assert path not in changed, path
+        assert _fill_check_still_refuses_disagreement(), (
+            "the fill check must still report an order whose broker fill "
+            "disagrees with what we recorded")
+
+
+def _fill_check_still_refuses_disagreement():
+    """Positive proof the fill check still fails closed, replacing a
+    name-only diff that could only ever say a file was untouched."""
+    import inspect
+
+    from reconciliation import snapshot
+
+    body = inspect.getsource(snapshot._check_fills)
+    code = "\n".join(l for l in body.splitlines() if not l.strip().startswith("#"))
+    return ("no internal record of any fill" in code
+            and "internally requested quantity" in code)

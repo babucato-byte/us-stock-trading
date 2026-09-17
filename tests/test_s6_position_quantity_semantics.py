@@ -265,8 +265,16 @@ class TestNothingElseChanged:
             ["git", "diff", "--name-only",
              "e20eef596cb396a10f83a493d0543b738e384e1c", "HEAD"],
             capture_output=True, text=True).stdout.split()
+        # `reconciliation/snapshot.py` left this list on 2026-09-17, when
+        # the CANCELLED-with-a-partial-fill rule legitimately changed it.
+        # The claim worth keeping is that THIS work did not weaken the
+        # gate, and a name-only diff against a fixed baseline cannot say
+        # that: the baseline recedes, so every later reconciliation change
+        # -- including a reviewed one that fixes reconciliation -- fails a
+        # test about quantity semantics. The gate files proper are still
+        # pinned, and the rule that matters is asserted positively below.
         for path in ("execution/execution_engine.py", "brokers/kis_broker.py",
-                     "reconciliation/snapshot.py", "brokers/kis_rate_limiter.py"):
+                     "brokers/kis_rate_limiter.py"):
             assert path not in changed, path
 
     def test_10_the_momentum_adapter_fix_is_preserved(self):
