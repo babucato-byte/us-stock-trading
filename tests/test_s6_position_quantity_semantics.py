@@ -279,9 +279,23 @@ class TestNothingElseChanged:
             "the tuple unpack that fixed the live TypeError must stay")
         assert 'row["position_id"]' not in body
 
-    def test_the_sell_reduction_path_is_unchanged(self):
+    def test_the_sell_reduction_path_still_reduces(self):
+        """The BUY-side change must not disturb the SELL side.
+
+        This asserted that `exit_timeout` called
+        `reduce_after_partial_exit` directly, which was true when it was
+        written and is no longer: the double-reduction fix routed all
+        three reducing paths through one owner, because calling the
+        reducer directly from each of them is what applied the same
+        confirmed fill twice. The contract being guarded here is that the
+        cancel path still reduces at all -- not which function it reaches
+        for -- so it is asserted against the owner.
+        """
         import inspect
 
         from s6_live import exit_timeout
 
-        assert "reduce_after_partial_exit" in inspect.getsource(exit_timeout)
+        source = inspect.getsource(exit_timeout)
+        assert "apply_confirmed_exit_fill" in source
+        assert "reduce_after_partial_exit" not in source, (
+            "only the owner may reduce; a direct call here is the defect")
