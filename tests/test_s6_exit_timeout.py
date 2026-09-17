@@ -378,11 +378,24 @@ class TestS1AndOtherS6ExitBehaviorUnchanged:
         proof cannot distinguish "this module broke" from "an unrelated
         change landed in the same file", so it checks only the files
         that should never have either.
+
+        `s6_live/position_store.py` left this list for the same reason,
+        on 2026-09-17. The cancel path must now correct the position
+        quantity before releasing a partially-filled SELL for retry --
+        VIAV sold 1 of 4, was released with quantity still 4 against a
+        broker holding 3, and every retry for the next hour was refused
+        by the reconciliation gate. Doing that needs
+        `position_store.reduce_after_partial_exit`, so this module has a
+        real reason to touch that file and the byte-diff premise no
+        longer holds for it. The behavioural coverage is in
+        tests/test_s6_partial_sell_quantity_sync.py, which asserts the
+        reduction happens BEFORE the release rather than that the file
+        never changed.
         """
         import subprocess
 
         diff = subprocess.run(
             ["git", "diff", "--stat", "HEAD", "--", "s1_live/exit_runtime.py",
-             "s6_live/position_store.py", "state_store/exit_intent_ledger.py"],
+             "state_store/exit_intent_ledger.py"],
             capture_output=True, text=True).stdout
         assert diff.strip() == "", diff

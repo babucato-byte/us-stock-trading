@@ -232,19 +232,24 @@ def _observe_momentum(conn, *, session, now):
     from s6_live import momentum_shadow, position_store
     from s6_live.momentum import evaluate_position_momentum
 
+    # `load_live` returns (position_id, row) PAIRS -- List[Tuple[str, Dict]]
+    # -- which is how every other caller in exit_runtime and exit_timeout
+    # consumes it. Iterating it as if it were a list of rows made
+    # `row["symbol"]` an index into a tuple, and the observation stage
+    # raised TypeError on every tick from the moment it was deployed.
     rows = position_store.load_live(conn) or ()
     if not rows:
         return 0
     trading_day = us_trading_day(now)
     written = 0
-    for row in rows:
+    for position_id, row in rows:
         symbol = row["symbol"]
         try:
             result = evaluate_position_momentum(
                 symbol, session=session, now=now, trading_day=trading_day)
             view = momentum_shadow.compute_from_result(result)
             if momentum_shadow.observe_position(
-                    view, position_id=row["position_id"],
+                    view, position_id=position_id,
                     trading_day=trading_day,
                     existing_exit=row.get("exit_reason"),
                     momentum=result.as_record()):

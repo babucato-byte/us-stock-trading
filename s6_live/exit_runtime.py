@@ -858,6 +858,12 @@ def recover_dead_exits(conn, *, broker, fills_for, positions=None,
         # reported it. Only the intent is ended, so the next attempt can
         # reserve its own.
         _abort_intent(conn, pid)
+        # The shares this dead SELL did fill are gone from the account.
+        # Reduce before releasing, so the retry the next tick makes is
+        # sized to what is actually held rather than to the original
+        # position -- see position_store.reduce_after_partial_exit.
+        position_store.reduce_after_partial_exit(conn, pid, sold=sold,
+                                                 now=current)
         released = position_store.release_dead_exit(
             conn, pid, reason=row.get("exit_reason"), now=current)
         logger.warning(
@@ -1001,7 +1007,21 @@ def reconcile_unconfirmed_exits(conn, *, broker, positions=None,
     return outcomes
 
 
-def _abort_intent(conn, position_id) -> None:
+def filled_before_abort(intent) -> int:
+    """How much an abandoned exit intent had already filled.
+
+    Zero for a missing intent or an unreadable quantity -- an abandoned
+    SELL whose progress cannot be read must not shrink the position.
+    """
+    if not intent:
+        return 0
+    try:
+        return max(int(float(intent.get("confirmed_filled_qty") or 0)), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _abort_intent(conn, position_id):
     """End the exit intent without claiming the fill was confirmed.
 
     `mark_confirmed` takes a confirmed_filled_qty and means exactly that.
@@ -1014,7 +1034,14 @@ def _abort_intent(conn, position_id) -> None:
         intent = eil.get_active_intent(conn, position_id)
         if intent:
             eil.mark_aborted(conn, intent["intent_id"])
+        # Returned so the caller can see how much this abandoned SELL had
+        # already filled. `mark_aborted` deliberately asserts no
+        # execution, but the ledger still carries the progress recorded
+        # while the order was live, and that quantity is gone from the
+        # account whether or not the order was ever confirmed.
+        return intent
     except Exception:  # noqa: BLE001 - the position is already terminal;
         # losing the ledger's copy must not undo that.
         logger.warning("could not abort exit intent for %s", position_id,
                        exc_info=True)
+        return None

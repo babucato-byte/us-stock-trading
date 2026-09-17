@@ -331,9 +331,24 @@ def cancel_stale_sell(conn, *, broker, row, reason, account_id, now=None) -> Dic
                 "action": ACTION_CANCEL_UNKNOWN, "reason": reason,
                 "detail": "cancel accepted but order still appears open"}
 
+    from s6_live import exit_runtime as exit_runtime_module
     from s6_live.exit_runtime import _abort_intent
 
-    _abort_intent(conn, position_id)
+    # The cancelled SELL may have filled part of the position before the
+    # cancel reached the broker. This path had no fill lookup at all: it
+    # abandoned the order and released the row with `quantity` untouched,
+    # so the next retry asked for the ORIGINAL size. VIAV on 2026-09-17
+    # sold 1 of 4, was released here with quantity still 4 against a
+    # broker holding 3, and every retry for the next hour was refused by
+    # the reconciliation gate.
+    #
+    # The intent already carries what it filled, so no new broker read is
+    # needed to correct it.
+    intent = _abort_intent(conn, position_id)
+    sold = exit_runtime_module.filled_before_abort(intent)
+    if sold:
+        position_store.reduce_after_partial_exit(conn, position_id,
+                                                 sold=sold, now=current)
     released = position_store.release_dead_exit(
         conn, position_id, reason=row.get("exit_reason"), now=current)
     logger.warning(

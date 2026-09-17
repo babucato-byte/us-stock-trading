@@ -350,6 +350,60 @@ def mark_exit_submitted(conn, position_id, reason, *, now=None) -> bool:
     return bool(changed)
 
 
+def reduce_after_partial_exit(conn, position_id, *, sold, now=None) -> int:
+    """Take `sold` shares off a position whose SELL is being abandoned.
+
+    The same reduction `exit_runtime.sync_sell_fills` already performs on
+    a partial fill, extracted so the paths that CANCEL a partially-filled
+    SELL can apply it too. Those paths abandon the order and return the
+    row to EXIT_PENDING, and until now they left `quantity` at the value
+    it had before any shares were sold.
+
+    VIAV, 2026-09-17: SELL 4 accepted 09:11, 1 share filled, the stale
+    order cancelled 09:26 and the position released for retry with
+    `quantity` still 4 while KIS held 3. Every retry after that was
+    refused by the reconciliation gate -- "internal=4 KIS=3 (quantity
+    mismatch)" -- seven rejected orders between 09:35 and 10:22. The gate
+    was right; the quantity it read was not.
+
+    Returns the new quantity. A `sold` of zero or less changes nothing
+    and returns the current quantity: an abandoned SELL that filled
+    nothing must not shrink the position.
+    """
+    row = load(conn, position_id)
+    if row is None:
+        return 0
+    held = int(row.get("quantity") or 0)
+    try:
+        taken = int(sold or 0)
+    except (TypeError, ValueError):
+        return held
+    if taken <= 0:
+        return held
+    remaining = held - taken
+    if remaining == held:
+        return held
+    if remaining < 1:
+        # A held position must have at least one share -- the table's own
+        # CHECK says so -- and a SELL that filled the WHOLE position is
+        # the ordinary close path's business, not this one's. Reducing to
+        # zero here would either violate the constraint or invent a
+        # zero-share held state that no lifecycle rule knows about.
+        logger.warning(
+            "S6 %s: an abandoned SELL filled %s of %s -- leaving the position "
+            "for the close path rather than reducing it to %s",
+            row.get("symbol"), taken, held, remaining)
+        return held
+    conn.execute(
+        f"UPDATE {TABLE} SET quantity = ?, updated_at = ? WHERE position_id = ?",
+        (remaining, _now(now), position_id))
+    conn.commit()
+    logger.warning(
+        "S6 %s: position quantity reduced %s -> %s after an abandoned SELL "
+        "filled %s", row.get("symbol"), held, remaining, taken)
+    return remaining
+
+
 def release_dead_exit(conn, position_id, *, reason=None, now=None) -> bool:
     """EXIT_SUBMITTED -> EXIT_PENDING when the SELL is provably dead.
 
