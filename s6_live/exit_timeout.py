@@ -344,11 +344,17 @@ def cancel_stale_sell(conn, *, broker, row, reason, account_id, now=None) -> Dic
     #
     # The intent already carries what it filled, so no new broker read is
     # needed to correct it.
-    intent = _abort_intent(conn, position_id)
-    sold = exit_runtime_module.filled_before_abort(intent)
-    if sold:
-        position_store.reduce_after_partial_exit(conn, position_id,
-                                                 sold=sold, now=current)
+    # Through the one owner, and BEFORE the abort: the intent's progress
+    # is both what this SELL filled and the record of what has already
+    # been taken off the position, so re-applying it here subtracted the
+    # same shares the fill sync had. Aborting first would also make that
+    # record unwritable. A fill the sync has already applied yields zero
+    # and changes nothing.
+    intent = exit_runtime_module._active_intent(conn, position_id)
+    exit_runtime_module.apply_confirmed_exit_fill(
+        conn, position_id, intent,
+        exit_runtime_module.filled_before_abort(intent), now=current)
+    _abort_intent(conn, position_id)
     released = position_store.release_dead_exit(
         conn, position_id, reason=row.get("exit_reason"), now=current)
     logger.warning(

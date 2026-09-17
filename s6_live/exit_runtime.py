@@ -397,7 +397,16 @@ def sync_sell_fills(conn, *, fills_for, session=None, now=None) -> List[Dict[str
                 symbol, SELL_FILL_REPORTS_ZERO, fill.get("status"), sold,
                 held, row.get("status"))
             continue
-        if sold >= held:
+        # `sold` is the broker's CUMULATIVE total for this exit; `held` is
+        # what the position has LEFT after any earlier partial was applied.
+        # Comparing them directly closed the position the moment the
+        # running total reached the remainder -- 7 of 10 sold against a
+        # row already reduced to 5 read as "fully filled" and closed it
+        # with three shares still in the account. The increment is what
+        # this tick learned, and it is what answers the remainder.
+        intent = _active_intent(conn, pid)
+        delta = max(sold - filled_before_abort(intent), 0)
+        if delta >= held:
             # The broker's own average fill, carried through instead of
             # discarded: it is the only price at which the trade actually
             # ended, and nothing downstream can recover it later.
@@ -409,8 +418,8 @@ def sync_sell_fills(conn, *, fills_for, session=None, now=None) -> List[Dict[str
                 conn, pid, reason=row.get("exit_reason"),
                 exit_price=fill.get("average_fill_price"),
                 exit_session=_session_name(session), now=now)
-            intent = _settle_intent(conn, pid, sold, done=True)
-            if intent:
+            settled = _settle_intent(conn, pid, sold, done=True)
+            if settled:
                 # The broker fill that closed the position is direct,
                 # positive execution evidence.  Keep the idempotency
                 # projection terminal too; failure here never reopens the
@@ -418,10 +427,10 @@ def sync_sell_fills(conn, *, fills_for, session=None, now=None) -> List[Dict[str
                 from reconciliation import sell_projection
 
                 sell_projection.settle_confirmed_sell(
-                    conn, client_order_id=intent.get("client_order_id"),
-                    broker_order_id=intent.get("broker_order_id") or fill.get("order_id"),
+                    conn, client_order_id=settled.get("client_order_id"),
+                    broker_order_id=settled.get("broker_order_id") or fill.get("order_id"),
                     confirmed_filled_qty=sold,
-                    expected_quantity=intent.get("requested_qty"),
+                    expected_quantity=settled.get("requested_qty"),
                     event_type="SELL_FILL_SYNCED",
                     evidence="broker_fill_sync", now=now,
                 )
@@ -432,13 +441,14 @@ def sync_sell_fills(conn, *, fills_for, session=None, now=None) -> List[Dict[str
             _announce_sell_fill(conn, row, pid, symbol, sold, fill,
                                 session=session, remaining=0)
         else:
-            remaining = held - sold
-            conn.execute(
-                "UPDATE s6_positions SET quantity = ?, updated_at = ? "
-                "WHERE position_id = ?",
-                (remaining, position_store._now(now), pid))
-            conn.commit()
-            _settle_intent(conn, pid, sold, done=False)
+            # Was an inline UPDATE of `held - sold` plus a separate
+            # progress write. `sold` is the broker's CUMULATIVE total, so
+            # observing the same partial on a later tick subtracted it
+            # again -- this path double-applied on its own, before any
+            # recovery path was involved.
+            apply_confirmed_exit_fill(conn, pid, intent, sold, now=now)
+            fresh = position_store.load(conn, pid) or {}
+            remaining = int(fresh.get("quantity") or 0)
             results.append({"position_id": pid, "symbol": symbol,
                             "status": "PARTIALLY_SOLD", "sold": sold,
                             "remaining": remaining})
@@ -857,13 +867,24 @@ def recover_dead_exits(conn, *, broker, fills_for, positions=None,
         # The old order stays in the ledger exactly as the broker
         # reported it. Only the intent is ended, so the next attempt can
         # reserve its own.
+        # No reduction happens here, and that is load-bearing. The
+        # quantity guard immediately above returns unless
+        # `broker_qty >= held_row`: reaching this line means the account
+        # still holds everything the row claims, so no share of this
+        # position has left it and there is nothing to take off. The
+        # reduction that used to sit here subtracted the dead SELL's
+        # filled quantity unconditionally, on top of the reduction
+        # `sync_sell_fills` had already applied for the same fill -- a
+        # position of 10 whose abandoned SELL filled 4 went to 6 and then
+        # to 2, four shares removed twice, leaving the book BELOW the
+        # account and inverting the gate mismatch the reduction exists to
+        # prevent.
+        #
+        # The case where the row does exceed the broker -- the shares are
+        # genuinely gone -- never arrives here; it is the
+        # DEAD_SELL_QUANTITY_MISMATCH branch above, which deliberately
+        # refuses to act without corroboration.
         _abort_intent(conn, pid)
-        # The shares this dead SELL did fill are gone from the account.
-        # Reduce before releasing, so the retry the next tick makes is
-        # sized to what is actually held rather than to the original
-        # position -- see position_store.reduce_after_partial_exit.
-        position_store.reduce_after_partial_exit(conn, pid, sold=sold,
-                                                 now=current)
         released = position_store.release_dead_exit(
             conn, pid, reason=row.get("exit_reason"), now=current)
         logger.warning(
@@ -876,7 +897,9 @@ def recover_dead_exits(conn, *, broker, fills_for, positions=None,
             "status": DEAD_SELL_RELEASED, "released": bool(released),
             "dead_broker_order_id": fill.get("order_id"),
             "previously_filled": sold,
-            "retryable_quantity": held_row,
+            "retryable_quantity": int(
+                (position_store.load(conn, pid) or {}).get("quantity")
+                or held_row),
             "exit_reason": row.get("exit_reason"),
         })
     return outcomes
@@ -1019,6 +1042,89 @@ def filled_before_abort(intent) -> int:
         return max(int(float(intent.get("confirmed_filled_qty") or 0)), 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _active_intent(conn, position_id):
+    """The position's live exit intent, or None. Never raises: a ledger we
+    cannot read must not stop a fill from being applied."""
+    from state_store import exit_intent_ledger as eil
+
+    try:
+        return eil.get_active_intent(conn, position_id)
+    except Exception:  # noqa: BLE001
+        logger.warning("S6 could not read the exit intent for %s",
+                       position_id, exc_info=True)
+        return None
+
+
+def apply_confirmed_exit_fill(conn, position_id, intent, cumulative_sold,
+                              *, now=None) -> int:
+    """Apply a confirmed SELL fill to `quantity` EXACTLY ONCE.
+
+    The single owner of "this exit sold shares, take them off the
+    position". Three paths used to do it independently -- the ordinary
+    fill sync, dead-sell recovery and the stale-cancel release -- each
+    subtracting the broker's CUMULATIVE filled quantity as though it were
+    news. It is not news the second time. A position of 10 whose
+    abandoned SELL filled 4 went to 6 in the fill sync and then to 2 in
+    recovery: the same four shares removed twice, leaving the book below
+    what the account actually held and inverting the very gate mismatch
+    the reduction exists to prevent.
+
+    `cumulative_sold` is the broker's running total for this exit, not an
+    increment. What has already been taken off is the intent's
+    `confirmed_filled_qty`, which is only ever written here alongside the
+    reduction it describes -- so the difference is exactly the shares this
+    observation adds, and a repeated observation yields zero.
+
+    Modelled on positions.lifecycle._apply_exit_fill_progress, which has
+    kept the S1 exit path free of this bug by keying off the same
+    cumulative field. Returns the shares taken off by THIS call.
+    """
+    already = filled_before_abort(intent)
+    try:
+        target = max(int(float(cumulative_sold or 0)), 0)
+    except (TypeError, ValueError):
+        return 0
+
+    if target < already:
+        # A cumulative fill must never regress. Giving shares back on a
+        # bad read would invent stock the account does not hold, so this
+        # reports and changes nothing rather than guessing.
+        logger.warning(
+            "S6 %s: exit fill regressed from %s to %s -- position quantity "
+            "left alone", position_id, already, target)
+        return 0
+
+    delta = target - already
+    if delta <= 0:
+        return 0
+
+    before = position_store.load(conn, position_id) or {}
+    position_store.reduce_after_partial_exit(conn, position_id, sold=delta,
+                                             now=now)
+    after = position_store.load(conn, position_id) or {}
+    if int(after.get("quantity") or 0) == int(before.get("quantity") or 0):
+        # reduce_after_partial_exit declined -- it refuses to take a
+        # position below one share, leaving that to the close path. The
+        # intent must not record the shares as applied when they were not,
+        # or the next observation would skip them.
+        return 0
+
+    if intent:
+        from state_store import exit_intent_ledger as eil
+
+        try:
+            eil.update_progress(conn, intent["intent_id"], target)
+        except Exception:  # noqa: BLE001
+            # The shares are off the position either way. Losing the
+            # ledger's copy risks re-applying them later, so it is logged
+            # loudly rather than swallowed.
+            logger.warning(
+                "S6 %s: quantity reduced by %s but the exit intent could not "
+                "record it -- a later observation may re-apply the same fill",
+                position_id, delta, exc_info=True)
+    return delta
 
 
 def _abort_intent(conn, position_id):

@@ -154,7 +154,7 @@ class TestCancelPathReducesBeforeRelease:
         row = position_store.load(conn, pid)
         assert row["status"] == position_store.EXIT_PENDING
         assert not row["exit_submitted"], "released for retry"
-        assert "reduce_after_partial_exit" in \
+        assert "apply_confirmed_exit_fill" in \
             __import__("inspect").getsource(exit_timeout)
 
     def test_the_cancel_path_calls_the_reducer_before_releasing(self):
@@ -166,18 +166,28 @@ class TestCancelPathReducesBeforeRelease:
         from s6_live import exit_timeout
 
         body = _executable(exit_timeout.cancel_stale_sell)
-        assert "reduce_after_partial_exit" in body
-        assert body.index("reduce_after_partial_exit") < \
+        assert "apply_confirmed_exit_fill" in body
+        assert body.index("apply_confirmed_exit_fill") < \
             body.index("release_dead_exit"), (
             "the quantity must be corrected before the row is released")
+        # The "apply before abort" ordering is pinned behaviourally in
+        # TestExactlyOnce rather than here: this function imports
+        # `_abort_intent` at the top, so a textual index finds the import
+        # long before the call and proves nothing.
 
-    def test_9_recover_dead_exits_reduces_before_release(self):
+    def test_9_recover_dead_exits_does_not_reduce_at_all(self):
+        """Inverted deliberately. This assertion used to require the
+        reduction that WAS the defect: the branch is only reachable when
+        `broker_qty >= held_row`, so the account still holds everything
+        the row claims and there is nothing to take off. Subtracting the
+        dead SELL's fill there double-applied whatever `sync_sell_fills`
+        had already applied for the same fill."""
         import inspect
 
-        body = inspect.getsource(exit_runtime.recover_dead_exits)
-        assert "reduce_after_partial_exit" in body
-        assert body.index("reduce_after_partial_exit") < \
-            body.index("release_dead_exit")
+        body = _executable(exit_runtime.recover_dead_exits)
+        assert "reduce_after_partial_exit" not in body
+        assert "apply_confirmed_exit_fill" not in body
+        assert "_abort_intent" in body, "the stale intent must still be ended"
 
 
 # -- 4. the retry reads the corrected quantity ---------------------------
