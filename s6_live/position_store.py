@@ -231,7 +231,11 @@ def apply_fill(conn, position_id, *, filled_quantity, average_fill_price,
     # `quantity` IS the cumulative fill, because the old sync kept it
     # there. Falling back to it makes the first delta zero rather than
     # re-adding the whole position.
-    applied = row["entry_filled_quantity"]
+    # `.get`, not `[...]`: a database whose migration has not run has no
+    # such key at all, and this path runs on every buy-fill tick. Absent
+    # and NULL mean the same thing here -- no BUY record of its own -- so
+    # both fall back to `quantity`, making the first delta zero.
+    applied = row.get("entry_filled_quantity")
     applied = held if applied is None else int(applied)
     delta = cumulative - applied
     if delta <= 0:

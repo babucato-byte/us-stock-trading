@@ -220,10 +220,29 @@ class TestDurability:
         assert _buy_sync(conn, pid, 4) is False
         assert _held(conn, pid) == 4
 
+    def test_the_migration_is_numbered_above_every_applied_version(self):
+        """Production is at 30: feature/exit-v2 applied 28/29/30 to the live
+        DB while the deployed line defines only up to 27. A migration
+        numbered 28 would be recorded as applied and silently skipped."""
+        from state_store.migrations import MIGRATIONS
+
+        versions = [m[0] for m in MIGRATIONS]
+        assert 31 in versions
+        assert max(versions) == 31
+        assert len(versions) == len(set(versions)), "duplicate migration version"
+
+    def test_a_missing_column_is_survivable(self, conn):
+        """If the migration has not run, the read must not raise."""
+        pid = _submitted(conn)
+        _buy_sync(conn, pid, 4)
+        row = dict(position_store.load(conn, pid))
+        row.pop("entry_filled_quantity", None)
+        assert row.get("entry_filled_quantity") is None
+
     def test_the_migration_backfills_existing_rows(self):
         from state_store.migrations import MIGRATIONS
 
-        entry = next(m for m in MIGRATIONS if m[0] == 28)
+        entry = next(m for m in MIGRATIONS if m[0] == 31)
         sql = " ".join(entry[2]).upper()
         assert "ADD COLUMN ENTRY_FILLED_QUANTITY" in sql
         assert "UPDATE S6_POSITIONS SET ENTRY_FILLED_QUANTITY = QUANTITY" in sql

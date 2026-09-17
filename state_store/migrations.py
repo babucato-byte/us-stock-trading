@@ -22,7 +22,7 @@ from state_store.schema import (
     MIGRATION_23_STATEMENTS, MIGRATION_24_STATEMENTS,
     MIGRATION_25_STATEMENTS, MIGRATION_26_STATEMENTS,
     MIGRATION_27_STATEMENTS,
-    MIGRATION_28_STATEMENTS,
+    MIGRATION_31_STATEMENTS,
 )
 
 MIGRATIONS = [
@@ -92,10 +92,10 @@ MIGRATIONS = [
      MIGRATION_26_STATEMENTS),
     (27, "S6 ACTIVE WATCH: durable full-scan through fill latency timestamps",
      MIGRATION_27_STATEMENTS),
-    (28, "S6 QUANTITY SEMANTICS: s6_positions.entry_filled_quantity -- the BUY "
+    (31, "S6 QUANTITY SEMANTICS: s6_positions.entry_filled_quantity -- the BUY "
          "side gets its own field so `quantity` can mean shares CURRENTLY "
          "HELD, and a buy-fill sync stops undoing SELL reductions",
-     MIGRATION_28_STATEMENTS),
+     MIGRATION_31_STATEMENTS),
 ]
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1][0]

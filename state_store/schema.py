@@ -1305,6 +1305,13 @@ _S6_LINEAGE_TIMESTAMPS = (
 # Backfilled from `quantity` because for every row written before this
 # migration that IS the cumulative BUY fill -- the buy sync had been keeping
 # it there, which is the whole defect.
+#
+# Numbered 31, not 28. The production database is already at version 30:
+# `feature/exit-v2` applied 28, 29 and 30 ("EXIT V2 PHASE 1/2/3") against the
+# live DB on 2026-09-10/11, while the deployed code line only defines up to
+# 27. A migration numbered 28 would be recorded as already applied and
+# SILENTLY SKIPPED, leaving the column absent -- which `apply_fill` would
+# then fail on, every tick. Caught at the pre-deploy snapshot on 2026-09-17.
 S6_POSITIONS_ADD_ENTRY_FILLED_QUANTITY = """
 ALTER TABLE s6_positions ADD COLUMN entry_filled_quantity INTEGER
 """
@@ -1314,7 +1321,7 @@ UPDATE s6_positions SET entry_filled_quantity = quantity
  WHERE entry_filled_quantity IS NULL
 """
 
-MIGRATION_28_STATEMENTS = [
+MIGRATION_31_STATEMENTS = [
     S6_POSITIONS_ADD_ENTRY_FILLED_QUANTITY,
     S6_POSITIONS_BACKFILL_ENTRY_FILLED_QUANTITY,
 ]
