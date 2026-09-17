@@ -1285,6 +1285,40 @@ _S6_LINEAGE_TIMESTAMPS = (
     "source_consumed_at", "precision_watch_started_at", "broker_submit_at",
     "fill_at",
 )
+# ---------------------------------------------------------------------------
+# `s6_positions.quantity` meant two different things, and the two writers
+# fought.
+#
+# `sync_buy_fills` treated it as the CUMULATIVE BUY fill and re-asserted it
+# every tick; the SELL lifecycle treated it as the shares CURRENTLY HELD and
+# reduced it. VIAV on 2026-09-17: bought 4, sold 1, broker held 3, the
+# position was corrected to 3 -- and the next buy-fill sync put it back to 4,
+# because 4 (cumulative) was greater than 3 (held). Seven SELLs were then
+# refused by the order gate for "internal=4 KIS=3".
+#
+# `entry_filled_quantity` gives the BUY side its own field, so `quantity` can
+# mean one thing: shares currently held. The buy sync now applies the DELTA
+# between the broker's cumulative fill and what has already been applied,
+# which is idempotent, still admits a late partial, and leaves SELL
+# reductions alone.
+#
+# Backfilled from `quantity` because for every row written before this
+# migration that IS the cumulative BUY fill -- the buy sync had been keeping
+# it there, which is the whole defect.
+S6_POSITIONS_ADD_ENTRY_FILLED_QUANTITY = """
+ALTER TABLE s6_positions ADD COLUMN entry_filled_quantity INTEGER
+"""
+
+S6_POSITIONS_BACKFILL_ENTRY_FILLED_QUANTITY = """
+UPDATE s6_positions SET entry_filled_quantity = quantity
+ WHERE entry_filled_quantity IS NULL
+"""
+
+MIGRATION_28_STATEMENTS = [
+    S6_POSITIONS_ADD_ENTRY_FILLED_QUANTITY,
+    S6_POSITIONS_BACKFILL_ENTRY_FILLED_QUANTITY,
+]
+
 MIGRATION_27_STATEMENTS = [
     f"ALTER TABLE order_lineage ADD COLUMN {name} TEXT"
     for name in _S6_LINEAGE_TIMESTAMPS

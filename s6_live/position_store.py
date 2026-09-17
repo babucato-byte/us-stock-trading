@@ -124,7 +124,8 @@ def open_from_fill(conn, position_id, *, quantity, average_fill_price,
     stamp = _now(now)
     changed = conn.execute(
         f"""UPDATE {TABLE}
-            SET status = ?, quantity = ?, entry_price = ?, entry_time = ?,
+            SET status = ?, quantity = ?, entry_filled_quantity = ?,
+                entry_price = ?, entry_time = ?,
                 venue = COALESCE(?, venue),
                 entry_order_id = COALESCE(?, entry_order_id),
                 peak_price = ?, peak_price_at = ?, trough_price = ?,
@@ -136,8 +137,12 @@ def open_from_fill(conn, position_id, *, quantity, average_fill_price,
         # against us, and one that only fell would report no give-back.
         # The peak is dated from the same moment: its age is what tells
         # a fresh high's shake from a stale high's stall.
-        (OPEN, qty, price, stamp, venue, entry_order_id, price, stamp, price,
-         stamp, position_id, SUBMITTED)).rowcount
+        # `entry_filled_quantity` is the BUY side's own record: the
+        # cumulative fill applied so far. `quantity` is the shares HELD,
+        # which SELLs reduce and this must never re-assert -- see
+        # migration 28.
+        (OPEN, qty, qty, price, stamp, venue, entry_order_id, price, stamp,
+         price, stamp, position_id, SUBMITTED)).rowcount
     conn.commit()
     if changed:
         logger.info("S6 position opened: %s qty=%d @ %.4f", position_id,
@@ -186,8 +191,22 @@ def apply_fill(conn, position_id, *, filled_quantity, average_fill_price,
     A partial fill opens the position at the quantity actually filled --
     a position of one share is a real position. A LATER fill for the same
     order raises the quantity and re-averages the price; applying the
-    same fill twice does not, because the cumulative filled quantity is
-    what is compared, not the delta.
+    same fill twice does not.
+
+    What is compared, and why it changed
+    ------------------------------------
+    The broker's CUMULATIVE fill is compared against
+    `entry_filled_quantity` -- the BUY fill already applied to this
+    position -- and only the DELTA is added to `quantity`.
+
+    It used to compare the cumulative fill against `quantity` itself and
+    overwrite it, which silently made `quantity` mean "cumulative BUY
+    fill". That is wrong the moment anything sells: VIAV on 2026-09-17
+    bought 4, sold 1, was corrected to 3, and the next sync restored 4
+    because 4 > 3 -- then the order gate refused every SELL for
+    "internal=4 KIS=3". Comparing against the BUY's own record instead
+    leaves SELL reductions alone, stays idempotent (a repeat gives a
+    delta of zero) and still admits a late partial (delta of one).
     """
     row = load(conn, position_id)
     if row is None:
@@ -208,18 +227,31 @@ def apply_fill(conn, position_id, *, filled_quantity, average_fill_price,
     if row["status"] not in HELD_STATUSES:
         return False
     held = int(row["quantity"] or 0)
-    if cumulative <= held:
-        # Already applied. Re-applying would double a position that the
-        # broker reports once -- the failure a retried sync invites.
+    # A row written before migration 28 has no BUY record of its own; its
+    # `quantity` IS the cumulative fill, because the old sync kept it
+    # there. Falling back to it makes the first delta zero rather than
+    # re-adding the whole position.
+    applied = row["entry_filled_quantity"]
+    applied = held if applied is None else int(applied)
+    delta = cumulative - applied
+    if delta <= 0:
+        # Already applied. Re-applying would double a position the broker
+        # reports once -- the failure a retried sync invites -- and this
+        # is also the path that must NOT undo a SELL: after selling 1 of
+        # 4 the cumulative fill is still 4, the applied fill is still 4,
+        # and the delta is zero.
         return False
     price = _finite(average_fill_price)
     if price is None or price <= 0:
         return False
     conn.execute(
-        f"""UPDATE {TABLE} SET quantity = ?, entry_price = ?, updated_at = ?
+        f"""UPDATE {TABLE} SET quantity = ?, entry_filled_quantity = ?,
+                entry_price = ?, updated_at = ?
             WHERE position_id = ?""",
-        (cumulative, price, _now(now), position_id))
+        (held + delta, cumulative, price, _now(now), position_id))
     conn.commit()
+    logger.info("S6 %s: BUY fill delta +%d applied (cumulative %d, held %d -> %d)",
+                row.get("symbol"), delta, cumulative, held, held + delta)
     return True
 
 
