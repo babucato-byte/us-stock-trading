@@ -169,14 +169,25 @@ def test_latency_derivation_keeps_missing_unknown():
     assert result["execution_latency_seconds"] is None
 
 
-def test_migration_27_has_every_required_latency_timestamp():
-    from state_store import db, migrations
+def test_order_lineage_has_every_required_latency_timestamp():
+    """Migration 27's contract: `order_lineage` carries every timestamp a
+    post-mortem needs to walk a candidate from full scan to fill.
+
+    The `CURRENT_SCHEMA_VERSION == 27` assertion that used to sit here was
+    not part of that contract. It pinned a literal "27 is the newest
+    migration", so every later migration broke a test named for latency
+    timestamps while saying nothing about them -- and the version it
+    pinned had already been wrong for weeks: production applied 28, 29 and
+    30 from another branch. Version-currentness is a property of the
+    migration registry and is asserted there, in test_state_store.py,
+    in a form that does not need editing every time a column is added.
+    """
+    from state_store import db
     conn = db.open_db()
     try:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(order_lineage)")}
     finally:
         conn.close()
-    assert migrations.CURRENT_SCHEMA_VERSION == 27
     assert {"full_scan_started_at", "symbol_evaluated_at",
             "candidate_discovered_at", "watchlist_added_at",
             "fast_watch_evaluated_at", "candidate_published_at",

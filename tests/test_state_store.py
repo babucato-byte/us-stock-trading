@@ -25,6 +25,25 @@ def conn(tmp_path):
 # Schema / migrations
 # ---------------------------------------------------------------------------
 
+def test_the_migration_registry_is_ordered_unique_and_current():
+    """The registry's own invariants, kept out of the feature tests.
+
+    Replaces a `CURRENT_SCHEMA_VERSION == 27` literal that lived in
+    test_s6_active_watch_runtime and broke on every later migration while
+    testing nothing about the feature it was named for. Asserted as
+    properties rather than a number, so adding a migration never requires
+    editing this test -- only genuinely breaking the ordering does.
+    """
+    from state_store.migrations import CURRENT_SCHEMA_VERSION, MIGRATIONS
+
+    versions = [m[0] for m in MIGRATIONS]
+    assert versions == sorted(versions), "migrations must be registered in order"
+    assert len(versions) == len(set(versions)), f"duplicate migration version in {versions}"
+    assert CURRENT_SCHEMA_VERSION == max(versions), (
+        "CURRENT_SCHEMA_VERSION must be the newest registered migration")
+    assert all(v >= 1 for v in versions)
+
+
 def test_init_db_creates_every_expected_table(conn):
     tables = {
         row["name"] for row in
