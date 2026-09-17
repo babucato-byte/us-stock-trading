@@ -68,11 +68,20 @@ class TestHMA20:
         assert ms.min_bars_for_hma() == min_bars_for_hma(20) == 23
 
     def test_it_reuses_the_framework_fast_hma(self):
-        """Not a second copy of the maths."""
+        """Not a second copy of the maths, at either level.
+
+        This module now delegates to `s6_live/momentum/indicators.py`,
+        which is the only file that knows the pair -- and that file in
+        turn uses the framework's `hma_series` rather than its own HMA.
+        """
         import inspect
 
-        assert "from scanners.base.indicators import hma_series" in \
+        from s6_live.momentum import indicators as ind
+
+        assert "from s6_live.momentum import indicators" in \
             inspect.getsource(ms._hma_fields)
+        assert "from scanners.base.indicators import hma_series" in \
+            inspect.getsource(ind._hma)
 
     def test_a_rising_series_is_direction_up(self):
         view = ms.compute(_bars(_accelerating()), symbol="A", session="REGULAR")

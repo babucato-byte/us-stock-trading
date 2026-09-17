@@ -184,6 +184,14 @@ def run_once(*, now=None) -> dict:
                 conn, broker=broker, fills_for=_sell_fill_lookup(
                     conn, broker, now=moment, open_orders=open_orders),
                 session=session, now=moment)),
+            # LAST, and after every exit stage above has already run.
+            # Observation only: s6_live/momentum is read by the daily
+            # analysis and decides nothing, so it cannot influence a SELL
+            # -- and the loop below already isolates each stage, which is
+            # what makes an observation failure unable to stop exit
+            # monitoring (§10).
+            ("momentum_observation", lambda: _observe_momentum(
+                conn, session=session, now=moment)),
         ):
             try:
                 report[stage] = call()
@@ -206,6 +214,45 @@ def run_once(*, now=None) -> dict:
             logger.warning("S6 monitor heartbeat not recorded", exc_info=True)
         _attach_session_report(report, conn=conn, session=session, now=moment)
     return report
+
+
+def _observe_momentum(conn, *, session, now):
+    """Record what momentum says about every OPEN position. Never sells.
+
+    Deliberately NOT gated on the entry stabilization window: a position
+    is already exposed, and making its weakness invisible for the first
+    five minutes of a new session would be a gap in monitoring rather
+    than a safety margin. `evaluate_position_momentum` encodes that.
+
+    Reads the collector's bar snapshots (a file read) and the position
+    rows the tick already loaded. No broker call, no order, no mutation
+    of position or order state.
+    """
+    from market_hours import us_trading_day
+    from s6_live import momentum_shadow, position_store
+    from s6_live.momentum import evaluate_position_momentum
+
+    rows = position_store.load_live(conn) or ()
+    if not rows:
+        return 0
+    trading_day = us_trading_day(now)
+    written = 0
+    for row in rows:
+        symbol = row["symbol"]
+        try:
+            result = evaluate_position_momentum(
+                symbol, session=session, now=now, trading_day=trading_day)
+            view = momentum_shadow.compute_from_result(result)
+            if momentum_shadow.observe_position(
+                    view, position_id=row["position_id"],
+                    trading_day=trading_day,
+                    existing_exit=row.get("exit_reason"),
+                    momentum=result.as_record()):
+                written += 1
+        except Exception:  # noqa: BLE001 - one symbol, never the sweep
+            logger.debug("momentum observation failed for %s", symbol,
+                         exc_info=True)
+    return written
 
 
 def _adopt_untracked_when_flat(conn, *, now):

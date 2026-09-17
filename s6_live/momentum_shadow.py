@@ -147,157 +147,115 @@ class MomentumView:
 
 
 def min_bars_for_hma(length=HMA_LENGTH) -> int:
-    """Delegated to the framework's own formula, not restated here."""
-    from scanners.base.indicators import min_bars_for_hma as _minimum
+    """Delegated: the momentum module owns the indicator contract."""
+    from s6_live.momentum.indicators import min_bars_for_hma as _minimum
 
     return int(_minimum(int(length)))
 
 
-def _finite(value) -> Optional[float]:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return number if math.isfinite(number) else None
+def _finite(value):
+    from s6_live.momentum.indicators import _finite as _f
+
+    return _f(value)
 
 
 def _frame(bars):
-    """The bars S6 already holds, as the frame the indicators expect.
+    """Delegated: `s6_live/momentum/indicators.py` owns the maths."""
+    from s6_live.momentum.indicators import frame_from
 
-    `Close` is the column name both `indicators.get_close_series` and
-    `scanners.base.indicators.close_series` look for first, so one frame
-    serves the HMA and the MACD without either being adapted.
-    """
-    import pandas as pd
-
-    rows, stamps = [], []
-    for bar in bars or ():
-        close = _finite(getattr(bar, "close", None))
-        minute = getattr(bar, "minute", None)
-        if close is None or minute is None:
-            continue
-        rows.append({"Close": close})
-        stamps.append(minute)
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows, index=pd.DatetimeIndex(stamps, name="Datetime"))
-
-
-def compute(bars, *, symbol, session, now=None) -> MomentumView:
-    """Both indicators from bars already loaded. Pure: no I/O at all.
-
-    Never raises. An indicator that cannot be computed is reported
-    unavailable with a reason, because a failed observation must not be
-    able to disturb the live cycle it is observing.
-    """
-    moment = (now or datetime.now(timezone.utc))
-    frame = _frame(bars)
-    count = int(len(frame))
-    base = {"symbol": symbol, "session": session,
-            "observed_at": moment.isoformat(), "bar_count": count,
-            "hma_min_bars": min_bars_for_hma()}
-
-    if count == 0:
-        return MomentumView(unavailable_reason="NO_BARS", **base)
-
-    hma_fields, hma_reason = _hma_fields(frame)
-    macd_fields, macd_reason = _macd_fields(frame)
-    reason = hma_reason or macd_reason
-    return MomentumView(unavailable_reason=reason, **base,
-                        **hma_fields, **macd_fields)
-
-
-def _hma_fields(frame):
-    """HMA20 value, previous and slope, via the framework's fast HMA."""
-    try:
-        from scanners.base.indicators import hma_series
-
-        series = hma_series(frame, HMA_LENGTH)
-    except Exception:  # noqa: BLE001 - an observation, never a failure
-        logger.debug("HMA%d unavailable", HMA_LENGTH, exc_info=True)
-        return _empty_hma(), "HMA_COMPUTE_FAILED"
-
-    values = [v for v in (_finite(x) for x in list(series)) if v is not None]
-    if len(values) < 2:
-        return _empty_hma(), "HMA_INSUFFICIENT_BARS"
-
-    current, previous = values[-1], values[-2]
-    slope = current - previous
-    if slope > 0:
-        direction = DIRECTION_UP
-    elif slope < 0:
-        direction = DIRECTION_DOWN
-    else:
-        direction = DIRECTION_FLAT
-    return ({"hma_available": True, "hma_value": current,
-             "hma_previous": previous, "hma_slope": slope,
-             "hma_direction": direction}, None)
-
-
-def _empty_hma():
-    return {"hma_available": False, "hma_value": None, "hma_previous": None,
-            "hma_slope": None, "hma_direction": DIRECTION_UNKNOWN}
-
-
-def _macd_fields(frame):
-    """Histogram, its previous value and the delta, from the existing
-    production HMA-MACD."""
-    try:
-        table = _hma_macd(frame)
-    except Exception:  # noqa: BLE001
-        logger.debug("HMA-MACD unavailable", exc_info=True)
-        return _empty_macd(), "MACD_COMPUTE_FAILED"
-
-    histogram = [v for v in (_finite(x) for x in
-                             list(table.get("hma_macd_histogram", [])))
-                 if v is not None]
-    if len(histogram) < 2:
-        return _empty_macd(), "MACD_INSUFFICIENT_BARS"
-
-    current, previous = histogram[-1], histogram[-2]
-    return ({"macd_available": True,
-             "macd": _finite(list(table["hma_macd_line"])[-1]),
-             "macd_signal": _finite(list(table["hma_macd_signal"])[-1]),
-             "histogram": current, "histogram_previous": previous,
-             "histogram_delta": current - previous}, None)
+    return frame_from(bars)
 
 
 def _hma_macd(frame):
-    """`indicators.calculate_hma_macd`'s configuration, on the fast HMA.
+    from s6_live.momentum.indicators import hma_macd
 
-    Same formula, same 12/26/9, same EWM signal with `min_periods` --
-    the ONLY difference is which HMA implementation computes the two
-    lines. The reference `indicators.hma` is a per-bar rolling `apply`
-    and measured 51.9ms per symbol here; `hma_series` is the convolution
-    the scanner framework already uses for exactly this reason ("the
-    reference implementation cost 0.90s per symbol ... and this returns
-    the same numbers in under a millisecond").
+    return hma_macd(frame)
 
-    At roughly 40 watched symbols on a one-minute fast-watch tick, 51.9ms
-    each is ~2s of pure arithmetic added to a latency-sensitive path, for
-    a feature that is only supposed to observe. Equivalence to the
-    reference is pinned by a test rather than assumed.
-    """
-    import pandas as pd
 
-    from scanners.base.indicators import hma_series
+def _hma_fields(frame):
+    from s6_live.momentum import indicators as ind
 
-    fast = hma_series(frame, MACD_FAST)
-    slow = hma_series(frame, MACD_SLOW)
-    macd_line = fast - slow
-    signal_line = macd_line.ewm(span=MACD_SIGNAL, adjust=False,
-                                min_periods=MACD_SIGNAL).mean()
-    return pd.DataFrame({
-        "hma_macd_line": macd_line,
-        "hma_macd_signal": signal_line,
-        "hma_macd_histogram": macd_line - signal_line,
-    })
+    fields, reason, _ = ind.measure(frame)
+    keep = ("hma_available", "hma_value", "hma_previous", "hma_slope",
+            "hma_direction")
+    return ({k: fields[k] for k in keep},
+            None if fields["hma_available"] else _legacy_reason(reason, "HMA"))
+
+
+def _empty_hma():
+    from s6_live.momentum.indicators import _empty_hma as _e
+
+    return _e()
+
+
+def _macd_fields(frame):
+    from s6_live.momentum import indicators as ind
+
+    fields, reason, _ = ind.measure(frame)
+    return ({"macd_available": fields["macd_available"],
+             "macd": fields["macd"], "macd_signal": fields["signal"],
+             "histogram": fields["histogram"],
+             "histogram_previous": fields["histogram_previous"],
+             "histogram_delta": fields["histogram_delta"]},
+            None if fields["macd_available"] else _legacy_reason(reason, "MACD"))
 
 
 def _empty_macd():
-    return {"macd_available": False, "macd": None, "macd_signal": None,
-            "histogram": None, "histogram_previous": None,
-            "histogram_delta": None}
+    from s6_live.momentum.indicators import _empty_macd as _e
+
+    fields = _e()
+    fields["macd_signal"] = fields.pop("signal")
+    fields.pop("macd_direction", None)
+    return fields
+
+
+def _legacy_reason(reason, prefix):
+    """This module's older reason spellings, kept for its own readers."""
+    if reason == "INSUFFICIENT_HISTORY":
+        return f"{prefix}_INSUFFICIENT_BARS"
+    if reason == "COMPUTE_FAILED":
+        return f"{prefix}_COMPUTE_FAILED"
+    return reason
+
+
+def compute(bars, *, symbol, session, now=None):
+    view, _ = compute_timed(bars, symbol=symbol, session=session, now=now)
+    return view
+
+
+def compute_timed(bars, *, symbol, session, now=None):
+    """`(view, timings_ms)` -- the measurement, via the momentum module."""
+    from datetime import datetime as _dt
+
+    from s6_live.momentum import indicators as ind
+
+    moment = now or _dt.now(timezone.utc)
+    started = time.perf_counter()
+    frame = ind.frame_from(bars)
+    frame_ms = (time.perf_counter() - started) * 1000.0
+    fields, reason, timings = ind.measure(frame)
+
+    hma = {k: fields[k] for k in ("hma_available", "hma_value", "hma_previous",
+                                  "hma_slope", "hma_direction")}
+    macd = {"macd_available": fields["macd_available"], "macd": fields["macd"],
+            "macd_signal": fields["signal"], "histogram": fields["histogram"],
+            "histogram_previous": fields["histogram_previous"],
+            "histogram_delta": fields["histogram_delta"]}
+    legacy = None
+    if not fields["hma_available"]:
+        legacy = _legacy_reason(reason, "HMA")
+    elif not fields["macd_available"]:
+        legacy = _legacy_reason(reason, "MACD")
+    view = MomentumView(symbol=symbol, session=session,
+                        observed_at=moment.isoformat(),
+                        bar_count=int(len(frame)),
+                        hma_min_bars=min_bars_for_hma(),
+                        unavailable_reason=legacy, **hma, **macd)
+    timings = dict(timings)
+    timings["FRAME_BUILD_MS"] = round(frame_ms, 3)
+    timings["TOTAL_AUX_COMPUTE_MS"] = round(
+        frame_ms + timings["HMA_COMPUTE_MS"] + timings["MACD_COMPUTE_MS"], 3)
+    return view, timings
 
 
 # -- the log -------------------------------------------------------------
@@ -349,8 +307,30 @@ def observe(evaluation, view, *, trading_day, env=None, extra=None) -> bool:
     return append(record, trading_day=trading_day, env=env)
 
 
+def compute_from_result(result) -> "MomentumView":
+    """A `MomentumResult` from `s6_live.momentum` as this log's view.
+
+    An adapter, not a second measurement: the numbers are the module's,
+    and this only renames them into the shape this log already writes so
+    the existing analysis helpers keep working.
+    """
+    return MomentumView(
+        symbol=result.symbol, session=result.session,
+        observed_at=result.observed_at,
+        bar_count=int(result.current_session_bar_count
+                      + result.inherited_bar_count),
+        hma_available=result.hma_available, hma_value=result.hma_value,
+        hma_previous=result.hma_previous, hma_slope=result.hma_slope,
+        hma_direction=result.hma_direction,
+        macd_available=result.macd_available, macd=result.macd,
+        macd_signal=result.signal, histogram=result.histogram,
+        histogram_previous=result.histogram_previous,
+        histogram_delta=result.histogram_delta,
+        hma_min_bars=min_bars_for_hma(), unavailable_reason=result.reason)
+
+
 def observe_position(view, *, position_id, trading_day, existing_exit=None,
-                     env=None) -> bool:
+                     env=None, momentum=None) -> bool:
     """Record one tick for an OPEN position -- the exit side.
 
     `existing_exit` is whatever the live exit path decided this tick, so
@@ -365,6 +345,11 @@ def observe_position(view, *, position_id, trading_day, existing_exit=None,
         "existing_exit": existing_exit,
         "momentum": view.as_record(),
     }
+    if momentum is not None:
+        # The full module result alongside the log's own view: the
+        # continuity fields (inherited bars, boundary gap, stabilization)
+        # live there and the analysis wants them.
+        record["momentum_result"] = momentum
     return append(record, trading_day=trading_day, env=env)
 
 
