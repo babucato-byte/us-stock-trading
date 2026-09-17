@@ -93,6 +93,7 @@ REASON_UNKNOWN_ORDER = "UNKNOWN_ORDER"
 REASON_HALT = "HALT"
 REASON_GATE = "GATE"
 REASON_STATE_PERSISTENCE = "STATE_PERSISTENCE"
+REASON_SIGNAL_EXPIRED_BEFORE_SUBMIT = "SIGNAL_EXPIRED_BEFORE_BROKER_SUBMIT"
 REASON_AUDIT_PERSISTENCE = "AUDIT_PERSISTENCE"
 # The broker's own guard refused before it touched the network. Distinct
 # from REASON_GATE (our gate said no) and from a broker rejection (KIS
@@ -283,7 +284,8 @@ def _audit_before_transport(*, audit_run_id, event_type, order_intent, side_labe
 
 
 def submit_buy_order(*, order_intent, buy_gate_context_builder, conn, broker, instrument,
-                     account_id, audit_run_id, now=None, bootstrap_capability=None):
+                     account_id, audit_run_id, now=None, bootstrap_capability=None,
+                     final_check=None):
     """`buy_gate_context_builder` is a ONE-ARG callable the caller
     supplies that takes the `ReconciliationSnapshot` this engine just
     built and returns a fully-populated `order_gate.BuyGateContext` --
@@ -297,6 +299,7 @@ def submit_buy_order(*, order_intent, buy_gate_context_builder, conn, broker, in
         order_intent=order_intent, gate_context_builder=buy_gate_context_builder,
         gate_fn=order_gate.evaluate_buy_gate, conn=conn, broker=broker, instrument=instrument,
         account_id=account_id, now=now, side_label="buy", audit_run_id=audit_run_id,
+        final_check=final_check,
         bootstrap_capability=bootstrap_capability,
     )
 
@@ -317,7 +320,8 @@ def submit_sell_order(*, order_intent, sell_gate_context_builder, conn, broker, 
 
 
 def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, broker, instrument,
-                       account_id, now, side_label, audit_run_id, bootstrap_capability=None):
+                       account_id, now, side_label, audit_run_id, bootstrap_capability=None,
+                       final_check=None):
     """The single new-order flow both submit_buy_order() and
     submit_sell_order() run -- buy and sell differ ONLY in which gate
     function evaluates the context, never in which safety steps run or
@@ -474,6 +478,32 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
             order_intent=order_intent, side_label=side_label, now=current,
             reason_code="APPROVED", detail=protective_exit_detail,
         )
+
+        # The last question asked before this order becomes irreversible,
+        # and the last point at which refusing is free.
+        #
+        # Everything above ran at gate time. LKQ, 2026-09-17: the signal's
+        # 180s budget was measured and passed at 17:11:27, and the order
+        # reached KIS at 17:15:00 -- 291 seconds old, 1.6x its budget, on
+        # evidence that was correct when it was asked for and stale by the
+        # time it was used. Nothing lied; the question was simply asked too
+        # early, and no one asked it again.
+        #
+        # Deliberately BEFORE the SUBMITTING transition rather than
+        # immediately before `broker.submit_order`. After it, a refusal
+        # would leave the row SUBMITTING with nothing on the wire, which is
+        # precisely the state restart recovery reads as "might be in
+        # flight" -- trading a stale-signal order for an ambiguous one. The
+        # remaining gap is an audit write and a Slack notify, neither of
+        # which waits on a network read.
+        if final_check is not None:
+            verdict = final_check()
+            if verdict is not None:
+                reason_code, detail = verdict
+                raise ExecutionEngineError(
+                    f"{side_label} order blocked immediately before transport: {detail}",
+                    reason_code=reason_code,
+                )
 
         try:
             record = order_repository.advance(

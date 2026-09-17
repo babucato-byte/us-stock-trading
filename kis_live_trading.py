@@ -446,6 +446,36 @@ REVALIDATION_STATE_UNREADABLE = "REVALIDATION_STATE_UNREADABLE"
 REVALIDATION_SIGNAL_EXPIRED = "REVALIDATION_SIGNAL_EXPIRED"
 
 
+def _log_entry_submit_latency(*, symbol, cycle_started, submit_started,
+                              signal, validity):
+    """ENTRY_SUBMIT_LATENCY -- where a submission's time actually went.
+
+    Deliberately derived from timestamps already taken for other reasons,
+    so it measures the path without lengthening it. Never raises: telemetry
+    that can break a submission is worse than no telemetry.
+    """
+    try:
+        done = datetime.now(timezone.utc)
+        age_ms = None
+        created = getattr(signal, "created_at", None)
+        if isinstance(created, datetime):
+            age_ms = round((done - created).total_seconds() * 1000, 1)
+        logger.info(
+            "ENTRY_SUBMIT_LATENCY symbol=%s claim_to_submit_ms=%.1f "
+            "submit_ms=%.1f final_signal_age_ms=%s signal_budget_s=%s",
+            symbol,
+            (submit_started - cycle_started).total_seconds() * 1000,
+            # The engine's own reconciliation collection happens INSIDE
+            # this span -- it is the 213 seconds the LKQ incident spent
+            # holding the execution lock, and the number to watch.
+            (done - submit_started).total_seconds() * 1000,
+            age_ms,
+            getattr(validity, "valid_for_seconds", None),
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("ENTRY_SUBMIT_LATENCY could not be recorded", exc_info=True)
+
+
 def _revalidate_before_submit(*, symbol, broker, conn, instrument, order_intent,
                               buffered_price, live_state, signal=None,
                               now=None, validity=None, submit_clock=None):
@@ -1288,12 +1318,63 @@ def run_live_buy_entry_cycle(*, broker, live_rollout=None, now=None,
                         # call returns, would leave a crash during the broker
                         # call with no audit of the approval that authorized
                         # an order that may already have reached KIS.
-                        result = execution_engine.submit_buy_order(
-                            order_intent=order_intent, buy_gate_context_builder=_buy_ctx_builder,
-                            conn=conn, broker=broker, instrument=instrument,
-                            account_id=account_snapshot.account_id, now=current,
-                            audit_run_id=run_id,
-                        )
+                        def _final_signal_check(
+                            validity=validity, signal=signal,
+                        ):
+                            """The signal's budget, asked again at the wire.
+
+                            `_revalidate_before_submit` above measures the
+                            same budget against the same anchor -- and then
+                            the engine collects its reconciliation evidence,
+                            which on 2026-09-17 took 213 seconds. LKQ passed
+                            at 17:11:27 with 78 seconds used and reached KIS
+                            at 17:15:00 having used 291 of its 180. The
+                            earlier check is kept: it refuses early and
+                            cheaply. This one refuses late and truthfully.
+
+                            Same authority, deliberately: the same `validity`
+                            object, the same `signal.created_at` anchor, the
+                            same `is_expired`. A source that states no budget
+                            is not measured here either, exactly as before.
+                            """
+                            if validity is None or signal is None:
+                                return None
+                            moment = validity.submit_moment(current)
+                            if moment is None or not signal.is_expired(now=moment):
+                                return None
+                            created = getattr(signal, "created_at", None)
+                            age = ((moment - created).total_seconds()
+                                   if isinstance(created, datetime) else None)
+                            return (
+                                execution_engine.REASON_SIGNAL_EXPIRED_BEFORE_SUBMIT,
+                                f"signal {getattr(signal, 'signal_id', None)!r} exceeded its "
+                                f"{validity.valid_for_seconds:.0f}s pipeline budget "
+                                f"({validity.policy_source}) while the order was being "
+                                f"authorized: accepted "
+                                f"{created.isoformat() if isinstance(created, datetime) else created}, "
+                                f"now {moment.isoformat()}"
+                                + (f", age {age:.1f}s" if age is not None else ""))
+
+                        _submit_started = datetime.now(timezone.utc)
+                        try:
+                            result = execution_engine.submit_buy_order(
+                                order_intent=order_intent, buy_gate_context_builder=_buy_ctx_builder,
+                                conn=conn, broker=broker, instrument=instrument,
+                                account_id=account_snapshot.account_id, now=current,
+                                audit_run_id=run_id,
+                                final_check=_final_signal_check,
+                                )
+                        finally:
+                            # One line per submission attempt, success or
+                            # not. The incident it exists for was invisible
+                            # in the logs as anything but a gap between two
+                            # timestamps four minutes apart, and the funnel's
+                            # own `ready_to_execution_ms` measured ready ->
+                            # claim, which was the fast fifth of the path.
+                            _log_entry_submit_latency(
+                                symbol=symbol, cycle_started=current,
+                                submit_started=_submit_started,
+                                signal=signal, validity=validity)
                     # A REJECTED transport result is not a submission.
                     #
                     # `submit_buy_order` PERSISTS the broker's answer and
