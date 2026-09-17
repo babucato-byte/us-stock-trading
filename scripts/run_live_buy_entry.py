@@ -1005,6 +1005,22 @@ def _record_shadow_signals(source, results, *, since):
         except Exception:  # noqa: BLE001 -- research, and the cycle is over
             logger.warning("could not record the ORB15 range shadow", exc_info=True)
 
+        # Its OWN try, for the reason the comment below the next block
+        # gives: two independent observations must not be able to take
+        # each other down. Same budget guard, same "never an order"
+        # contract -- s6_live/momentum_shadow.py decides nothing and is
+        # read only by the daily analysis.
+        try:
+            from market_hours import us_trading_day
+            from s6_live import momentum_shadow
+
+            momentum_shadow.record_cycle(
+                source, trading_day=us_trading_day(since), now=since,
+                deadline=optional_deadline.expired,
+                remaining_seconds=optional_deadline.remaining_seconds)
+        except Exception:  # noqa: BLE001 -- research, and the cycle is over
+            logger.warning("could not record the momentum shadow", exc_info=True)
+
     # In its OWN try. It used to sit inside the block above, after the
     # shadow-signal import -- so when that import was wrong, this never
     # ran either, and two independent observations were lost to one
