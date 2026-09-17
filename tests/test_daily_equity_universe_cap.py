@@ -301,6 +301,113 @@ class TestCaptureRunsOnlyDaily:
         assert capture_daily_equity(argv) is None
 
 
+# -- where the snapshot lives ---------------------------------------------
+
+class TestSnapshotPathResolution:
+    """The first version defaulted to `BASE_DIR / FILENAME`, which on the
+    Oracle host resolves INSIDE the release directory -- so the snapshot
+    did not survive a release switch and left an untracked file in the
+    release worktree. Resolution now mirrors
+    `brokers/route_evidence.evidence_path`.
+    """
+
+    PROD_DB = "/home/ubuntu/releases/us-stock-trading/shared/state/TRADING_STATE.db"
+    PROD_SNAPSHOT = ("/home/ubuntu/releases/us-stock-trading/shared/state/"
+                     "DAILY_ACCOUNT_EQUITY.json")
+
+    def test_1_the_explicit_env_path_is_honoured(self, monkeypatch, tmp_path):
+        target = tmp_path / "somewhere" / "EQUITY.json"
+        monkeypatch.setenv(daily_equity.SNAPSHOT_ENV, str(target))
+        assert daily_equity.snapshot_path() == target
+
+    def test_1b_an_explicit_argument_outranks_the_environment(self, monkeypatch,
+                                                              tmp_path):
+        monkeypatch.setenv(daily_equity.SNAPSHOT_ENV, str(tmp_path / "env.json"))
+        assert daily_equity.snapshot_path(tmp_path / "arg.json") == tmp_path / "arg.json"
+
+    def test_2_the_production_path_is_outside_the_release_directory(
+            self, monkeypatch):
+        """The whole point of the fix, asserted against the real shape of
+        the host's layout."""
+        monkeypatch.delenv(daily_equity.SNAPSHOT_ENV, raising=False)
+        monkeypatch.setenv(daily_equity.SNAPSHOT_ENV, self.PROD_SNAPSHOT)
+        resolved = str(daily_equity.snapshot_path())
+        assert resolved == self.PROD_SNAPSHOT
+        assert "/shared/state/" in resolved
+        # A release directory is keyed by a 40-character SHA; the snapshot
+        # must not sit under one.
+        import re
+
+        assert not re.search(r"/[0-9a-f]{40}/", resolved), (
+            "the snapshot must not live inside a release directory")
+
+    def test_3_the_snapshot_survives_a_release_root_change(self, monkeypatch,
+                                                          tmp_path):
+        """Simulates a deploy: the release root moves, shared state does
+        not. The value written under the old release must still be read
+        under the new one."""
+        shared = tmp_path / "shared" / "state"
+        shared.mkdir(parents=True)
+        monkeypatch.delenv(daily_equity.SNAPSHOT_ENV, raising=False)
+
+        monkeypatch.setenv("STATE_STORE_DB_FILE", str(shared / "TRADING_STATE.db"))
+        monkeypatch.chdir(tmp_path)
+        daily_equity.write({"schema_version": 1, "trading_date": DAY,
+                            "equity_usd": 4242.0})
+        assert daily_equity.equity_for(DAY) == 4242.0
+
+        # "Deploy": a brand new release directory, same shared state.
+        new_release = tmp_path / "releases" / ("b" * 40)
+        new_release.mkdir(parents=True)
+        monkeypatch.chdir(new_release)
+        assert daily_equity.equity_for(DAY) == 4242.0, (
+            "the snapshot must survive a release switch")
+
+    def test_4_without_its_own_env_it_follows_the_state_database(
+            self, monkeypatch, tmp_path):
+        """The canonical shared-state marker, not a second path system."""
+        shared = tmp_path / "shared" / "state"
+        shared.mkdir(parents=True)
+        monkeypatch.delenv(daily_equity.SNAPSHOT_ENV, raising=False)
+        monkeypatch.setenv("STATE_STORE_DB_FILE", str(shared / "TRADING_STATE.db"))
+        assert daily_equity.snapshot_path() == shared / daily_equity.FILENAME
+
+    def test_4b_the_legacy_db_variable_is_also_accepted(self, monkeypatch,
+                                                        tmp_path):
+        monkeypatch.delenv(daily_equity.SNAPSHOT_ENV, raising=False)
+        monkeypatch.delenv("STATE_STORE_DB_FILE", raising=False)
+        monkeypatch.setenv("TRADING_STATE_DB", str(tmp_path / "TRADING_STATE.db"))
+        assert daily_equity.snapshot_path() == tmp_path / daily_equity.FILENAME
+
+    def test_4c_no_state_configuration_resolves_to_nothing(self, monkeypatch):
+        """Never a repository-relative default: a stray file in a checkout
+        must not become a live account figure."""
+        for name in (daily_equity.SNAPSHOT_ENV, "STATE_STORE_DB_FILE",
+                     "TRADING_STATE_DB"):
+            monkeypatch.delenv(name, raising=False)
+        assert daily_equity.snapshot_path() is None
+        assert daily_equity.read() is None
+        assert daily_equity.equity_for(DAY) is None
+        assert daily_equity.write({"equity_usd": 1.0}) is None
+
+    def test_4d_a_blank_override_is_not_a_path(self, monkeypatch, tmp_path):
+        monkeypatch.setenv(daily_equity.SNAPSHOT_ENV, "   ")
+        monkeypatch.setenv("STATE_STORE_DB_FILE", str(tmp_path / "db.sqlite"))
+        assert daily_equity.snapshot_path() == tmp_path / daily_equity.FILENAME
+
+    def test_the_module_keeps_no_repository_relative_default(self):
+        """The defect, asserted gone."""
+        import inspect
+
+        code = "\n".join(
+            line for line in inspect.getsource(daily_equity).splitlines()
+            if not line.lstrip().startswith("#"))
+        body = code.split('"""')
+        executable = "".join(body[i] for i in range(0, len(body), 2))
+        assert "BASE_DIR" not in executable
+        assert "Path(__file__)" not in executable
+
+
 # -- what must NOT have changed -------------------------------------------
 
 class TestUnchangedBehaviour:

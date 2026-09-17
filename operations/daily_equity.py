@@ -64,8 +64,7 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-DEFAULT_SNAPSHOT_FILE = BASE_DIR / "DAILY_ACCOUNT_EQUITY.json"
+FILENAME = "DAILY_ACCOUNT_EQUITY.json"
 SNAPSHOT_ENV = "DAILY_ACCOUNT_EQUITY_FILE"
 
 SCHEMA_VERSION = 1
@@ -82,10 +81,45 @@ CASH_SOURCE = "CTRP6504R:output2[crcy_cd=USD].frcr_dncl_amt_2"
 POSITION_SOURCE = "TTTS3012R:output1(ovrs_cblc_qty,pchs_avg_pric,evlu_pfls_amt)"
 
 
-def snapshot_path(env=None) -> Path:
+def snapshot_path(explicit=None, env=None) -> Optional[Path]:
+    """Where the snapshot lives, or None when no state directory is known.
+
+    Resolved the way `brokers/route_evidence.evidence_path` resolves its
+    store, rather than with a path system of this module's own: an
+    explicit argument, then this module's own env override, then the
+    directory the state DATABASE already lives in.
+
+    There is deliberately NO repository-relative default. The first
+    version had one -- `BASE_DIR / FILENAME` -- following the in-repo
+    convention of `reconciliation_state` and its siblings, and on the
+    Oracle host that resolves INSIDE the release directory:
+
+        /home/ubuntu/releases/us-stock-trading/<sha>/DAILY_ACCOUNT_EQUITY.json
+
+    which does not survive a release switch (so the cap silently reverted
+    to "none" after every deploy) and left an untracked file in the
+    release worktree that the deploy integrity check flags. Those
+    siblings get away with it only because production redirects every one
+    of them by env var; a module that is NOT yet in that env file lands
+    in the release tree.
+
+    None is the honest answer for a process with no state configuration
+    -- a test, a laptop shell. It means no snapshot is read and no cap is
+    applied, which is the same safe direction every other uncertainty in
+    this module takes.
+    """
+    if explicit is not None:
+        return Path(explicit)
     source = env if env is not None else os.environ
     override = source.get(SNAPSHOT_ENV)
-    return Path(override) if override else DEFAULT_SNAPSHOT_FILE
+    if override and override.strip():
+        return Path(override)
+    # The state database is the canonical marker for "the persistent
+    # shared state directory", and is what route_evidence keys off too.
+    state_db = source.get("STATE_STORE_DB_FILE") or source.get("TRADING_STATE_DB")
+    if state_db and state_db.strip():
+        return Path(state_db).parent / FILENAME
+    return None
 
 
 def capture(broker, *, trading_date, now=None) -> Dict[str, Any]:
@@ -180,9 +214,20 @@ def _position_value_usd(position) -> Optional[float]:
     return quantity * average + unrealized
 
 
-def write(snapshot, path=None) -> Path:
-    """Persist atomically; the reader never sees a half-written file."""
-    target = Path(path) if path is not None else snapshot_path()
+def write(snapshot, path=None) -> Optional[Path]:
+    """Persist atomically; the reader never sees a half-written file.
+
+    Returns None without writing when no state directory is known, for
+    the same reason `snapshot_path` returns None: a process with no state
+    configuration must not drop this file into whatever directory it
+    happens to be standing in.
+    """
+    target = snapshot_path(path)
+    if target is None:
+        logger.warning("no state directory configured (%s / STATE_STORE_DB_FILE "
+                       "unset); the daily equity snapshot was not written",
+                       SNAPSHOT_ENV)
+        return None
     target.parent.mkdir(parents=True, exist_ok=True)
     temp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
     temp.write_text(json.dumps(snapshot, indent=2, sort_keys=True),
@@ -192,7 +237,9 @@ def write(snapshot, path=None) -> Path:
 
 
 def read(path=None) -> Optional[Dict[str, Any]]:
-    target = Path(path) if path is not None else snapshot_path()
+    target = snapshot_path(path)
+    if target is None:
+        return None
     try:
         document = json.loads(target.read_text(encoding="utf-8"))
     except FileNotFoundError:
