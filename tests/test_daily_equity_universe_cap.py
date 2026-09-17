@@ -270,6 +270,23 @@ class TestDailyLifecycle:
         assert daily_equity.equity_for(tomorrow) == 4200.0
         assert daily_equity.equity_for(DAY) is None, "the old day is not reused"
 
+    def test_the_snapshot_is_owner_only(self, snapshot_file):
+        """It carries the account's cash and equity totals, and every
+        other file in shared/state is 0600."""
+        import stat
+
+        daily_equity.write({"schema_version": 1, "trading_date": DAY,
+                            "equity_usd": 1.0})
+        mode = stat.S_IMODE(snapshot_file.stat().st_mode)
+        assert mode == daily_equity.SNAPSHOT_MODE == 0o600, oct(mode)
+
+    def test_the_mode_is_set_before_the_rename(self):
+        """Never briefly world-readable under its real name."""
+        import inspect
+
+        body = inspect.getsource(daily_equity.write)
+        assert body.index("os.chmod(temp") < body.index("os.replace(temp")
+
     def test_the_write_is_atomic(self, snapshot_file):
         daily_equity.write({"schema_version": 1, "trading_date": DAY,
                             "equity_usd": 1.0})

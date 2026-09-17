@@ -65,6 +65,11 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 FILENAME = "DAILY_ACCOUNT_EQUITY.json"
+
+#: Owner-only, as every other file in shared/state is. Set on the
+#: temporary file BEFORE the rename, so the snapshot is never briefly
+#: world-readable at its real name.
+SNAPSHOT_MODE = 0o600
 SNAPSHOT_ENV = "DAILY_ACCOUNT_EQUITY_FILE"
 
 SCHEMA_VERSION = 1
@@ -232,6 +237,12 @@ def write(snapshot, path=None) -> Optional[Path]:
     temp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
     temp.write_text(json.dumps(snapshot, indent=2, sort_keys=True),
                     encoding="utf-8")
+    # 0600 before the rename, matching RECONCILIATION.json, KILL_SWITCH.json
+    # and every other file in shared/state. The directory is already 0700,
+    # so this is defence in depth rather than the only barrier -- but this
+    # file carries the account's cash and equity totals, and it should not
+    # be the one readable thing in there.
+    os.chmod(temp, SNAPSHOT_MODE)
     os.replace(temp, target)
     return target
 
