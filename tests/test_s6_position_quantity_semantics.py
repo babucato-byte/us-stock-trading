@@ -258,24 +258,38 @@ class TestNothingElseChanged:
         assert exit_runtime._sell_still_valid(
             {"status": "OPEN", "quantity": 0}).startswith("no quantity")
 
-    def test_9b_no_broker_gate_or_reconciliation_file_changed(self):
-        import subprocess
+    def test_9b_the_quantity_contract_is_what_it_claims(self):
+        """G. and H. -- the contracts this change established, asserted
+        directly rather than by diffing a file list against a fixed SHA.
 
-        changed = subprocess.run(
-            ["git", "diff", "--name-only",
-             "e20eef596cb396a10f83a493d0543b738e384e1c", "HEAD"],
-            capture_output=True, text=True).stdout.split()
-        # `reconciliation/snapshot.py` left this list on 2026-09-17, when
-        # the CANCELLED-with-a-partial-fill rule legitimately changed it.
-        # The claim worth keeping is that THIS work did not weaken the
-        # gate, and a name-only diff against a fixed baseline cannot say
-        # that: the baseline recedes, so every later reconciliation change
-        # -- including a reviewed one that fixes reconciliation -- fails a
-        # test about quantity semantics. The gate files proper are still
-        # pinned, and the rule that matters is asserted positively below.
-        for path in ("execution/execution_engine.py", "brokers/kis_broker.py",
-                     "brokers/kis_rate_limiter.py"):
-            assert path not in changed, path
+        The diff form broke twice in two days: its baseline recedes, so any
+        later edit to a shared file fails a test about quantity semantics
+        and reads as a regression that is not one. What matters is not that
+        a file went untouched but that these still hold.
+        """
+        import inspect
+
+        from s6_live import exit_runtime, position_store
+
+        # quantity = shares CURRENTLY HELD; entry_filled_quantity = the
+        # cumulative BUY fill already applied.
+        apply_fill = inspect.getsource(position_store.apply_fill)
+        assert "entry_filled_quantity" in apply_fill
+        assert "delta" in apply_fill, "the BUY sync applies a delta, not a total"
+
+        # exactly-once SELL reduction, through the single owner.
+        assert hasattr(exit_runtime, "apply_confirmed_exit_fill")
+        owners = set()
+        tree = __import__("ast").parse(inspect.getsource(exit_runtime))
+        for node in __import__("ast").walk(tree):
+            if not isinstance(node, __import__("ast").FunctionDef):
+                continue
+            for call in __import__("ast").walk(node):
+                if (isinstance(call, __import__("ast").Call)
+                        and isinstance(call.func, __import__("ast").Attribute)
+                        and call.func.attr == "reduce_after_partial_exit"):
+                    owners.add(node.name)
+        assert owners == {"apply_confirmed_exit_fill"}, sorted(owners)
 
     def test_10_the_momentum_adapter_fix_is_preserved(self):
         import inspect

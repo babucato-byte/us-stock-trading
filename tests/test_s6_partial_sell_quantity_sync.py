@@ -265,25 +265,15 @@ class TestGateUnchanged:
         assert exit_runtime._sell_still_valid(
             {"status": "OPEN", "quantity": 0}).startswith("no quantity")
 
-    def test_no_order_gate_file_was_modified(self):
+    def test_the_gate_that_refused_is_still_there(self):
         """The reconciliation POSITION_MISMATCH gate did its job; the fix
-        is upstream state, not a weakened gate."""
-        import subprocess
+        was upstream state, not a weakened gate.
 
-        changed = subprocess.run(
-            ["git", "diff", "--name-only",
-             "7b02a37ac038bcf854af51d8b18ad1f7bd79375f", "HEAD"],
-            capture_output=True, text=True).stdout.split()
-        # `reconciliation/snapshot.py` left this list on 2026-09-17, when
-        # the CANCELLED-with-a-partial-fill rule legitimately changed it.
-        # The claim worth keeping is that THIS work did not weaken the
-        # gate, and a name-only diff against a fixed baseline cannot say
-        # that: the baseline recedes, so every later reconciliation change
-        # -- including a reviewed one that fixes reconciliation -- fails a
-        # test about quantity semantics. The gate files proper are still
-        # pinned, and the rule that matters is asserted positively below.
-        for path in ("execution/execution_engine.py", "brokers/kis_broker.py"):
-            assert path not in changed, path
+        Asserted as behaviour. What stood here was a name-only diff against
+        a fixed SHA, which could only say a file was untouched -- and broke
+        the first time one of those files was legitimately edited. The
+        refusals themselves are exercised in TestTheGateStillRefuses below.
+        """
         assert _fill_check_still_refuses_disagreement(), (
             "the fill check must still report an order whose broker fill "
             "disagrees with what we recorded")
@@ -300,3 +290,132 @@ def _fill_check_still_refuses_disagreement():
     code = "\n".join(l for l in body.splitlines() if not l.strip().startswith("#"))
     return ("no internal record of any fill" in code
             and "internally requested quantity" in code)
+
+
+# -- the safety contracts these tests actually protect ---------------------
+#
+# What stood here was `git diff --name-only <fixed sha> HEAD` plus
+# "assert this file is not in the list". The intent was right -- this work
+# must not weaken the gate that refuses a BUY -- but a name-only diff
+# against a FIXED baseline cannot express it. The baseline recedes: every
+# later commit adds to the list, so the first legitimate edit to a shared
+# file fails a test about quantity semantics and tells the reader the
+# opposite of the truth. It happened twice, to the same guard, a day apart.
+#
+# A newer SHA would only reset the clock. These assert the contracts
+# instead, so they hold no matter who edits what.
+
+
+def _blocked_snapshot(**flags):
+    """A ReconciliationSnapshot that is dirty in exactly one way."""
+    from datetime import datetime, timezone
+
+    from reconciliation.snapshot import ReconciliationSnapshot
+
+    base = dict(positions_match=True, open_orders_match=True,
+                fills_match=True, has_unknown_orders=False)
+    base.update(flags)
+    return ReconciliationSnapshot(
+        account_id="ACCT", symbol="AAPL",
+        checked_at=datetime.now(timezone.utc), source="test", **base)
+
+
+def _verify(snapshot):
+    """verify_snapshot's verdict: None if it permits, the error if it refuses."""
+    from reconciliation.snapshot import ReconciliationBlockedError, verify_snapshot
+
+    try:
+        verify_snapshot(snapshot, account_id="ACCT", symbol="AAPL")
+        return None
+    except ReconciliationBlockedError as exc:
+        return exc
+
+
+class TestTheGateStillRefuses:
+    """A. B. C. D. -- the refusals a BUY depends on, asserted by behaviour.
+
+    Each builds a snapshot dirty in exactly ONE way and requires
+    `verify_snapshot` to refuse it. A clean snapshot must still be
+    permitted, or these would pass against a gate that refuses everything.
+    """
+
+    def test_a_clean_snapshot_is_permitted(self):
+        assert _verify(_blocked_snapshot()) is None, (
+            "a gate that refuses everything proves nothing below")
+
+    def test_A_a_reconciliation_dirty_snapshot_is_refused(self):
+        assert _verify(_blocked_snapshot(fills_match=False)) is not None
+
+    def test_B_a_position_mismatch_is_refused(self):
+        assert _verify(_blocked_snapshot(positions_match=False)) is not None
+
+    def test_C_an_unknown_order_is_refused(self):
+        assert _verify(_blocked_snapshot(has_unknown_orders=True)) is not None
+
+    def test_C2_an_open_order_disagreement_is_refused(self):
+        assert _verify(_blocked_snapshot(open_orders_match=False)) is not None
+
+    def test_D_a_missing_snapshot_is_refused(self):
+        from reconciliation.snapshot import ReconciliationBlockedError, verify_snapshot
+
+        with pytest.raises(ReconciliationBlockedError):
+            verify_snapshot(None, account_id="ACCT")
+
+    def test_D2_a_snapshot_for_another_account_is_refused(self):
+        from reconciliation.snapshot import ReconciliationBlockedError, verify_snapshot
+
+        with pytest.raises(ReconciliationBlockedError):
+            verify_snapshot(_blocked_snapshot(), account_id="SOMEONE_ELSE")
+
+    def test_D3_a_stale_snapshot_is_refused(self):
+        from datetime import datetime, timedelta, timezone
+
+        from reconciliation.snapshot import ReconciliationBlockedError, verify_snapshot
+
+        old = _blocked_snapshot()
+        future = datetime.now(timezone.utc) + timedelta(days=1)
+        with pytest.raises(ReconciliationBlockedError):
+            verify_snapshot(old, account_id="ACCT", symbol="AAPL", now=future)
+
+    def test_E_the_engine_refuses_rather_than_reporting_a_reason(self):
+        """The engine converts a blocked snapshot into a refusal with a
+        reason code -- it never returns a permissive default."""
+        from execution import execution_engine
+
+        assert execution_engine.REASON_RECONCILIATION_DIRTY == "RECONCILIATION_DIRTY"
+        assert execution_engine.REASON_UNKNOWN_ORDER == "UNKNOWN_ORDER"
+        assert execution_engine.REASON_HALT == "HALT"
+        code = execution_engine._reconciliation_block_code(
+            _blocked_snapshot(has_unknown_orders=True))
+        assert code == execution_engine.REASON_UNKNOWN_ORDER
+        assert execution_engine._reconciliation_block_code(
+            _blocked_snapshot(positions_match=False)) == \
+            execution_engine.REASON_RECONCILIATION_DIRTY
+
+
+class TestLimiterPolicyUnchanged:
+    """F. -- asserted from the configuration itself, not from a file diff."""
+
+    def test_the_read_interval_and_queue_depth_are_unchanged(self):
+        from brokers import kis_rate_limiter as limiter
+
+        assert limiter.DEFAULT_READ_MIN_INTERVAL == 3.0
+        assert limiter.DEFAULT_MAX_RESERVATION_DEPTH == 16
+
+    def test_the_priority_caps_are_unchanged(self):
+        """Caps are in INTERVALS -- multiples of the read interval -- not in
+        absolute seconds. An absolute cap once broke TOKEN, whose interval
+        is 60s."""
+        from brokers import kis_rate_limiter as limiter
+
+        caps = limiter.LOW_PRIORITY_QUEUE_CAP_INTERVALS
+        assert caps[limiter.PRIORITY_P1] == 4.0
+        assert caps[limiter.PRIORITY_P2] == 2.0
+        assert caps[limiter.PRIORITY_P3] == 1.0
+
+    def test_p0_is_uncapped(self):
+        """A safety read must never be refused by this codebase's own
+        fairness rule, so P0 carries no cap at all."""
+        from brokers import kis_rate_limiter as limiter
+
+        assert limiter.PRIORITY_P0 not in limiter.LOW_PRIORITY_QUEUE_CAP_INTERVALS
