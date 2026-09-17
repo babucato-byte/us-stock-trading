@@ -181,6 +181,11 @@ _INTERNAL_LIVE_STATUSES = ("SUBMITTING", "ACCEPTED", "PARTIALLY_FILLED", "CANCEL
 # the market" -- a KIS fill for one of these is a genuine contradiction.
 _INTERNAL_DEAD_STATUSES = ("REJECTED", "CANCELLED")
 
+# Fill quantities cross a REAL-typed column and a broker string. Whole
+# shares never need this; it exists so float round-tripping alone can
+# never manufacture a mismatch out of two equal quantities.
+_FILL_QUANTITY_TOLERANCE = 1e-6
+
 _SYMBOL_KEYS = ("pdno", "PDNO", "ovrs_pdno", "OVRS_PDNO", "symbol")
 
 
@@ -288,13 +293,52 @@ def _check_fills(conn, kis_fills, internal_live_ids):
         if name:
             dirty_symbols.add(name)
 
+    # What this codebase durably believes each order executed, keyed by
+    # KIS's own order id. A status and a filled quantity answer different
+    # questions and are compared separately below.
+    from state_store import exit_intent_ledger as eil
+
+    try:
+        internal_filled = eil.confirmed_fill_by_broker_order_id(conn)
+    except Exception:  # noqa: BLE001 - unreadable evidence is not agreement
+        logger.warning("reconciliation could not read internal exit fills; "
+                       "every dead order with a KIS fill will be reported",
+                       exc_info=True)
+        internal_filled = {}
+
     for order_id, filled in sorted(cumulative.items()):
         if order_id in dead_ids:
-            detail.append(
-                f"KIS reports fills for order {order_id!r} that is recorded internally as "
-                f"{dead_ids[order_id]}"
-            )
-            _implicate(order_id)
+            # A CANCELLED order that filled part way is not a contradiction.
+            # It is the ordinary shape of a protective SELL that got some of
+            # its shares away before the cancel reached the broker: the
+            # STATUS describes what happened to the REMAINDER of the order,
+            # the QUANTITY describes what executed, and the two are
+            # orthogonal. This branch used to treat any KIS fill for a
+            # REJECTED/CANCELLED order as proof of disagreement without ever
+            # looking at how much we thought it filled.
+            #
+            # VIAV, 2026-09-17: SELL 4 accepted, 1 share filled, the
+            # remaining 3 cancelled. Internally CANCELLED with
+            # confirmed_filled_qty 1, which is the correct record of exactly
+            # that. Reconciliation called it ORDER_MISMATCH anyway, and
+            # because reconciliation was not OK the gate refused every
+            # replacement SELL -- for six hours, against a position that was
+            # by then perfectly consistent with the account.
+            #
+            # Agreement is still required, and only agreement is accepted.
+            ours = internal_filled.get(order_id)
+            if ours is None:
+                detail.append(
+                    f"KIS reports fills for order {order_id!r} that is recorded internally as "
+                    f"{dead_ids[order_id]} with no internal record of any fill"
+                )
+                _implicate(order_id)
+            elif abs(ours - filled) > _FILL_QUANTITY_TOLERANCE:
+                detail.append(
+                    f"KIS reports {filled!r} filled for order {order_id!r} which is recorded "
+                    f"internally as {dead_ids[order_id]} having filled {ours!r}"
+                )
+                _implicate(order_id)
         expected = requested.get(order_id)
         if expected is not None and filled > expected:
             detail.append(

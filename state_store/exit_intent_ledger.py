@@ -65,6 +65,40 @@ def get_active_intent(conn, position_id):
     return dict(row) if row else None
 
 
+def confirmed_fill_by_broker_order_id(conn):
+    """Cumulative confirmed SELL fill per KIS order id, for reconciliation.
+
+    `confirmed_filled_qty` is this codebase's durable record of what an
+    exit actually executed, written by the exit lifecycle alongside the
+    reduction it describes. Reconciliation needs it keyed by the broker's
+    own order id so it can compare KIS's fill rows against what we already
+    believe about that order.
+
+    Deliberately NOT filtered by intent state. An order that filled part
+    way and was then cancelled ends ABORTED, and the quantity it filled
+    before that is exactly the fact reconciliation is checking; requiring
+    CONFIRMED here would hide every partial-then-cancelled exit, which is
+    the case this exists for. The intent's STATE describes the exit's
+    lifecycle, the quantity describes what executed, and the two are
+    independent.
+
+    MAX because an order id could appear on more than one intent row and
+    the quantity is cumulative, never additive.
+    """
+    rows = conn.execute(
+        "SELECT broker_order_id, MAX(confirmed_filled_qty) AS filled "
+        "FROM exit_intents WHERE broker_order_id IS NOT NULL "
+        "GROUP BY broker_order_id"
+    ).fetchall()
+    out = {}
+    for row in rows:
+        try:
+            out[row["broker_order_id"]] = float(row["filled"] or 0)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def get_by_id(conn, intent_id):
     row = conn.execute("SELECT * FROM exit_intents WHERE intent_id = ?", (intent_id,)).fetchone()
     return dict(row) if row else None
