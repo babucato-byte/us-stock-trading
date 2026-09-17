@@ -91,22 +91,28 @@ class TestPacingIsUnchanged:
         assert "reserved = last + interval" in source
 
     def test_the_slot_is_stored_before_the_request_goes_out(self):
-        """Still the same invariant, matched on the call rather than on
-        one spelling of its argument list.
+        """Still the same invariant: the reservation is made durable
+        inside the lock, after it is computed and before the caller
+        proceeds.
 
-        The persistence call now also carries the phase timer, so pinning
-        the exact argument string made this fail on an instrumentation
-        change that moved nothing. What must stay true is that the
-        reservation is made durable inside the lock, right after it is
-        computed -- so that is what is asserted.
+        Asserted by ORDER within `_wait_locked`, not by distance. This
+        previously scanned a fixed character window after the reservation
+        and had to be widened twice for comments and instrumentation that
+        moved nothing -- a brittle proxy for the real invariant, which is
+        simply that the slot is persisted after it is computed and before
+        the caller is allowed to proceed.
         """
-        source = (REPO_ROOT / "brokers" / "kis_rate_limiter.py").read_text()
-        block = source[source.index("reserved = last + interval"):]
-        head = block[:1200]
-        assert "self._store_state(path, state, category" in head, (
-            "the reserved slot must be persisted before the request is sent")
-        assert head.index("self._store_state(") < head.index("return slept"), (
-            "the store must happen before the call returns to the caller")
+        import inspect
+
+        from brokers.kis_rate_limiter import KisRateLimiter
+
+        body = inspect.getsource(KisRateLimiter._wait_locked)
+        reserved = body.index("reserved = last + interval")
+        stored = body.index("self._store_state(path, state, category")
+        returned = body.rindex("return slept")
+        assert reserved < stored < returned, (
+            "the reserved slot must be persisted after it is computed and "
+            "before the call returns to the caller")
 
 
 class TestQueuedCallersAcrossTheDepth:

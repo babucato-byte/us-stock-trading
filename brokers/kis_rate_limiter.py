@@ -144,6 +144,20 @@ LONG_LOCK_HOLD_ENV = "KIS_LIMITER_LONG_LOCK_HOLD_MS"
 #: The telemetry name an operator greps for.
 LONG_LOCK_HOLD_EVENT = "KIS_LIMITER_LONG_LOCK_HOLD"
 
+#: One line per SUCCESSFUL reservation, so a queue can be reconstructed.
+#:
+#: The 2026-09-17 P1 investigation could name the caller that was REFUSED
+#: (S6_ENTRY, would_wait 12.8s against a 12.0s cap) and could not name a
+#: single caller that had built that 12.8s queue: `KIS_LOCK ... ACQUIRED`
+#: only reaches INFO when wait or hold clears `_TELEMETRY_NOTABLE_MS`
+#: (500ms), and every reservation in that window was sub-millisecond. The
+#: composition of the queue was therefore unrecoverable from the logs.
+#:
+#: READ only. TOKEN/ORDER/CANCEL are low-volume and already legible from
+#: the existing lines; emitting for them would add noise without adding
+#: an answer.
+QUEUE_STATE_EVENT = "KIS_LIMITER_QUEUE_STATE"
+
 
 def long_lock_hold_ms():
     """Env-overridable threshold; a bad override falls back to the default
@@ -224,10 +238,14 @@ class _PhaseTimer:
     able to break a request that has already been paced and reserved.
     """
 
-    __slots__ = ("phases",)
+    __slots__ = ("phases", "reservation")
 
     def __init__(self):
         self.phases = {}
+        #: Filled by `_wait_locked` once the slot is taken: the numbers
+        #: `_report_contention` needs to describe the resulting queue.
+        #: None whenever no reservation was made (refused, or pacing off).
+        self.reservation = None
 
     @contextlib.contextmanager
     def phase(self, name):
@@ -862,6 +880,12 @@ class KisRateLimiter:
             line = ("KIS_LOCK owner=%s category=%s outcome=ACQUIRED "
                     "lock_wait_ms=%.1f lock_hold_ms=%.1f pid=%d")
             args = (lock_owner(), category, wait_ms, hold_ms, os.getpid())
+
+            # BEFORE the long-hold branch below, which returns early. A
+            # hold that was slow is still a successful reservation, and
+            # it is exactly the one whose queue position a reader wants.
+            self._report_queue_state(category, wait_ms, hold_ms, timer)
+
             if timer is not None and hold_ms >= long_lock_hold_ms():
                 _PROCESS_METRICS.long_holds += 1
                 # The line the CMG incident needed and did not have. At
@@ -882,6 +906,50 @@ class KisRateLimiter:
         except Exception:  # noqa: BLE001 -- telemetry must never be able
             # to fail a request that has already been paced and reserved.
             logger.debug("KIS lock telemetry failed", exc_info=True)
+
+    def _report_queue_state(self, category, wait_ms, hold_ms, timer):
+        """One INFO line per successful READ reservation.
+
+        Exists so a future deferral can be explained. `_report_contention`
+        answers "was this call slow"; this answers "who was in the queue
+        and how deep did they leave it", which is the question the
+        2026-09-17 P1 investigation could not answer at all.
+
+        Emitted only when a reservation was actually taken -- a refused
+        caller changed nothing and has no queue state to report -- and
+        only for READ, the one high-volume category.
+
+        Reads values already computed. No lock, no file, no KIS call, no
+        sleep, and nothing here mutates the queue.
+        """
+        try:
+            if category != CATEGORY_READ:
+                return
+            reservation = getattr(timer, "reservation", None) if timer else None
+            if not reservation:
+                return
+            interval = float(reservation.get("interval_s") or 0.0)
+            depth_seconds = float(reservation.get("queue_depth_seconds") or 0.0)
+            # Slots rather than seconds is how the cap is actually
+            # expressed (LOW_PRIORITY_QUEUE_CAP_INTERVALS), so a reader
+            # can compare this line to the cap without arithmetic.
+            slots = (depth_seconds / interval) if interval > 0 else None
+            before = reservation.get("reserved_before")
+            after = reservation.get("reserved_after")
+            priority = priority_for_owner()
+            logger.info(
+                "%s owner=%s category=%s priority=P%d pid=%d wait_s=%.3f "
+                "hold_ms=%.1f reserved_before=%s reserved_after=%s "
+                "queue_depth_seconds=%.2f queue_depth_slots=%s interval_s=%.1f",
+                QUEUE_STATE_EVENT, lock_owner(), category, priority,
+                os.getpid(), wait_ms / 1000.0, hold_ms,
+                "none" if before is None else f"{float(before):.3f}",
+                "none" if after is None else f"{float(after):.3f}",
+                depth_seconds,
+                "none" if slots is None else f"{slots:.2f}", interval)
+        except Exception:  # noqa: BLE001 -- telemetry must never be able
+            # to fail a request that has already been paced and reserved.
+            logger.debug("KIS queue-state telemetry failed", exc_info=True)
 
     def _release(self, lock_handle, acquired, category):
         """Unlocks and closes. Returns the error to raise, or None.
@@ -1037,7 +1105,18 @@ class KisRateLimiter:
                     # leave the queue exactly as it was found.
                     self._enforce_queue_cap(category, slept, interval)
                     now = reserved
+            reserved_before = last if has_entry else None
             state[category] = now
+            # Recorded AFTER the state update so it describes the queue
+            # this caller actually left behind, not the one it found.
+            # Pure bookkeeping on values already computed: no lock, no
+            # read, no mutation of its own.
+            timer.reservation = {
+                "reserved_before": reserved_before,
+                "reserved_after": now,
+                "queue_depth_seconds": slept,
+                "interval_s": interval,
+            }
         # The reservation must be DURABLE before the request goes out,
         # and before the lock is released -- a slot handed out twice
         # would let two callers issue at the same instant.
