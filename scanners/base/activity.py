@@ -262,6 +262,25 @@ class ActivityStore:
         usable.sort(key=lambda r: r.dollar_volume, reverse=True)
         return [r.symbol for r in usable[: max(0, int(limit))]]
 
+    def price_of(self, symbol) -> Optional[float]:
+        """The last price the daily profile recorded for `symbol`.
+
+        None when the symbol is unranked or the profile never recorded a
+        price. Callers that filter on it must treat None as "unknown",
+        never as zero -- a missing price is not an affordable one.
+        """
+        record = self._records.get(str(symbol).upper())
+        if record is None:
+            record = self._records.get(symbol)
+        price = getattr(record, "price", None) if record is not None else None
+        if price is None:
+            return None
+        try:
+            value = float(price)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
     def summary(self, *, today: Optional[date] = None) -> Dict[str, Any]:
         moment = today or datetime.now(timezone.utc).date()
         days = sorted({str(r.trading_day) for r in self._records.values()})

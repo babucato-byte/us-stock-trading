@@ -61,6 +61,11 @@ class UniverseSelection:
     requested: int = 0
     considered: int = 0
     skipped_ineligible: int = 0
+    #: Symbols dropped because ONE share costs more than the account's
+    #: daily equity. Counted separately from `skipped_ineligible` because
+    #: it is a cost decision about this account, not a judgement about
+    #: the symbol.
+    skipped_unaffordable: int = 0
     depth_reached: int = 0
     depth_exhausted: bool = False
     supplement_added: int = 0
@@ -71,6 +76,7 @@ class UniverseSelection:
             "selected": len(self.symbols),
             "considered": self.considered,
             "skipped_ineligible": self.skipped_ineligible,
+            "skipped_unaffordable": self.skipped_unaffordable,
             "depth_reached": self.depth_reached,
             "depth_exhausted": self.depth_exhausted,
             "supplement_added": self.supplement_added,
@@ -84,13 +90,26 @@ class UniverseSelection:
 
 
 def eligible_top(activity_store, eligibility_store, *, limit,
-                 today=None, max_depth=None) -> UniverseSelection:
+                 today=None, max_depth=None,
+                 max_share_price=None) -> UniverseSelection:
     """`limit` eligible symbols, taken in activity-ranking order.
 
     The ranking is asked for `max_depth` names and filtered; it is not
     asked repeatedly with a growing limit, because `active_symbols`
     sorts the whole store on every call and doing that in a loop would
     turn a linear fill into a quadratic one.
+
+    `max_share_price` is the account's equity for the day, captured once
+    by `operations.daily_equity`. A symbol whose ONE-share price exceeds
+    it can never become an entry for this account, so it is dropped here
+    rather than spending a provider call on it.
+
+    Two properties of that filter are deliberate. It changes MEMBERSHIP
+    only -- the ranking order is untouched and every retained symbol
+    keeps the rank it had -- and `None` means NO cap, so an equity figure
+    that could not be obtained excludes nothing. A price this cannot read
+    is likewise never treated as affordable OR unaffordable: it is simply
+    not filtered, because a missing price is not evidence.
     """
     wanted = max(0, int(limit))
     depth = int(max_depth) if max_depth else wanted * DEFAULT_DEPTH_MULTIPLE
@@ -104,6 +123,10 @@ def eligible_top(activity_store, eligibility_store, *, limit,
         selection.depth_reached = position
         if eligibility_store.should_skip(symbol, today=today):
             selection.skipped_ineligible += 1
+            continue
+        if max_share_price is not None and _unaffordable(
+                activity_store, symbol, max_share_price):
+            selection.skipped_unaffordable += 1
             continue
         upper = str(symbol).upper()
         selection.symbols.append(symbol)
@@ -122,6 +145,28 @@ def eligible_top(activity_store, eligibility_store, *, limit,
                     "eligible after %s considered",
                     len(selection.symbols), wanted, selection.considered)
     return selection
+
+
+def _unaffordable(activity_store, symbol, max_share_price) -> bool:
+    """One share costs more than the whole account holds.
+
+    Reads the price the daily profile already recorded on the ranking, so
+    this costs no network. A store that cannot answer, or a symbol with
+    no recorded price, returns False -- unknown is not unaffordable.
+    """
+    getter = getattr(activity_store, "price_of", None)
+    if getter is None:
+        return False
+    try:
+        price = getter(symbol)
+    except Exception:  # noqa: BLE001 - a filter must not break the fill
+        return False
+    if price is None:
+        return False
+    try:
+        return float(price) > float(max_share_price)
+    except (TypeError, ValueError):
+        return False
 
 
 def merge_supplement(selection: UniverseSelection, supplement,

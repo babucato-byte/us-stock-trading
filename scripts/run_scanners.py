@@ -118,5 +118,65 @@ def session_provider(argv=None):
         return None
 
 
+def capture_daily_equity(argv=None):
+    """Record the account's equity once, during the DAILY refresh only.
+
+    Built here rather than inside `scanners/` for the same reason
+    `session_provider` is: choosing it inside the scanner package would
+    mean that package importing a broker, which
+    tests/test_scanner_trading_isolation.py forbids. The scanner reads
+    the FILE this writes and never the account.
+
+    Returns the snapshot it wrote, or None when this run is not the daily
+    refresh or no snapshot could be taken. Never raises: a scan must not
+    fail because an optional cost filter could not be primed, and a
+    missing snapshot already means "no cap".
+    """
+    import logging
+
+    log = logging.getLogger(__name__)
+    try:
+        if _profile_of(argv) != "daily":
+            return None
+
+        from market_hours import us_trading_day
+        from operations import daily_equity
+
+        from brokers.kis_broker import KISBroker
+
+        snapshot = daily_equity.capture(KISBroker(),
+                                        trading_date=us_trading_day())
+        daily_equity.write(snapshot)
+        if snapshot.get("equity_usd") is None:
+            log.warning("DAILY_ACCOUNT_EQUITY unavailable (%s); the universe "
+                        "keeps its current behaviour",
+                        snapshot.get("unavailable_reason"))
+        else:
+            log.info("DAILY_ACCOUNT_EQUITY captured: equity_usd=%.2f "
+                     "cash_usd=%.2f positions_usd=%.2f positions=%s "
+                     "trading_date=%s",
+                     snapshot["equity_usd"], snapshot["cash_usd"],
+                     snapshot["positions_usd"], snapshot["position_count"],
+                     snapshot["trading_date"])
+        return snapshot
+    except Exception:  # noqa: BLE001 - an optional filter, never a blocker
+        log.warning("could not capture the daily account equity; the universe "
+                    "keeps its current behaviour", exc_info=True)
+        return None
+
+
+def _profile_of(argv=None):
+    """The `--profile` value on the command line, or None."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    for index, token in enumerate(args):
+        if token == "--profile":
+            return args[index + 1] if index + 1 < len(args) else None
+        if token.startswith("--profile="):
+            return token.split("=", 1)[1]
+    return None
+
+
 if __name__ == "__main__":
+    # Before the scan, so the universe this run builds can already use it.
+    capture_daily_equity()
     sys.exit(main(provider=session_provider()))

@@ -575,8 +575,15 @@ def run_scanners(
     if symbols is None:
         if selected_universe == UNIVERSE_ACTIVE:
             pool = limit or active_pool_size
+            # The account's equity for THIS trading day, captured once by
+            # the daily refresh. None means no cap -- an equity that could
+            # not be read must never empty the universe, so the filter is
+            # simply not applied. Nothing here reads a broker: this is a
+            # file the daily job already wrote.
+            equity_cap = _daily_equity_cap(day)
             universe_selection = universe_sel.eligible_top(
-                activity_store, eligibility_store, limit=pool)
+                activity_store, eligibility_store, limit=pool,
+                max_share_price=equity_cap)
             symbols = list(universe_selection.symbols)
             report.skipped_ineligible = universe_selection.skipped_ineligible
             if symbols and supplement_size > 0:
@@ -1295,6 +1302,25 @@ def _snapshot_safely(rows, *, scanner_name, report) -> None:
         # survive a failed write.
         logger.warning("could not record an S6 candidate snapshot",
                        exc_info=True)
+
+
+def _daily_equity_cap(trading_day):
+    """The day's account equity, or None for "do not filter on price".
+
+    Isolated in one function so the scanner's dependency on it is a
+    single file read that fails to None. `operations.daily_equity` holds
+    no broker import -- it takes one as an argument when the daily job
+    captures -- so reading it here does not give the scanner a capability
+    it must not have (tests/test_scanner_trading_isolation.py).
+    """
+    try:
+        from operations import daily_equity
+
+        return daily_equity.equity_for(trading_day)
+    except Exception:  # noqa: BLE001 - no cap is the safe direction
+        logger.debug("daily equity cap unavailable; the universe is unfiltered "
+                     "by price", exc_info=True)
+        return None
 
 
 def _admit_s6_pass_provisionally(signal, *, trading_day, session, scan_id,
