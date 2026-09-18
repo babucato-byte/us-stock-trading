@@ -215,7 +215,7 @@ def _reconciliation_block_code(snapshot):
 
 
 def _reconcile_now(*, conn, broker, order_intent, account_id, current, side_label,
-                   defer_dirty_to_gate=False):
+                   defer_dirty_to_gate=False, scope=None):
     """CODEX-044: the engine collects the REAL state itself, immediately
     before the gate, and judges it -- no caller may hand it a
     `reconciliation_ok` boolean. A failed KIS read, a stale snapshot, a
@@ -234,6 +234,12 @@ def _reconcile_now(*, conn, broker, order_intent, account_id, current, side_labe
         snapshot = reconciliation_snapshot.build_snapshot(
             broker=broker, conn=conn, account_id=account_id,
             symbol=order_intent.symbol, now=current,
+            # A BUY establishes what it needs about THIS order and leaves
+            # historical ledger integrity to the canonical pass, whose
+            # DIRTY verdict now latches ENTRY_DISABLED. A SELL is
+            # unchanged: its protective-exit evidence weighs a dirty
+            # snapshot, so it still needs the full one.
+            scope=scope or reconciliation_snapshot.SCOPE_FULL,
         )
     except ReconciliationUnavailableError as exc:
         raise ExecutionEngineError(
@@ -436,8 +442,15 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
             conn=conn, broker=broker, order_intent=order_intent, account_id=account_id,
             current=current, side_label=side_label,
             # TCN-02A: only a SELL may carry a dirty snapshot into the
-            # gate. The buy path is byte-for-byte what it was.
+            # gate.
             defer_dirty_to_gate=(side_label == "sell"),
+            # A BUY establishes what it needs about THIS order and leaves
+            # historical ledger integrity to the canonical pass, whose DIRTY
+            # verdict now latches ENTRY_DISABLED. A SELL is unchanged: its
+            # protective-exit evidence weighs a dirty snapshot, so it still
+            # needs the full one.
+            scope=(reconciliation_snapshot.SCOPE_FULL if side_label == "sell"
+                   else reconciliation_snapshot.SCOPE_SUBMIT),
         )
     except ExecutionEngineError as exc:
         # A reconciliation refusal is a real judgement about the account,

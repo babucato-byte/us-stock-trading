@@ -48,6 +48,7 @@ read failing, because the two are different operational states.
 """
 
 import logging
+import time
 import math
 import os
 from dataclasses import dataclass
@@ -181,6 +182,29 @@ _INTERNAL_LIVE_STATUSES = ("SUBMITTING", "ACCEPTED", "PARTIALLY_FILLED", "CANCEL
 # the market" -- a KIS fill for one of these is a genuine contradiction.
 _INTERNAL_DEAD_STATUSES = ("REJECTED", "CANCELLED")
 
+#: How much of the account a snapshot is asked to establish.
+#:
+#: FULL is the canonical pass: positions, open orders, and the paged fill
+#: history whose window reaches back to the oldest order still believed
+#: live. It owns historical ledger integrity and nothing here changes that.
+#:
+#: SUBMIT is what a single order needs before it goes out, and deliberately
+#: less. The fill sweep is ~28 of the ~34 broker reads a submission made
+#: and cost 174-308 seconds measured live, which aged every signal past its
+#: 180s budget: on 2026-09-18 REGULAR, submit_ms=248,899 against a
+#: signal_budget of 180,000, and not one BUY reached the broker all day.
+#:
+#: What SUBMIT still establishes, freshly, is every question about THIS
+#: order: does the account already hold this symbol, is there an open order
+#: for it, and is anything trading this account that we do not know about.
+#: What it does NOT re-establish is historical ledger integrity -- dead
+#: orders that filled, overfills, internally-live orders KIS has no record
+#: of. Those are the canonical pass's, and since 2026-09-18 a DIRTY verdict
+#: there sets a durable ENTRY_DISABLED latch, so that judgement keeps
+#: blocking entries without every submission re-deriving it.
+SCOPE_FULL = "full"
+SCOPE_SUBMIT = "submit"
+
 # Fill quantities cross a REAL-typed column and a broker string. Whole
 # shares never need this; it exists so float round-tripping alone can
 # never manufacture a mismatch out of two equal quantities.
@@ -224,7 +248,7 @@ def _check_open_orders(conn, kis_open_orders, kis_fills):
         if order_id:
             kis_open_by_id[order_id] = _symbol_of(order)
     kis_open_ids = set(kis_open_by_id)
-    kis_fill_ids = {oid for oid in (_order_id_of(f) for f in kis_fills) if oid}
+    kis_fill_ids = {oid for oid in (_order_id_of(f) for f in (kis_fills or ())) if oid}
     internal_ids = set()
     internal_symbol_by_id = {}
     for row in idempotency.list_orders_by_status(conn, _INTERNAL_LIVE_STATUSES):
@@ -240,13 +264,19 @@ def _check_open_orders(conn, kis_open_orders, kis_fills):
         detail.append(f"KIS reports open order {order_id!r} that is not tracked internally")
         if kis_open_by_id.get(order_id):
             dirty_symbols.add(kis_open_by_id[order_id])
-    for order_id in sorted(internal_ids - kis_open_ids - kis_fill_ids):
-        detail.append(
-            f"order {order_id!r} is recorded internally as live but KIS reports neither an open "
-            "order nor any fill for it"
-        )
-        if internal_symbol_by_id.get(order_id):
-            dirty_symbols.add(internal_symbol_by_id[order_id])
+    # Needs the fill history to be meaningful: an order missing from KIS's
+    # open orders may simply have filled. With fills NOT collected this
+    # cannot be asked, and asking it anyway would report every live order
+    # as unbacked. The canonical pass asks it, and its DIRTY verdict now
+    # latches ENTRY_DISABLED, so the answer still reaches new orders.
+    if kis_fills is not None:
+        for order_id in sorted(internal_ids - kis_open_ids - kis_fill_ids):
+            detail.append(
+                f"order {order_id!r} is recorded internally as live but KIS reports neither an open "
+                "order nor any fill for it"
+            )
+            if internal_symbol_by_id.get(order_id):
+                dirty_symbols.add(internal_symbol_by_id[order_id])
     return (not detail), detail, internal_ids, dirty_symbols
 
 
@@ -262,6 +292,10 @@ def _check_fills(conn, kis_fills, internal_live_ids):
     dirty_symbols = set()
     cumulative = {}
     fill_symbol_by_id = {}
+    if kis_fills is None:
+        # Not collected. Reported as nothing to say rather than as
+        # agreement: the canonical pass owns this question.
+        return True, detail, dirty_symbols
     for fill in kis_fills:
         order_id = _order_id_of(fill)
         if not order_id:
@@ -351,7 +385,8 @@ def _check_fills(conn, kis_fills, internal_live_ids):
 
 
 def build_snapshot(*, broker, conn, account_id, symbol=None, now=None,
-                    internal_positions=None, source="execution_engine"):
+                    internal_positions=None, source="execution_engine",
+                    scope=SCOPE_FULL):
     """Collects the REAL state -- KIS balance/positions, KIS open orders,
     KIS fills, internal positions, internal open orders, internal
     UNKNOWN orders -- and returns the judgement as an immutable snapshot.
@@ -379,27 +414,49 @@ def build_snapshot(*, broker, conn, account_id, symbol=None, now=None,
     # compared against a broker view collected from here onward, so this
     # is the instant the comparison is implicitly claiming our side had.
     consistency_before = consistency.capture(conn)
+    #: Where a submission's time actually went, so the critical path is
+    #: reported rather than inferred.
+    timings = {}
+    _t_pos = time.monotonic()
 
     try:
         kis_positions = broker.get_positions()
     except Exception as exc:
         raise _unavailable("KIS position read failed", exc) from exc
+    _t_open = time.monotonic()
     try:
         kis_open_orders = broker.get_open_orders()
     except Exception as exc:
         raise _unavailable("KIS open-order read failed", exc) from exc
-    try:
-        # Not today-only. `_check_open_orders` below reports an
-        # internally-live order that appears in neither KIS's open
-        # orders nor its fills, and an order that filled on a PREVIOUS
-        # session can never appear in today's fill list -- so a
-        # today-only window made that mismatch permanent and blocked
-        # every BUY for every strategy from the next morning onward.
-        # The window is derived from the oldest order still believed
-        # live (reconciliation/fill_window.py).
-        kis_fills = fill_window.read_fills(broker, conn, now=current)
-    except Exception as exc:
-        raise _unavailable("KIS fill-history read failed", exc) from exc
+    # None means NOT COLLECTED, and is not the same as "collected and
+    # empty" -- an empty list would make every internally-live order look
+    # unbacked and turn a submission into a mismatch storm. The checks
+    # below skip what they cannot answer rather than guessing.
+    #
+    # The window is NOT narrowed for either scope. A today-only window once
+    # made a previous session's fill permanently invisible and blocked
+    # every BUY from the next morning onward; the fix is to stop asking on
+    # the critical path, not to ask a smaller question.
+    timings["positions_read_ms"] = round((_t_open - _t_pos) * 1000.0, 1)
+    timings["open_orders_read_ms"] = round((time.monotonic() - _t_open) * 1000.0, 1)
+    _t_fills = time.monotonic()
+    kis_fills = None
+    if scope == SCOPE_FULL:
+        try:
+            kis_fills = fill_window.read_fills(broker, conn, now=current)
+        except Exception as exc:
+            raise _unavailable("KIS fill-history read failed", exc) from exc
+    timings["fills_read_ms"] = round((time.monotonic() - _t_fills) * 1000.0, 1)
+    # Logged rather than attached: the snapshot is frozen and its fields are
+    # the decision, not instrumentation. One line per snapshot, so a
+    # submission's cost is readable instead of inferred.
+    logger.info(
+        "RECONCILIATION_SNAPSHOT_TIMING scope=%s source=%s symbol=%s "
+        "positions_read_ms=%s open_orders_read_ms=%s fills_read_ms=%s "
+        "fills_collected=%s",
+        scope, source, symbol, timings["positions_read_ms"],
+        timings["open_orders_read_ms"], timings["fills_read_ms"],
+        kis_fills is not None)
 
     # The broker view is now fixed. If our side moved while it was being
     # collected, the comparison below would be reading two different

@@ -309,17 +309,31 @@ class TestPerSymbolOutcomes:
 
     def test_reconciliation_reads_always_precede_the_order(self, monkeypatch):
         # CODEX-044: on a completely cold start -- no recorded
-        # reconciliation anywhere -- the engine still performs the real
-        # KIS position/open-order/fill reads BEFORE the order is
-        # submitted. There is no window in which an order can be placed
+        # reconciliation anywhere -- the engine still performs the real KIS
+        # reads BEFORE the order is submitted, from its own reads, never
+        # from a caller. There is no window in which an order can be placed
         # "before reconciliation has run".
+        #
+        # The FILL history left this list on 2026-09-18. It was ~28 of the
+        # ~34 broker reads a submission made and cost 174-308 seconds
+        # measured live, which aged every signal past its 180s budget: not
+        # one BUY reached KIS that day. It answers historical ledger
+        # integrity -- dead orders that filled, overfills, internally-live
+        # orders KIS has no record of -- which is the canonical pass's
+        # question, not this order's, and a DIRTY verdict there now latches
+        # ENTRY_DISABLED so that judgement still reaches new orders.
+        #
+        # What this order needs is still read fresh, inline, every time:
+        # does the account hold this symbol, is there an open order for it,
+        # is anything trading this account we do not know about.
         _patch_common(monkeypatch)
         broker = _FakeBroker()
         results = klt.run_live_buy_entry_cycle(broker=broker, live_rollout=_rollout(), now=NOW)
         assert results["submitted"] == ["AAPL"]
         assert broker.call_log.index("get_positions") < broker.call_log.index("submit_order")
         assert broker.call_log.index("get_open_orders") < broker.call_log.index("submit_order")
-        assert broker.call_log.index("get_fills") < broker.call_log.index("submit_order")
+        assert "get_fills" not in broker.call_log, (
+            "the paged fill history must not be on the BUY critical path")
 
     def test_dirty_reconciliation_blocks_zero_broker_calls(self, monkeypatch):
         # CODEX-044: the block now comes from the Execution Engine's own

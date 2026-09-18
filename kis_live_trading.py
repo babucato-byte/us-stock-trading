@@ -462,7 +462,8 @@ def _log_entry_submit_latency(*, symbol, cycle_started, submit_started,
             age_ms = round((done - created).total_seconds() * 1000, 1)
         logger.info(
             "ENTRY_SUBMIT_LATENCY symbol=%s claim_to_submit_ms=%.1f "
-            "submit_ms=%.1f final_signal_age_ms=%s signal_budget_s=%s",
+            "submit_ms=%.1f final_signal_age_ms=%s signal_budget_ms=%s "
+            "signal_budget_s=%s full_reconciliation_in_submit_path=false",
             symbol,
             (submit_started - cycle_started).total_seconds() * 1000,
             # The engine's own reconciliation collection happens INSIDE

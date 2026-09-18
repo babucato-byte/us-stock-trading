@@ -327,6 +327,7 @@ def run_once(*, broker=None, now=None, conn=None, account_id=None):
         if not snapshot.is_clean():
             for line in snapshot.detail:
                 logger.error("reconciliation mismatch: %s", line)
+            _latch_entry_block(snapshot, was_clean=was_clean, now=current)
         _announce_reconciliation_transition(
             conn, clean=snapshot.is_clean(), was_clean=was_clean,
             mismatch_count=snapshot.mismatch_count(), detail=snapshot.detail, now=current)
@@ -342,6 +343,64 @@ def run_once(*, broker=None, now=None, conn=None, account_id=None):
     finally:
         if owns_conn:
             conn.close()
+
+
+def _latch_entry_block(snapshot, *, was_clean, now):
+    """A ledger mismatch must keep blocking entries after this pass ends.
+
+    Until now a DIRTY verdict blocked a BUY only because the BUY path
+    happened to rebuild the same snapshot itself, inline, on every
+    submission. That rebuild is what took 174-308 seconds and aged every
+    signal past its 180s budget, so it is being removed from the critical
+    path -- and removing it would take the block with it, leaving a
+    detected mismatch that alerts and nothing more.
+
+    So the block becomes durable instead of incidental. ENTRY_DISABLED is
+    the existing state for exactly this: new buys refused, exits still
+    allowed, which is what a disagreement about the ledger calls for --
+    stop opening new risk, keep the protective path working.
+
+    Deliberately NOT HALT, which also stops selling, and deliberately not
+    EMERGENCY_LIQUIDATE, which this codebase never triggers automatically.
+
+    Set on the CLEAN -> DIRTY transition only. `activate` is idempotent, but
+    re-activating every five minutes would append an audit snapshot each
+    time and bury the transition that mattered.
+
+    NEVER cleared here. Recovery is an operator action --
+    `kill_switch_state.release(released_by=...)` -- because a pass that
+    reads clean once is not evidence that whatever caused the disagreement
+    was understood. A latch that clears itself is not a latch.
+
+    Never fatal: failing to set it must not abort a reconciliation pass
+    that has already done its repair work. It is logged at error so a
+    missing latch is visible rather than silent.
+    """
+    if was_clean is False:
+        return  # still dirty; the latch is already set from the transition
+    try:
+        import kill_switch_state
+
+        if not kill_switch_state.is_entry_allowed():
+            logger.warning(
+                "RECONCILIATION_ENTRY_BLOCK_ALREADY_SET state=%s -- leaving it",
+                kill_switch_state.get_state())
+            return
+        detail = "; ".join(snapshot.detail) or "no detail"
+        kill_switch_state.activate(
+            kill_switch_state.ENTRY_DISABLED,
+            reason=(f"reconciliation found the account and the ledger in "
+                    f"disagreement: {detail[:400]}"),
+            activated_by="reconciliation",
+        )
+        logger.error(
+            "RECONCILIATION_ENTRY_BLOCK_SET state=ENTRY_DISABLED mismatch_count=%s "
+            "-- new BUYs are refused until an operator releases it; exits stay "
+            "allowed", snapshot.mismatch_count())
+    except Exception:  # noqa: BLE001 - the pass already did its repair work
+        logger.error("RECONCILIATION_ENTRY_BLOCK_FAILED -- a ledger mismatch was "
+                     "found but the durable entry block could not be set",
+                     exc_info=True)
 
 
 def main(argv=None):
