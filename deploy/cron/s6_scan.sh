@@ -126,7 +126,7 @@ flock -n -E 99 /home/ubuntu/logs/cron/s6_scan.lock \
       SCANNER_LOG_DIR="$SCANNER_LOG_DIR" \
       SCANNER_UNIVERSE_FILE="$SCANNER_UNIVERSE_FILE" \
   venv/bin/python scripts/run_scanners.py --scanners orb \
-    --session "$SESSION" --universe manifest \
+    --session "$SESSION" --universe "$UNIVERSE_ARG" \
     --manifest-path "$MANIFEST_PATH" \
     --supplement-size 50 >> "$LOG" 2>&1
 SCAN_STATUS=$?

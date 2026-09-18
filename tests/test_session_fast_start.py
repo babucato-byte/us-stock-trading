@@ -313,6 +313,17 @@ def test_23_and_24_the_startup_scan_shares_the_existing_lock():
     assert "run_scanners.py" not in prep, "no second scanner process"
 
 
+def test_24b_the_wrapper_actually_passes_the_mode_it_computed():
+    """Caught in review, not by a test: the wrapper computed UNIVERSE_ARG
+    and still passed a hard-coded `--universe manifest`, so the startup
+    mode was dead code that nothing would have reported."""
+    wrapper = (REPO_ROOT / "deploy" / "cron" / "s6_scan.sh").read_text()
+    assert 'UNIVERSE_ARG="prepared"' in wrapper
+    assert '--universe "$UNIVERSE_ARG"' in wrapper
+    assert "--universe manifest" not in wrapper.split("# --universe manifest")[0], (
+        "a computed mode that is not passed is worse than no mode at all")
+
+
 # -- 25-26. fallback is safe, and says it is not fast ----------------------
 
 def test_25_a_missing_preparation_falls_back_and_records_the_miss():
