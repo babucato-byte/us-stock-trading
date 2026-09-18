@@ -628,6 +628,29 @@ def evaluate_position(conn, *, broker_adapter, position_id, row,
             ", ".join(diagnostics["unavailable_rules"]))
         diagnostics["position_data_unavailable"] = bool(whole_view_missing)
 
+    # Observation only, and AFTER the decision exists so it cannot be part
+    # of one. A profit-protection exit is under measurement, not in force:
+    # see s6_live/profit_protection_shadow.py. Wrapped because a research
+    # record must never be able to stop a position from leaving.
+    try:
+        from market_hours import us_trading_day
+        from s6_live import profit_protection_shadow as pps
+
+        pps.observe(
+            position_id=position_id, symbol=symbol,
+            session=_session_name(session),
+            trading_day=us_trading_day(now),
+            now=now, entry_price=refreshed.get("entry_price"),
+            price=exit_policy._price_of(features, current_price),
+            peak_price=refreshed.get("peak_price"),
+            ema9=_finite(getattr(features, "ema9", None)),
+            decision_action=(exit_policy.SELL if decision.sells
+                             else exit_policy.HOLD),
+            decision_reason=decision.reason)
+    except Exception:  # noqa: BLE001 - fail open: never block a real exit
+        logger.warning("profit-protection shadow skipped for %s", symbol,
+                       exc_info=True)
+
     if not decision.sells:
         # The diagnostics ARE the detail. An empty string here is what
         # made the DT hold unexplainable after the fact.
