@@ -137,12 +137,15 @@ try:
         "OVERNIGHT_DAYTIME": ("AFTER_HOURS", day),
     }.get(session, (None, None))
 
-    # The prepared startup universe first, and the SAME file the startup
-    # scan reads. The collector and the scanner used to derive their
-    # watchlists independently -- 41 symbols here against 600 there -- so
-    # a symbol could pass the scan and never be streamed, and fail
-    # MARKET_DATA_FRESH at the gate. One artifact removes that by
-    # construction.
+    # The prepared COLLECTOR view of the startup artifact -- the symbols
+    # this process will subscribe to, bounded by the transport ceiling.
+    #
+    # The scanner reads the same artifact but a different view of it, and
+    # takes its universe from the manifest. It briefly took this list
+    # instead, which made one appkey's websocket ceiling the strategy's
+    # universe ceiling. Both views come from one generation, so the two
+    # halves still cannot disagree about what was prepared; they are
+    # simply no longer the same answer to two different questions.
     import os
 
     from scanners.base import session_startup
@@ -169,7 +172,8 @@ try:
             symbols=[sym for sym, _ in pairs], cap=wire.MAX_SUBSCRIPTIONS,
             source=session_startup.SOURCE_COLLECTOR_FALLBACK,
             source_session=prior_session, fallback_reason=status,
-            selection_source=repr(why))
+            selection_source=repr(why),
+            scanner_view=session_startup.build_scanner_view(session))
         try:
             session_startup.write_atomic(root, artifact)
             sys.stderr.write(
@@ -184,7 +188,7 @@ try:
         # Exchange is not stored in the artifact: it is a property of the
         # symbol, resolved the same way the builder resolves it.
         out = []
-        for sym in prepared["symbols"]:
+        for sym in session_startup.collector_symbols(prepared):
             exch = bootstrap._exchange_for(sym)
             if exch is not None:
                 out.append("%s:%s" % (sym, exch))

@@ -91,25 +91,38 @@ esac
 # are siblings by construction.
 MANIFEST_PATH="$(dirname "$SCANNER_CANDIDATE_DIR")/discovery/manifest.json"
 
-# The first invocation after a session boundary starts on the small set
-# prepared before the session opened; every later one uses the ordinary
-# universe. Asked of the same session truth the probe above used -- no
-# session start time is written here.
-#
-# There is no separate fast-scan wrapper and no second lock: this IS the
-# startup scan, so there remains one scanner process and one publication
-# owner. Empty means "leave the profile's own universe alone".
-UNIVERSE_MODE=$(venv/bin/python -c "
-from scanners.base import session_startup
-print(session_startup.universe_mode())
-" 2>/dev/null)
-if [ "${UNIVERSE_MODE:-}" = "prepared" ]; then
-    UNIVERSE_ARG="prepared"
-else
-    UNIVERSE_ARG="manifest"
-fi
+# Every invocation scans the SAME universe -- the manifest. There was
+# briefly a `prepared` mode here that handed the scanner the collector's
+# 41-symbol startup list, and it made one appkey's websocket ceiling the
+# strategy's universe ceiling. What a session's first scan needs is a
+# later start, not a smaller universe: see the gate below.
+UNIVERSE_ARG="manifest"
 
 echo "$(date -u +%FT%TZ) session=$SESSION universe_mode=$UNIVERSE_ARG scanner_sha=$SCANNER_SHA root=$SCANNER_RUNTIME_ROOT candidates=$SCANNER_CANDIDATE_DIR manifest=$MANIFEST_PATH" >> "$LOG"
+
+# An invocation that lands before the market can answer it WAITS, here,
+# BEFORE the lock.
+#
+# The cron cadence does not line up with a session boundary: the first
+# tick after one can fall minutes before the opening range has been
+# broken, and on 2026-09-19 that tick rejected 41 of 41 symbols for
+# INSUFFICIENT_POST_RANGE_BARS while the next tick was fifteen minutes
+# later. Scanning early wastes the cycle; waiting for the next tick blinds
+# the strategy to the window it exists to trade. So this one waits and
+# then scans.
+#
+# ORDER IS LOAD-BEARING. This runs before `flock`, so the wait cannot hold
+# the scanner lock -- a process sleeping with that lock would make every
+# other session's scan in the window skip for no reason at all. The gate
+# re-derives the session, the trading day and the release after waking and
+# prints ABORT if any of them moved.
+GATE=$(env TRADING_PROJECT_ROOT="$SCANNER_RUNTIME_ROOT" SCANNER_SHA="$SCANNER_SHA" \
+  venv/bin/python -m scripts.strategy_startup_gate --session "$SESSION" \
+  2>>"$LOG")
+if [ "${GATE:-}" != "PROCEED" ]; then
+    echo "$(date -u +%FT%TZ) STRATEGY_STARTUP_GATE_STOP session=$SESSION verdict=${GATE:-EMPTY}" >> "$LOG"
+    exit 0
+fi
 # The outer lock's refusal used to be silent.
 #
 # `flock -n` simply exited non-zero and the wrapper ended, so a scan that

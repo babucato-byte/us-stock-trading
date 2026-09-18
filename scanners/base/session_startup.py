@@ -15,8 +15,25 @@ which the entry worker was healthy, `orders_allowed=True`, and had nothing
 to work with because `scanned=0`. The 08:17 scan ran long too and the 08:32
 invocation was SCANNER_LOCK_SKIPPED behind it.
 
-So the heavy discovery moves BEFORE the session, and the session starts on
-the small set that heavy discovery already chose.
+So the heavy discovery moves BEFORE the session, and the collector starts
+streaming the set that heavy discovery already chose.
+
+The scanner does NOT start on that set. For a while it did, and the two
+halves of that sentence were the same list, which made the transport
+ceiling the strategy's universe ceiling: 41 symbols evaluated on a morning
+when 593 were available. The transport ceiling is a property of one
+appkey's websocket, not a statement about how much market is worth
+looking at.
+
+What actually costs a session its first minutes is not the universe size
+but the clock. An opening range needs `orb_minutes` to form and
+`min_post_range_bars` to be broken, so a scan before that cannot describe
+the market -- every symbol fails for the same structural reason. Measured
+live on 2026-09-19, a scan two minutes into REGULAR rejected 41 of 41
+symbols with INSUFFICIENT_POST_RANGE_BARS and no acquisition failures;
+twenty-four minutes in, one of 593. So this module also answers WHEN a
+verdict can first mean anything, and a pre-evaluable invocation waits for
+that moment instead of spending itself on a market that cannot answer yet.
 
 What this module is, and is not
 -------------------------------
@@ -45,6 +62,12 @@ artifact answers WHO TO LOOK AT, and the session's own fresh market data
 answers WHAT THEY LOOK LIKE NOW. Storing a value here that a scan could
 reuse is how a candidate published in one session gets built from another
 session's numbers.
+
+One generation, two views. `symbols` is the collector's, bounded by the
+transport ceiling. `scanner_view` is the strategy's, and holds no symbol
+list at all -- it names the manifest as the universe and records the
+moment that universe becomes evaluable. A second symbol list here would
+be a second universe bounded by whoever wrote it.
 """
 import json
 import logging
@@ -60,7 +83,19 @@ logger = logging.getLogger(__name__)
 
 #: Bumped when the artifact's meaning changes. An unrecognised version is
 #: refused rather than guessed at.
-ARTIFACT_VERSION = 1
+#:
+#: v2 splits the artifact into two CONSUMER VIEWS of one generation. v1
+#: carried a single `symbols` list that both the collector and the scanner
+#: read, which made the transport ceiling the scanner's universe ceiling
+#: too -- 41 symbols evaluated when 593 were available. v2 keeps `symbols`
+#: as the collector view, byte for byte, and states the scanner's universe
+#: separately.
+ARTIFACT_VERSION = 2
+
+#: v1 is still READ. A v1 artifact is a valid collector view and says
+#: nothing about the scanner, which is exactly the fail-safe degradation
+#: wanted: collector = its 41, scanner = the manifest.
+SUPPORTED_ARTIFACT_VERSIONS = (1, 2)
 
 #: How long before a session opens the preparation window runs. A range
 #: rather than an instant because the wrapper fires on a cron tick and must
@@ -73,11 +108,17 @@ PREP_LEAD_MIN_MINUTES = 30
 #: produced it is from an earlier cycle.
 MAX_ARTIFACT_AGE_SECONDS = 3 * 60 * 60
 
-#: How long after a session opens the startup mode applies. The existing
-#: scanner cron fires at :02/:17/:32/:47, so this covers the first
-#: invocation after a boundary and no more -- past it the ordinary cadence
-#: resumes with the ordinary universe.
-STARTUP_WINDOW_MINUTES = 5
+#: The longest a pre-evaluable invocation may wait for the market to
+#: become evaluable. One scanner cron interval: a wait longer than the
+#: cadence would still be waiting when the next tick arrived, and that
+#: tick is already closer to the answer than this one can get.
+MAX_DEFER_SECONDS = 15 * 60
+
+#: What the scanner's universe is. Named so the artifact records the
+#: decision rather than implying it by omission, and deliberately NOT a
+#: symbol list: copying one here would give the scanner a second universe
+#: bounded by whatever wrote it.
+SCANNER_VIEW_SOURCE_MANIFEST = "MANIFEST"
 
 SOURCE_PREPARED = "SESSION_STARTUP_PREP"
 SOURCE_COLLECTOR_FALLBACK = "COLLECTOR_FALLBACK"
@@ -152,8 +193,22 @@ def build_artifact(*, trading_day, target_session, symbols, cap,
                    source=SOURCE_PREPARED, source_session=None,
                    source_manifest_generation=None,
                    source_manifest_created_at=None,
-                   selection_source=None, fallback_reason=None, now=None):
-    """The artifact's content. Symbols only -- never a measurement."""
+                   selection_source=None, fallback_reason=None,
+                   scanner_view=None, now=None):
+    """One generation, two consumer views. Symbols only -- never a
+    measurement.
+
+    `symbols` and `collector_cap` stay at the top level in the v1 spelling
+    and mean what they always meant: the symbols the COLLECTOR will
+    subscribe to, bounded by the transport ceiling. The collector reads
+    them unchanged.
+
+    `scanner_view` says what the STRATEGY universe is, and says it without
+    a symbol list. That is the point of the split: the scanner's universe
+    is the manifest, and the manifest is already a single source of truth
+    for it. Copying 593 symbols in here would create a second one whose
+    bound is whatever this writer happened to have.
+    """
     stamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     ordered = [str(s).strip().upper() for s in symbols if str(s).strip()]
     return {
@@ -168,10 +223,55 @@ def build_artifact(*, trading_day, target_session, symbols, cap,
         "source_manifest_generation": source_manifest_generation,
         "source_manifest_created_at": source_manifest_created_at,
         "selection_source": selection_source,
+        # -- collector view (v1 spelling, unchanged meaning) --
         "collector_cap": int(cap),
         "symbols": ordered,
         "symbol_count": len(ordered),
+        # -- scanner view --
+        "scanner_view": dict(scanner_view) if scanner_view else None,
     }
+
+
+def build_scanner_view(target_session, *, timing=None):
+    """The scanner's half of the artifact: where its universe comes from,
+    and the earliest moment a verdict about that session can mean
+    anything.
+
+    `cap` is present and null ON PURPOSE. An absent key reads as "nobody
+    considered it"; a null one records that the strategy universe is
+    deliberately unbounded by the transport ceiling.
+    """
+    view = {
+        "source": SCANNER_VIEW_SOURCE_MANIFEST,
+        "cap": None,
+    }
+    resolved = timing if timing is not None else strategy_timing(
+        session=target_session)
+    for key in ("earliest_evaluable_at", "orb_minutes", "min_post_range_bars",
+                "bar_interval_minutes", "session_started_at"):
+        value = resolved.get(key)
+        view[key] = value.isoformat() if hasattr(value, "isoformat") else value
+    return view
+
+
+def collector_symbols(artifact):
+    """The symbols the COLLECTOR subscribes to, for v1 and v2 alike.
+
+    One accessor so no reader has to know which version it was handed --
+    a reader that checked the version itself would be the place a v1
+    artifact silently became a scanner universe again.
+    """
+    return list((artifact or {}).get("symbols") or [])
+
+
+def scanner_view_of(artifact):
+    """The scanner's view, or None for a v1 artifact.
+
+    None is not a failure and must not be treated as one: it means this
+    artifact has nothing to say about the strategy universe, so the
+    scanner uses the manifest -- which is what it uses anyway.
+    """
+    return (artifact or {}).get("scanner_view") or None
 
 
 def write_atomic(discovery_root, artifact) -> str:
@@ -221,7 +321,7 @@ def load_valid(discovery_root, *, trading_day, target_session, cap,
     except (OSError, ValueError):
         return None, STATUS_UNREADABLE
 
-    if artifact.get("version") != ARTIFACT_VERSION:
+    if artifact.get("version") not in SUPPORTED_ARTIFACT_VERSIONS:
         return None, STATUS_VERSION
     if str(artifact.get("trading_day")) != str(trading_day):
         return None, STATUS_WRONG_DAY
@@ -293,27 +393,120 @@ def session_started_at(now=None, *, horizon_minutes=26 * 60, step_minutes=1):
     return None
 
 
-def in_startup_window(now=None, *, window_minutes=STARTUP_WINDOW_MINUTES):
-    """Is this the first few minutes of a session?
+def _bar_interval_minutes(timeframe) -> int:
+    """Minutes per bar, from the scanner's own `source_timeframe`.
 
-    Decides whether a scan should start on the prepared universe or on the
-    ordinary one. False for everything else, including a session whose
-    start cannot be located -- an unanswerable clock must not silently
-    shrink the universe a scan looks at.
+    Read from the scanner rather than written here. The ORB verdict is
+    built from whatever that string names, so a second constant would be
+    a second opinion about how long the post-range bars take to form.
+    """
+    text = str(timeframe or "").strip().lower()
+    for suffix in ("min", "m"):
+        if text.endswith(suffix):
+            head = text[: -len(suffix)].strip()
+            if head.isdigit() and int(head) > 0:
+                return int(head)
+            break
+    raise ValueError(f"unsupported source_timeframe {timeframe!r}")
+
+
+def strategy_inputs(session):
+    """(orb_minutes, min_post_range_bars, bar_interval_minutes).
+
+    All three come from the ORB scanner instance the runner itself builds,
+    including the `orb_minutes_by_session` override. Asking the scanner is
+    what keeps this from becoming a copy of its configuration that drifts
+    the first time a session's window changes.
+    """
+    from scanners.registry import build_scanner
+
+    scanner = build_scanner("orb")
+    return (int(scanner.orb_minutes(session)),
+            int(scanner.config.require_int("min_post_range_bars")),
+            _bar_interval_minutes(scanner.source_timeframe))
+
+
+def earliest_evaluable_at(session_start, *, orb_minutes,
+                          min_post_range_bars, bar_interval_minutes):
+    """The first moment an ORB verdict about this session can mean
+    anything.
+
+    Before it, every symbol fails for the same structural reason and the
+    scan is not describing the market:
+
+        opening range          orb_minutes
+        + enough bars to break min_post_range_bars * bar_interval
+
+    Measured live on 2026-09-19: a REGULAR scan at T+2 rejected 41 of 41
+    symbols with INSUFFICIENT_POST_RANGE_BARS and zero acquisition
+    failures, while T+24 rejected 1 of 593 for that reason. The universe
+    size was never the problem; the clock was.
+    """
+    return session_start + timedelta(
+        minutes=int(orb_minutes) + int(min_post_range_bars) * int(bar_interval_minutes))
+
+
+def strategy_timing(now=None, session=None):
+    """When the current session's strategy scan may first say something.
+
+    Returns a dict rather than a moment because every field is telemetry
+    the deferral has to report: an operator reading a six-minute wait must
+    be able to see which three numbers produced it.
+
+    `earliest_evaluable_at` is None when it cannot be derived -- a session
+    whose start is not locatable, a closed market, an unreadable scanner
+    config. None means DO NOT DEFER: waiting on a moment nobody can
+    compute would turn an unanswerable clock into a skipped scan.
     """
     current = now or datetime.now(timezone.utc)
-    if scan_session.session_at(current) == scan_session.CLOSED:
-        return False
+    here = scan_session.session_at(current)
+    timing = {
+        "session": here,
+        "now": current,
+        "session_started_at": None,
+        "earliest_evaluable_at": None,
+        "orb_minutes": None,
+        "min_post_range_bars": None,
+        "bar_interval_minutes": None,
+        "unavailable_reason": None,
+    }
+    if here == scan_session.CLOSED:
+        timing["unavailable_reason"] = "SESSION_CLOSED"
+        return timing
     started = session_started_at(current)
     if started is None:
-        return False
-    return 0 <= _minutes(current - started) <= window_minutes
+        timing["unavailable_reason"] = "SESSION_START_NOT_LOCATABLE"
+        return timing
+    timing["session_started_at"] = started
+    try:
+        orb, post, interval = strategy_inputs(session or here)
+    except Exception as exc:  # noqa: BLE001 - see the docstring: never defer blind
+        timing["unavailable_reason"] = "STRATEGY_INPUTS_UNAVAILABLE:%r" % (exc,)
+        return timing
+    timing["orb_minutes"] = orb
+    timing["min_post_range_bars"] = post
+    timing["bar_interval_minutes"] = interval
+    timing["earliest_evaluable_at"] = earliest_evaluable_at(
+        started, orb_minutes=orb, min_post_range_bars=post,
+        bar_interval_minutes=interval)
+    return timing
 
 
-def universe_mode(now=None) -> str:
-    """`prepared` inside the startup window, empty otherwise.
+def defer_seconds(timing, *, max_defer_seconds=MAX_DEFER_SECONDS):
+    """How long this invocation should wait, and 0.0 when it should not.
 
-    Printed for a shell caller, which passes it straight to
-    `--universe`. Empty means "leave the profile's own choice alone".
+    0.0 for everything that is not a plainly-bounded wait toward a
+    computable moment: an unavailable derivation, a market already
+    evaluable, or a wait longer than the scanner's own cadence. In that
+    last case the NEXT tick is closer to the answer than this one can
+    get by holding a process open across it.
     """
-    return "prepared" if in_startup_window(now) else ""
+    earliest = timing.get("earliest_evaluable_at")
+    if earliest is None:
+        return 0.0
+    wait = (earliest - timing["now"]).total_seconds()
+    if wait <= 0:
+        return 0.0
+    if wait > max_defer_seconds:
+        return 0.0
+    return wait

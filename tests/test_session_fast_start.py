@@ -22,8 +22,11 @@ What these tests hold onto:
   * the schedule is asked, never restated -- 04:00/09:30/16:00/20:00 must
     not appear as a second set of constants, because 주간거래 is published
     in KST and moves against Eastern with US DST
-  * the collector's symbols and the scanner's symbols are the same list,
-    on the fallback path as much as the prepared one
+  * the collector's symbols and the scanner's universe come from ONE
+    generation but are no longer the same list -- the transport ceiling
+    bounds what can be streamed and must not bound what is evaluated
+  * a pre-evaluable invocation WAITS for the evaluable moment and does not
+    hold the scanner lock while it waits
   * the artifact says WHO to look at and never WHAT they looked like, so a
     session cannot publish on another session's numbers
   * a missing preparation is safe and slow, and says so rather than
@@ -42,6 +45,25 @@ SESSIONS = ["OVERNIGHT_DAYTIME", "PREMARKET", "REGULAR", "AFTER_HOURS"]
 DAY = "2026-09-18"
 NOW = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
 CAP = 41
+
+
+def _executable(path):
+    """The file's code with every string literal blanked.
+
+    A guard that reads the raw text cannot tell a constant from a comment
+    citing the incident that produced it, and this repository has now had
+    several tests fail on their own documentation. So the guards ask the
+    AST.
+    """
+    import ast
+
+    tree = ast.parse(Path(path).read_text()) if str(path).endswith(".py") else None
+    if tree is None:
+        return Path(path).read_text()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            node.value = ""
+    return ast.dump(tree)
 
 
 def _artifact(root, session, **over):
@@ -149,12 +171,27 @@ def test_8_exceeding_the_collector_cap_is_rejected(tmp_path):
 
 
 def test_8b_the_cap_comes_from_the_collector_not_a_new_constant():
-    from market_data import kis_hdfscnt0 as wire
-    from scanners import runner
+    """The ceiling is READ from the transport module, never restated.
 
-    assert runner._startup_cap() == wire.MAX_SUBSCRIPTIONS
-    source = (REPO_ROOT / "scanners" / "base" / "session_startup.py").read_text()
-    assert "41" not in source, "the ceiling is read, never restated"
+    Checked against the EXECUTABLE code with string literals blanked, not
+    against the file's text. The text cites the live measurements that
+    produced this design -- "41 of 41 symbols rejected" -- and a guard
+    that cannot tell a citation from a constant makes the documentation
+    the thing that fails.
+    """
+    from market_data import kis_hdfscnt0 as wire
+
+    for name in ("scanners/base/session_startup.py",
+                 "scripts/strategy_startup_gate.py"):
+        code = _executable(REPO_ROOT / name)
+        assert "41" not in code, f"{name}: the ceiling is read, never restated"
+
+    # And the writers that DO bound the collector read it from there.
+    for name in ("scripts/prepare_session_startup.py",
+                 "deploy/cron/s6_realtime_collector.sh"):
+        text = (REPO_ROOT / name).read_text()
+        assert "MAX_SUBSCRIPTIONS" in text, name
+    assert isinstance(wire.MAX_SUBSCRIPTIONS, int)
 
 
 # -- 10-12. the schedule is consumed, not restated -------------------------
@@ -251,17 +288,40 @@ def test_16_both_readers_resolve_the_same_artifact_path(tmp_path):
     assert json.loads(Path(collector_path).read_text())["symbols"] == art["symbols"]
 
 
-# -- 17-18. the startup scan uses the reduced universe ---------------------
+# -- 17-18. the startup scan uses the MANIFEST, like every other scan -----
 
-def test_17_and_18_the_runner_prefers_prepared_over_the_full_universe():
+def test_17_and_18_the_startup_scan_uses_the_manifest():
+    """The reduced startup universe is GONE.
+
+    It handed the scanner the collector's prepared list, which made one
+    appkey's subscription ceiling the strategy's universe ceiling: on
+    2026-09-19 a REGULAR startup scan evaluated a transport-sized universe
+    and rejected all of it for INSUFFICIENT_POST_RANGE_BARS, while the
+    manifest held 593 names. The universe was never the problem.
+    """
     from scanners import runner
 
-    source = (REPO_ROOT / "scanners" / "runner.py").read_text()
-    assert runner.UNIVERSE_PREPARED == "prepared"
-    assert source.index("selected_universe == UNIVERSE_PREPARED") < \
-        source.index("selected_universe == UNIVERSE_MANIFEST"), (
-        "the prepared branch must be reached before the 600-symbol one")
-    assert "SESSION_FAST_SCAN_START" in source
+    code = _executable(REPO_ROOT / "scanners" / "runner.py")
+    assert not hasattr(runner, "UNIVERSE_PREPARED")
+    assert not hasattr(runner, "_startup_cap")
+    assert "UNIVERSE_PREPARED" not in code
+    assert "_startup_cap" not in code
+    assert runner.UNIVERSE_MANIFEST == "manifest"
+
+    wrapper = (REPO_ROOT / "deploy" / "cron" / "s6_scan.sh").read_text()
+    assert 'UNIVERSE_ARG="manifest"' in wrapper
+    assert '--universe "$UNIVERSE_ARG"' in wrapper
+    assert 'UNIVERSE_ARG="prepared"' not in wrapper
+
+
+def test_17b_the_scanner_path_never_reads_the_transport_ceiling():
+    """The strategy universe must not be bounded by the websocket cap --
+    not by importing it, and not by naming it."""
+    for name in ("scanners/runner.py", "scanners/base/session_startup.py",
+                 "scripts/strategy_startup_gate.py"):
+        code = _executable(REPO_ROOT / name)
+        assert "MAX_SUBSCRIPTIONS" not in code, name
+        assert "kis_hdfscnt0" not in code, name
 
 
 def test_18b_the_scanner_never_imports_the_builder():
@@ -313,37 +373,51 @@ def test_23_and_24_the_startup_scan_shares_the_existing_lock():
     assert "run_scanners.py" not in prep, "no second scanner process"
 
 
-def test_24b_the_wrapper_actually_passes_the_mode_it_computed():
-    """Caught in review, not by a test: the wrapper computed UNIVERSE_ARG
-    and still passed a hard-coded `--universe manifest`, so the startup
-    mode was dead code that nothing would have reported."""
+def test_24b_the_defer_happens_before_the_lock_is_taken():
+    """ORDER IS THE WHOLE SAFETY PROPERTY.
+
+    A process waiting for the evaluable moment must not be holding the
+    scanner lock: every other session's scan in that window would become a
+    SCANNER_LOCK_SKIPPED for no reason. Asserted on the wrapper's
+    ORDERING, because "we intended not to hold it" is not a property.
+    """
     wrapper = (REPO_ROOT / "deploy" / "cron" / "s6_scan.sh").read_text()
-    assert 'UNIVERSE_ARG="prepared"' in wrapper
-    assert '--universe "$UNIVERSE_ARG"' in wrapper
-    assert "--universe manifest" not in wrapper.split("# --universe manifest")[0], (
-        "a computed mode that is not passed is worse than no mode at all")
+    assert "strategy_startup_gate" in wrapper
+    assert wrapper.index("strategy_startup_gate") < wrapper.index("flock -n"), (
+        "the gate -- and therefore the wait -- must complete before flock")
+    # And the gate refuses to scan on its own: it prints a verdict.
+    assert 'if [ "${GATE:-}" != "PROCEED" ]' in wrapper
+    gate = _executable(REPO_ROOT / "scripts" / "strategy_startup_gate.py")
+    assert "flock" not in gate
+    for forbidden in ("run_scanners", "runner.run", "publish"):
+        assert forbidden not in gate, forbidden
 
 
-# -- 25-26. fallback is safe, and says it is not fast ----------------------
+# -- 25-26. the deferral is reported, and so is the completion ------------
 
-def test_25_a_missing_preparation_falls_back_and_records_the_miss():
-    source = (REPO_ROOT / "scanners" / "runner.py").read_text()
-    assert "SESSION_FAST_SCAN_INVALID_PREP" in source
-    assert "SESSION_FAST_SCAN_FALLBACK" in source
-    assert "fast_start_slo_met=false" in source
-    assert "selected_universe = UNIVERSE_MANIFEST" in source, (
-        "safe means it still scans, not that it stops")
+def test_25_the_deferral_and_every_abort_are_named():
+    gate = (REPO_ROOT / "scripts" / "strategy_startup_gate.py").read_text()
+    for event in ("STRATEGY_STARTUP_DEFERRED", "STRATEGY_STARTUP_RESUMED",
+                  "STRATEGY_STARTUP_DEFER_ABORTED", "STRATEGY_STARTUP_NO_DEFER"):
+        assert event in gate, event
+    for field in ("defer_seconds", "orb_minutes", "min_post_range_bars",
+                  "bar_interval_minutes", "start_lag_ms"):
+        assert field in gate, field
+    for reason in ("SESSION_CHANGED", "TRADING_DAY_CHANGED", "RELEASE_CHANGED",
+                   "SESSION_CLOSED"):
+        assert reason in gate, reason
 
 
 def test_26_completion_is_reported_even_with_no_candidates():
-    from scanners import runner
-
     source = (REPO_ROOT / "scanners" / "runner.py").read_text()
-    assert "SESSION_FAST_SCAN_COMPLETE" in source
+    assert "STRATEGY_STARTUP_SCAN_START" in source
+    assert "STRATEGY_STARTUP_SCAN_COMPLETE" in source
     body = source[source.index("def _log_fast_scan_complete"):]
     body = body[:body.index("\ndef ")]
     assert "passed" in body and "evaluated" in body
-    assert "if report.fast_start_slo_met is None" in body
+    # the universe size is the claim most worth being able to disprove
+    assert "report.universe_size" in body
+    assert "strategy_start_lag_ms" in body
     # nothing in the completion path is conditional on a candidate existing
     assert "if passed" not in body
 
@@ -389,6 +463,7 @@ def test_29_fast_start_does_not_reach_the_trading_modules():
     FAST_START_FILES = [
         REPO_ROOT / "scanners" / "base" / "session_startup.py",
         REPO_ROOT / "scripts" / "prepare_session_startup.py",
+        REPO_ROOT / "scripts" / "strategy_startup_gate.py",
     ]
     forbidden = ("execution", "brokers", "reconciliation", "s1_live",
                  "kis_live_trading", "kis_position_manager")
@@ -403,3 +478,347 @@ def test_29_fast_start_does_not_reach_the_trading_modules():
             for name in names:
                 assert name.split(".")[0] not in forbidden, (
                     f"{path.name} imports {name!r}")
+
+
+# -- 30-34. one generation, two views -------------------------------------
+
+@pytest.mark.parametrize("session", SESSIONS)
+def test_30_the_scanner_view_is_uncapped_and_carries_no_symbols(tmp_path, session):
+    """`cap` is present and NULL on purpose.
+
+    An absent key reads as "nobody considered it". A null one records that
+    the strategy universe is deliberately not bounded by the transport
+    ceiling -- which is the entire decision this artifact version exists
+    to write down.
+    """
+    art = _artifact(str(tmp_path), session,
+                    scanner_view=ss.build_scanner_view(session))
+    view = art["scanner_view"]
+    assert "cap" in view, "an absent cap cannot be told from an unconsidered one"
+    assert view["cap"] is None
+    assert view["source"] == ss.SCANNER_VIEW_SOURCE_MANIFEST
+    # no symbol list anywhere in the scanner view: a second list would be a
+    # second universe, bounded by whoever wrote it
+    for key, value in view.items():
+        assert not isinstance(value, (list, tuple)), key
+
+
+@pytest.mark.parametrize("session", SESSIONS)
+def test_31_both_views_come_from_one_generation(tmp_path, session):
+    art = _artifact(str(tmp_path), session,
+                    scanner_view=ss.build_scanner_view(session))
+    loaded, status = ss.load_valid(str(tmp_path), trading_day=DAY,
+                                   target_session=session, cap=CAP, now=NOW)
+    assert status == ss.STATUS_VALID
+    # the collector view and the scanner view are halves of ONE artifact:
+    # same trading day, same target session, same generation stamp
+    assert ss.collector_symbols(loaded) == art["symbols"]
+    assert ss.scanner_view_of(loaded)["source"] == ss.SCANNER_VIEW_SOURCE_MANIFEST
+    assert loaded["trading_day"] == DAY
+    assert loaded["target_session"] == session
+    assert loaded["generated_at"] == art["generated_at"]
+
+
+def test_32_a_v1_artifact_is_a_collector_view_and_nothing_more(tmp_path):
+    """Fail-safe degradation, and the direction of it matters.
+
+    A v1 artifact predates the split, so it says nothing about the
+    scanner. It must remain a usable COLLECTOR view -- refusing it would
+    leave a session with no stream -- and must NOT become a scanner
+    universe again, because that is the coupling being removed.
+    """
+    art = _artifact(str(tmp_path), "REGULAR")
+    path = Path(ss.artifact_path(str(tmp_path), trading_day=DAY,
+                                 target_session="REGULAR"))
+    raw = json.loads(path.read_text())
+    raw["version"] = 1
+    raw.pop("scanner_view", None)
+    path.write_text(json.dumps(raw))
+
+    loaded, status = ss.load_valid(str(tmp_path), trading_day=DAY,
+                                   target_session="REGULAR", cap=CAP, now=NOW)
+    assert status == ss.STATUS_VALID, "a v1 artifact is still a valid stream list"
+    assert ss.collector_symbols(loaded) == art["symbols"]
+    assert ss.scanner_view_of(loaded) is None, (
+        "a v1 artifact must not be readable as a scanner universe")
+
+
+def test_33_an_unknown_version_is_still_refused(tmp_path):
+    art = _artifact(str(tmp_path), "REGULAR")
+    path = Path(ss.artifact_path(str(tmp_path), trading_day=DAY,
+                                 target_session="REGULAR"))
+    raw = json.loads(path.read_text())
+    raw["version"] = max(ss.SUPPORTED_ARTIFACT_VERSIONS) + 1
+    path.write_text(json.dumps(raw))
+    _, status = ss.load_valid(str(tmp_path), trading_day=DAY,
+                              target_session="REGULAR", cap=CAP, now=NOW)
+    assert status == ss.STATUS_VERSION
+    assert art["version"] == ss.ARTIFACT_VERSION
+
+
+def test_34_the_collector_view_is_still_bounded_by_the_transport_cap(tmp_path):
+    """The split loosens the SCANNER. It must not loosen the collector:
+    one appkey streams a fixed number of symbols and that is measured, not
+    negotiable."""
+    from market_data import kis_hdfscnt0 as wire
+
+    too_many = [f"SYM{i}" for i in range(wire.MAX_SUBSCRIPTIONS + 1)]
+    _artifact(str(tmp_path), "REGULAR", symbols=too_many)
+    _, status = ss.load_valid(str(tmp_path), trading_day=DAY,
+                              target_session="REGULAR",
+                              cap=wire.MAX_SUBSCRIPTIONS, now=NOW)
+    assert status == ss.STATUS_TOO_MANY
+
+
+# -- 35-38. the evaluable moment is derived, never written ----------------
+
+@pytest.mark.parametrize("session", SESSIONS)
+def test_35_earliest_evaluable_is_derived_for_every_live_session(session):
+    """From the ORB scanner's own configuration, including its
+    per-session window override -- not from a constant here."""
+    orb, post, interval = ss.strategy_inputs(session)
+    assert orb > 0 and post > 0 and interval > 0
+
+    start = datetime(2026, 9, 18, 13, 30, tzinfo=timezone.utc)
+    earliest = ss.earliest_evaluable_at(
+        start, orb_minutes=orb, min_post_range_bars=post,
+        bar_interval_minutes=interval)
+    assert earliest == start + timedelta(minutes=orb + post * interval)
+    assert earliest > start, "a session is never evaluable at its own open"
+
+
+def test_35b_no_evaluable_moment_is_hard_coded():
+    """The derivation must read the config. A literal offset here would
+    survive a config edit and quietly describe a window nobody set."""
+    for name in ("scanners/base/session_startup.py",
+                 "scripts/strategy_startup_gate.py"):
+        code = _executable(REPO_ROOT / name)
+        for literal in ("value=8", "value=13", "value=930"):
+            assert literal not in code, f"{name}: {literal}"
+    source = (REPO_ROOT / "scanners" / "base" / "session_startup.py").read_text()
+    assert "min_post_range_bars" in source and "orb_minutes" in source
+
+
+def test_36_a_pre_evaluable_invocation_defers(monkeypatch):
+    """T+2 against a T+8 evaluable moment waits the difference."""
+    start = datetime(2026, 9, 18, 13, 30, tzinfo=timezone.utc)
+    invoked = start + timedelta(minutes=2)
+    monkeypatch.setattr(ss, "session_started_at", lambda *a, **k: start)
+    monkeypatch.setattr(scan_session, "session_at", lambda *a, **k: "REGULAR")
+
+    timing = ss.strategy_timing(invoked, session="REGULAR")
+    orb, post, interval = ss.strategy_inputs("REGULAR")
+    expected = (orb + post * interval) - 2
+    assert timing["earliest_evaluable_at"] == start + timedelta(
+        minutes=orb + post * interval)
+    assert ss.defer_seconds(timing) == pytest.approx(expected * 60.0)
+
+
+def test_37_an_evaluable_invocation_does_not_defer(monkeypatch):
+    start = datetime(2026, 9, 18, 13, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(ss, "session_started_at", lambda *a, **k: start)
+    monkeypatch.setattr(scan_session, "session_at", lambda *a, **k: "REGULAR")
+    timing = ss.strategy_timing(start + timedelta(minutes=24), session="REGULAR")
+    assert ss.defer_seconds(timing) == 0.0
+
+
+def test_38_an_underivable_moment_never_defers(monkeypatch):
+    """An unanswerable clock must not become a skipped scan.
+
+    Every failure to derive the moment resolves to "scan now", which is
+    what this wrapper did before the deferral existed. Waiting on a moment
+    nobody can compute would be strictly worse than scanning early.
+    """
+    monkeypatch.setattr(scan_session, "session_at", lambda *a, **k: "REGULAR")
+    monkeypatch.setattr(ss, "session_started_at", lambda *a, **k: None)
+    timing = ss.strategy_timing(NOW, session="REGULAR")
+    assert timing["earliest_evaluable_at"] is None
+    assert timing["unavailable_reason"] == "SESSION_START_NOT_LOCATABLE"
+    assert ss.defer_seconds(timing) == 0.0
+
+    monkeypatch.setattr(scan_session, "session_at",
+                        lambda *a, **k: scan_session.CLOSED)
+    closed = ss.strategy_timing(NOW, session=None)
+    assert closed["unavailable_reason"] == "SESSION_CLOSED"
+    assert ss.defer_seconds(closed) == 0.0
+
+
+def test_39_the_wait_is_bounded_by_one_scanner_cadence(monkeypatch):
+    """A wait longer than the cron cadence is not taken at all: the next
+    tick is already closer to the answer than this process can get by
+    holding itself open across it."""
+    start = datetime(2026, 9, 18, 13, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(ss, "session_started_at", lambda *a, **k: start)
+    monkeypatch.setattr(scan_session, "session_at", lambda *a, **k: "REGULAR")
+    timing = ss.strategy_timing(start, session="REGULAR")
+    assert ss.defer_seconds(timing, max_defer_seconds=60) == 0.0
+    assert ss.defer_seconds(timing, max_defer_seconds=ss.MAX_DEFER_SECONDS) > 0
+
+
+# -- 40-42. nothing learned before the wait is trusted after it -----------
+
+def _deferring_gate(monkeypatch, *, session_answers, release_answers=None):
+    """The gate, forced into a real deferral, with the sleep removed.
+
+    The session is claimed to have opened NOW, so the evaluable moment is
+    a few minutes out and `defer_seconds` is positive. `session_at` then
+    answers from a list: the first call is the pre-wait session, later
+    calls are what the clock says after waking.
+    """
+    import scripts.strategy_startup_gate as gate
+
+    monkeypatch.setattr(ss, "session_started_at",
+                        lambda *a, **k: datetime.now(timezone.utc))
+
+    asked = {"n": 0}
+
+    def answer(*_a, **_k):
+        index = min(asked["n"], len(session_answers) - 1)
+        asked["n"] += 1
+        return session_answers[index]
+
+    monkeypatch.setattr(scan_session, "session_at", answer)
+
+    releases = list(release_answers or [("root", "sha")])
+    handed = {"n": 0}
+
+    def release():
+        index = min(handed["n"], len(releases) - 1)
+        handed["n"] += 1
+        return releases[index]
+
+    monkeypatch.setattr(gate, "_release_identity", release)
+
+    slept = []
+    monkeypatch.setattr(gate.time, "sleep", slept.append)
+    return gate, slept, asked
+
+
+def test_40_the_gate_revalidates_the_session_after_waking(monkeypatch, capsys):
+    """A session can end during the wait. Scanning after that would
+    publish candidates describing a session that is already over."""
+    gate, slept, asked = _deferring_gate(
+        monkeypatch, session_answers=["REGULAR", "AFTER_HOURS"])
+
+    code = gate.run(["--session", "REGULAR"])
+    out = capsys.readouterr()
+
+    assert code == 0
+    assert slept and slept[0] > 0, "this test is only meaningful if it deferred"
+    assert asked["n"] >= 2, "the session must be asked again AFTER the wait"
+    assert out.out.strip() == "ABORT"
+    assert "STRATEGY_STARTUP_DEFER_ABORTED" in out.err
+    assert "SESSION_CHANGED" in out.err
+    assert "STRATEGY_STARTUP_RESUMED" not in out.err
+
+
+def test_40b_an_unchanged_session_resumes_and_proceeds(monkeypatch, capsys):
+    """The other half of the same claim: revalidation must not be a
+    blanket refusal to scan after waiting."""
+    gate, slept, _ = _deferring_gate(monkeypatch, session_answers=["REGULAR"])
+
+    code = gate.run(["--session", "REGULAR"])
+    out = capsys.readouterr()
+
+    assert code == 0
+    assert slept and slept[0] > 0
+    assert out.out.strip() == "PROCEED"
+    assert "STRATEGY_STARTUP_DEFERRED" in out.err
+    assert "STRATEGY_STARTUP_RESUMED" in out.err
+    assert "start_lag_ms=" in out.err
+
+
+def test_41_the_gate_aborts_when_the_release_moves_under_it(monkeypatch, capsys):
+    """A deploy switches the release pointers atomically. A process that
+    resolved one release before the wait and scanned after it would run
+    half of one release and half of another."""
+    gate, slept, _ = _deferring_gate(
+        monkeypatch, session_answers=["REGULAR"],
+        release_answers=[("root", "sha-old"), ("root", "sha-new")])
+
+    code = gate.run(["--session", "REGULAR"])
+    out = capsys.readouterr()
+
+    assert code == 0
+    assert slept and slept[0] > 0
+    assert out.out.strip() == "ABORT"
+    assert "RELEASE_CHANGED" in out.err
+
+
+def test_41b_the_wait_happens_before_any_verdict_is_printed(monkeypatch, capsys):
+    """The wrapper takes the lock only after this process exits, so the
+    sleep must be inside the gate's own lifetime -- not deferred to the
+    caller in any form."""
+    gate, slept, _ = _deferring_gate(monkeypatch, session_answers=["REGULAR"])
+    gate.run(["--session", "REGULAR"])
+    out = capsys.readouterr()
+    assert slept, "the gate itself must do the waiting"
+    assert out.err.index("STRATEGY_STARTUP_DEFERRED") < \
+        out.err.index("STRATEGY_STARTUP_RESUMED")
+
+
+def test_42_the_gate_prints_exactly_one_verdict(monkeypatch, capsys):
+    """The wrapper branches on this single word. Anything else on stdout
+    would make it read as a refusal."""
+    import scripts.strategy_startup_gate as gate
+
+    monkeypatch.setattr(scan_session, "session_at", lambda *a, **k: "REGULAR")
+    monkeypatch.setattr(
+        ss, "session_started_at",
+        lambda *a, **k: datetime.now(timezone.utc) - timedelta(hours=2))
+    code = gate.run(["--session", "REGULAR", "--no-wait"])
+    out = capsys.readouterr()
+    assert code == 0
+    assert out.out.strip() in {"PROCEED", "ABORT"}
+    assert len(out.out.strip().splitlines()) == 1, (
+        "telemetry goes to stderr; stdout carries the verdict alone")
+
+
+# -- 43-46. the invariants this change must not touch ---------------------
+
+def test_43_the_shared_lock_and_its_skip_are_unchanged():
+    """An overlapping invocation is still a plain flock skip. No new
+    overlap mechanism: the first scan running past the next tick is
+    NORMAL now, because it starts later and reads 593 symbols."""
+    wrapper = (REPO_ROOT / "deploy" / "cron" / "s6_scan.sh").read_text()
+    assert wrapper.count("s6_scan.lock") >= 1
+    assert "flock -n -E 99" in wrapper
+    assert "SCANNER_LOCK_SKIPPED" in wrapper
+    assert "SCANNER_LOCK_ACQUIRED" in wrapper
+
+
+def test_44_the_logical_and_physical_watch_limits_are_untouched():
+    from market_data import kis_hdfscnt0 as wire
+    from s6_live import active_watch
+
+    assert wire.MAX_SUBSCRIPTIONS == 41
+    assert active_watch.MAX_LOGICAL_WATCH_SYMBOLS == 120
+    assert active_watch.MAX_LOGICAL_WATCH_SYMBOLS > wire.MAX_SUBSCRIPTIONS, (
+        "the logical watch is deliberately larger than what can be streamed")
+
+
+def test_45_the_legacy_rotation_modules_still_have_no_production_caller():
+    """discovery_tiers is dead code and slot_rotation is observation-only.
+    Neither may be wired by this change -- they encode the very coupling
+    being removed, a world where only a streamed symbol can be READY."""
+    import subprocess
+
+    for module in ("discovery_tiers", "slot_rotation"):
+        found = subprocess.run(
+            ["grep", "-rln", module, "--include=*.py", "--include=*.sh",
+             "scanners", "scripts", "deploy", "s6_live", "execution"],
+            cwd=str(REPO_ROOT), capture_output=True, text=True).stdout.split()
+        callers = [f for f in found if not f.endswith(f"{module}.py")]
+        assert not callers, f"{module} acquired a caller: {callers}"
+
+
+def test_46_the_transport_only_membership_question_is_unchanged():
+    """A REST-backed candidate may still become READY. The physical cap
+    bounds the stream, not eligibility."""
+    from s6_live import active_watch
+
+    assert hasattr(active_watch, "is_transport_only")
+    code = _executable(REPO_ROOT / "scanners" / "base" / "session_startup.py")
+    for forbidden in ("is_transport_only", "record_provisional_pass",
+                      "READY_TO_BUY", "CLAIM"):
+        assert forbidden not in code, forbidden

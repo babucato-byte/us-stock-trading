@@ -95,6 +95,9 @@ def run(argv=None) -> int:
     # The trading day the TARGET session belongs to, not today's. A
     # premarket that opens after midnight UTC belongs to the day it trades.
     target_day = us_trading_day(boundary or now)
+    # The COLLECTOR's ceiling, and only the collector's. The scanner view
+    # this artifact also carries is deliberately uncapped -- the strategy
+    # universe is the manifest, not what one websocket can stream.
     cap = wire.MAX_SUBSCRIPTIONS
 
     print("SESSION_STARTUP_PREP_START target_session=%s trading_day=%s "
@@ -141,6 +144,7 @@ def run(argv=None) -> int:
             {k: why.get(k) for k in ("from_held_positions", "from_prior_session",
                                      "from_coarse_discovery", "from_manifest",
                                      "cap", "unused_slots")}, sort_keys=True),
+        scanner_view=session_startup.build_scanner_view(target),
         now=now)
     path = session_startup.write_atomic(root, artifact)
 
