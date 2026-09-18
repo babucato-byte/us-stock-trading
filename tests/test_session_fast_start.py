@@ -369,13 +369,37 @@ def test_28_preparation_cannot_submit_an_order():
         assert forbidden not in code, forbidden
 
 
-def test_29_no_trading_module_was_modified():
-    import subprocess
+def test_29_fast_start_does_not_reach_the_trading_modules():
+    """Asserted structurally, not by diffing against a fixed baseline.
 
-    changed = subprocess.run(
-        ["git", "diff", "--name-only",
-         "9bc7e8266c58dc07ed7a23d11111481cab87b50e", "HEAD"],
-        capture_output=True, text=True, cwd=str(REPO_ROOT)).stdout.split()
-    for path in changed:
-        assert not path.startswith(("execution/", "brokers/", "reconciliation/",
-                                    "s6_live/", "s1_live/", "state_store/")), path
+    This compared the tree against a pinned SHA and required that no
+    trading module had changed since. That is a receding baseline: it
+    accumulates every later commit, so the first legitimate change to
+    `execution/` or `reconciliation/` -- made by a DIFFERENT P0, for
+    reasons of its own -- fails a test about FAST-START and tells the
+    reader something untrue. The same defect has now bitten this
+    repository three times.
+
+    What FAST-START actually claims is that its own modules observe and
+    prepare, and never reach the code that trades. That is a property of
+    these files and holds no matter what else the repository does.
+    """
+    import ast
+
+    FAST_START_FILES = [
+        REPO_ROOT / "scanners" / "base" / "session_startup.py",
+        REPO_ROOT / "scripts" / "prepare_session_startup.py",
+    ]
+    forbidden = ("execution", "brokers", "reconciliation", "s1_live",
+                 "kis_live_trading", "kis_position_manager")
+    for path in FAST_START_FILES:
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            names = []
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                names = [node.module or ""]
+            for name in names:
+                assert name.split(".")[0] not in forbidden, (
+                    f"{path.name} imports {name!r}")
