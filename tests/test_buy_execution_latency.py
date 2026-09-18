@@ -202,11 +202,66 @@ def test_20_the_latch_is_never_cleared_automatically():
         "a latch")
 
 
-def test_21_it_is_set_on_the_transition_not_every_pass():
-    body = RECON[RECON.index("def _latch_entry_block"):]
-    body = body[:body.index("\ndef ")]
-    assert "if was_clean is False:" in body, (
-        "re-activating every five minutes would bury the transition")
+def test_21_the_latch_is_keyed_on_state_not_on_the_transition(tmp_path, monkeypatch):
+    """The hole this closes, exercised rather than asserted.
+
+    Keying on CLEAN -> DIRTY looks equivalent and is not: a process that
+    restarts while the account is already dirty sees was_clean=False on
+    every later pass and would conclude the latch was already set when
+    nothing had set it.
+    """
+    # No importlib.reload: `_resolve_state_path()` reads the environment on
+    # every call and derives the lock path from it, so setenv alone isolates
+    # this. Reloading replaced the module object and broke
+    # `kill_switch.activate is kill_switch_state.activate` for every later
+    # test in the process -- pollution, not isolation.
+    monkeypatch.setenv("KILL_SWITCH_STATE_FILE", str(tmp_path / "ks.json"))
+    import kill_switch_state
+    import scripts.run_reconciliation as rr
+
+    class Dirty:
+        detail = ("position mismatch for AAPL: internal=2 KIS=1",)
+
+        def is_clean(self): return False
+        def mismatch_count(self): return 1
+
+    assert kill_switch_state.is_entry_allowed() is True
+
+    # already dirty for several passes, no latch anywhere -- the restart case
+    rr._latch_entry_block(Dirty(), was_clean=False, now=None)
+    assert kill_switch_state.get_state() == kill_switch_state.ENTRY_DISABLED, (
+        "a dirty account with no active block must be blocked, transition or not")
+    record = kill_switch_state.get_current_record()
+    first_activated_at = record["activated_at"]
+    assert record["activated_by"] == "reconciliation"
+
+    # still dirty on the next pass -- must not re-activate or re-stamp
+    rr._latch_entry_block(Dirty(), was_clean=False, now=None)
+    rr._latch_entry_block(Dirty(), was_clean=False, now=None)
+    assert kill_switch_state.get_current_record()["activated_at"] == first_activated_at, (
+        "re-activating every five minutes would re-stamp and re-alert")
+
+    # exits stay allowed
+    assert kill_switch_state.is_liquidation_allowed() is True
+    assert kill_switch_state.is_entry_allowed() is False
+
+
+def test_21b_a_stricter_operator_state_is_never_downgraded(tmp_path, monkeypatch):
+    monkeypatch.setenv("KILL_SWITCH_STATE_FILE", str(tmp_path / "ks2.json"))
+    import kill_switch_state
+    import scripts.run_reconciliation as rr
+
+    class Dirty:
+        detail = ("x",)
+
+        def is_clean(self): return False
+        def mismatch_count(self): return 1
+
+    kill_switch_state.activate(kill_switch_state.ALL_TRADING_DISABLED,
+                               reason="operator", activated_by="Hugh")
+    rr._latch_entry_block(Dirty(), was_clean=True, now=None)
+    assert kill_switch_state.get_state() == kill_switch_state.ALL_TRADING_DISABLED, (
+        "a stricter operator state must not be downgraded to ENTRY_DISABLED")
 
 
 def test_22_a_failed_latch_never_aborts_the_pass_and_is_loud():

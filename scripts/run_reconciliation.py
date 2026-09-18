@@ -363,9 +363,18 @@ def _latch_entry_block(snapshot, *, was_clean, now):
     Deliberately NOT HALT, which also stops selling, and deliberately not
     EMERGENCY_LIQUIDATE, which this codebase never triggers automatically.
 
-    Set on the CLEAN -> DIRTY transition only. `activate` is idempotent, but
-    re-activating every five minutes would append an audit snapshot each
-    time and bury the transition that mattered.
+    Keyed on whether an entry block is CURRENTLY ACTIVE, never on the
+    CLEAN -> DIRTY transition. Keying on the transition looked equivalent
+    and is not: a process that restarts while the account is already dirty
+    sees was_clean=False on every later pass and would conclude the latch
+    was "already set from the transition" when nothing had set it. The same
+    hole opens for a transition that happened before this code existed, and
+    for an operator who releases the block while the disagreement is still
+    there. The state, not the edge, is what must be true.
+
+    So: dirty and nothing blocking entry -> block once. Dirty and something
+    already blocking -> leave it exactly as it is, which is what stops this
+    from re-activating and re-alerting every five minutes.
 
     NEVER cleared here. Recovery is an operator action --
     `kill_switch_state.release(released_by=...)` -- because a pass that
@@ -376,15 +385,20 @@ def _latch_entry_block(snapshot, *, was_clean, now):
     that has already done its repair work. It is logged at error so a
     missing latch is visible rather than silent.
     """
-    if was_clean is False:
-        return  # still dirty; the latch is already set from the transition
     try:
         import kill_switch_state
 
+        # FIRST, and deliberately before anything about transitions. Any
+        # state that already refuses entry -- a reconciliation block from
+        # an earlier pass, an operator's ENTRY_OFF, ALL_TRADING_DISABLED,
+        # MANUAL_REVIEW -- is left exactly as it is. `is_entry_allowed()`
+        # is true only in ACTIVE, so this can neither double-latch nor
+        # downgrade a stricter state to ENTRY_DISABLED.
         if not kill_switch_state.is_entry_allowed():
-            logger.warning(
-                "RECONCILIATION_ENTRY_BLOCK_ALREADY_SET state=%s -- leaving it",
-                kill_switch_state.get_state())
+            logger.info(
+                "RECONCILIATION_ENTRY_BLOCK_ALREADY_ACTIVE state=%s "
+                "was_clean=%s -- leaving it untouched",
+                kill_switch_state.get_state(), was_clean)
             return
         detail = "; ".join(snapshot.detail) or "no detail"
         kill_switch_state.activate(
