@@ -394,8 +394,14 @@ class TestS1AndOtherS6ExitBehaviorUnchanged:
         """
         import subprocess
 
+        # `s1_live/exit_runtime.py` left this list on 2026-09-18, when the
+        # shared execution lock moved into the engine: `_submit_sell` now
+        # forwards a lock owner and an under-lock re-check, which is a real
+        # reason for THIS module's work to touch that file and breaks the
+        # byte-diff premise for it. The behaviour is covered positively in
+        # tests/test_shared_execution_lock_scope.py instead.
         diff = subprocess.run(
-            ["git", "diff", "--stat", "HEAD", "--", "s1_live/exit_runtime.py",
+            ["git", "diff", "--stat", "HEAD", "--",
              "state_store/exit_intent_ledger.py"],
             capture_output=True, text=True).stdout
         assert diff.strip() == "", diff

@@ -39,14 +39,17 @@ intentionally NOT retried by this function (spec §9) -- reconciliation/
 order_reconciler.py is the only path that can move it out of UNKNOWN.
 """
 
+import contextlib
 import logging
 import sqlite3
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 
 from brokers.kis_broker import (KISAmbiguousResponseError, KISBrokerError,
                                 KISDaytimeEligibilityError)
 from brokers.kis_config import KISConfigError
-from execution import authorization, idempotency, order_gate, order_repository
+from execution import (authorization, execution_lock, idempotency, order_gate,
+                       order_repository)
 from execution.authorization import UnauthorizedExecutionError
 from execution.order_repository import (
     FatalRepositoryConnectionError,
@@ -94,6 +97,13 @@ REASON_HALT = "HALT"
 REASON_GATE = "GATE"
 REASON_STATE_PERSISTENCE = "STATE_PERSISTENCE"
 REASON_SIGNAL_EXPIRED_BEFORE_SUBMIT = "SIGNAL_EXPIRED_BEFORE_BROKER_SUBMIT"
+
+# Transient infrastructure conditions, NOT refusals of the candidate. Both
+# leave no order attempt behind, so a later tick may try the same signal
+# again -- unlike a reconciliation refusal, which is a real judgement about
+# the account and consumes the attempt exactly as it always has.
+REASON_EXECUTION_LOCK_UNAVAILABLE = "EXECUTION_LOCK_UNAVAILABLE"
+REASON_SNAPSHOT_STALE = "RECONCILIATION_SNAPSHOT_STALE"
 REASON_AUDIT_PERSISTENCE = "AUDIT_PERSISTENCE"
 # The broker's own guard refused before it touched the network. Distinct
 # from REASON_GATE (our gate said no) and from a broker rejection (KIS
@@ -285,7 +295,7 @@ def _audit_before_transport(*, audit_run_id, event_type, order_intent, side_labe
 
 def submit_buy_order(*, order_intent, buy_gate_context_builder, conn, broker, instrument,
                      account_id, audit_run_id, now=None, bootstrap_capability=None,
-                     final_check=None):
+                     final_check=None, lock_owner=None, pre_submit_check=None):
     """`buy_gate_context_builder` is a ONE-ARG callable the caller
     supplies that takes the `ReconciliationSnapshot` this engine just
     built and returns a fully-populated `order_gate.BuyGateContext` --
@@ -299,13 +309,15 @@ def submit_buy_order(*, order_intent, buy_gate_context_builder, conn, broker, in
         order_intent=order_intent, gate_context_builder=buy_gate_context_builder,
         gate_fn=order_gate.evaluate_buy_gate, conn=conn, broker=broker, instrument=instrument,
         account_id=account_id, now=now, side_label="buy", audit_run_id=audit_run_id,
-        final_check=final_check,
+        final_check=final_check, lock_owner=lock_owner,
+        pre_submit_check=pre_submit_check,
         bootstrap_capability=bootstrap_capability,
     )
 
 
 def submit_sell_order(*, order_intent, sell_gate_context_builder, conn, broker, instrument,
-                      account_id, audit_run_id, now=None):
+                      account_id, audit_run_id, now=None, lock_owner=None,
+                      pre_submit_check=None):
     """CODEX-044: identical reconciliation policy to the buy path --
     same snapshot, same TTL, same account/symbol binding, same
     fail-closed outcomes. `sell_gate_context_builder` takes the
@@ -314,14 +326,68 @@ def submit_sell_order(*, order_intent, sell_gate_context_builder, conn, broker, 
         order_intent=order_intent, gate_context_builder=sell_gate_context_builder,
         gate_fn=order_gate.evaluate_sell_gate, conn=conn, broker=broker, instrument=instrument,
         account_id=account_id, now=now, side_label="sell", audit_run_id=audit_run_id,
+        lock_owner=lock_owner, pre_submit_check=pre_submit_check,
         # A SELL is never a bootstrap order: the bootstrap places one BUY.
         bootstrap_capability=None,
     )
 
 
+def _register_and_start(conn, *, order_intent, trading_date, side_label):
+    """Register the durable attempt and move it to VALIDATING.
+
+    Shared by the two paths that need a durable record: the reconciliation
+    refusal, which registers only in order to record that the account was
+    judged unsafe, and the live submission, which registers because it is
+    about to send an order. Extracted so those two cannot drift apart.
+
+    Must be called inside `idempotency.single_run_lock()`.
+    """
+    try:
+        idempotency.register(
+            conn, internal_order_id=order_intent.internal_order_id,
+            signal_id=order_intent.signal_id, symbol=order_intent.symbol,
+            side=order_intent.side, trading_date=trading_date,
+            requested_quantity=order_intent.quantity,
+            # Recorded HERE, before the gate and before any network
+            # call, for the same reason the row itself is: the
+            # per-strategy cap counts this row as in flight, and a
+            # row that arrived without its owner would be counted
+            # against every strategy (execution/entry_limits.py).
+            strategy_id=getattr(order_intent, "strategy_id", None),
+        )
+    except idempotency.DuplicateOrderAttemptError as exc:
+        raise ExecutionEngineError(
+            f"{side_label} order blocked by idempotency check: {exc}",
+            reason_code=REASON_DUPLICATE,
+        ) from exc
+
+    record = order_repository.load(conn, order_intent.internal_order_id)
+    try:
+        # Deliberately WITHOUT now=current, here and at every other
+        # transition below. `current` is the cycle's timestamp --
+        # every symbol in the entry loop shares it -- so stamping a
+        # transition with it records when the CYCLE began, not when
+        # the order moved. Passing it produced the OWL order's
+        # history, where VALIDATING, APPROVED, SUBMITTING and
+        # ACCEPTED all read 15:13:06.630 and no latency between any
+        # two steps could be measured. The repository stamps the
+        # moment instead.
+        record = order_repository.advance(
+            conn, record, "VALIDATING", event_type="VALIDATION_STARTED",
+        )
+    except FatalRepositoryConnectionError:
+        raise  # CODEX-059: fatal outranks the ordinary persistence path
+    except OrderRepositoryError as exc:
+        raise ExecutionEngineError(
+            f"{side_label} order blocked -- could not durably record VALIDATING: {exc}",
+            reason_code=REASON_STATE_PERSISTENCE,
+        ) from exc
+    return record
+
+
 def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, broker, instrument,
                        account_id, now, side_label, audit_run_id, bootstrap_capability=None,
-                       final_check=None):
+                       final_check=None, lock_owner=None, pre_submit_check=None):
     """The single new-order flow both submit_buy_order() and
     submit_sell_order() run -- buy and sell differ ONLY in which gate
     function evaluates the context, never in which safety steps run or
@@ -356,60 +422,119 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
     # regular session the two agree, but any evaluation after 20:00 ET
     # would have rolled the UTC date while the trading day had not.
     trading_date = us_trading_day(current)
-    with idempotency.single_run_lock():
-        try:
-            idempotency.register(
-                conn, internal_order_id=order_intent.internal_order_id,
-                signal_id=order_intent.signal_id, symbol=order_intent.symbol,
-                side=order_intent.side, trading_date=trading_date,
-                requested_quantity=order_intent.quantity,
-                # Recorded HERE, before the gate and before any network
-                # call, for the same reason the row itself is: the
-                # per-strategy cap counts this row as in flight, and a
-                # row that arrived without its owner would be counted
-                # against every strategy (execution/entry_limits.py).
-                strategy_id=getattr(order_intent, "strategy_id", None),
-            )
-        except idempotency.DuplicateOrderAttemptError as exc:
-            raise ExecutionEngineError(
-                f"{side_label} order blocked by idempotency check: {exc}",
-                reason_code=REASON_DUPLICATE,
-            ) from exc
 
-        record = order_repository.load(conn, order_intent.internal_order_id)
-        try:
-            # Deliberately WITHOUT now=current, here and at every other
-            # transition below. `current` is the cycle's timestamp --
-            # every symbol in the entry loop shares it -- so stamping a
-            # transition with it records when the CYCLE began, not when
-            # the order moved. Passing it produced the OWL order's
-            # history, where VALIDATING, APPROVED, SUBMITTING and
-            # ACCEPTED all read 15:13:06.630 and no latency between any
-            # two steps could be measured. The repository stamps the
-            # moment instead.
-            record = order_repository.advance(
-                conn, record, "VALIDATING", event_type="VALIDATION_STARTED",
-            )
-        except FatalRepositoryConnectionError:
-            raise  # CODEX-059: fatal outranks the ordinary persistence path
-        except OrderRepositoryError as exc:
-            raise ExecutionEngineError(
-                f"{side_label} order blocked -- could not durably record VALIDATING: {exc}",
-                reason_code=REASON_STATE_PERSISTENCE,
-            ) from exc
-
-        try:
-            snapshot = _reconcile_now(
-                conn=conn, broker=broker, order_intent=order_intent, account_id=account_id,
-                current=current, side_label=side_label,
-                # TCN-02A: only a SELL may carry a dirty snapshot into the
-                # gate. The buy path is byte-for-byte what it was.
-                defer_dirty_to_gate=(side_label == "sell"),
-            )
-        except ExecutionEngineError as exc:
+    # The evidence is gathered FIRST, and with no lock held.
+    #
+    # These are the engine's own reads, taken by the engine from the broker,
+    # exactly as CODEX-044 requires -- what changed is only when the
+    # execution lock is taken. Under the lock they cost LKQ 213.8 seconds on
+    # 2026-09-17: three venue sweeps and a paged fill history reaching back
+    # to the oldest order still believed live, while four cron ticks were
+    # dropped and the signal being authorized aged past its own budget.
+    try:
+        snapshot = _reconcile_now(
+            conn=conn, broker=broker, order_intent=order_intent, account_id=account_id,
+            current=current, side_label=side_label,
+            # TCN-02A: only a SELL may carry a dirty snapshot into the
+            # gate. The buy path is byte-for-byte what it was.
+            defer_dirty_to_gate=(side_label == "sell"),
+        )
+    except ExecutionEngineError as exc:
+        # A reconciliation refusal is a real judgement about the account,
+        # and it stays exactly as terminal as it has always been: the
+        # attempt is registered so the refusal is durable, rejected with
+        # the same RECONCILIATION_BLOCKED event, and the candidate is
+        # consumed for the day. The only thing that changed is that none of
+        # it needs the execution lock -- recording a refusal never touches
+        # the broker, and taking a broker-mutation lock to write a rejection
+        # is how the lock came to be held across reads in the first place.
+        with idempotency.single_run_lock():
+            record = _register_and_start(
+                conn, order_intent=order_intent, trading_date=trading_date,
+                side_label=side_label)
             _reject(conn, record, event_type="RECONCILIATION_BLOCKED", reason=str(exc))
-            raise
-        reconciliation_dirty = not snapshot.is_clean()
+        raise
+    reconciliation_dirty = not snapshot.is_clean()
+    evidence_gathered_at = time.monotonic()
+
+    with contextlib.ExitStack() as execution_critical:
+        # THE CRITICAL SECTION. Nothing below reads the account again.
+        #
+        # `lock_owner=None` means a caller holds it already -- the cancel
+        # path, and tests that drive the engine directly -- so their
+        # behaviour is unchanged.
+        if lock_owner is not None:
+            try:
+                execution_critical.enter_context(execution_lock.hold(lock_owner))
+            except execution_lock.ExecutionLockUnavailable as exc:
+                # TRANSIENT, and deliberately registered NOWHERE. The
+                # idempotency key is (signal_id, symbol, side, trading_date)
+                # and matches regardless of status, so a candidate gets one
+                # attempt per day by design. Burning it because another
+                # cycle happened to hold a lock would turn contention into
+                # a lost trade.
+                raise ExecutionEngineError(
+                    f"{side_label} order not submitted -- the execution lock is "
+                    f"held by another cycle: {exc}",
+                    reason_code=REASON_EXECUTION_LOCK_UNAVAILABLE,
+                ) from exc
+
+            # The snapshot predates the wait for the lock, which is the
+            # staleness window that did not exist when the lock came first.
+            # Judged by the mechanism that already owns that question --
+            # `verify_snapshot`'s age bound -- re-asked against the clock
+            # now, and transient for the same reason the lock is: nothing
+            # about the candidate was found wanting.
+            # Measured against the CALLER's clock advanced by the wait that
+            # actually elapsed, not by `datetime.now()`. Callers pass a fixed
+            # `now` -- the cycle's timestamp -- and judging a snapshot
+            # stamped with it against wall-clock time compares two different
+            # clocks and fails every order. The monotonic delta is the real
+            # question anyway: how long did waiting for this lock take.
+            waited = max(0.0, time.monotonic() - evidence_gathered_at)
+            try:
+                reconciliation_snapshot.verify_snapshot(
+                    snapshot, account_id=account_id, symbol=order_intent.symbol,
+                    now=current + timedelta(seconds=waited),
+                )
+            except ReconciliationBlockedError as exc:
+                if not (reconciliation_dirty and side_label == "sell"):
+                    # A dirty SELL snapshot was deliberately carried past
+                    # verification above (TCN-02A) and must not be re-judged
+                    # here; anything else -- an aged snapshot above all --
+                    # refuses, before anything is registered.
+                    raise ExecutionEngineError(
+                        f"{side_label} order not submitted -- the reconciliation "
+                        f"snapshot went stale while waiting for the execution "
+                        f"lock: {exc}",
+                        reason_code=REASON_SNAPSHOT_STALE,
+                    ) from exc
+
+        execution_critical.enter_context(idempotency.single_run_lock())
+
+        # Registered only now, under the lock, with clean evidence in hand
+        # and the intention to send an order. `register` re-checks for an
+        # existing attempt inside `single_run_lock`, and the table's UNIQUE
+        # constraints are the real guarantee, so a racing tick that got here
+        # first is still refused as a duplicate rather than duplicated.
+        record = _register_and_start(
+            conn, order_intent=order_intent, trading_date=trading_date,
+            side_label=side_label)
+
+        # The caller's own last look, taken here because under the lock is
+        # the only place it means anything: for a BUY the kill switches and
+        # the cash re-read, for a SELL that the row is still one a SELL may
+        # be sent for.
+        if pre_submit_check is not None:
+            blocked = pre_submit_check()
+            if blocked is not None:
+                reason_code, detail = blocked
+                _reject(conn, record, event_type="PRE_SUBMIT_REVALIDATION",
+                        reason=detail)
+                raise ExecutionEngineError(
+                    f"{side_label} order blocked immediately before the gate: {detail}",
+                    reason_code=reason_code,
+                )
 
         # The context the gate actually evaluated, captured so the
         # pre-transport notification reports the SAME facts the gate

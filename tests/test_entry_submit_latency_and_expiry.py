@@ -104,29 +104,25 @@ def test_the_reason_code_is_distinct_and_named():
 
 # -- what did NOT change, recorded so the gap is not mistaken for done ----
 
-def test_the_deep_sweep_is_STILL_inside_the_execution_lock():
-    """Documents an OPEN defect, deliberately asserted as it stands.
+def test_the_deep_sweep_is_no_longer_inside_the_execution_lock():
+    """This test used to assert the opposite, deliberately.
 
-    Moving the collection out of the lock was attempted and reverted: the
-    engine collecting its own broker truth is CODEX-044, asserted by
-    tests/test_buy_submit_read_dedup.py, and handing it a caller-collected
-    view violates that invariant rather than satisfying this one. The
-    latency fix therefore needs the LOCK to move, not the reads -- see the
-    report accompanying this branch.
-
-    Until then the 213-second hold remains, and this test says so out loud
-    so nobody reads the signal fix as having addressed it.
+    When the final signal check shipped, the 213-second lock hold was left
+    open and documented here so nobody could mistake the signal fix for
+    having addressed it. It has since been addressed: the lock moved into
+    the engine, taken after its reconciliation reads rather than around
+    them. The full contract lives in
+    tests/test_shared_execution_lock_scope.py; this is the marker flipping.
     """
     import inspect
 
     import kis_live_trading
+    from execution import execution_engine
 
-    source = inspect.getsource(kis_live_trading)
-    hold = source.index("execution_lock.hold(_EXEC_LOCK_OWNER_ENTRY)")
-    submit = source.index("execution_engine.submit_buy_order(")
-    assert hold < submit, (
-        "submit_buy_order -- which collects the reconciliation snapshot -- "
-        "still runs inside the execution lock")
+    assert "execution_lock.hold" not in inspect.getsource(kis_live_trading)
+    engine = inspect.getsource(execution_engine)
+    assert engine.index("snapshot = _reconcile_now(") < \
+        engine.index("execution_lock.hold(lock_owner)")
 
 
 def test_the_engine_still_collects_its_own_facts():
@@ -158,17 +154,29 @@ def test_the_fill_window_was_not_narrowed():
 # -- G / H: nothing else moved --------------------------------------------
 
 def test_G_and_H_the_safety_flow_is_unchanged():
+    """The steps and their order, re-expressed after the lock relocation.
+
+    `idempotency.register` moved into `_register_and_start`, shared by the
+    reconciliation-refusal path and the live path, so it is asserted through
+    that helper rather than by name here.
+    """
     import inspect
 
+    from execution import execution_engine
+
     source = inspect.getsource(execution_engine._submit_new_order)
-    for step in ("idempotency.register", "_reconcile_now", "single_run_lock"):
+    for step in ("_reconcile_now", "_register_and_start", "single_run_lock"):
         assert step in source, step
-    # order preserved: register -> reconcile -> gate -> final check -> submit
-    assert (source.index("idempotency.register")
-            < source.index("snapshot = _reconcile_now(")
+    helper = inspect.getsource(execution_engine._register_and_start)
+    assert "idempotency.register(" in helper
+
+    # reconcile -> lock -> register -> gate -> final check -> submit
+    assert (source.index("snapshot = _reconcile_now(")
+            < source.index("execution_lock.hold(lock_owner)")
+            < source.index("record = _register_and_start(\n            conn,")
             < source.index("_build_gate_context, gate_fn")
             < source.index("if final_check is not None:")
-            < source.index("broker.submit_order("))
+            < source.index("execution_record = broker.submit_order("))
 
 
 def test_the_default_path_is_byte_for_byte_the_old_one():

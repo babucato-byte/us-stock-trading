@@ -172,7 +172,8 @@ class KISBrokerAdapter:
 
     def submit_order(self, symbol, qty=1, *, side, order_type="market", time_in_force="day",
                       client_order_id=None, live_entry_context=None, account_cash_snapshot=None,
-                      sell_evidence=None):
+                      sell_evidence=None,
+                      execution_lock_owner=None, pre_submit_check=None):
         """`sell_evidence` (TCN-02A) is the caller's
         `execution.sell_safe_evidence.LocalPositionEvidence` for the row
         being sold. When supplied, this adapter adds its own broker and
@@ -314,6 +315,13 @@ class KISBrokerAdapter:
                     order_intent=order_intent, sell_gate_context_builder=_sell_ctx_builder,
                     conn=conn, broker=self.kis_broker, instrument=instrument,
                     account_id=account_id, now=current, audit_run_id=run_id,
+                    # Passed straight through. The engine takes the
+                    # broker-mutation lock around the decision and the write,
+                    # so its own reconciliation reads no longer happen inside
+                    # it; None leaves the caller responsible, exactly as
+                    # before.
+                    lock_owner=execution_lock_owner,
+                    pre_submit_check=pre_submit_check,
                 )
             except ExecutionEngineError as exc:
                 return self._blocked(

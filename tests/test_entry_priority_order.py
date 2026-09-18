@@ -29,8 +29,13 @@ class TestExitPriorityIsSymbolScoped:
         assert "run_once(strategy=args.strategy)" in main
 
     def test_submit_time_revalidation_remains_in_the_shared_cycle(self):
+        """The revalidation is still the shared cycle's, and still runs
+        under the execution lock -- but the lock is now the ENGINE's, taken
+        after its reconciliation reads rather than around them, so the cycle
+        hands the check down instead of wrapping the call in a lock."""
         shared = (REPO_ROOT / "kis_live_trading.py").read_text(encoding="utf-8")
-        assert "with execution_lock.hold(_EXEC_LOCK_OWNER_ENTRY):" in shared
+        assert "lock_owner=_EXEC_LOCK_OWNER_ENTRY" in shared
+        assert "pre_submit_check=_pre_submit_revalidation" in shared
         assert "_revalidate_before_submit(" in shared
         assert "REVALIDATION_EXIT_IN_FLIGHT" in shared
 

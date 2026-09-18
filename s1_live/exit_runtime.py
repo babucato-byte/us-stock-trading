@@ -129,8 +129,20 @@ def _accepts_sell_evidence(broker_adapter) -> bool:
     return "sell_evidence" in parameters
 
 
+def _accepts_execution_lock(broker_adapter) -> bool:
+    """Whether this adapter can be handed the execution-lock owner."""
+    import inspect
+
+    try:
+        params = inspect.signature(broker_adapter.submit_order).parameters
+    except (TypeError, ValueError):  # builtins, C-implemented fakes
+        return False
+    return "execution_lock_owner" in params
+
+
 def _submit_sell(conn, *, broker_adapter, position_id, row, reason, now=None,
-                 store=None, prefix="s1exit") -> ExitOutcome:
+                 store=None, prefix="s1exit", execution_lock_owner=None,
+                 pre_submit_check=None) -> ExitOutcome:
     """Reserve the intent, place the order through the VERIFIED path, and
     record the outcome. Never places a second order for a position.
 
@@ -163,6 +175,14 @@ def _submit_sell(conn, *, broker_adapter, position_id, row, reason, now=None,
     # passed to an adapter that can receive it, so a fake or legacy
     # adapter sees the call it always saw.
     submit_kwargs = {"side": "sell", "client_order_id": client_order_id}
+    # Only handed to an adapter that can receive them, for the same reason
+    # `sell_evidence` is: a fake or legacy adapter must see the call it
+    # always saw. When supplied, the execution lock is taken by the engine
+    # around the decision and the write rather than by the caller around the
+    # engine's account reads.
+    if execution_lock_owner is not None and _accepts_execution_lock(broker_adapter):
+        submit_kwargs["execution_lock_owner"] = execution_lock_owner
+        submit_kwargs["pre_submit_check"] = pre_submit_check
     if _accepts_sell_evidence(broker_adapter):
         submit_kwargs["sell_evidence"] = LocalPositionEvidence.from_row(
             row, position_id=position_id)

@@ -36,6 +36,7 @@ from typing import Any, Dict, List, Optional
 from execution import execution_lock
 from execution.execution_lock import ExecutionLockUnavailable
 from s1_live.exit_runtime import (
+    _accepts_execution_lock,
     ACTION_BLOCKED as _ACTION_BLOCKED,
     ACTION_LATCHED as _ACTION_LATCHED,
     ExitOutcome,
@@ -47,6 +48,8 @@ logger = logging.getLogger(__name__)
 
 #: Named so `EXEC_LOCK owner=...` says which side of the book took it.
 _EXEC_LOCK_OWNER_EXIT = "S6_EXIT_SUBMIT"
+#: Reason code for the under-lock row re-check refusing a SELL.
+_SELL_PRECHECK_REASON_CODE = "SELL_PRECHECK_FAILED"
 
 #: Statuses from which a SELL may still be sent. SUBMITTED is excluded on
 #: purpose: that row has no fill behind it yet, so there is nothing to
@@ -513,27 +516,69 @@ def _submit_sell_locked(conn, *, broker_adapter, position_id, row, reason,
     `retry_latched_exits` sends it on the next tick.
     """
     symbol = row["symbol"]
-    try:
-        with execution_lock.hold(_EXEC_LOCK_OWNER_EXIT):
-            fresh = position_store.load(conn, position_id)
-            blocked = _sell_still_valid(fresh)
-            if blocked:
-                logger.warning(
-                    "S6 %s: SELL abandoned after taking the execution lock "
-                    "-- %s", symbol, blocked)
-                return ExitOutcome(position_id, symbol, _ACTION_BLOCKED,
-                                   reason, blocked)
-            return _submit_sell(
-                conn, broker_adapter=broker_adapter, position_id=position_id,
-                row=fresh, reason=reason, now=now, store=position_store,
-                prefix=CLIENT_ORDER_PREFIX)
-    except ExecutionLockUnavailable as exc:
-        position_store.latch_pending_exit(conn, position_id, reason, now=now)
+
+    # The lock moved INTO the engine, around the decision and the write.
+    #
+    # Held here it wrapped the engine's own reconciliation reads -- three
+    # venue sweeps and a paged fill history -- exactly as the entry path did
+    # before LKQ cost it 213.8 seconds on 2026-09-17. Those reads are still
+    # the engine's, taken by the engine, as CODEX-044 requires; only the
+    # moment the lock is taken has changed.
+    #
+    # `_sell_still_valid` travels with it as `pre_submit_check`, so the row
+    # is re-read and re-judged under the lock, which is the only place that
+    # question means anything. A lock that cannot be taken, or a snapshot
+    # that went stale while waiting for it, now surfaces as a blocked
+    # submission -- which `_submit_sell` already handles by aborting the
+    # intent and LATCHING, the same transient retry this function used to
+    # perform itself.
+    def _still_sellable():
+        fresh_row = position_store.load(conn, position_id)
+        blocked = _sell_still_valid(fresh_row)
+        if not blocked:
+            return None
         logger.warning(
-            "S6 %s: execution lock unavailable, exit LATCHED for the next "
-            "tick rather than submitted: %s", symbol, exc)
-        return ExitOutcome(position_id, symbol, _ACTION_LATCHED, reason,
-                           f"execution lock unavailable: {exc}")
+            "S6 %s: SELL abandoned after taking the execution lock -- %s",
+            symbol, blocked)
+        return (_SELL_PRECHECK_REASON_CODE, blocked)
+
+    if not _accepts_execution_lock(broker_adapter):
+        # An adapter that cannot carry the lock keeps the ORIGINAL shape:
+        # this function takes the lock and runs the re-check itself.
+        #
+        # Deliberately not a silent degrade. Handing the check to an adapter
+        # that drops it would remove a refusal rather than weaken one -- a
+        # closed position would be sold -- so the capability probe falls
+        # back to the behaviour it is replacing instead of to none.
+        try:
+            with execution_lock.hold(_EXEC_LOCK_OWNER_EXIT):
+                fresh = position_store.load(conn, position_id)
+                blocked = _sell_still_valid(fresh)
+                if blocked:
+                    logger.warning(
+                        "S6 %s: SELL abandoned after taking the execution lock "
+                        "-- %s", symbol, blocked)
+                    return ExitOutcome(position_id, symbol, _ACTION_BLOCKED,
+                                       reason, blocked)
+                return _submit_sell(
+                    conn, broker_adapter=broker_adapter, position_id=position_id,
+                    row=fresh, reason=reason, now=now, store=position_store,
+                    prefix=CLIENT_ORDER_PREFIX)
+        except ExecutionLockUnavailable as exc:
+            position_store.latch_pending_exit(conn, position_id, reason, now=now)
+            logger.warning(
+                "S6 %s: execution lock unavailable, exit LATCHED for the next "
+                "tick rather than submitted: %s", symbol, exc)
+            return ExitOutcome(position_id, symbol, _ACTION_LATCHED, reason,
+                               f"execution lock unavailable: {exc}")
+
+    fresh = position_store.load(conn, position_id) or row
+    return _submit_sell(
+        conn, broker_adapter=broker_adapter, position_id=position_id,
+        row=fresh, reason=reason, now=now, store=position_store,
+        prefix=CLIENT_ORDER_PREFIX,
+        execution_lock_owner=_EXEC_LOCK_OWNER_EXIT,
+        pre_submit_check=_still_sellable)
 
 
 def evaluate_position(conn, *, broker_adapter, position_id, row,

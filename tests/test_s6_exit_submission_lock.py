@@ -259,7 +259,9 @@ class TestSerialisedAgainstBuy:
 
         assert execution_lock.lock_path() == str(lock_file)
         source = (REPO_ROOT / "kis_live_trading.py").read_text()
-        assert "execution_lock.hold(_EXEC_LOCK_OWNER_ENTRY)" in source
+        assert "lock_owner=_EXEC_LOCK_OWNER_ENTRY" in source, (
+            "the entry hands the lock to the engine, which takes it after "
+            "its reconciliation reads rather than around them")
         exit_source = (REPO_ROOT / "s6_live" / "exit_runtime.py").read_text()
         assert "execution_lock.hold(_EXEC_LOCK_OWNER_EXIT)" in exit_source
 

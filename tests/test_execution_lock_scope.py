@@ -92,7 +92,18 @@ class TestTheWrapperNoLongerHoldsTheExecutionLock:
 
 
 class TestTheLockIsHeldAroundTheSubmissionOnly:
-    """Structural, because a timing test cannot prove where a lock is not."""
+    """Structural, because a timing test cannot prove where a lock is not.
+
+    These asserted the lock was taken by `run_live_buy_entry_cycle` around
+    `submit_buy_order`. It has since moved INTO the engine, around the
+    decision and the write, because wrapping `submit_buy_order` also wrapped
+    the engine's own reconciliation reads: three venue sweeps and a paged
+    fill history, 213.8 seconds for LKQ on 2026-09-17, four cron ticks
+    dropped and the signal aged past its budget.
+
+    The claim is unchanged -- the lock covers the submission and not the
+    analysis -- so it is asserted where the lock now lives.
+    """
 
     @staticmethod
     def _cycle_function():
@@ -103,61 +114,51 @@ class TestTheLockIsHeldAroundTheSubmissionOnly:
         raise AssertionError("run_live_buy_entry_cycle not found")
 
     @staticmethod
-    def _lock_blocks(func):
-        found = []
-        for node in ast.walk(func):
-            if not isinstance(node, ast.With):
-                continue
-            for item in node.items:
-                call = item.context_expr
-                if (isinstance(call, ast.Call)
-                        and isinstance(call.func, ast.Attribute)
-                        and call.func.attr == "hold"):
-                    found.append(node)
-        return found
+    def _engine_source():
+        return (REPO_ROOT / "execution" / "execution_engine.py").read_text()
 
-    def _calls_within(self, node):
-        names = set()
-        for inner in ast.walk(node):
-            if isinstance(inner, ast.Call):
-                target = inner.func
-                if isinstance(target, ast.Attribute):
-                    names.add(target.attr)
-                elif isinstance(target, ast.Name):
-                    names.add(target.id)
-        return names
+    def test_the_cycle_no_longer_holds_the_lock_itself(self):
+        assert "execution_lock.hold" not in KLT_SOURCE, (
+            "the entry cycle must hand the lock to the engine, not hold it "
+            "around the engine's account reads")
 
-    def test_exactly_one_lock_block_exists(self):
-        blocks = self._lock_blocks(self._cycle_function())
-        assert len(blocks) == 1, (
-            f"expected one critical section, found {len(blocks)}")
+    def test_the_engine_holds_the_lock(self):
+        assert "execution_lock.hold(lock_owner)" in self._engine_source()
 
-    def test_the_submission_happens_inside_the_lock(self):
-        block = self._lock_blocks(self._cycle_function())[0]
-        assert "submit_buy_order" in self._calls_within(block)
+    def test_the_lock_is_taken_after_the_reconciliation_reads(self):
+        engine = self._engine_source()
+        assert engine.index("snapshot = _reconcile_now(") < \
+            engine.index("execution_lock.hold(lock_owner)"), (
+            "the whole point: the deep reads happen before the lock is taken")
 
-    def test_revalidation_happens_inside_the_lock(self):
-        block = self._lock_blocks(self._cycle_function())[0]
-        assert "_revalidate_before_submit" in self._calls_within(block)
+    def test_the_lock_is_taken_before_the_transport_call(self):
+        engine = self._engine_source()
+        assert engine.index("execution_lock.hold(lock_owner)") < \
+            engine.index("execution_record = broker.submit_order("), (
+            "the write must happen under the lock")
+
+    def test_the_revalidation_still_happens_under_the_lock(self):
+        """It moved with the lock rather than being left behind."""
+        engine = self._engine_source()
+        assert engine.index("execution_lock.hold(lock_owner)") < \
+            engine.index("blocked = pre_submit_check()")
+        assert engine.index("blocked = pre_submit_check()") < \
+            engine.index("execution_record = broker.submit_order(")
+        assert "pre_submit_check=_pre_submit_revalidation" in KLT_SOURCE, (
+            "the entry cycle must still supply its revalidation")
 
     @pytest.mark.parametrize("slow_call", [
-        "symbols",            # the precision watch / pre-trade validation
+        # `symbols` is deliberately absent: it is a substring of
+        # `allowed_symbols`, which the gate context legitimately carries,
+        # so asserting on it tests spelling rather than scope.
         "get_price_quote",    # per-symbol KIS quotes
-        "get_orderable_usd",  # sizing
-        "qualify",
+        "qualify",            # the precision watch / pre-trade validation
     ])
-    def test_the_slow_analysis_is_outside_the_lock(self, slow_call):
-        """The whole point. Each of these took seconds to minutes."""
-        block = self._lock_blocks(self._cycle_function())[0]
-        inside = self._calls_within(block)
-        # `get_orderable_usd` is legitimately re-read by the revalidation,
-        # so it may appear inside -- but the SIZING call must not be the
-        # one in there. Distinguish by the analysis calls that have no
-        # business in a critical section at all.
-        if slow_call == "get_orderable_usd":
-            pytest.skip("re-read under the lock by design, see revalidation")
-        assert slow_call not in inside, (
-            f"{slow_call}() is analysis and must not hold the execution lock")
+    def test_the_slow_analysis_is_not_in_the_engine_at_all(self, slow_call):
+        """The whole point. Each of these took seconds to minutes, and none
+        of them belongs anywhere near the critical section."""
+        assert slow_call not in self._engine_source(), (
+            f"{slow_call}() is analysis and must not be in the engine")
 
 
 class TestTheLockActuallyExcludes:
