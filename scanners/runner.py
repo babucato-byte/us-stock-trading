@@ -138,6 +138,45 @@ UNIVERSE_ACTIVE = "active"
 #: take a laptop's uptime as a dependency of its own discovery.
 UNIVERSE_MANIFEST = "manifest"
 
+#: The small set a session STARTS on, chosen before it opened by
+#: scripts/prepare_session_startup.py and shared with the collector.
+#:
+#: The ordinary universe is 593-600 symbols read one KIS minute chart at a
+#: time at SCANNER priority. Measured repeatedly since 2026-08-27 that is
+#: 700-950 seconds, and on 2026-09-18 the PREMARKET scan took 636s -- ten
+#: minutes in which the entry worker was healthy and had nothing to work
+#: with, because `scanned=0`. This mode does not make that scan faster; it
+#: keeps it off the critical path of a session's first five minutes by
+#: starting on the symbols the collector is actually streaming.
+#:
+#: Falls back to whatever the profile would have done when no valid
+#: preparation exists. Safe, but NOT a fast start -- the two are recorded
+#: separately, because a fallback that reads as success would hide the
+#: very latency this exists to remove.
+UNIVERSE_PREPARED = "prepared"
+
+
+def _discovery_root(manifest_path=None):
+    """The shared discovery directory, derived from the manifest path the
+    caller already resolved so the two cannot point at different trees."""
+    import os
+
+    base = manifest_path or MANIFEST_DEFAULT_PATH
+    return os.path.dirname(str(base))
+
+
+def _startup_cap():
+    """The collector's real subscription ceiling.
+
+    Read from the transport module the collector reads, never restated: a
+    second copy of that number is a second opinion about how many symbols
+    can be streamed, and the startup universe is bounded by what the
+    collector can actually watch. This is NOT a cap on broad discovery.
+    """
+    from market_data import kis_hdfscnt0 as wire
+
+    return wire.MAX_SUBSCRIPTIONS
+
 #: Where the trading node looks for the scanner node's manifest. The
 #: scanner node writes it here over scp; nothing else writes to it.
 MANIFEST_DEFAULT_PATH = "shared/state/discovery/manifest.json"
@@ -166,6 +205,12 @@ class RunReport:
     #: A run that carries it has stopped cooperatively and must not
     #: publish: its candidates describe a session that is over.
     session_boundary_aborted: bool = False
+    #: Fast-start bookkeeping. `fast_start_slo_met` is None for a run that
+    #: never attempted one, False for a fallback, True for a prepared start.
+    prepared_symbol_count: Optional[int] = None
+    prepared_normally: Optional[bool] = None
+    prepared_status: Optional[str] = None
+    fast_start_slo_met: Optional[bool] = None
     #: The session the clock had moved to when that was noticed.
     boundary_session: Optional[str] = None
     #: How far in the scan got before it stopped.
@@ -541,6 +586,41 @@ def run_scanners(
                          if use_eligibility
                          else elig.NullEligibilityStore(report.provider))
     universe_selection = None
+
+    if symbols is None and selected_universe == UNIVERSE_PREPARED:
+        from scanners.base import session_startup
+
+        prepared, prep_status = session_startup.load_valid(
+            _discovery_root(manifest_path), trading_day=day,
+            target_session=report.session, cap=_startup_cap())
+        if prepared is not None:
+            symbols = list(prepared["symbols"])
+            report.universe_type = UNIVERSE_PREPARED
+            report.prepared_symbol_count = len(symbols)
+            report.prepared_normally = bool(prepared.get("prepared_normally"))
+            report.fast_start_slo_met = bool(prepared.get("prepared_normally"))
+            logger.info(
+                "SESSION_FAST_SCAN_START session=%s trading_day=%s "
+                "prepared_symbol_count=%s source=%s prepared_normally=%s "
+                "artifact_age_s=%.1f",
+                report.session, day, len(symbols), prepared.get("source"),
+                prepared.get("prepared_normally"),
+                session_startup.artifact_age_seconds(prepared) or -1.0)
+        else:
+            # Named, and distinguished from a clean start. The scan still
+            # runs -- refusing to scan because a preparation is missing
+            # would trade a slow session for no session -- but the SLO is
+            # not met and says so.
+            report.prepared_status = prep_status
+            report.fast_start_slo_met = False
+            logger.warning(
+                "SESSION_FAST_SCAN_INVALID_PREP session=%s trading_day=%s "
+                "reason=%s", report.session, day, prep_status)
+            logger.warning(
+                "SESSION_FAST_SCAN_FALLBACK session=%s trading_day=%s "
+                "reason=%s fast_start_slo_met=false to=%s",
+                report.session, day, prep_status, UNIVERSE_MANIFEST)
+            selected_universe = UNIVERSE_MANIFEST
 
     if symbols is None and selected_universe == UNIVERSE_MANIFEST:
         from discovery import manifest as manifest_module
@@ -1002,7 +1082,34 @@ def _log_summary(report: RunReport) -> None:
         "fetch_failures=%s duration=%.1fs",
         report.trading_day, report.universe_size, report.signal_count,
         report.stored_signals, report.fetch_failures, report.duration_seconds)
+    _log_fast_scan_complete(report)
     _log_data_error_summary(report.outcomes)
+
+
+def _log_fast_scan_complete(report) -> None:
+    """One line per startup scan, emitted even when nothing passed.
+
+    A zero-candidate session and a session whose scan never finished are
+    different facts, and for ten minutes on 2026-09-18 they were
+    indistinguishable from the outside. This says the cycle completed and
+    how long it took, whether or not it produced anything.
+    """
+    if report.fast_start_slo_met is None and report.prepared_status is None:
+        return  # not a startup scan; the ordinary summary above says enough
+    evaluated = sum(getattr(o, "evaluated", 0) or 0 for o in report.outcomes)
+    passed = sum(getattr(o, "signal_count", 0) or 0 for o in report.outcomes)
+    data_errors = sum(getattr(o, "data_errors", 0) or 0 for o in report.outcomes)
+    logger.info(
+        "SESSION_FAST_SCAN_COMPLETE session=%s trading_day=%s "
+        "prepared_symbol_count=%s universe=%s evaluated=%s passed=%s "
+        "data_errors=%s limiter_deferred=%s elapsed_ms=%.0f "
+        "first_publication_at=%s fast_start_slo_met=%s prepared_status=%s",
+        report.session, report.trading_day, report.prepared_symbol_count,
+        report.universe_size, evaluated, passed, data_errors,
+        getattr(report, "limiter_deferred", None),
+        (report.duration_seconds or 0.0) * 1000.0,
+        getattr(report, "first_publication_at", None),
+        bool(report.fast_start_slo_met), report.prepared_status)
 
 
 def _log_data_error_summary(outcomes) -> None:
@@ -1106,7 +1213,8 @@ def parse_args(argv=None):
                         help="run even when the US market is closed (backfill/testing)")
     parser.add_argument("--universe",
                         choices=[UNIVERSE_FULL, UNIVERSE_ACTIVE,
-                                 UNIVERSE_MANIFEST], default=None,
+                                 UNIVERSE_MANIFEST, UNIVERSE_PREPARED],
+                        default=None,
                         help="which universe to draw from; defaults to the profile's "
                              "own (daily=full, premarket/open=active)")
     parser.add_argument("--manifest-path", default=None,

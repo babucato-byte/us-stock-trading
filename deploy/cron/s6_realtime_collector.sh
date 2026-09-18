@@ -137,11 +137,63 @@ try:
         "OVERNIGHT_DAYTIME": ("AFTER_HOURS", day),
     }.get(session, (None, None))
 
-    pairs, why = bootstrap.build(session=session, trading_day=day,
-                                 prior_session=prior_session,
-                                 prior_trading_day=prior_day)
-    sys.stderr.write("bootstrap %s\n" % why)
-    print(",".join("%s:%s" % (sym, exch) for sym, exch in pairs))
+    # The prepared startup universe first, and the SAME file the startup
+    # scan reads. The collector and the scanner used to derive their
+    # watchlists independently -- 41 symbols here against 600 there -- so
+    # a symbol could pass the scan and never be streamed, and fail
+    # MARKET_DATA_FRESH at the gate. One artifact removes that by
+    # construction.
+    import os
+
+    from scanners.base import session_startup
+    from market_data import kis_hdfscnt0 as wire
+
+    candidates = os.environ.get("SCANNER_CANDIDATE_DIR", "")
+    root = os.path.join(os.path.dirname(candidates.rstrip("/")), "discovery")
+
+    prepared, status = session_startup.load_valid(
+        root, trading_day=day, target_session=session,
+        cap=wire.MAX_SUBSCRIPTIONS)
+
+    if prepared is None:
+        # No usable preparation. Build one, and WRITE IT -- the scanner
+        # must read the same list this collector is about to subscribe to,
+        # and a collector that fell back privately would put the two back
+        # out of step exactly when things are already degraded.
+        pairs, why = bootstrap.build(session=session, trading_day=day,
+                                     prior_session=prior_session,
+                                     prior_trading_day=prior_day)
+        sys.stderr.write("bootstrap %s\n" % why)
+        artifact = session_startup.build_artifact(
+            trading_day=day, target_session=session,
+            symbols=[sym for sym, _ in pairs], cap=wire.MAX_SUBSCRIPTIONS,
+            source=session_startup.SOURCE_COLLECTOR_FALLBACK,
+            source_session=prior_session, fallback_reason=status,
+            selection_source=repr(why))
+        try:
+            session_startup.write_atomic(root, artifact)
+            sys.stderr.write(
+                "SESSION_STARTUP_PREP_INVALID target_session=%s trading_day=%s "
+                "reason=%s fallback=COLLECTOR_FALLBACK symbol_count=%d "
+                "fast_start_slo_met=false\n"
+                % (session, day, status, len(pairs)))
+        except Exception as exc:
+            sys.stderr.write("fallback artifact not written: %r\n" % (exc,))
+        print(",".join("%s:%s" % (sym, exch) for sym, exch in pairs))
+    else:
+        # Exchange is not stored in the artifact: it is a property of the
+        # symbol, resolved the same way the builder resolves it.
+        out = []
+        for sym in prepared["symbols"]:
+            exch = bootstrap._exchange_for(sym)
+            if exch is not None:
+                out.append("%s:%s" % (sym, exch))
+        sys.stderr.write(
+            "startup artifact source=%s prepared_normally=%s symbols=%d "
+            "target_session=%s trading_day=%s\n"
+            % (prepared.get("source"), prepared.get("prepared_normally"),
+               len(out), session, day))
+        print(",".join(out))
 except Exception as exc:
     sys.stderr.write("bootstrap failed: %r\n" % (exc,))
     print("")

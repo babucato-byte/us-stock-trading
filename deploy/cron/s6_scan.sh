@@ -91,7 +91,25 @@ esac
 # are siblings by construction.
 MANIFEST_PATH="$(dirname "$SCANNER_CANDIDATE_DIR")/discovery/manifest.json"
 
-echo "$(date -u +%FT%TZ) session=$SESSION scanner_sha=$SCANNER_SHA root=$SCANNER_RUNTIME_ROOT candidates=$SCANNER_CANDIDATE_DIR manifest=$MANIFEST_PATH" >> "$LOG"
+# The first invocation after a session boundary starts on the small set
+# prepared before the session opened; every later one uses the ordinary
+# universe. Asked of the same session truth the probe above used -- no
+# session start time is written here.
+#
+# There is no separate fast-scan wrapper and no second lock: this IS the
+# startup scan, so there remains one scanner process and one publication
+# owner. Empty means "leave the profile's own universe alone".
+UNIVERSE_MODE=$(venv/bin/python -c "
+from scanners.base import session_startup
+print(session_startup.universe_mode())
+" 2>/dev/null)
+if [ "${UNIVERSE_MODE:-}" = "prepared" ]; then
+    UNIVERSE_ARG="prepared"
+else
+    UNIVERSE_ARG="manifest"
+fi
+
+echo "$(date -u +%FT%TZ) session=$SESSION universe_mode=$UNIVERSE_ARG scanner_sha=$SCANNER_SHA root=$SCANNER_RUNTIME_ROOT candidates=$SCANNER_CANDIDATE_DIR manifest=$MANIFEST_PATH" >> "$LOG"
 # The outer lock's refusal used to be silent.
 #
 # `flock -n` simply exited non-zero and the wrapper ended, so a scan that
