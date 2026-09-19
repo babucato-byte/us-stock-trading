@@ -72,12 +72,14 @@ def _latch_source() -> str:
 
 # -- 1 / 2: the heavy work is off the BUY critical path -------------------
 
-def test_1_and_2_a_buy_uses_the_submit_scope_and_a_sell_does_not():
+def test_1_and_2_a_buy_uses_the_submit_scope():
+    """The SELL joined it later -- see tests/test_sell_scope_submit.py,
+    which owns that claim and the evidence behind it. What this file
+    still pins is that the BUY path asks for the submit scope."""
     assert snap.SCOPE_SUBMIT == "submit" and snap.SCOPE_FULL == "full"
     call = ENGINE[ENGINE.index("snapshot = _reconcile_now("):]
     call = call[:call.index("reconciliation_dirty")]
-    assert "SCOPE_SUBMIT" in call and "SCOPE_FULL" in call
-    assert 'side_label == "sell"' in call, "the SELL keeps the full snapshot"
+    assert "SCOPE_SUBMIT" in call
 
 
 def test_2_the_submit_scope_never_reads_the_paged_fill_history():
@@ -302,16 +304,20 @@ def test_26_and_27_sell_and_exit_are_untouched():
 
     A baseline that recedes accumulates every later commit and fails the
     next legitimate change for reasons that have nothing to do with this
-    one. What matters is that the SELL still gets the full snapshot and
-    that the exit lifecycle is reached the way it always was.
+    one. What matters is that the SELL keeps the protection that made it
+    different from a BUY.
+
+    That protection is TCN-02A -- a dirty snapshot deferred to the gate,
+    which only a SELL may do -- and NOT the size of the snapshot. The
+    SELL later moved to the submit scope too, on the evidence in
+    tests/test_sell_scope_submit.py; the deferral did not move with it.
     """
     assert 'side_label == "sell"' in ENGINE
     call = ENGINE[ENGINE.index("snapshot = _reconcile_now("):]
     call = call[:call.index("reconciliation_dirty")]
-    assert "SCOPE_FULL if side_label" in call, (
-        "a SELL must keep the full snapshot: its protective-exit evidence "
-        "weighs a dirty one")
-    assert "defer_dirty_to_gate" in call, "TCN-02A is unchanged"
+    assert 'defer_dirty_to_gate=(side_label == "sell")' in call, (
+        "TCN-02A is unchanged: only a SELL carries a dirty snapshot to "
+        "the gate")
 
 
 def test_28_fast_start_is_untouched():

@@ -234,11 +234,10 @@ def _reconcile_now(*, conn, broker, order_intent, account_id, current, side_labe
         snapshot = reconciliation_snapshot.build_snapshot(
             broker=broker, conn=conn, account_id=account_id,
             symbol=order_intent.symbol, now=current,
-            # A BUY establishes what it needs about THIS order and leaves
-            # historical ledger integrity to the canonical pass, whose
-            # DIRTY verdict now latches ENTRY_DISABLED. A SELL is
-            # unchanged: its protective-exit evidence weighs a dirty
-            # snapshot, so it still needs the full one.
+            # The caller chooses, and both sides now pass SCOPE_SUBMIT.
+            # The default stays FULL so any other caller keeps the
+            # stricter reading rather than inheriting a narrower one by
+            # omission.
             scope=scope or reconciliation_snapshot.SCOPE_FULL,
         )
     except ReconciliationUnavailableError as exc:
@@ -444,13 +443,26 @@ def _submit_new_order(*, order_intent, gate_context_builder, gate_fn, conn, brok
             # TCN-02A: only a SELL may carry a dirty snapshot into the
             # gate.
             defer_dirty_to_gate=(side_label == "sell"),
-            # A BUY establishes what it needs about THIS order and leaves
-            # historical ledger integrity to the canonical pass, whose DIRTY
-            # verdict now latches ENTRY_DISABLED. A SELL is unchanged: its
-            # protective-exit evidence weighs a dirty snapshot, so it still
-            # needs the full one.
-            scope=(reconciliation_snapshot.SCOPE_FULL if side_label == "sell"
-                   else reconciliation_snapshot.SCOPE_SUBMIT),
+            # Neither side reads the fill history to send ONE order.
+            #
+            # Each establishes what it needs about THIS order -- the broker's
+            # positions and its open orders -- and leaves historical ledger
+            # integrity to the canonical pass, whose DIRTY verdict latches
+            # ENTRY_DISABLED. On 2026-09-18 that history cost HAYW's exit
+            # 170.6 of the 209.9 seconds its snapshot took, and produced
+            # nothing: the snapshot was clean, so the evidence it feeds was
+            # never consulted.
+            #
+            # What it feeds is one clause of one rule -- the fill-derived
+            # half of `order_dirty_symbols`, read by rule 6 of
+            # execution/sell_safe_evidence.py. Every other protection a SELL
+            # has is unchanged and reads what is still collected here:
+            # BROKER_REPORTS_FLAT and the min(local, broker) quantity cap
+            # come from the positions read, the duplicate-sell refusals from
+            # the open orders, the exit intents and the idempotency table.
+            # DEAD_SELL recovery never touched this snapshot at all -- it
+            # asks kis_fill_inquiry about one order at a time.
+            scope=reconciliation_snapshot.SCOPE_SUBMIT,
         )
     except ExecutionEngineError as exc:
         # A reconciliation refusal is a real judgement about the account,
