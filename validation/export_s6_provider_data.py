@@ -10,7 +10,11 @@ needed here.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import os
+import statistics
+import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +28,8 @@ from validation.toss_openapi.client import TossReadOnlyClient
 DEFAULT_OUTPUT_DIR = Path("/tmp/s6-provider-export")
 FORBIDDEN_TEXT = ("token", "secret", "account", "authorization", "cookie", "header", "app_key", "client_secret")
 PHASE_A_SYMBOLS = ("AAPL", "NVDA", "QQQ", "AMD", "PLTR", "TSLA", "MSFT", "AMZN", "META", "AVGO")
+PHASE_B_MIN_SYMBOLS = 50
+PHASE_B_MAX_SYMBOLS = 100
 
 
 def _error(exc: BaseException) -> str:
@@ -33,6 +39,45 @@ def _error(exc: BaseException) -> str:
 
 def _rate_limited(exc: BaseException) -> bool:
     return getattr(exc, "code", None) == 429 or getattr(exc, "status", None) == 429 or "429" in str(exc)
+
+
+def load_symbols(path: Path, *, minimum: int = 1, maximum: int = 100) -> list[str]:
+    """Read a ``symbol`` CSV column without importing a candidate pipeline.
+
+    The input file is read once, never written.  Source order is retained so
+    a production Discovery artifact remains a Discovery-derived universe.
+    """
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        rows = csv.DictReader(handle)
+        if not rows.fieldnames or "symbol" not in {name.lower() for name in rows.fieldnames}:
+            raise ValueError("SYMBOL_FILE_REQUIRES_SYMBOL_COLUMN")
+        column = next(name for name in rows.fieldnames if name.lower() == "symbol")
+        symbols: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            symbol = str(row.get(column) or "").strip().upper()
+            if symbol and symbol not in seen:
+                symbols.append(symbol)
+                seen.add(symbol)
+    if not minimum <= len(symbols) <= maximum:
+        raise ValueError("SYMBOL_FILE_COUNT_OUT_OF_RANGE")
+    return symbols
+
+
+def _summary(records: Sequence[Mapping[str, Any]], cycle_durations: Sequence[float]) -> Mapping[str, Any]:
+    latencies = [record["latency_ms"] for record in records if record.get("success") and record.get("latency_ms") is not None]
+    ordered = sorted(latencies)
+    p95 = ordered[max(0, (len(ordered) * 95 + 99) // 100 - 1)] if ordered else None
+    duration_ms = [round(value * 1000, 3) for value in cycle_durations]
+    median_total = statistics.median(duration_ms) if duration_ms else None
+    symbols_per_second = (len(records) / sum(cycle_durations)) if cycle_durations and sum(cycle_durations) else None
+    return {"requests": len(records), "success": sum(bool(record.get("success")) for record in records),
+            "failed": sum(not bool(record.get("success")) for record in records),
+            "min_latency_ms": min(latencies) if latencies else None,
+            "median_latency_ms": statistics.median(latencies) if latencies else None,
+            "p95_latency_ms": p95, "max_latency_ms": max(latencies) if latencies else None,
+            "total_duration_ms": round(sum(duration_ms), 3), "median_cycle_duration_ms": median_total,
+            "symbols_per_second": symbols_per_second, "request_records": list(records)}
 
 
 def _number(value: Any) -> float | None:
@@ -110,52 +155,83 @@ def secrets_in_export(payload: Mapping[str, Any]) -> bool:
 class S6ProviderDataExporter:
     """Collects Phase-A candle data without a production write surface."""
 
-    def __init__(self, kis: Any, toss: TossReadOnlyClient, *, candle_count: int = 120) -> None:
+    def __init__(self, kis: Any, toss: TossReadOnlyClient, *, candle_count: int = 120,
+                 toss_min_interval_seconds: float = 0.05) -> None:
         self.kis = kis
         self.toss = toss
         self.candle_count = int(candle_count)
         if not 1 <= self.candle_count <= 200:
             raise ValueError("candle_count must be between 1 and 200")
+        self.toss_min_interval_seconds = max(0.05, float(toss_min_interval_seconds))
 
-    def collect(self, symbols: Sequence[str] = PHASE_A_SYMBOLS, *, now: datetime | None = None) -> Mapping[str, Any]:
+    def collect(self, symbols: Sequence[str] = PHASE_A_SYMBOLS, *, now: datetime | None = None,
+                cycles: int = 1, universe_source: str = "PHASE_A_FIXED") -> Mapping[str, Any]:
         moment = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        if cycles < 1:
+            raise ValueError("cycles must be positive")
         errors, rate_limited = {"KIS": Counter(), "TOSS": Counter()}, 0
-        bars: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        normalized_symbols = [str(symbol).upper() for symbol in symbols]
+        bars: dict[str, dict[str, list[dict[str, Any]]]] = {symbol: {"KIS": [], "TOSS": []} for symbol in normalized_symbols}
+        records: dict[str, list[dict[str, Any]]] = {"KIS": [], "TOSS": []}
+        cycle_durations: dict[str, list[float]] = {"KIS": [], "TOSS": []}
         try:
             self.toss.authenticate()
         except Exception as exc:  # retain KIS collection if Toss auth is unavailable
-            errors["TOSS"][_error(exc)] += len(symbols)
+            errors["TOSS"][_error(exc)] += len(normalized_symbols) * cycles
             if _rate_limited(exc):
                 rate_limited += 1
             toss_authenticated = False
         else:
             toss_authenticated = True
-        for raw_symbol in symbols:
-            symbol = str(raw_symbol).upper()
-            item = {"KIS": [], "TOSS": []}
-            try:
-                item["KIS"] = _normalize_completed_bars(self.kis.bars(symbol), now=moment)
-                if not item["KIS"]:
-                    errors["KIS"]["EMPTY_RESPONSE"] += 1
-            except Exception as exc:
-                errors["KIS"][_error(exc)] += 1
-                if _rate_limited(exc):
-                    rate_limited += 1
-            if toss_authenticated:
-                try:
-                    response = self.toss.candles_1m(symbol, count=self.candle_count)
-                    item["TOSS"] = _normalize_completed_bars(_parse_toss_candles(response.data), now=moment)
-                    if not item["TOSS"]:
-                        errors["TOSS"]["EMPTY_RESPONSE"] += 1
-                except Exception as exc:
-                    errors["TOSS"][_error(exc)] += 1
-                    if _rate_limited(exc):
-                        rate_limited += 1
-            bars[symbol] = item
+        for cycle in range(cycles):
+            # Alternate provider order to avoid systematically giving one
+            # provider the earlier/later position in every observation.
+            order = ("KIS", "TOSS") if cycle % 2 == 0 else ("TOSS", "KIS")
+            for provider in order:
+                if provider == "TOSS" and not toss_authenticated:
+                    # Authentication was one failed request and is already
+                    # counted above.  Do not manufacture candle attempts or
+                    # EMPTY_RESPONSE errors that never occurred.
+                    continue
+                started_cycle = time.monotonic()
+                for symbol in normalized_symbols:
+                    started_at = datetime.now(timezone.utc).isoformat()
+                    began = time.monotonic()
+                    success, count = False, 0
+                    try:
+                        if provider == "KIS":
+                            value = _normalize_completed_bars(self.kis.bars(symbol), now=moment)
+                        elif toss_authenticated:
+                            response = self.toss.candles_1m(symbol, count=self.candle_count)
+                            value = _normalize_completed_bars(_parse_toss_candles(response.data), now=moment)
+                        else:
+                            value = []
+                        count, success = len(value), bool(value)
+                        bars[symbol][provider] = value
+                        if not success:
+                            errors[provider]["EMPTY_RESPONSE"] += 1
+                    except Exception as exc:
+                        errors[provider][_error(exc)] += 1
+                        if _rate_limited(exc):
+                            rate_limited += 1
+                    latency_ms = round((time.monotonic() - began) * 1000, 3)
+                    records[provider].append({"symbol": symbol, "request_started_at": started_at,
+                                              "latency_ms": latency_ms, "success": success, "bar_count": count,
+                                              "cycle": cycle + 1})
+                    if provider == "TOSS":
+                        elapsed = time.monotonic() - began
+                        if elapsed < self.toss_min_interval_seconds:
+                            time.sleep(self.toss_min_interval_seconds - elapsed)
+                cycle_durations[provider].append(time.monotonic() - started_cycle)
+        performance = {provider: _summary(records[provider], cycle_durations[provider]) for provider in ("KIS", "TOSS")}
+        left, right = performance["KIS"]["median_cycle_duration_ms"], performance["TOSS"]["median_cycle_duration_ms"]
+        performance["relative"] = {"speed_ratio_kis_over_toss": (left / right) if left is not None and right else None}
         payload = {
             "metadata": {"generated_at": moment.isoformat(), "symbols": list(bars), "providers": ["KIS", "TOSS"],
                          "timezone_normalized": "UTC", "interval": "1m", "forming_candle_excluded": True,
-                         "toss_volume_source": "REST_CANDLE", "execution_calls": 0},
+                         "toss_volume_source": "REST_CANDLE", "execution_calls": 0, "cycles": cycles,
+                         "universe_source": universe_source, "provider_order": "ALTERNATING"},
+            "performance": performance,
             "bars": bars,
             "errors": {provider: dict(values) for provider, values in errors.items()},
             "rate_limited_429": rate_limited,
@@ -164,11 +240,11 @@ class S6ProviderDataExporter:
             raise RuntimeError("SANITIZATION_FAILED")
         return payload
 
-    def write(self, output_dir: Path = DEFAULT_OUTPUT_DIR, **kwargs: Any) -> Path:
+    def write(self, output_dir: Path = DEFAULT_OUTPUT_DIR, *, phase: str = "a", **kwargs: Any) -> Path:
         payload = self.collect(**kwargs)
         output_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        target = output_dir / f"s6_phase_a_{stamp}.json"
+        target = output_dir / f"s6_phase_{str(phase).lower()}_{stamp}.json"
         target.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
         return target
 
@@ -187,10 +263,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Read-only Oracle S6 candle exporter")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--symbols", nargs="*", default=list(PHASE_A_SYMBOLS))
+    parser.add_argument("--symbols-file", type=Path)
     parser.add_argument("--candle-count", type=int, default=120)
+    parser.add_argument("--cycles", type=int, default=1)
+    parser.add_argument("--phase", choices=("a", "b"), default="a")
     args = parser.parse_args(argv)
+    if args.symbols_file:
+        minimum = PHASE_B_MIN_SYMBOLS if args.phase == "b" else 1
+        symbols = load_symbols(args.symbols_file, minimum=minimum, maximum=PHASE_B_MAX_SYMBOLS)
+        source = "READ_ONLY_SYMBOL_FILE"
+    else:
+        symbols, source = args.symbols, "PHASE_A_FIXED"
+    if args.phase == "b" and args.cycles < 3:
+        parser.error("Phase B requires --cycles >= 3")
     path = S6ProviderDataExporter(_KISReadOnlyFacade(), TossReadOnlyClient(), candle_count=args.candle_count).write(
-        args.output_dir, symbols=args.symbols)
+        args.output_dir, phase=args.phase, symbols=symbols, cycles=args.cycles, universe_source=source)
     print(_result(path))
     return 0
 

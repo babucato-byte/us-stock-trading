@@ -9,6 +9,7 @@ from validation.export_s6_provider_data import (
     S6ProviderDataExporter,
     _KISReadOnlyFacade,
     _normalize_completed_bars,
+    load_symbols,
     secrets_in_export,
 )
 
@@ -111,3 +112,25 @@ def test_timestamp_is_normalized_to_utc_minute():
     rows = [{"timestamp": (NOW - timedelta(minutes=1)).astimezone(plus_nine), "open": 1, "high": 2, "low": 1,
              "close": 2, "volume": 3}]
     assert _normalize_completed_bars(rows, now=NOW)[0]["timestamp"] == "2026-09-29T14:59:00+00:00"
+
+
+def test_phase_b_cycles_include_per_request_latency_and_summary():
+    payload = S6ProviderDataExporter(KIS(), Toss()).collect(["AAPL", "NVDA"], now=NOW, cycles=3,
+                                                               universe_source="READ_ONLY_SYMBOL_FILE")
+    assert payload["metadata"]["cycles"] == 3
+    assert payload["metadata"]["provider_order"] == "ALTERNATING"
+    for provider in ("KIS", "TOSS"):
+        performance = payload["performance"][provider]
+        assert performance["requests"] == 6
+        assert performance["success"] == 6
+        assert len(performance["request_records"]) == 6
+        assert all(set(row) == {"symbol", "request_started_at", "latency_ms", "success", "bar_count", "cycle"}
+                   for row in performance["request_records"])
+        assert performance["median_cycle_duration_ms"] is not None
+    assert payload["performance"]["relative"]["speed_ratio_kis_over_toss"] is not None
+
+
+def test_read_only_symbol_file_preserves_order_and_deduplicates(tmp_path):
+    path = tmp_path / "candidates.csv"
+    path.write_text("symbol,score\nNVDA,9\nAAPL,8\nNVDA,7\n", encoding="utf-8")
+    assert load_symbols(path, minimum=2, maximum=3) == ["NVDA", "AAPL"]
