@@ -1,4 +1,4 @@
-"""Oracle-side, read-only Phase-A OHLCV exporter for offline S6 parity.
+"""Self-contained Oracle-side, read-only Phase-A OHLCV exporter.
 
 The exporter deliberately performs no S6 calculation.  It emits only a
 whitelisted market-data schema which can be copied off Oracle and evaluated
@@ -16,13 +16,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from validation.broker_shadow_compare import _KISReadOnlyFacade, parse_toss_candles
-from validation.s6_provider_parity import PHASE_A_SYMBOLS, normalize_bars
+from brokers.kis_broker import KISBroker
+from market_data.kis_minute_chart import fetch
 from validation.toss_openapi.client import TossReadOnlyClient
 
 
 DEFAULT_OUTPUT_DIR = Path("/tmp/s6-provider-export")
 FORBIDDEN_TEXT = ("token", "secret", "account", "authorization", "cookie", "header", "app_key", "client_secret")
+PHASE_A_SYMBOLS = ("AAPL", "NVDA", "QQQ", "AMD", "PLTR", "TSLA", "MSFT", "AMZN", "META", "AVGO")
 
 
 def _error(exc: BaseException) -> str:
@@ -34,11 +35,70 @@ def _rate_limited(exc: BaseException) -> bool:
     return getattr(exc, "code", None) == 429 or getattr(exc, "status", None) == 429 or "429" in str(exc)
 
 
-def _bar_records(rows: Sequence[Mapping[str, Any]], *, now: datetime) -> list[dict[str, Any]]:
+def _number(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and number not in (float("inf"), float("-inf")) else None
+
+
+def _normalize_timestamp(value: Any) -> datetime | None:
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        return None
+    return value.astimezone(timezone.utc).replace(second=0, microsecond=0)
+
+
+def _normalize_completed_bars(rows: Sequence[Mapping[str, Any]], *, now: datetime) -> list[dict[str, Any]]:
     """The only serialized records: UTC completed OHLCV bars."""
-    return [{"timestamp": bar.timestamp.isoformat(), "open": bar.open, "high": bar.high,
-             "low": bar.low, "close": bar.close, "volume": bar.volume}
-            for bar in normalize_bars(rows, now=now)]
+    cutoff = now.astimezone(timezone.utc).replace(second=0, microsecond=0)
+    output: dict[datetime, dict[str, Any]] = {}
+    for row in rows or ():
+        if not isinstance(row, Mapping):
+            continue
+        timestamp = _normalize_timestamp(row.get("at", row.get("timestamp")))
+        values = [_number(row.get(name)) for name in ("open", "high", "low", "close", "volume")]
+        if timestamp is None or timestamp >= cutoff or any(value is None for value in values):
+            continue
+        open_, high, low, close, volume = values
+        if min(open_, high, low, close) <= 0 or volume < 0 or low > high:
+            continue
+        output[timestamp] = {"timestamp": timestamp.isoformat(), "open": open_, "high": high,
+                             "low": low, "close": close, "volume": volume}
+    return [output[key] for key in sorted(output)]
+
+
+def _parse_toss_candles(payload: Any) -> list[dict[str, Any]]:
+    """Parse only the independently verified Toss REST-candle schema."""
+    result = payload.get("result") if isinstance(payload, Mapping) else None
+    candles = result.get("candles") if isinstance(result, Mapping) else None
+    if not isinstance(candles, list):
+        raise ValueError("TOSS_CANDLE_SCHEMA_UNVERIFIED")
+    rows = []
+    required = ("timestamp", "openPrice", "highPrice", "lowPrice", "closePrice", "volume", "currency")
+    for candle in candles:
+        if not isinstance(candle, Mapping) or not all(key in candle for key in required):
+            raise ValueError("TOSS_CANDLE_SCHEMA_UNVERIFIED")
+        rows.append({"timestamp": candle["timestamp"], "open": candle["openPrice"], "high": candle["highPrice"],
+                     "low": candle["lowPrice"], "close": candle["closePrice"], "volume": candle["volume"]})
+    return rows
+
+
+class _KISReadOnlyFacade:
+    """Minute-chart reads only; no account, quote, or execution surface."""
+
+    def __init__(self) -> None:
+        self._broker = KISBroker()
+
+    def bars(self, symbol: str):
+        return fetch(self._broker, symbol=symbol, exchange="NASDAQ")
 
 
 def secrets_in_export(payload: Mapping[str, Any]) -> bool:
@@ -74,7 +134,7 @@ class S6ProviderDataExporter:
             symbol = str(raw_symbol).upper()
             item = {"KIS": [], "TOSS": []}
             try:
-                item["KIS"] = _bar_records(self.kis.bars(symbol), now=moment)
+                item["KIS"] = _normalize_completed_bars(self.kis.bars(symbol), now=moment)
                 if not item["KIS"]:
                     errors["KIS"]["EMPTY_RESPONSE"] += 1
             except Exception as exc:
@@ -84,7 +144,7 @@ class S6ProviderDataExporter:
             if toss_authenticated:
                 try:
                     response = self.toss.candles_1m(symbol, count=self.candle_count)
-                    item["TOSS"] = _bar_records(parse_toss_candles(response.data), now=moment)
+                    item["TOSS"] = _normalize_completed_bars(_parse_toss_candles(response.data), now=moment)
                     if not item["TOSS"]:
                         errors["TOSS"]["EMPTY_RESPONSE"] += 1
                 except Exception as exc:
